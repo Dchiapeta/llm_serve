@@ -1,36 +1,72 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# RunPod LLM Manager
 
-## Getting Started
+Painel de gerenciamento de infraestrutura de LLM no RunPod: criação de
+máquinas (pods) e templates, logs por máquina e por usuário, contas com chaves
+de acesso HEX, slots por capacidade e dashboard de alocação.
 
-First, run the development server:
+## Arquitetura
+
+- **Painel**: Next.js (App Router) + shadcn/ui (componentes ReUI) + Supabase
+- **Máquinas**: pods do RunPod rodando a imagem [`docker/`](docker/README.md)
+  (vLLM interno na porta 8001 + agent FastAPI na 8000)
+- **Contas**: cada usuário recebe uma chave HEX; o agent valida a chave,
+  repassa ao vLLM e mede uso por chave. O painel faz push das chaves ativas
+  para o agent e coleta métricas/logs.
+
+## Setup
+
+### 1. Supabase
+
+1. Crie um projeto em [supabase.com](https://supabase.com).
+2. Rode a migration [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql)
+   no SQL Editor do projeto.
+3. Em **Authentication → Users**, crie o usuário admin (e-mail + senha) que
+   fará login no painel.
+
+### 2. Variáveis de ambiente
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cp .env.example .env.local
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Preencha:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- `RUNPOD_API_KEY` — em [runpod.io → Settings → API Keys](https://www.runpod.io/console/user/settings)
+- `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
+  `SUPABASE_SERVICE_ROLE_KEY` — em Project Settings → API do Supabase
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+### 3. Imagem Docker
 
-## Learn More
+Faça o build e push da imagem (ver [docker/README.md](docker/README.md)) e use
+o nome dela (`seuusuario/vllm-agent:latest`) ao criar templates no painel.
 
-To learn more about Next.js, take a look at the following resources:
+### 4. Rodar
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+npm install
+npm run dev
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Fluxo de uso
 
-## Deploy on Vercel
+1. **Templates** → criar template (imagem, modelo, GPUs, parâmetros de capacidade)
+2. **Máquinas** → nova máquina (template + GPU) — cria o pod no RunPod
+3. **Contas & Chaves** → criar conta e gerar chave HEX (exibida uma única vez)
+4. O usuário chama a LLM:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```bash
+curl https://<pod-id>-8000.proxy.runpod.net/v1/chat/completions \
+  -H "Authorization: Bearer <chave-hex>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen2.5-7B-Instruct", "messages": [{"role": "user", "content": "Olá"}]}'
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+5. **Dashboard** → alocação de capacidade, distribuição de uso e atividade;
+   detalhe da máquina mostra slots, uso por conta, logs e variáveis, com ações
+   de desativar/iniciar/apagar.
+
+## Slots por capacidade
+
+`slots_max = floor((VRAM da GPU − footprint do modelo) / reserva por usuário)`
+
+Footprint e reserva são configurados por template ([lib/capacity.ts](lib/capacity.ts)).
