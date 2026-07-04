@@ -1,10 +1,10 @@
 "use client"
 
 import * as React from "react"
-import { Plus } from "lucide-react"
+import { Download } from "lucide-react"
 import { toast } from "sonner"
 
-import { createTemplate } from "@/lib/actions"
+import { importTemplate } from "@/lib/actions"
 import type { GpuType } from "@/lib/runpod"
 import { Button } from "@/components/ui/button"
 import {
@@ -17,20 +17,29 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Textarea } from "@/components/ui/textarea"
 
-export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
+export function ImportTemplateDialog({
+  runpodTemplateId,
+  name,
+  image,
+  gpus,
+}: {
+  runpodTemplateId: string
+  name: string
+  image: string
+  gpus: GpuType[]
+}) {
   const [open, setOpen] = React.useState(false)
   const [pending, startTransition] = React.useTransition()
 
   function onSubmit(formData: FormData) {
     startTransition(async () => {
       try {
-        await createTemplate(formData)
-        toast.success("Template criado")
+        await importTemplate(formData)
+        toast.success("Template importado")
         setOpen(false)
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : "Erro ao criar template")
+        toast.error(e instanceof Error ? e.message : "Erro ao importar template")
       }
     })
   }
@@ -38,55 +47,41 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button>
-          <Plus /> Novo template
+        <Button variant="outline" size="sm">
+          <Download /> Importar
         </Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Novo template</DialogTitle>
+          <DialogTitle>Importar “{name}”</DialogTitle>
           <DialogDescription>
-            Define a imagem Docker, o modelo e os parâmetros de capacidade.
+            Complete os parâmetros de modelo e capacidade. Imagem e disco vêm do
+            RunPod.
           </DialogDescription>
         </DialogHeader>
         <form action={onSubmit} className="flex flex-col gap-4">
+          <input type="hidden" name="runpod_template_id" value={runpodTemplateId} />
+
           <div className="flex flex-col gap-2">
-            <Label htmlFor="name">Nome</Label>
-            <Input id="name" name="name" placeholder="vllm-qwen-7b" required />
+            <Label>Imagem Docker (do RunPod)</Label>
+            <Input value={image} readOnly className="font-mono text-xs" />
           </div>
+
           <div className="flex flex-col gap-2">
-            <Label htmlFor="model_name">Modelo (Hugging Face)</Label>
+            <Label htmlFor={`model_name-${runpodTemplateId}`}>Modelo</Label>
             <Input
-              id="model_name"
+              id={`model_name-${runpodTemplateId}`}
               name="model_name"
               placeholder="Qwen/Qwen2.5-7B-Instruct"
-              pattern="[^/\s]+/[^/\s]+"
-              title="Use o ID do repositório do Hugging Face no formato org/modelo"
-              required
-            />
-            <p className="text-xs text-muted-foreground">
-              ID do repositório no Hugging Face (org/modelo). Copie de
-              huggingface.co e cole aqui — ex.: Qwen/Qwen2.5-7B-Instruct
-            </p>
-          </div>
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="image">Imagem Docker</Label>
-            <Input
-              id="image"
-              name="image"
-              placeholder="seuusuario/vllm-agent:latest"
               required
             />
           </div>
-          <div className="grid grid-cols-3 gap-4">
+
+          <div className="grid grid-cols-2 gap-4">
             <div className="flex flex-col gap-2">
-              <Label htmlFor="disk_gb">Disco (GB)</Label>
-              <Input id="disk_gb" name="disk_gb" type="number" defaultValue={40} />
-            </div>
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="model_footprint_gb">Modelo (GB VRAM)</Label>
+              <Label htmlFor={`footprint-${runpodTemplateId}`}>Modelo (GB VRAM)</Label>
               <Input
-                id="model_footprint_gb"
+                id={`footprint-${runpodTemplateId}`}
                 name="model_footprint_gb"
                 type="number"
                 step="0.5"
@@ -94,9 +89,9 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
               />
             </div>
             <div className="flex flex-col gap-2">
-              <Label htmlFor="kv_reserve_gb_per_user">Reserva/usuário (GB)</Label>
+              <Label htmlFor={`kv-${runpodTemplateId}`}>Reserva/usuário (GB)</Label>
               <Input
-                id="kv_reserve_gb_per_user"
+                id={`kv-${runpodTemplateId}`}
                 name="kv_reserve_gb_per_user"
                 type="number"
                 step="0.5"
@@ -104,8 +99,9 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
               />
             </div>
           </div>
+
           <div className="flex flex-col gap-2">
-            <Label>GPU compatível</Label>
+            <Label>GPUs compatíveis</Label>
             {gpus.length === 0 ? (
               <p className="text-xs text-muted-foreground">
                 Nenhuma GPU disponível (falha ao consultar o RunPod).
@@ -118,7 +114,7 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
                     className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-muted"
                   >
                     <input
-                      type="radio"
+                      type="checkbox"
                       name="gpu_types"
                       value={g.id}
                       className="size-4 accent-primary"
@@ -132,22 +128,10 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
                 ))}
               </div>
             )}
-            <p className="text-xs text-muted-foreground">
-              Selecione a GPU em que este modelo vai rodar.
-            </p>
           </div>
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="env">Variáveis de ambiente (JSON)</Label>
-            <Textarea
-              id="env"
-              name="env"
-              rows={3}
-              defaultValue={`{}`}
-              className="font-mono text-xs"
-            />
-          </div>
+
           <Button type="submit" disabled={pending}>
-            {pending ? "Criando…" : "Criar template"}
+            {pending ? "Importando…" : "Importar template"}
           </Button>
         </form>
       </DialogContent>

@@ -22,6 +22,30 @@ export async function login(formData: FormData) {
   redirect("/")
 }
 
+export async function signup(formData: FormData) {
+  const email = String(formData.get("email"))
+  const password = String(formData.get("password"))
+  const confirm = String(formData.get("confirm"))
+
+  if (password !== confirm) {
+    redirect(`/signup?error=${encodeURIComponent("As senhas não coincidem")}`)
+  }
+
+  const supabase = await createSupabaseServerClient()
+  const { data, error } = await supabase.auth.signUp({ email, password })
+  if (error) redirect(`/signup?error=${encodeURIComponent(error.message)}`)
+
+  // Quando a confirmação de e-mail está ativa, não há sessão ainda.
+  if (!data.session) {
+    redirect(
+      `/login?message=${encodeURIComponent(
+        "Conta criada. Verifique seu e-mail para confirmar o acesso."
+      )}`
+    )
+  }
+  redirect("/")
+}
+
 export async function logout() {
   const supabase = await createSupabaseServerClient()
   await supabase.auth.signOut()
@@ -45,9 +69,9 @@ export async function createTemplate(formData: FormData) {
   const diskGb = Number(formData.get("disk_gb") || 40)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
-  const gpuTypes = String(formData.get("gpu_types") || "")
-    .split(",")
-    .map((s) => s.trim())
+  const gpuTypes = formData
+    .getAll("gpu_types")
+    .map((s) => String(s).trim())
     .filter(Boolean)
 
   let env: Record<string, string> = {}
@@ -80,6 +104,42 @@ export async function createTemplate(formData: FormData) {
     gpu_types: gpuTypes,
     env,
     disk_gb: diskGb,
+    model_footprint_gb: footprint,
+    kv_reserve_gb_per_user: kvReserve,
+  })
+  if (error) throw new Error(error.message)
+  revalidatePath("/templates")
+}
+
+// Importa um template que já existe no RunPod, criando o registro local
+// que aponta para ele. Os campos de capacidade (modelo/footprint) são
+// informados pelo usuário, pois o RunPod não os armazena.
+export async function importTemplate(formData: FormData) {
+  const db = createSupabaseAdmin()
+  const runpodTemplateId = String(formData.get("runpod_template_id"))
+  if (!runpodTemplateId) throw new Error("Template do RunPod não informado")
+
+  // busca os dados autoritativos direto do RunPod
+  const templates = await runpod.listTemplates()
+  const remote = templates.find((t) => t.id === runpodTemplateId)
+  if (!remote) throw new Error("Template não encontrado no RunPod")
+
+  const modelName = String(formData.get("model_name"))
+  const footprint = Number(formData.get("model_footprint_gb") || 16)
+  const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
+  const gpuTypes = formData
+    .getAll("gpu_types")
+    .map((s) => String(s).trim())
+    .filter(Boolean)
+
+  const { error } = await db.from("templates").insert({
+    runpod_template_id: remote.id,
+    name: remote.name,
+    image: remote.imageName,
+    model_name: modelName,
+    gpu_types: gpuTypes,
+    env: remote.env ?? {},
+    disk_gb: remote.containerDiskInGb ?? 40,
     model_footprint_gb: footprint,
     kv_reserve_gb_per_user: kvReserve,
   })

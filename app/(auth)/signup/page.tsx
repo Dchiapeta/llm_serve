@@ -1,6 +1,6 @@
 import Link from "next/link"
 
-import { login } from "@/lib/actions"
+import { signup } from "@/lib/actions"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -13,30 +13,25 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 
-export default async function LoginPage({
+export default async function SignupPage({
   searchParams,
 }: {
-  searchParams: Promise<{ error?: string; message?: string }>
+  searchParams: Promise<{ error?: string }>
 }) {
-  const { error, message } = await searchParams
+  const { error } = await searchParams
 
   return (
     <div className="flex min-h-screen items-center justify-center p-4">
       <Card className="w-full max-w-sm">
         <CardHeader>
-          <CardTitle>RunPod LLM Manager</CardTitle>
-          <CardDescription>Entre com sua conta de administrador</CardDescription>
+          <CardTitle>Criar conta</CardTitle>
+          <CardDescription>Cadastre um novo administrador</CardDescription>
         </CardHeader>
         <CardContent>
-          <form action={login} className="flex flex-col gap-4">
+          <form action={signup} className="flex flex-col gap-4">
             {error && (
               <Alert variant="destructive">
                 <AlertDescription>{error}</AlertDescription>
-              </Alert>
-            )}
-            {message && (
-              <Alert>
-                <AlertDescription>{message}</AlertDescription>
               </Alert>
             )}
             <div className="flex flex-col gap-2">
@@ -45,15 +40,31 @@ export default async function LoginPage({
             </div>
             <div className="flex flex-col gap-2">
               <Label htmlFor="password">Senha</Label>
-              <Input id="password" name="password" type="password" required />
+              <Input
+                id="password"
+                name="password"
+                type="password"
+                minLength={6}
+                required
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="confirm">Confirmar senha</Label>
+              <Input
+                id="confirm"
+                name="confirm"
+                type="password"
+                minLength={6}
+                required
+              />
             </div>
             <Button type="submit" className="w-full">
-              Entrar
+              Criar conta
             </Button>
             <p className="text-center text-sm text-muted-foreground">
-              Não tem uma conta?{" "}
-              <Link href="/signup" className="underline">
-                Criar conta
+              Já tem uma conta?{" "}
+              <Link href="/login" className="underline">
+                Entrar
               </Link>
             </p>
           </form>

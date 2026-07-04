@@ -35,6 +35,14 @@ export function CreateMachineDialog({
 }) {
   const [open, setOpen] = React.useState(false)
   const [pending, startTransition] = React.useTransition()
+  const [templateId, setTemplateId] = React.useState("")
+
+  const selectedTemplate = templates.find((t) => t.id === templateId)
+  // se o template lista GPUs compatíveis, restringe a seleção a elas
+  const availableGpus =
+    selectedTemplate && selectedTemplate.gpu_types.length > 0
+      ? gpus.filter((g) => selectedTemplate.gpu_types.includes(g.id))
+      : gpus
 
   function onSubmit(formData: FormData) {
     startTransition(async () => {
@@ -70,7 +78,12 @@ export function CreateMachineDialog({
           </div>
           <div className="flex flex-col gap-2">
             <Label>Template</Label>
-            <Select name="template_id" required>
+            <Select
+              name="template_id"
+              required
+              value={templateId}
+              onValueChange={setTemplateId}
+            >
               <SelectTrigger>
                 <SelectValue placeholder="Escolha um template" />
               </SelectTrigger>
@@ -85,12 +98,18 @@ export function CreateMachineDialog({
           </div>
           <div className="flex flex-col gap-2">
             <Label>GPU</Label>
-            <Select name="gpu_type" required>
+            <Select name="gpu_type" required disabled={!selectedTemplate}>
               <SelectTrigger>
-                <SelectValue placeholder="Escolha a GPU" />
+                <SelectValue
+                  placeholder={
+                    selectedTemplate
+                      ? "Escolha a GPU"
+                      : "Escolha um template primeiro"
+                  }
+                />
               </SelectTrigger>
               <SelectContent>
-                {gpus.map((g) => (
+                {availableGpus.map((g) => (
                   <SelectItem key={g.id} value={g.id}>
                     {g.displayName} — {g.memoryInGb} GB
                     {g.securePrice ? ` — $${g.securePrice.toFixed(2)}/h` : ""}
@@ -98,6 +117,11 @@ export function CreateMachineDialog({
                 ))}
               </SelectContent>
             </Select>
+            {selectedTemplate && availableGpus.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                Este template não tem GPUs compatíveis cadastradas.
+              </p>
+            )}
           </div>
           <Button type="submit" disabled={pending || templates.length === 0}>
             {pending ? "Criando pod…" : "Criar máquina"}

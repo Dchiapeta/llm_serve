@@ -65,6 +65,19 @@ export type CreatePodInput = {
   templateId?: string
 }
 
+export type RunPodTemplate = {
+  id: string
+  name: string
+  imageName: string
+  containerDiskInGb?: number
+  volumeInGb?: number
+  volumeMountPath?: string
+  category?: string
+  ports?: string[]
+  env?: Record<string, string>
+  readme?: string
+}
+
 export const runpod = {
   listPods: () => rest<RunPodPod[]>("/pods"),
   getPod: (podId: string) => rest<RunPodPod>(`/pods/${podId}`),
@@ -78,7 +91,7 @@ export const runpod = {
     rest<void>(`/pods/${podId}`, { method: "DELETE" }),
 
   // ---------- Templates ----------
-  listTemplates: () => rest<unknown[]>("/templates"),
+  listTemplates: () => rest<RunPodTemplate[]>("/templates"),
   createTemplate: (input: {
     name: string
     imageName: string

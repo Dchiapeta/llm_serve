@@ -1,4 +1,5 @@
 import { createSupabaseAdmin } from "@/lib/supabase/server"
+import { listGpuTypes, runpod, type GpuType, type RunPodTemplate } from "@/lib/runpod"
 import type { Template } from "@/lib/types"
 import { Badge } from "@/components/ui/badge"
 import {
@@ -18,6 +19,7 @@ import {
 } from "@/components/ui/table"
 import { CreateTemplateDialog } from "@/components/templates/create-template-dialog"
 import { DeleteTemplateButton } from "@/components/templates/delete-template-button"
+import { ImportTemplateDialog } from "@/components/templates/import-template-dialog"
 
 export const dynamic = "force-dynamic"
 
@@ -29,6 +31,26 @@ export default async function TemplatesPage() {
     .order("created_at", { ascending: false })
   const templates = (data ?? []) as Template[]
 
+  // templates que existem no RunPod mas ainda não foram importados localmente
+  let remoteTemplates: RunPodTemplate[] = []
+  let runpodError: string | null = null
+  try {
+    remoteTemplates = await runpod.listTemplates()
+  } catch (e) {
+    runpodError = e instanceof Error ? e.message : "Falha ao consultar o RunPod"
+  }
+  const importedIds = new Set(
+    templates.map((t) => t.runpod_template_id).filter(Boolean)
+  )
+  const notImported = remoteTemplates.filter((t) => !importedIds.has(t.id))
+
+  let gpus: GpuType[] = []
+  try {
+    gpus = await listGpuTypes()
+  } catch {
+    // sem GPUs, o dialog mostra aviso
+  }
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
@@ -38,13 +60,23 @@ export default async function TemplatesPage() {
             Configurações de imagem e modelo para criar máquinas
           </p>
         </div>
-        <CreateTemplateDialog />
+        <CreateTemplateDialog gpus={gpus} />
       </div>
+
+      {runpodError && (
+        <p className="text-sm text-destructive">
+          Não foi possível consultar o RunPod: {runpodError}
+        </p>
+      )}
 
       <Card>
         <CardHeader>
           <CardTitle>Todos os templates</CardTitle>
-          <CardDescription>{templates.length} template(s)</CardDescription>
+          <CardDescription>
+            {templates.length} local(is)
+            {notImported.length > 0 &&
+              ` · ${notImported.length} no RunPod para importar`}
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <Table>
@@ -55,18 +87,19 @@ export default async function TemplatesPage() {
                 <TableHead>Imagem</TableHead>
                 <TableHead>Disco</TableHead>
                 <TableHead>Capacidade</TableHead>
-                <TableHead>RunPod</TableHead>
-                <TableHead className="w-12" />
+                <TableHead>Origem</TableHead>
+                <TableHead className="w-28" />
               </TableRow>
             </TableHeader>
             <TableBody>
-              {templates.length === 0 && (
+              {templates.length === 0 && notImported.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={7} className="text-center text-muted-foreground">
                     Nenhum template ainda. Crie o primeiro.
                   </TableCell>
                 </TableRow>
               )}
+
               {templates.map((t) => (
                 <TableRow key={t.id}>
                   <TableCell className="font-medium">{t.name}</TableCell>
@@ -85,6 +118,27 @@ export default async function TemplatesPage() {
                   </TableCell>
                   <TableCell>
                     <DeleteTemplateButton id={t.id} name={t.name} />
+                  </TableCell>
+                </TableRow>
+              ))}
+
+              {notImported.map((t) => (
+                <TableRow key={t.id} className="text-muted-foreground">
+                  <TableCell className="font-medium">{t.name}</TableCell>
+                  <TableCell className="text-xs">—</TableCell>
+                  <TableCell className="font-mono text-xs">{t.imageName}</TableCell>
+                  <TableCell>{t.containerDiskInGb ?? "—"} GB</TableCell>
+                  <TableCell className="text-xs">—</TableCell>
+                  <TableCell>
+                    <Badge variant="outline">só no RunPod</Badge>
+                  </TableCell>
+                  <TableCell>
+                    <ImportTemplateDialog
+                      runpodTemplateId={t.id}
+                      name={t.name}
+                      image={t.imageName}
+                      gpus={gpus}
+                    />
                   </TableCell>
                 </TableRow>
               ))}

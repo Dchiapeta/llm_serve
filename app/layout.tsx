@@ -28,7 +28,10 @@ export default function RootLayout({
       lang="pt-BR"
       className={`${geistSans.variable} ${geistMono.variable} style-nova h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-muted/40">
+      <body
+        className="min-h-full flex flex-col bg-muted/40"
+        suppressHydrationWarning
+      >
         {children}
         <Toaster position="top-right" />
       </body>
