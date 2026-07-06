@@ -18,7 +18,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { CreateTemplateDialog } from "@/components/templates/create-template-dialog"
-import { DeleteTemplateButton } from "@/components/templates/delete-template-button"
+import { TemplateRowActions } from "@/components/templates/template-row-actions"
 import { ImportTemplateDialog } from "@/components/templates/import-template-dialog"
 
 export const dynamic = "force-dynamic"
@@ -116,8 +116,8 @@ export default async function TemplatesPage() {
                       <Badge variant="outline">só local</Badge>
                     )}
                   </TableCell>
-                  <TableCell>
-                    <DeleteTemplateButton id={t.id} name={t.name} />
+                  <TableCell className="text-right">
+                    <TemplateRowActions template={t} gpus={gpus} />
                   </TableCell>
                 </TableRow>
               ))}

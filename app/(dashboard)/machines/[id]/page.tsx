@@ -3,6 +3,7 @@ import { notFound } from "next/navigation"
 import { ExternalLink } from "lucide-react"
 
 import { computeCapacity } from "@/lib/capacity"
+import { reconcileMachineStatuses } from "@/lib/machines"
 import { runpod } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type { Account, ApiKey, Machine, Template, UsageMetric } from "@/lib/types"
@@ -49,7 +50,9 @@ export default async function MachineDetailPage({
     .eq("id", id)
     .single<Machine>()
   if (!machineData) notFound()
-  const machine = machineData
+
+  // Reflete o estado real do RunPod já no carregamento (não só via botão).
+  const [machine] = await reconcileMachineStatuses([machineData], db)
 
   const [{ data: tplData }, { data: keysData }, { data: accountsData }, { data: usageData }] =
     await Promise.all([

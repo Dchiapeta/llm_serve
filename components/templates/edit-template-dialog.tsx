@@ -1,11 +1,11 @@
 "use client"
 
 import * as React from "react"
-import { Plus } from "lucide-react"
 import { toast } from "sonner"
 
-import { createTemplate } from "@/lib/actions"
+import { updateTemplate } from "@/lib/actions"
 import type { GpuType } from "@/lib/runpod"
+import type { Template } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -13,55 +13,67 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 
-export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
-  const [open, setOpen] = React.useState(false)
+export function EditTemplateDialog({
+  template,
+  gpus,
+  open,
+  onOpenChange,
+}: {
+  template: Template
+  gpus: GpuType[]
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
   const [pending, startTransition] = React.useTransition()
+  const selectedGpus = new Set(template.gpu_types ?? [])
 
   function onSubmit(formData: FormData) {
     startTransition(async () => {
       try {
-        await createTemplate(formData)
-        toast.success("Template criado")
-        setOpen(false)
+        await updateTemplate(formData)
+        toast.success("Template atualizado")
+        onOpenChange(false)
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : "Erro ao criar template")
+        toast.error(e instanceof Error ? e.message : "Erro ao atualizar template")
       }
     })
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button>
-          <Plus /> Novo template
-        </Button>
-      </DialogTrigger>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90vh] grid-rows-[auto_1fr] overflow-hidden sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Novo template</DialogTitle>
+          <DialogTitle>Editar template</DialogTitle>
           <DialogDescription>
-            Define a imagem Docker, o modelo e os parâmetros de capacidade.
+            Ajuste a imagem Docker, o modelo e os parâmetros de capacidade.
           </DialogDescription>
         </DialogHeader>
         <form action={onSubmit} className="flex min-h-0 flex-col gap-4 overflow-y-auto pr-1">
+          <input type="hidden" name="id" value={template.id} />
           <div className="flex flex-col gap-2">
-            <Label htmlFor="name">Nome</Label>
-            <Input id="name" name="name" placeholder="vllm-qwen-7b" required />
+            <Label htmlFor="edit-name">Nome</Label>
+            <Input
+              id="edit-name"
+              name="name"
+              placeholder="vllm-qwen-7b"
+              defaultValue={template.name}
+              required
+            />
           </div>
           <div className="flex flex-col gap-2">
-            <Label htmlFor="model_name">Modelo (Hugging Face)</Label>
+            <Label htmlFor="edit-model_name">Modelo (Hugging Face)</Label>
             <Input
-              id="model_name"
+              id="edit-model_name"
               name="model_name"
               placeholder="Qwen/Qwen2.5-7B-Instruct"
               pattern="[^/\s]+/[^/\s]+"
               title="Use o ID do repositório do Hugging Face no formato org/modelo"
+              defaultValue={template.model_name}
               required
             />
             <p className="text-xs text-muted-foreground">
@@ -70,21 +82,23 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
             </p>
           </div>
           <div className="flex flex-col gap-2">
-            <Label htmlFor="image">Imagem Docker</Label>
+            <Label htmlFor="edit-image">Imagem Docker</Label>
             <Input
-              id="image"
+              id="edit-image"
               name="image"
               placeholder="seuusuario/vllm-agent:latest"
+              defaultValue={template.image}
               required
             />
           </div>
           <div className="flex flex-col gap-2">
-            <Label htmlFor="start_command">Container start command</Label>
+            <Label htmlFor="edit-start_command">Container start command</Label>
             <Textarea
-              id="start_command"
+              id="edit-start_command"
               name="start_command"
               rows={6}
               placeholder={"--model org/modelo\n--served-model-name meu-modelo\n--port 8000"}
+              defaultValue={template.start_command ?? ""}
               className="font-mono text-xs"
             />
             <p className="text-xs text-muted-foreground">
@@ -94,27 +108,32 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
           </div>
           <div className="grid grid-cols-3 gap-4">
             <div className="flex flex-col gap-2">
-              <Label htmlFor="disk_gb">Disco (GB)</Label>
-              <Input id="disk_gb" name="disk_gb" type="number" defaultValue={40} />
-            </div>
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="model_footprint_gb">Modelo (GB VRAM)</Label>
+              <Label htmlFor="edit-disk_gb">Disco (GB)</Label>
               <Input
-                id="model_footprint_gb"
-                name="model_footprint_gb"
+                id="edit-disk_gb"
+                name="disk_gb"
                 type="number"
-                step="0.5"
-                defaultValue={16}
+                defaultValue={template.disk_gb}
               />
             </div>
             <div className="flex flex-col gap-2">
-              <Label htmlFor="kv_reserve_gb_per_user">Reserva/usuário (GB)</Label>
+              <Label htmlFor="edit-model_footprint_gb">Modelo (GB VRAM)</Label>
               <Input
-                id="kv_reserve_gb_per_user"
+                id="edit-model_footprint_gb"
+                name="model_footprint_gb"
+                type="number"
+                step="0.5"
+                defaultValue={template.model_footprint_gb}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="edit-kv_reserve_gb_per_user">Reserva/usuário (GB)</Label>
+              <Input
+                id="edit-kv_reserve_gb_per_user"
                 name="kv_reserve_gb_per_user"
                 type="number"
                 step="0.5"
-                defaultValue={2}
+                defaultValue={template.kv_reserve_gb_per_user}
               />
             </div>
           </div>
@@ -135,6 +154,7 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
                       type="checkbox"
                       name="gpu_types"
                       value={g.id}
+                      defaultChecked={selectedGpus.has(g.id)}
                       className="size-4 accent-primary"
                     />
                     <span className="flex-1">{g.displayName}</span>
@@ -151,17 +171,17 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
             </p>
           </div>
           <div className="flex flex-col gap-2">
-            <Label htmlFor="env">Variáveis de ambiente (JSON)</Label>
+            <Label htmlFor="edit-env">Variáveis de ambiente (JSON)</Label>
             <Textarea
-              id="env"
+              id="edit-env"
               name="env"
               rows={3}
-              defaultValue={`{}`}
+              defaultValue={JSON.stringify(template.env ?? {}, null, 2)}
               className="font-mono text-xs"
             />
           </div>
           <Button type="submit" disabled={pending}>
-            {pending ? "Criando…" : "Criar template"}
+            {pending ? "Salvando…" : "Salvar alterações"}
           </Button>
         </form>
       </DialogContent>

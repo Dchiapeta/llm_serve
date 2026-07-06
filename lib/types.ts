@@ -6,6 +6,7 @@ export type Template = {
   model_name: string
   gpu_types: string[]
   env: Record<string, string>
+  start_command: string | null
   disk_gb: number
   model_footprint_gb: number
   kv_reserve_gb_per_user: number

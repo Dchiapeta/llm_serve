@@ -59,6 +59,12 @@ async function logEvent(machineId: string | null, type: string, message: string)
   await db.from("machine_events").insert({ machine_id: machineId, type, message })
 }
 
+// Converte o "Container start command" (texto multilinha) em argv para o RunPod.
+// Cada token separado por espaço/quebra de linha vira um argumento.
+function parseStartCommand(raw: string | null | undefined): string[] {
+  return (raw ?? "").split(/\s+/).filter(Boolean)
+}
+
 // ---------- Templates ----------
 
 export async function createTemplate(formData: FormData) {
@@ -69,6 +75,7 @@ export async function createTemplate(formData: FormData) {
   const diskGb = Number(formData.get("disk_gb") || 40)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
+  const startCommand = String(formData.get("start_command") || "").trim() || null
   const gpuTypes = formData
     .getAll("gpu_types")
     .map((s) => String(s).trim())
@@ -90,6 +97,7 @@ export async function createTemplate(formData: FormData) {
       containerDiskInGb: diskGb,
       env,
       ports: ["8000/http"],
+      dockerStartCmd: parseStartCommand(startCommand),
     })
     runpodTemplateId = created.id
   } catch (e) {
@@ -103,6 +111,7 @@ export async function createTemplate(formData: FormData) {
     model_name: modelName,
     gpu_types: gpuTypes,
     env,
+    start_command: startCommand,
     disk_gb: diskGb,
     model_footprint_gb: footprint,
     kv_reserve_gb_per_user: kvReserve,
@@ -139,10 +148,71 @@ export async function importTemplate(formData: FormData) {
     model_name: modelName,
     gpu_types: gpuTypes,
     env: remote.env ?? {},
+    start_command: (remote.dockerStartCmd ?? []).join(" ") || null,
     disk_gb: remote.containerDiskInGb ?? 40,
     model_footprint_gb: footprint,
     kv_reserve_gb_per_user: kvReserve,
   })
+  if (error) throw new Error(error.message)
+  revalidatePath("/templates")
+}
+
+export async function updateTemplate(formData: FormData) {
+  const db = createSupabaseAdmin()
+  const id = String(formData.get("id"))
+  if (!id) throw new Error("Template não informado")
+
+  const name = String(formData.get("name"))
+  const image = String(formData.get("image"))
+  const modelName = String(formData.get("model_name"))
+  const diskGb = Number(formData.get("disk_gb") || 40)
+  const footprint = Number(formData.get("model_footprint_gb") || 16)
+  const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
+  const startCommand = String(formData.get("start_command") || "").trim() || null
+  const gpuTypes = formData
+    .getAll("gpu_types")
+    .map((s) => String(s).trim())
+    .filter(Boolean)
+
+  let env: Record<string, string> = {}
+  try {
+    env = JSON.parse(String(formData.get("env") || "{}"))
+  } catch {
+    throw new Error("Env vars devem ser um JSON válido")
+  }
+
+  const { data: tpl } = await db.from("templates").select("*").eq("id", id).single<Template>()
+
+  // reflete a alteração no RunPod quando o template está sincronizado
+  if (tpl?.runpod_template_id) {
+    try {
+      await runpod.updateTemplate(tpl.runpod_template_id, {
+        name,
+        imageName: image,
+        containerDiskInGb: diskGb,
+        env,
+        ports: ["8000/http"],
+        dockerStartCmd: parseStartCommand(startCommand),
+      })
+    } catch (e) {
+      console.error("Falha ao atualizar template no RunPod:", e)
+    }
+  }
+
+  const { error } = await db
+    .from("templates")
+    .update({
+      name,
+      image,
+      model_name: modelName,
+      gpu_types: gpuTypes,
+      env,
+      start_command: startCommand,
+      disk_gb: diskGb,
+      model_footprint_gb: footprint,
+      kv_reserve_gb_per_user: kvReserve,
+    })
+    .eq("id", id)
   if (error) throw new Error(error.message)
   revalidatePath("/templates")
 }
@@ -181,6 +251,7 @@ export async function createMachine(formData: FormData) {
   const gpus = await listGpuTypes()
   const gpu = gpus.find((g) => g.id === gpuTypeId)
 
+  const startCmd = parseStartCommand(tpl.start_command)
   const pod = await runpod.createPod({
     name,
     imageName: tpl.image,
@@ -189,6 +260,8 @@ export async function createMachine(formData: FormData) {
     containerDiskInGb: tpl.disk_gb,
     ports: ["8000/http"],
     cloudType: "SECURE",
+    // só sobrescreve o entrypoint da imagem quando o template define um comando
+    ...(startCmd.length > 0 ? { dockerStartCmd: startCmd } : {}),
     env: {
       ...tpl.env,
       MODEL_NAME: tpl.model_name,

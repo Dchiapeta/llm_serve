@@ -47,7 +47,12 @@ export default async function DashboardPage() {
       .limit(8),
   ])
 
-  const machines = (machinesData ?? []) as Machine[]
+  // Reconcilia com o RunPod e descarta máquinas terminadas por fora.
+  const reconciled = await reconcileMachineStatuses(
+    (machinesData ?? []) as Machine[],
+    db
+  )
+  const machines = reconciled.filter((m) => m.status !== "terminated")
   const templates = (templatesData ?? []) as Template[]
   const templateById = new Map(templates.map((t) => [t.id, t]))
   const usage = (usageData ?? []) as UsageMetric[]

@@ -63,6 +63,7 @@ export type CreatePodInput = {
   ports?: string[]
   cloudType?: "SECURE" | "COMMUNITY"
   templateId?: string
+  dockerStartCmd?: string[]
 }
 
 export type RunPodTemplate = {
@@ -75,6 +76,7 @@ export type RunPodTemplate = {
   category?: string
   ports?: string[]
   env?: Record<string, string>
+  dockerStartCmd?: string[]
   readme?: string
 }
 
@@ -98,8 +100,20 @@ export const runpod = {
     containerDiskInGb?: number
     env?: Record<string, string>
     ports?: string[]
+    dockerStartCmd?: string[]
     isServerless?: boolean
   }) => rest<{ id: string }>("/templates", { method: "POST", json: input }),
+  updateTemplate: (
+    templateId: string,
+    input: {
+      name?: string
+      imageName?: string
+      containerDiskInGb?: number
+      env?: Record<string, string>
+      ports?: string[]
+      dockerStartCmd?: string[]
+    }
+  ) => rest<{ id: string }>(`/templates/${templateId}`, { method: "PATCH", json: input }),
   deleteTemplate: (templateId: string) =>
     rest<void>(`/templates/${templateId}`, { method: "DELETE" }),
 }
