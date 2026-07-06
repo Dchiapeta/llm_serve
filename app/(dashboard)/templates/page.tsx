@@ -86,6 +86,7 @@ export default async function TemplatesPage() {
                 <TableHead>Modelo</TableHead>
                 <TableHead>Imagem</TableHead>
                 <TableHead>Disco</TableHead>
+                <TableHead>Env vars</TableHead>
                 <TableHead>Capacidade</TableHead>
                 <TableHead>Origem</TableHead>
                 <TableHead className="w-28" />
@@ -94,7 +95,7 @@ export default async function TemplatesPage() {
             <TableBody>
               {templates.length === 0 && notImported.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={7} className="text-center text-muted-foreground">
+                  <TableCell colSpan={8} className="text-center text-muted-foreground">
                     Nenhum template ainda. Crie o primeiro.
                   </TableCell>
                 </TableRow>
@@ -106,6 +107,14 @@ export default async function TemplatesPage() {
                   <TableCell className="font-mono text-xs">{t.model_name}</TableCell>
                   <TableCell className="font-mono text-xs">{t.image}</TableCell>
                   <TableCell>{t.disk_gb} GB</TableCell>
+                  <TableCell
+                    className="max-w-40 truncate font-mono text-xs text-muted-foreground"
+                    title={Object.keys(t.env ?? {}).join(", ")}
+                  >
+                    {Object.keys(t.env ?? {}).length > 0
+                      ? Object.keys(t.env).join(", ")
+                      : "—"}
+                  </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {t.model_footprint_gb} GB + {t.kv_reserve_gb_per_user} GB/usuário
                   </TableCell>
@@ -128,6 +137,14 @@ export default async function TemplatesPage() {
                   <TableCell className="text-xs">—</TableCell>
                   <TableCell className="font-mono text-xs">{t.imageName}</TableCell>
                   <TableCell>{t.containerDiskInGb ?? "—"} GB</TableCell>
+                  <TableCell
+                    className="max-w-40 truncate font-mono text-xs"
+                    title={Object.keys(t.env ?? {}).join(", ")}
+                  >
+                    {Object.keys(t.env ?? {}).length > 0
+                      ? Object.keys(t.env ?? {}).join(", ")
+                      : "—"}
+                  </TableCell>
                   <TableCell className="text-xs">—</TableCell>
                   <TableCell>
                     <Badge variant="outline">só no RunPod</Badge>
