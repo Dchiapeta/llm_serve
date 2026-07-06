@@ -1,13 +1,17 @@
 "use client"
 
 import * as React from "react"
-import { Plus } from "lucide-react"
-import { toast } from "sonner"
+import { AlertCircle, Plus } from "lucide-react"
 
 import { createMachine } from "@/lib/actions"
 import { vramSlots } from "@/lib/capacity"
 import type { GpuType } from "@/lib/runpod"
 import type { Template } from "@/lib/types"
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+} from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -36,6 +40,7 @@ export function CreateMachineDialog({
   const [templateId, setTemplateId] = React.useState("")
   const [gpuTypeId, setGpuTypeId] = React.useState("")
   const [maxUsers, setMaxUsers] = React.useState("")
+  const [error, setError] = React.useState<string | null>(null)
 
   const selectedTemplate = templates.find((t) => t.id === templateId)
   // se o template lista GPUs compatíveis, restringe a seleção a elas
@@ -59,6 +64,7 @@ export function CreateMachineDialog({
     gpuCapacity !== null && maxUsersNum !== null && maxUsersNum > gpuCapacity
 
   function onTemplateChange(id: string) {
+    setError(null)
     setTemplateId(id)
     setGpuTypeId("")
     const tpl = templates.find((t) => t.id === id)
@@ -66,20 +72,28 @@ export function CreateMachineDialog({
   }
 
   function onSubmit(formData: FormData) {
+    setError(null)
     startTransition(async () => {
       try {
-        await createMachine(formData)
-        // redirect acontece na action; toast só em caso de erro
+        // redirect acontece na action; erros esperados voltam como { error }
+        const result = await createMachine(formData)
+        if (result?.error) setError(result.error)
       } catch (e) {
         // redirect() lança um erro interno do Next — não tratar como falha
         if (e && typeof e === "object" && "digest" in e) throw e
-        toast.error(e instanceof Error ? e.message : "Erro ao criar máquina")
+        setError(e instanceof Error ? e.message : "Erro ao criar máquina")
       }
     })
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next)
+        if (!next) setError(null)
+      }}
+    >
       <DialogTrigger asChild>
         <Button>
           <Plus /> Nova máquina
@@ -125,7 +139,10 @@ export function CreateMachineDialog({
               required
               disabled={!selectedTemplate}
               value={gpuTypeId}
-              onChange={(e) => setGpuTypeId(e.target.value)}
+              onChange={(e) => {
+                setError(null)
+                setGpuTypeId(e.target.value)
+              }}
               className="w-full"
             >
               <NativeSelectOption value="" disabled>
@@ -173,6 +190,13 @@ export function CreateMachineDialog({
               </p>
             )}
           </div>
+          {error && (
+            <Alert variant="destructive">
+              <AlertCircle />
+              <AlertTitle>Não foi possível criar a máquina</AlertTitle>
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
           <Button
             type="submit"
             disabled={pending || templates.length === 0 || overCapacity}

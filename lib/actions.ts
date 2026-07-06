@@ -312,7 +312,7 @@ export async function createMachine(formData: FormData) {
     .select("*")
     .eq("id", templateId)
     .single<Template>()
-  if (tplErr || !tpl) throw new Error("Template não encontrado")
+  if (tplErr || !tpl) return { error: "Template não encontrado" }
 
   // teto manual: valor do form, com fallback para o padrão do template
   const maxUsers = parseMaxUsers(formData) ?? tpl.max_users
@@ -329,33 +329,45 @@ export async function createMachine(formData: FormData) {
       kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
     })
     if (maxUsers > cap) {
-      throw new Error(
-        `A GPU ${gpu.displayName} comporta no máximo ${cap} usuário(s) para este modelo (pedido: ${maxUsers})`
-      )
+      return {
+        error: `A GPU ${gpu.displayName} comporta no máximo ${cap} usuário(s) para este modelo (pedido: ${maxUsers})`,
+      }
     }
   }
 
   const startCmd = parseStartCommand(tpl.start_command)
   const ports = toRunpodPorts(tpl.http_ports ?? [], tpl.tcp_ports ?? [])
-  const pod = await runpod.createPod({
-    name,
-    imageName: tpl.image,
-    gpuTypeIds: [gpuTypeId],
-    gpuCount: 1,
-    containerDiskInGb: tpl.disk_gb,
-    volumeInGb: tpl.volume_gb ?? 0,
-    volumeMountPath: tpl.volume_mount_path || "/workspace",
-    ports: ports.length > 0 ? ports : ["8000/http"],
-    cloudType: "SECURE",
-    // só sobrescreve o entrypoint da imagem quando o template define um comando
-    ...(startCmd.length > 0 ? { dockerStartCmd: startCmd } : {}),
-    env: {
-      ...tpl.env,
-      MODEL_NAME: tpl.model_name,
-      AGENT_ADMIN_SECRET: adminSecret,
-      ...(maxUsers !== null ? { MAX_USERS: String(maxUsers) } : {}),
-    },
-  })
+  let pod: Awaited<ReturnType<typeof runpod.createPod>>
+  try {
+    pod = await runpod.createPod({
+      name,
+      imageName: tpl.image,
+      gpuTypeIds: [gpuTypeId],
+      gpuCount: 1,
+      containerDiskInGb: tpl.disk_gb,
+      volumeInGb: tpl.volume_gb ?? 0,
+      volumeMountPath: tpl.volume_mount_path || "/workspace",
+      ports: ports.length > 0 ? ports : ["8000/http"],
+      cloudType: "SECURE",
+      // só sobrescreve o entrypoint da imagem quando o template define um comando
+      ...(startCmd.length > 0 ? { dockerStartCmd: startCmd } : {}),
+      env: {
+        ...tpl.env,
+        MODEL_NAME: tpl.model_name,
+        AGENT_ADMIN_SECRET: adminSecret,
+        ...(maxUsers !== null ? { MAX_USERS: String(maxUsers) } : {}),
+      },
+    })
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    // Falta de estoque no RunPod é um erro esperado — devolve mensagem amigável
+    if (msg.includes("no instances currently available")) {
+      return {
+        error: `Sem GPUs ${gpu?.displayName ?? gpuTypeId} disponíveis no RunPod agora. Tente outro tipo de GPU ou novamente em alguns minutos.`,
+      }
+    }
+    return { error: `Falha ao criar o pod no RunPod: ${msg}` }
+  }
 
   const { data: machine, error } = await db
     .from("machines")
@@ -374,7 +386,11 @@ export async function createMachine(formData: FormData) {
     })
     .select()
     .single<Machine>()
-  if (error) throw new Error(error.message)
+  if (error) {
+    return {
+      error: `Pod ${pod.id} criado no RunPod, mas falhou ao salvar no banco: ${error.message}`,
+    }
+  }
 
   await logEvent(machine.id, "created", `Máquina "${name}" criada (${gpu?.displayName ?? gpuTypeId})`)
   revalidatePath("/machines")
