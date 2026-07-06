@@ -99,18 +99,6 @@ async def sync_keys(body: SyncKeysBody, x_admin_secret: str | None = Header(None
     return {"ok": True, "count": len(keys_by_hash)}
 
 
-@app.get("/admin/metrics")
-async def get_metrics(x_admin_secret: str | None = Header(None)):
-    require_admin(x_admin_secret)
-    return {
-        "uptime_s": int(time.time() - STARTED_AT),
-        "total_requests": total_requests,
-        "concurrent_now": concurrent_now,
-        "concurrent_peak": concurrent_peak,
-        "per_key": metrics_per_key,
-    }
-
-
 @app.get("/admin/logs")
 async def get_logs(
     x_admin_secret: str | None = Header(None),

@@ -9,17 +9,6 @@ export type AgentKeyEntry = {
   account_name: string
 }
 
-export type AgentMetrics = {
-  uptime_s: number
-  total_requests: number
-  concurrent_now: number
-  concurrent_peak: number
-  per_key: Record<
-    string, // key_prefix
-    { requests: number; tokens_in: number; tokens_out: number; last_used: number | null }
-  >
-}
-
 async function agentFetch<T>(
   machine: Pick<Machine, "public_url" | "admin_secret">,
   path: string,
@@ -50,8 +39,6 @@ export const agent = {
       method: "POST",
       json: { keys },
     }),
-  metrics: (m: Pick<Machine, "public_url" | "admin_secret">) =>
-    agentFetch<AgentMetrics>(m, "/metrics"),
   logs: (
     m: Pick<Machine, "public_url" | "admin_secret">,
     opts?: { keyPrefix?: string; tail?: number }

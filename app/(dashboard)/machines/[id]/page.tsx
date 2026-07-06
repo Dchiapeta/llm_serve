@@ -28,12 +28,24 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { CreateKeyDialog } from "@/components/accounts/create-key-dialog"
 import { RevokeKeyButton } from "@/components/accounts/revoke-key-button"
 import { CapacityBar } from "@/components/machines/capacity-bar"
+import { MachineAbout } from "@/components/machines/machine-about"
 import { MachineActions } from "@/components/machines/machine-actions"
 import { StatusBadge } from "@/components/machines/status-badge"
 
 export const dynamic = "force-dynamic"
 
 type KeyWithAccount = ApiKey & { accounts: { name: string } | null }
+
+// "3d 4h", "2h 15min", "38min"
+function formatRuntime(ms: number): string {
+  const totalMin = Math.max(0, Math.floor(ms / 60_000))
+  const days = Math.floor(totalMin / (60 * 24))
+  const hours = Math.floor((totalMin % (60 * 24)) / 60)
+  const minutes = totalMin % 60
+  if (days > 0) return `${days}d ${hours}h`
+  if (hours > 0) return `${hours}h ${minutes}min`
+  return `${minutes}min`
+}
 
 export default async function MachineDetailPage({
   params,
@@ -80,14 +92,20 @@ export default async function MachineDetailPage({
 
   // env vars reais do pod (se ainda existir no RunPod)
   let podEnv: Record<string, string> = template?.env ?? {}
+  let lastStartedAt: string | null = null
   if (machine.runpod_pod_id && machine.status !== "terminated") {
     try {
       const pod = await runpod.getPod(machine.runpod_pod_id)
       if (pod.env) podEnv = pod.env
+      lastStartedAt = pod.lastStartedAt ?? null
     } catch {
       // pod pode não existir mais; usa env do template como referência
     }
   }
+  const runtime =
+    machine.status === "running" && lastStartedAt
+      ? formatRuntime(Date.now() - new Date(lastStartedAt).getTime())
+      : null
 
   const cap = computeCapacity({
     vramGb: machine.vram_gb,
@@ -141,7 +159,20 @@ export default async function MachineDetailPage({
         <MachineActions machine={machine} />
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <Card>
+          <CardHeader>
+            <CardDescription>Runtime</CardDescription>
+            <CardTitle className="text-2xl">{runtime ?? "—"}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-xs text-muted-foreground">
+              {machine.status === "running" && lastStartedAt
+                ? `No ar desde ${new Date(lastStartedAt).toLocaleString("pt-BR")}`
+                : "Máquina não está rodando"}
+            </p>
+          </CardContent>
+        </Card>
         <Card>
           <CardHeader>
             <CardDescription>Alocação de capacidade</CardDescription>
@@ -188,6 +219,7 @@ export default async function MachineDetailPage({
         <TabsList>
           <TabsTrigger value="accounts">Contas & Slots</TabsTrigger>
           <TabsTrigger value="env">Variáveis</TabsTrigger>
+          <TabsTrigger value="about">Sobre</TabsTrigger>
         </TabsList>
 
         <TabsContent value="accounts" className="mt-4">
@@ -290,6 +322,23 @@ export default async function MachineDetailPage({
                   ))}
                 </div>
               )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="about" className="mt-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Como usar</CardTitle>
+              <CardDescription>
+                Exemplos de requisição para esta máquina via terminal e Claude Code CLI
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <MachineAbout
+                publicUrl={machine.public_url}
+                modelName={machine.model_name}
+              />
             </CardContent>
           </Card>
         </TabsContent>

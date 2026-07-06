@@ -20,7 +20,6 @@ import {
 } from "@/components/ui/card"
 import { CapacityBar } from "@/components/machines/capacity-bar"
 import { StatusBadge } from "@/components/machines/status-badge"
-import { PollMetricsButton } from "@/components/dashboard/poll-metrics-button"
 import { UsageDonut } from "@/components/dashboard/usage-donut"
 
 export const dynamic = "force-dynamic"
@@ -132,14 +131,11 @@ export default async function DashboardPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Dashboard</h1>
-          <p className="text-sm text-muted-foreground">
-            Visão geral da infraestrutura de LLM
-          </p>
-        </div>
-        <PollMetricsButton />
+      <div>
+        <h1 className="text-2xl font-semibold">Dashboard</h1>
+        <p className="text-sm text-muted-foreground">
+          Visão geral da infraestrutura de LLM
+        </p>
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
