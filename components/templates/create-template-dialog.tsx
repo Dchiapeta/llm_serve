@@ -105,7 +105,7 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
             </div>
           </div>
           <div className="flex flex-col gap-2">
-            <Label>GPU compatível</Label>
+            <Label>GPUs compatíveis</Label>
             {gpus.length === 0 ? (
               <p className="text-xs text-muted-foreground">
                 Nenhuma GPU disponível (falha ao consultar o RunPod).
@@ -118,7 +118,7 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
                     className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-muted"
                   >
                     <input
-                      type="radio"
+                      type="checkbox"
                       name="gpu_types"
                       value={g.id}
                       className="size-4 accent-primary"
@@ -133,7 +133,7 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
               </div>
             )}
             <p className="text-xs text-muted-foreground">
-              Selecione a GPU em que este modelo vai rodar.
+              Selecione uma ou mais GPUs em que este modelo pode rodar.
             </p>
           </div>
           <div className="flex flex-col gap-2">

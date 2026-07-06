@@ -2,6 +2,7 @@ import Link from "next/link"
 import { Activity, DollarSign, KeyRound, Server } from "lucide-react"
 
 import { computeCapacity } from "@/lib/capacity"
+import { reconcileMachineStatuses } from "@/lib/machines"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type {
   Machine,

@@ -1,6 +1,7 @@
 import Link from "next/link"
 
 import { computeCapacity } from "@/lib/capacity"
+import { reconcileMachineStatuses } from "@/lib/machines"
 import { listGpuTypes } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type { Machine, Template } from "@/lib/types"
@@ -39,8 +40,15 @@ export default async function MachinesPage() {
       listGpuTypes().catch(() => []),
     ])
 
-  const machines = (machinesData ?? []) as Machine[]
   const templates = (templatesData ?? []) as Template[]
+
+  // Reconcilia o status do banco com a realidade do RunPod e descarta as que
+  // foram terminadas por fora (mesmo filtro aplicado na query).
+  const reconciled = await reconcileMachineStatuses(
+    (machinesData ?? []) as Machine[],
+    db
+  )
+  const machines = reconciled.filter((m) => m.status !== "terminated")
   const templateById = new Map(templates.map((t) => [t.id, t]))
 
   const { data: keyCounts } = await db

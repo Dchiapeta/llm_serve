@@ -19,12 +19,9 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
+  NativeSelect,
+  NativeSelectOption,
+} from "@/components/ui/native-select"
 
 export function CreateMachineDialog({
   templates,
@@ -77,46 +74,47 @@ export function CreateMachineDialog({
             <Input id="name" name="name" placeholder="llm-prod-01" required />
           </div>
           <div className="flex flex-col gap-2">
-            <Label>Template</Label>
-            <Select
+            <Label htmlFor="template_id">Template</Label>
+            <NativeSelect
+              id="template_id"
               name="template_id"
               required
               value={templateId}
-              onValueChange={setTemplateId}
+              onChange={(e) => setTemplateId(e.target.value)}
+              className="w-full"
             >
-              <SelectTrigger>
-                <SelectValue placeholder="Escolha um template" />
-              </SelectTrigger>
-              <SelectContent>
-                {templates.map((t) => (
-                  <SelectItem key={t.id} value={t.id}>
-                    {t.name} — {t.model_name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              <NativeSelectOption value="" disabled>
+                Escolha um template
+              </NativeSelectOption>
+              {templates.map((t) => (
+                <NativeSelectOption key={t.id} value={t.id}>
+                  {t.name} — {t.model_name}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
           </div>
           <div className="flex flex-col gap-2">
-            <Label>GPU</Label>
-            <Select name="gpu_type" required disabled={!selectedTemplate}>
-              <SelectTrigger>
-                <SelectValue
-                  placeholder={
-                    selectedTemplate
-                      ? "Escolha a GPU"
-                      : "Escolha um template primeiro"
-                  }
-                />
-              </SelectTrigger>
-              <SelectContent>
-                {availableGpus.map((g) => (
-                  <SelectItem key={g.id} value={g.id}>
-                    {g.displayName} — {g.memoryInGb} GB
-                    {g.securePrice ? ` — $${g.securePrice.toFixed(2)}/h` : ""}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <Label htmlFor="gpu_type">GPU</Label>
+            <NativeSelect
+              id="gpu_type"
+              name="gpu_type"
+              required
+              disabled={!selectedTemplate}
+              defaultValue=""
+              className="w-full"
+            >
+              <NativeSelectOption value="" disabled>
+                {selectedTemplate
+                  ? "Escolha a GPU"
+                  : "Escolha um template primeiro"}
+              </NativeSelectOption>
+              {availableGpus.map((g) => (
+                <NativeSelectOption key={g.id} value={g.id}>
+                  {g.displayName} — {g.memoryInGb} GB
+                  {g.securePrice ? ` — $${g.securePrice.toFixed(2)}/h` : ""}
+                </NativeSelectOption>
+              ))}
+            </NativeSelect>
             {selectedTemplate && availableGpus.length === 0 && (
               <p className="text-xs text-muted-foreground">
                 Este template não tem GPUs compatíveis cadastradas.
