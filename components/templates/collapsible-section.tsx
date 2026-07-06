@@ -31,7 +31,12 @@ export function CollapsibleSection({
         {title}
         <ChevronDown className="size-4 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
       </CollapsibleTrigger>
-      <CollapsibleContent className="flex flex-col gap-4 border-t px-4 py-4">
+      {/* forceMount mantém os inputs no DOM quando fechada — sem isso, campos
+          de seções colapsadas ficam fora do FormData no submit */}
+      <CollapsibleContent
+        forceMount
+        className="flex flex-col gap-4 border-t px-4 py-4 data-[state=closed]:hidden"
+      >
         {children}
       </CollapsibleContent>
     </Collapsible>

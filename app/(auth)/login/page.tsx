@@ -1,4 +1,5 @@
 import Link from "next/link"
+import { CircleAlert, Info } from "lucide-react"
 
 import { login } from "@/lib/actions"
 import { Button } from "@/components/ui/button"
@@ -31,11 +32,13 @@ export default async function LoginPage({
           <form action={login} className="flex flex-col gap-4">
             {error && (
               <Alert variant="destructive">
+                <CircleAlert />
                 <AlertDescription>{error}</AlertDescription>
               </Alert>
             )}
             {message && (
               <Alert>
+                <Info />
                 <AlertDescription>{message}</AlertDescription>
               </Alert>
             )}

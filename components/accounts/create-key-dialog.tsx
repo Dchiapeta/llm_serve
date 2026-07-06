@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Check, Copy, KeyRound } from "lucide-react"
+import { Check, Copy, KeyRound, TriangleAlert } from "lucide-react"
 import { toast } from "sonner"
 
 import { createKey } from "@/lib/actions"
@@ -90,6 +90,7 @@ export function CreateKeyDialog({
         {plainKey ? (
           <div className="flex flex-col gap-4">
             <Alert>
+              <TriangleAlert />
               <AlertTitle>Guarde esta chave agora</AlertTitle>
               <AlertDescription>
                 Ela não será exibida novamente — armazenamos apenas o hash.
