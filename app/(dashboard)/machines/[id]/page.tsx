@@ -95,6 +95,7 @@ export default async function MachineDetailPage({
     modelFootprintGb: template?.model_footprint_gb ?? 16,
     kvReserveGbPerUser: template?.kv_reserve_gb_per_user ?? 2,
     activeKeys: activeKeys.length,
+    maxUsers: machine.max_users,
   })
 
   const usageByKey = new Map<string, { requests: number; tokensIn: number; tokensOut: number }>()

@@ -23,6 +23,9 @@ from pydantic import BaseModel
 VLLM_URL = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
 ADMIN_SECRET = os.environ.get("AGENT_ADMIN_SECRET", "")
 MODEL_NAME = os.environ.get("MODEL_NAME", "")
+# teto de usuários definido pelo painel na criação do pod; 0 = sem teto.
+# O enforcement real é do painel (emissão de chaves) — aqui é só informativo.
+MAX_USERS = int(os.environ.get("MAX_USERS", "0") or 0)
 VLLM_LOG_FILE = os.environ.get("VLLM_LOG_FILE", "/var/log/vllm.log")
 
 STARTED_AT = time.time()
@@ -133,7 +136,7 @@ async def get_logs(
 @app.get("/admin/health")
 async def admin_health(x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
-    return {"ok": True, "model": MODEL_NAME}
+    return {"ok": True, "model": MODEL_NAME, "max_users": MAX_USERS}
 
 
 # ---------- Health público ----------

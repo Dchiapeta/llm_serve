@@ -18,6 +18,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
+import { CollapsibleSection } from "@/components/templates/collapsible-section"
 
 export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
   const [open, setOpen] = React.useState(false)
@@ -94,10 +95,6 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
           </div>
           <div className="grid grid-cols-3 gap-4">
             <div className="flex flex-col gap-2">
-              <Label htmlFor="disk_gb">Disco (GB)</Label>
-              <Input id="disk_gb" name="disk_gb" type="number" defaultValue={40} />
-            </div>
-            <div className="flex flex-col gap-2">
               <Label htmlFor="model_footprint_gb">Modelo (GB VRAM)</Label>
               <Input
                 id="model_footprint_gb"
@@ -117,7 +114,22 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
                 defaultValue={2}
               />
             </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="max_users">Máx. usuários</Label>
+              <Input
+                id="max_users"
+                name="max_users"
+                type="number"
+                min={1}
+                step={1}
+                placeholder="automático (VRAM)"
+              />
+            </div>
           </div>
+          <p className="text-xs text-muted-foreground">
+            Máx. usuários limita quantas chaves ativas a máquina aceita. Vazio =
+            calculado pela VRAM da GPU.
+          </p>
           <div className="flex flex-col gap-2">
             <Label>GPUs compatíveis</Label>
             {gpus.length === 0 ? (
@@ -150,16 +162,78 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
               Selecione uma ou mais GPUs em que este modelo pode rodar.
             </p>
           </div>
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="env">Variáveis de ambiente (JSON)</Label>
-            <Textarea
-              id="env"
-              name="env"
-              rows={3}
-              defaultValue={`{}`}
-              className="font-mono text-xs"
-            />
-          </div>
+          <CollapsibleSection title="Storage configuration">
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="disk_gb">Container disk (GB)</Label>
+              <Input
+                id="disk_gb"
+                name="disk_gb"
+                type="number"
+                min={0}
+                defaultValue={40}
+              />
+              <p className="text-xs text-muted-foreground">
+                Armazenamento temporário, apagado quando o pod é parado.
+              </p>
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="volume_gb">Persistent storage (GB)</Label>
+              <Input
+                id="volume_gb"
+                name="volume_gb"
+                type="number"
+                min={0}
+                defaultValue={0}
+              />
+              <p className="text-xs text-muted-foreground">
+                Volume persistente montado no pod. 0 = sem volume.
+              </p>
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="volume_mount_path">
+                Persistent storage mount path
+              </Label>
+              <Input
+                id="volume_mount_path"
+                name="volume_mount_path"
+                placeholder="/workspace"
+                defaultValue="/workspace"
+              />
+            </div>
+          </CollapsibleSection>
+
+          <CollapsibleSection title="Networking configuration">
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="http_ports">HTTP Ports</Label>
+              <Input
+                id="http_ports"
+                name="http_ports"
+                placeholder="8000"
+                defaultValue="8000"
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="tcp_ports">TCP Ports</Label>
+              <Input id="tcp_ports" name="tcp_ports" placeholder="22" />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Números de porta separados por vírgula. Ex.: 8000, 8080
+            </p>
+          </CollapsibleSection>
+
+          <CollapsibleSection title="Environment variables">
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="env">Variáveis de ambiente (JSON)</Label>
+              <Textarea
+                id="env"
+                name="env"
+                rows={3}
+                defaultValue={`{}`}
+                className="font-mono text-xs"
+              />
+            </div>
+          </CollapsibleSection>
+
           <Button type="submit" disabled={pending}>
             {pending ? "Criando…" : "Criar template"}
           </Button>

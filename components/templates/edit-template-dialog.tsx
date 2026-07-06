@@ -17,6 +17,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
+import { CollapsibleSection } from "@/components/templates/collapsible-section"
 
 export function EditTemplateDialog({
   template,
@@ -108,15 +109,6 @@ export function EditTemplateDialog({
           </div>
           <div className="grid grid-cols-3 gap-4">
             <div className="flex flex-col gap-2">
-              <Label htmlFor="edit-disk_gb">Disco (GB)</Label>
-              <Input
-                id="edit-disk_gb"
-                name="disk_gb"
-                type="number"
-                defaultValue={template.disk_gb}
-              />
-            </div>
-            <div className="flex flex-col gap-2">
               <Label htmlFor="edit-model_footprint_gb">Modelo (GB VRAM)</Label>
               <Input
                 id="edit-model_footprint_gb"
@@ -136,7 +128,23 @@ export function EditTemplateDialog({
                 defaultValue={template.kv_reserve_gb_per_user}
               />
             </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="edit-max_users">Máx. usuários</Label>
+              <Input
+                id="edit-max_users"
+                name="max_users"
+                type="number"
+                min={1}
+                step={1}
+                placeholder="automático (VRAM)"
+                defaultValue={template.max_users ?? ""}
+              />
+            </div>
           </div>
+          <p className="text-xs text-muted-foreground">
+            Máx. usuários limita quantas chaves ativas a máquina aceita. Vazio =
+            calculado pela VRAM da GPU. Não retroage para máquinas já criadas.
+          </p>
           <div className="flex flex-col gap-2">
             <Label>GPUs compatíveis</Label>
             {gpus.length === 0 ? (
@@ -170,16 +178,83 @@ export function EditTemplateDialog({
               Selecione uma ou mais GPUs em que este modelo pode rodar.
             </p>
           </div>
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="edit-env">Variáveis de ambiente (JSON)</Label>
-            <Textarea
-              id="edit-env"
-              name="env"
-              rows={3}
-              defaultValue={JSON.stringify(template.env ?? {}, null, 2)}
-              className="font-mono text-xs"
-            />
-          </div>
+          <CollapsibleSection title="Storage configuration">
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="edit-disk_gb">Container disk (GB)</Label>
+              <Input
+                id="edit-disk_gb"
+                name="disk_gb"
+                type="number"
+                min={0}
+                defaultValue={template.disk_gb}
+              />
+              <p className="text-xs text-muted-foreground">
+                Armazenamento temporário, apagado quando o pod é parado.
+              </p>
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="edit-volume_gb">Persistent storage (GB)</Label>
+              <Input
+                id="edit-volume_gb"
+                name="volume_gb"
+                type="number"
+                min={0}
+                defaultValue={template.volume_gb}
+              />
+              <p className="text-xs text-muted-foreground">
+                Volume persistente montado no pod. 0 = sem volume.
+              </p>
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="edit-volume_mount_path">
+                Persistent storage mount path
+              </Label>
+              <Input
+                id="edit-volume_mount_path"
+                name="volume_mount_path"
+                placeholder="/workspace"
+                defaultValue={template.volume_mount_path}
+              />
+            </div>
+          </CollapsibleSection>
+
+          <CollapsibleSection title="Networking configuration">
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="edit-http_ports">HTTP Ports</Label>
+              <Input
+                id="edit-http_ports"
+                name="http_ports"
+                placeholder="8000"
+                defaultValue={(template.http_ports ?? []).join(", ")}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="edit-tcp_ports">TCP Ports</Label>
+              <Input
+                id="edit-tcp_ports"
+                name="tcp_ports"
+                placeholder="22"
+                defaultValue={(template.tcp_ports ?? []).join(", ")}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Números de porta separados por vírgula. Ex.: 8000, 8080
+            </p>
+          </CollapsibleSection>
+
+          <CollapsibleSection title="Environment variables">
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="edit-env">Variáveis de ambiente (JSON)</Label>
+              <Textarea
+                id="edit-env"
+                name="env"
+                rows={3}
+                defaultValue={JSON.stringify(template.env ?? {}, null, 2)}
+                className="font-mono text-xs"
+              />
+            </div>
+          </CollapsibleSection>
+
           <Button type="submit" disabled={pending}>
             {pending ? "Salvando…" : "Salvar alterações"}
           </Button>

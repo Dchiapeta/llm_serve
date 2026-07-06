@@ -5,6 +5,7 @@ import { Plus } from "lucide-react"
 import { toast } from "sonner"
 
 import { createMachine } from "@/lib/actions"
+import { vramSlots } from "@/lib/capacity"
 import type { GpuType } from "@/lib/runpod"
 import type { Template } from "@/lib/types"
 import { Button } from "@/components/ui/button"
@@ -33,6 +34,8 @@ export function CreateMachineDialog({
   const [open, setOpen] = React.useState(false)
   const [pending, startTransition] = React.useTransition()
   const [templateId, setTemplateId] = React.useState("")
+  const [gpuTypeId, setGpuTypeId] = React.useState("")
+  const [maxUsers, setMaxUsers] = React.useState("")
 
   const selectedTemplate = templates.find((t) => t.id === templateId)
   // se o template lista GPUs compatíveis, restringe a seleção a elas
@@ -40,6 +43,27 @@ export function CreateMachineDialog({
     selectedTemplate && selectedTemplate.gpu_types.length > 0
       ? gpus.filter((g) => selectedTemplate.gpu_types.includes(g.id))
       : gpus
+
+  const selectedGpu = availableGpus.find((g) => g.id === gpuTypeId)
+  // quantos usuários a GPU escolhida comporta para este modelo
+  const gpuCapacity =
+    selectedTemplate && selectedGpu?.memoryInGb != null
+      ? vramSlots({
+          vramGb: selectedGpu.memoryInGb,
+          modelFootprintGb: selectedTemplate.model_footprint_gb,
+          kvReserveGbPerUser: selectedTemplate.kv_reserve_gb_per_user,
+        })
+      : null
+  const maxUsersNum = maxUsers.trim() ? Number(maxUsers) : null
+  const overCapacity =
+    gpuCapacity !== null && maxUsersNum !== null && maxUsersNum > gpuCapacity
+
+  function onTemplateChange(id: string) {
+    setTemplateId(id)
+    setGpuTypeId("")
+    const tpl = templates.find((t) => t.id === id)
+    setMaxUsers(tpl?.max_users != null ? String(tpl.max_users) : "")
+  }
 
   function onSubmit(formData: FormData) {
     startTransition(async () => {
@@ -80,7 +104,7 @@ export function CreateMachineDialog({
               name="template_id"
               required
               value={templateId}
-              onChange={(e) => setTemplateId(e.target.value)}
+              onChange={(e) => onTemplateChange(e.target.value)}
               className="w-full"
             >
               <NativeSelectOption value="" disabled>
@@ -100,7 +124,8 @@ export function CreateMachineDialog({
               name="gpu_type"
               required
               disabled={!selectedTemplate}
-              defaultValue=""
+              value={gpuTypeId}
+              onChange={(e) => setGpuTypeId(e.target.value)}
               className="w-full"
             >
               <NativeSelectOption value="" disabled>
@@ -121,7 +146,37 @@ export function CreateMachineDialog({
               </p>
             )}
           </div>
-          <Button type="submit" disabled={pending || templates.length === 0}>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="max_users">Limite de usuários</Label>
+            <Input
+              id="max_users"
+              name="max_users"
+              type="number"
+              min={1}
+              step={1}
+              placeholder="automático (VRAM)"
+              value={maxUsers}
+              onChange={(e) => setMaxUsers(e.target.value)}
+            />
+            {overCapacity ? (
+              <p className="text-xs text-destructive">
+                Esta GPU comporta no máximo {gpuCapacity} usuário(s) para este
+                modelo.
+              </p>
+            ) : gpuCapacity !== null ? (
+              <p className="text-xs text-muted-foreground">
+                Esta GPU comporta até {gpuCapacity} usuário(s) para este modelo.
+              </p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                Vazio = limite calculado pela VRAM da GPU.
+              </p>
+            )}
+          </div>
+          <Button
+            type="submit"
+            disabled={pending || templates.length === 0 || overCapacity}
+          >
             {pending ? "Criando pod…" : "Criar máquina"}
           </Button>
           {templates.length === 0 && (

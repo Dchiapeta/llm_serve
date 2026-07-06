@@ -8,8 +8,13 @@ export type Template = {
   env: Record<string, string>
   start_command: string | null
   disk_gb: number
+  volume_gb: number
+  volume_mount_path: string
+  http_ports: string[]
+  tcp_ports: string[]
   model_footprint_gb: number
   kv_reserve_gb_per_user: number
+  max_users: number | null
   created_at: string
 }
 
@@ -25,6 +30,7 @@ export type Machine = {
   vram_gb: number | null
   cost_per_hr: number | null
   public_url: string | null
+  max_users: number | null
   created_at: string
 }
 

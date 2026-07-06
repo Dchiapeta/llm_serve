@@ -59,6 +59,8 @@ export type CreatePodInput = {
   gpuTypeIds: string[]
   gpuCount?: number
   containerDiskInGb?: number
+  volumeInGb?: number
+  volumeMountPath?: string
   env?: Record<string, string>
   ports?: string[]
   cloudType?: "SECURE" | "COMMUNITY"
@@ -98,6 +100,8 @@ export const runpod = {
     name: string
     imageName: string
     containerDiskInGb?: number
+    volumeInGb?: number
+    volumeMountPath?: string
     env?: Record<string, string>
     ports?: string[]
     dockerStartCmd?: string[]
@@ -109,6 +113,8 @@ export const runpod = {
       name?: string
       imageName?: string
       containerDiskInGb?: number
+      volumeInGb?: number
+      volumeMountPath?: string
       env?: Record<string, string>
       ports?: string[]
       dockerStartCmd?: string[]

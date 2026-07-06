@@ -5,6 +5,7 @@ import { redirect } from "next/navigation"
 import { randomBytes } from "crypto"
 
 import { agent, type AgentKeyEntry } from "./agent"
+import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
 import { listGpuTypes, podProxyUrl, runpod } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
@@ -59,10 +60,37 @@ async function logEvent(machineId: string | null, type: string, message: string)
   await db.from("machine_events").insert({ machine_id: machineId, type, message })
 }
 
+// Teto manual de usuários: campo opcional; vazio = sem teto (só VRAM).
+function parseMaxUsers(formData: FormData): number | null {
+  const raw = String(formData.get("max_users") ?? "").trim()
+  if (!raw) return null
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error("Máx. de usuários deve ser um número inteiro maior que zero")
+  }
+  return n
+}
+
 // Converte o "Container start command" (texto multilinha) em argv para o RunPod.
 // Cada token separado por espaço/quebra de linha vira um argumento.
 function parseStartCommand(raw: string | null | undefined): string[] {
   return (raw ?? "").split(/\s+/).filter(Boolean)
+}
+
+// Lista de portas informada como texto (separadas por vírgula/espaço) → array.
+function parsePortList(raw: string | null | undefined): string[] {
+  return (raw ?? "")
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+// Formato de portas do RunPod: "8000/http", "22/tcp".
+function toRunpodPorts(httpPorts: string[], tcpPorts: string[]): string[] {
+  return [
+    ...httpPorts.map((p) => `${p}/http`),
+    ...tcpPorts.map((p) => `${p}/tcp`),
+  ]
 }
 
 // ---------- Templates ----------
@@ -75,7 +103,13 @@ export async function createTemplate(formData: FormData) {
   const diskGb = Number(formData.get("disk_gb") || 40)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
+  const maxUsers = parseMaxUsers(formData)
   const startCommand = String(formData.get("start_command") || "").trim() || null
+  const volumeGb = Number(formData.get("volume_gb") || 0)
+  const volumeMountPath =
+    String(formData.get("volume_mount_path") || "").trim() || "/workspace"
+  const httpPorts = parsePortList(String(formData.get("http_ports") || ""))
+  const tcpPorts = parsePortList(String(formData.get("tcp_ports") || ""))
   const gpuTypes = formData
     .getAll("gpu_types")
     .map((s) => String(s).trim())
@@ -95,8 +129,10 @@ export async function createTemplate(formData: FormData) {
       name,
       imageName: image,
       containerDiskInGb: diskGb,
+      volumeInGb: volumeGb,
+      volumeMountPath,
       env,
-      ports: ["8000/http"],
+      ports: toRunpodPorts(httpPorts, tcpPorts),
       dockerStartCmd: parseStartCommand(startCommand),
     })
     runpodTemplateId = created.id
@@ -113,8 +149,13 @@ export async function createTemplate(formData: FormData) {
     env,
     start_command: startCommand,
     disk_gb: diskGb,
+    volume_gb: volumeGb,
+    volume_mount_path: volumeMountPath,
+    http_ports: httpPorts,
+    tcp_ports: tcpPorts,
     model_footprint_gb: footprint,
     kv_reserve_gb_per_user: kvReserve,
+    max_users: maxUsers,
   })
   if (error) throw new Error(error.message)
   revalidatePath("/templates")
@@ -136,10 +177,19 @@ export async function importTemplate(formData: FormData) {
   const modelName = String(formData.get("model_name"))
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
+  const maxUsers = parseMaxUsers(formData)
   const gpuTypes = formData
     .getAll("gpu_types")
     .map((s) => String(s).trim())
     .filter(Boolean)
+
+  const remotePorts = remote.ports ?? []
+  const httpPorts = remotePorts
+    .filter((p) => p.endsWith("/http"))
+    .map((p) => p.replace("/http", ""))
+  const tcpPorts = remotePorts
+    .filter((p) => p.endsWith("/tcp"))
+    .map((p) => p.replace("/tcp", ""))
 
   const { error } = await db.from("templates").insert({
     runpod_template_id: remote.id,
@@ -150,8 +200,13 @@ export async function importTemplate(formData: FormData) {
     env: remote.env ?? {},
     start_command: (remote.dockerStartCmd ?? []).join(" ") || null,
     disk_gb: remote.containerDiskInGb ?? 40,
+    volume_gb: remote.volumeInGb ?? 0,
+    volume_mount_path: remote.volumeMountPath || "/workspace",
+    http_ports: httpPorts,
+    tcp_ports: tcpPorts,
     model_footprint_gb: footprint,
     kv_reserve_gb_per_user: kvReserve,
+    max_users: maxUsers,
   })
   if (error) throw new Error(error.message)
   revalidatePath("/templates")
@@ -168,7 +223,13 @@ export async function updateTemplate(formData: FormData) {
   const diskGb = Number(formData.get("disk_gb") || 40)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
+  const maxUsers = parseMaxUsers(formData)
   const startCommand = String(formData.get("start_command") || "").trim() || null
+  const volumeGb = Number(formData.get("volume_gb") || 0)
+  const volumeMountPath =
+    String(formData.get("volume_mount_path") || "").trim() || "/workspace"
+  const httpPorts = parsePortList(String(formData.get("http_ports") || ""))
+  const tcpPorts = parsePortList(String(formData.get("tcp_ports") || ""))
   const gpuTypes = formData
     .getAll("gpu_types")
     .map((s) => String(s).trim())
@@ -190,8 +251,10 @@ export async function updateTemplate(formData: FormData) {
         name,
         imageName: image,
         containerDiskInGb: diskGb,
+        volumeInGb: volumeGb,
+        volumeMountPath,
         env,
-        ports: ["8000/http"],
+        ports: toRunpodPorts(httpPorts, tcpPorts),
         dockerStartCmd: parseStartCommand(startCommand),
       })
     } catch (e) {
@@ -209,8 +272,13 @@ export async function updateTemplate(formData: FormData) {
       env,
       start_command: startCommand,
       disk_gb: diskGb,
+      volume_gb: volumeGb,
+      volume_mount_path: volumeMountPath,
+      http_ports: httpPorts,
+      tcp_ports: tcpPorts,
       model_footprint_gb: footprint,
       kv_reserve_gb_per_user: kvReserve,
+      max_users: maxUsers,
     })
     .eq("id", id)
   if (error) throw new Error(error.message)
@@ -246,19 +314,38 @@ export async function createMachine(formData: FormData) {
     .single<Template>()
   if (tplErr || !tpl) throw new Error("Template não encontrado")
 
+  // teto manual: valor do form, com fallback para o padrão do template
+  const maxUsers = parseMaxUsers(formData) ?? tpl.max_users
+
   const adminSecret = randomBytes(24).toString("hex")
 
   const gpus = await listGpuTypes()
   const gpu = gpus.find((g) => g.id === gpuTypeId)
 
+  if (maxUsers !== null && gpu?.memoryInGb != null) {
+    const cap = vramSlots({
+      vramGb: gpu.memoryInGb,
+      modelFootprintGb: tpl.model_footprint_gb,
+      kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
+    })
+    if (maxUsers > cap) {
+      throw new Error(
+        `A GPU ${gpu.displayName} comporta no máximo ${cap} usuário(s) para este modelo (pedido: ${maxUsers})`
+      )
+    }
+  }
+
   const startCmd = parseStartCommand(tpl.start_command)
+  const ports = toRunpodPorts(tpl.http_ports ?? [], tpl.tcp_ports ?? [])
   const pod = await runpod.createPod({
     name,
     imageName: tpl.image,
     gpuTypeIds: [gpuTypeId],
     gpuCount: 1,
     containerDiskInGb: tpl.disk_gb,
-    ports: ["8000/http"],
+    volumeInGb: tpl.volume_gb ?? 0,
+    volumeMountPath: tpl.volume_mount_path || "/workspace",
+    ports: ports.length > 0 ? ports : ["8000/http"],
     cloudType: "SECURE",
     // só sobrescreve o entrypoint da imagem quando o template define um comando
     ...(startCmd.length > 0 ? { dockerStartCmd: startCmd } : {}),
@@ -266,6 +353,7 @@ export async function createMachine(formData: FormData) {
       ...tpl.env,
       MODEL_NAME: tpl.model_name,
       AGENT_ADMIN_SECRET: adminSecret,
+      ...(maxUsers !== null ? { MAX_USERS: String(maxUsers) } : {}),
     },
   })
 
@@ -282,6 +370,7 @@ export async function createMachine(formData: FormData) {
       vram_gb: gpu?.memoryInGb ?? null,
       cost_per_hr: pod.costPerHr ?? null,
       public_url: podProxyUrl(pod.id, 8000),
+      max_users: maxUsers,
     })
     .select()
     .single<Machine>()
@@ -375,6 +464,39 @@ export async function createKey(input: {
   machineId: string
 }): Promise<{ plainKey: string }> {
   const db = createSupabaseAdmin()
+
+  // Valida o limite de slots da máquina antes de emitir a chave.
+  // Check-then-insert: há corrida teórica entre duas emissões simultâneas,
+  // aceitável para um painel de administração.
+  const { data: m } = await db
+    .from("machines")
+    .select("*")
+    .eq("id", input.machineId)
+    .single<Machine>()
+  if (!m) throw new Error("Máquina não encontrada")
+
+  const { count: activeKeys } = await db
+    .from("api_keys")
+    .select("id", { count: "exact", head: true })
+    .eq("machine_id", input.machineId)
+    .eq("status", "active")
+
+  const { data: tpl } = m.template_id
+    ? await db.from("templates").select("*").eq("id", m.template_id).single<Template>()
+    : { data: null }
+
+  const cap = computeCapacity({
+    vramGb: m.vram_gb,
+    modelFootprintGb: tpl?.model_footprint_gb ?? 16,
+    kvReserveGbPerUser: tpl?.kv_reserve_gb_per_user ?? 2,
+    activeKeys: activeKeys ?? 0,
+    maxUsers: m.max_users,
+  })
+  // slotsMax = 0 significa capacidade desconhecida (sem VRAM nem teto) — não bloqueia
+  if (cap.slotsMax > 0 && cap.slotsUsed >= cap.slotsMax) {
+    throw new Error(`Limite de ${cap.slotsMax} usuário(s) atingido nesta máquina`)
+  }
+
   const plainKey = generateHexKey()
 
   const { error } = await db.from("api_keys").insert({

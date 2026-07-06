@@ -76,6 +76,7 @@ export default async function DashboardPage() {
         modelFootprintGb: tpl?.model_footprint_gb ?? 16,
         kvReserveGbPerUser: tpl?.kv_reserve_gb_per_user ?? 2,
         activeKeys: activeKeysByMachine.get(m.id) ?? 0,
+        maxUsers: m.max_users,
       }),
     }
   })

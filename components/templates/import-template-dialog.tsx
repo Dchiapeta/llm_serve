@@ -98,6 +98,17 @@ export function ImportTemplateDialog({
                 defaultValue={2}
               />
             </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor={`max-users-${runpodTemplateId}`}>Máx. usuários</Label>
+              <Input
+                id={`max-users-${runpodTemplateId}`}
+                name="max_users"
+                type="number"
+                min={1}
+                step={1}
+                placeholder="automático (VRAM)"
+              />
+            </div>
           </div>
 
           <div className="flex flex-col gap-2">
