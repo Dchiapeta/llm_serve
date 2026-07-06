@@ -4,6 +4,29 @@ import type { Machine } from "./types"
 
 type SupabaseAdmin = ReturnType<typeof createSupabaseAdmin>
 
+// Status exibido na UI: além dos status do banco, "starting" indica que o
+// pod está de pé mas o vLLM ainda não respondeu (baixando/carregando modelo).
+export type MachineDisplayStatus = Machine["status"] | "starting"
+
+// Sonda o /health público do agent para saber se o vLLM já está servindo.
+export async function machineDisplayStatus(m: Machine): Promise<MachineDisplayStatus> {
+  if (m.status !== "running") return m.status
+  if (!m.public_url) return "running"
+  try {
+    const res = await fetch(`${m.public_url}/health`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(3_000),
+    })
+    if (!res.ok) return "starting"
+    const body = (await res.json()) as { ok?: boolean; vllm_ready?: boolean }
+    // agents antigos não reportam vllm_ready; se respondem, consideramos pronto
+    return body.vllm_ready === false ? "starting" : "running"
+  } catch {
+    // agent inacessível com pod RUNNING = ainda puxando imagem / subindo
+    return "starting"
+  }
+}
+
 // Mapeia o desiredStatus do RunPod para o status interno da máquina.
 const POD_STATUS_MAP: Record<string, Machine["status"]> = {
   RUNNING: "running",

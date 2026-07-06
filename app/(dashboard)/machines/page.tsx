@@ -1,7 +1,7 @@
 import Link from "next/link"
 
 import { computeCapacity } from "@/lib/capacity"
-import { reconcileMachineStatuses } from "@/lib/machines"
+import { machineDisplayStatus, reconcileMachineStatuses } from "@/lib/machines"
 import { listGpuTypes } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type { Machine, Template } from "@/lib/types"
@@ -50,6 +50,12 @@ export default async function MachinesPage() {
   )
   const machines = reconciled.filter((m) => m.status !== "terminated")
   const templateById = new Map(templates.map((t) => [t.id, t]))
+
+  // "Rodando" só quando o vLLM já responde; antes disso, "Subindo".
+  const displayStatuses = await Promise.all(machines.map(machineDisplayStatus))
+  const displayStatusById = new Map(
+    machines.map((m, i) => [m.id, displayStatuses[i]])
+  )
 
   const { data: keyCounts } = await db
     .from("api_keys")
@@ -120,7 +126,7 @@ export default async function MachinesPage() {
                       </Link>
                     </TableCell>
                     <TableCell>
-                      <StatusBadge status={m.status} />
+                      <StatusBadge status={displayStatusById.get(m.id) ?? m.status} />
                     </TableCell>
                     <TableCell className="text-sm">{m.gpu_type}</TableCell>
                     <TableCell className="font-mono text-xs">{m.model_name}</TableCell>

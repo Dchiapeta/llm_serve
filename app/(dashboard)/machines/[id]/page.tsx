@@ -3,7 +3,7 @@ import { notFound } from "next/navigation"
 import { ExternalLink } from "lucide-react"
 
 import { computeCapacity } from "@/lib/capacity"
-import { reconcileMachineStatuses } from "@/lib/machines"
+import { machineDisplayStatus, reconcileMachineStatuses } from "@/lib/machines"
 import { runpod, runpodConsoleUrl } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type { Account, ApiKey, Machine, Template, UsageMetric } from "@/lib/types"
@@ -64,6 +64,7 @@ export default async function MachineDetailPage({
 
   // Reflete o estado real do RunPod já no carregamento (não só via botão).
   const [machine] = await reconcileMachineStatuses([machineData], db)
+  const displayStatus = await machineDisplayStatus(machine)
 
   const [{ data: tplData }, { data: keysData }, { data: accountsData }, { data: usageData }] =
     await Promise.all([
@@ -131,7 +132,7 @@ export default async function MachineDetailPage({
         <div>
           <div className="flex items-center gap-3">
             <h1 className="text-2xl font-semibold">{machine.name}</h1>
-            <StatusBadge status={machine.status} />
+            <StatusBadge status={displayStatus} />
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
             {machine.gpu_type} · {machine.model_name ?? "sem modelo"} ·{" "}

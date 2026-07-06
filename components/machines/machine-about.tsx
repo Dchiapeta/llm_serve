@@ -44,9 +44,9 @@ export function MachineAbout({
   const url = publicUrl ?? "https://<url-da-maquina>"
   const model = modelName ?? "<modelo>"
 
-  const curlSnippet = `curl ${url}/v1/messages \\
+  const curlSnippet = `curl ${url}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
-  -H "anthropic-version: 2023-06-01" \\
+  -H "Authorization: Bearer <SUA_CHAVE_DE_ACESSO>" \\
   -d '{
     "model": "${model}",
     "max_tokens": 200,
@@ -54,7 +54,7 @@ export function MachineAbout({
   }'`
 
   const claudeSnippet = `export ANTHROPIC_BASE_URL="${url}"
-export ANTHROPIC_AUTH_TOKEN="ollama"
+export ANTHROPIC_AUTH_TOKEN="<SUA_CHAVE_DE_ACESSO>"
 export ANTHROPIC_API_KEY=""
 export ANTHROPIC_MODEL="${model}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"

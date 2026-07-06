@@ -2,7 +2,7 @@ import Link from "next/link"
 import { Activity, DollarSign, KeyRound, Server } from "lucide-react"
 
 import { computeCapacity } from "@/lib/capacity"
-import { reconcileMachineStatuses } from "@/lib/machines"
+import { machineDisplayStatus, reconcileMachineStatuses } from "@/lib/machines"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type {
   Machine,
@@ -53,6 +53,12 @@ export default async function DashboardPage() {
   )
   const machines = reconciled.filter((m) => m.status !== "terminated")
   const templates = (templatesData ?? []) as Template[]
+
+  // "Rodando" só quando o vLLM já responde; antes disso, "Subindo".
+  const displayStatuses = await Promise.all(machines.map(machineDisplayStatus))
+  const displayStatusById = new Map(
+    machines.map((m, i) => [m.id, displayStatuses[i]])
+  )
   const templateById = new Map(templates.map((t) => [t.id, t]))
   const usage = (usageData ?? []) as UsageMetric[]
   const events = (eventsData ?? []) as MachineEvent[]
@@ -244,7 +250,7 @@ export default async function DashboardPage() {
                     {m.gpu_type} · {m.model_name}
                   </p>
                 </div>
-                <StatusBadge status={m.status} />
+                <StatusBadge status={displayStatusById.get(m.id) ?? m.status} />
               </Link>
             ))}
           </CardContent>

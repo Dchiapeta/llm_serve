@@ -132,7 +132,15 @@ async def admin_health(x_admin_secret: str | None = Header(None)):
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    # vLLM só responde ao /health quando o modelo terminou de carregar;
+    # enquanto baixa/carrega, o painel usa isso para mostrar "Subindo".
+    vllm_ready = False
+    try:
+        r = await client.get("/health", timeout=2.0)
+        vllm_ready = r.status_code == 200
+    except Exception:
+        pass
+    return {"ok": True, "vllm_ready": vllm_ready, "model": MODEL_NAME}
 
 
 # ---------- Proxy OpenAI-compatible ----------
