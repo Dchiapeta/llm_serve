@@ -156,3 +156,8 @@ export async function listGpuTypes(): Promise<GpuType[]> {
 export function podProxyUrl(podId: string, port: number): string {
   return `https://${podId}-${port}.proxy.runpod.net`
 }
+
+// Página do pod no console do RunPod
+export function runpodConsoleUrl(podId: string): string {
+  return `https://console.runpod.io/pods?id=${podId}`
+}

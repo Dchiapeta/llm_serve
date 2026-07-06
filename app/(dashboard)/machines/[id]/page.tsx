@@ -4,7 +4,7 @@ import { ExternalLink } from "lucide-react"
 
 import { computeCapacity } from "@/lib/capacity"
 import { reconcileMachineStatuses } from "@/lib/machines"
-import { runpod } from "@/lib/runpod"
+import { runpod, runpodConsoleUrl } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type { Account, ApiKey, Machine, Template, UsageMetric } from "@/lib/types"
 import { Badge } from "@/components/ui/badge"
@@ -29,7 +29,6 @@ import { CreateKeyDialog } from "@/components/accounts/create-key-dialog"
 import { RevokeKeyButton } from "@/components/accounts/revoke-key-button"
 import { CapacityBar } from "@/components/machines/capacity-bar"
 import { MachineActions } from "@/components/machines/machine-actions"
-import { MachineLogs } from "@/components/machines/machine-logs"
 import { StatusBadge } from "@/components/machines/status-badge"
 
 export const dynamic = "force-dynamic"
@@ -129,6 +128,15 @@ export default async function MachineDetailPage({
               {machine.public_url} <ExternalLink className="size-3" />
             </Link>
           )}
+          {machine.runpod_pod_id && (
+            <Link
+              href={runpodConsoleUrl(machine.runpod_pod_id)}
+              target="_blank"
+              className="mt-1 flex items-center gap-1 text-xs text-muted-foreground hover:underline"
+            >
+              Abrir no RunPod <ExternalLink className="size-3" />
+            </Link>
+          )}
         </div>
         <MachineActions machine={machine} />
       </div>
@@ -179,7 +187,6 @@ export default async function MachineDetailPage({
       <Tabs defaultValue="accounts">
         <TabsList>
           <TabsTrigger value="accounts">Contas & Slots</TabsTrigger>
-          <TabsTrigger value="logs">Logs</TabsTrigger>
           <TabsTrigger value="env">Variáveis</TabsTrigger>
         </TabsList>
 
@@ -253,26 +260,6 @@ export default async function MachineDetailPage({
                   })}
                 </TableBody>
               </Table>
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        <TabsContent value="logs" className="mt-4">
-          <Card>
-            <CardHeader>
-              <CardTitle>Logs</CardTitle>
-              <CardDescription>
-                Logs da máquina inteira ou filtrados por usuário (via agent)
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <MachineLogs
-                machineId={machine.id}
-                keys={activeKeys.map((k) => ({
-                  key_prefix: k.key_prefix,
-                  account_name: k.accounts?.name ?? "desconhecida",
-                }))}
-              />
             </CardContent>
           </Card>
         </TabsContent>
