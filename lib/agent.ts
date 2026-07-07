@@ -9,13 +9,28 @@ export type AgentKeyEntry = {
   account_name: string
 }
 
+export type AgentKeyMetrics = {
+  requests: number
+  tokens_in: number
+  tokens_out: number
+  last_used: number | null
+}
+
+export type AgentMetricsSnapshot = {
+  per_key: Record<string, AgentKeyMetrics>
+  total_requests: number
+  concurrent_now: number
+  concurrent_peak: number
+  uptime_s: number
+}
+
 async function agentFetch<T>(
   machine: Pick<Machine, "public_url" | "admin_secret">,
   path: string,
-  init?: RequestInit & { json?: unknown }
+  init?: RequestInit & { json?: unknown; timeoutMs?: number }
 ): Promise<T> {
   if (!machine.public_url) throw new Error("Máquina sem URL pública")
-  const { json, ...rest } = init ?? {}
+  const { json, timeoutMs, ...rest } = init ?? {}
   const res = await fetch(`${machine.public_url}/admin${path}`, {
     ...rest,
     headers: {
@@ -25,7 +40,7 @@ async function agentFetch<T>(
     },
     body: json !== undefined ? JSON.stringify(json) : rest.body,
     cache: "no-store",
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(timeoutMs ?? 15_000),
   })
   if (!res.ok) {
     throw new Error(`Agent ${path} → ${res.status}: ${await res.text()}`)
@@ -51,4 +66,14 @@ export const agent = {
   },
   health: (m: Pick<Machine, "public_url" | "admin_secret">) =>
     agentFetch<{ ok: boolean; model: string }>(m, "/health"),
+  // reset=true zera os contadores no agent após a leitura (coleta por delta).
+  metrics: (
+    m: Pick<Machine, "public_url" | "admin_secret">,
+    opts?: { reset?: boolean }
+  ) =>
+    agentFetch<AgentMetricsSnapshot>(
+      m,
+      `/metrics${opts?.reset ? "?reset=true" : ""}`,
+      { timeoutMs: 5_000 }
+    ),
 }

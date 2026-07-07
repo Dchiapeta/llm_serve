@@ -10,6 +10,7 @@ Agent que roda dentro do pod, na frente do vLLM.
 
 import asyncio
 import hashlib
+import json
 import os
 import time
 from collections import deque
@@ -121,6 +122,28 @@ async def get_logs(
     return {"lines": machine_lines + ["", "--- requisições ---"] + req_lines}
 
 
+@app.get("/admin/metrics")
+async def get_metrics(
+    x_admin_secret: str | None = Header(None),
+    reset: bool = Query(False),
+):
+    require_admin(x_admin_secret)
+    global concurrent_peak
+    snapshot = {
+        "per_key": {p: dict(m) for p, m in metrics_per_key.items()},
+        "total_requests": total_requests,
+        "concurrent_now": concurrent_now,
+        "concurrent_peak": concurrent_peak,
+        "uptime_s": time.time() - STARTED_AT,
+    }
+    # reset=true entrega o delta desde a última coleta e zera os contadores,
+    # para o painel gravar janelas sem contar duplicado.
+    if reset:
+        metrics_per_key.clear()
+        concurrent_peak = concurrent_now
+    return snapshot
+
+
 @app.get("/admin/health")
 async def admin_health(x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
@@ -128,6 +151,13 @@ async def admin_health(x_admin_secret: str | None = Header(None)):
 
 
 # ---------- Health público ----------
+
+
+@app.get("/")
+async def root():
+    # o proxy/health-check do RunPod bate na raiz; sem esta rota ele recebia 404
+    # e reiniciava o pod em loop, matando o vLLM antes de carregar o modelo.
+    return {"ok": True, "service": "agent"}
 
 
 @app.get("/health")
@@ -172,8 +202,18 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
     log_line(prefix, account, f"{request.method} /v1/{path}")
 
     try:
-        # detecta streaming para repassar SSE
-        is_stream = b'"stream": true' in body or b'"stream":true' in body
+        # detecta streaming para repassar SSE; injeta include_usage para o
+        # vLLM emitir o chunk final com usage (senão tokens não são contados)
+        is_stream = False
+        try:
+            body_json = json.loads(body)
+            is_stream = body_json.get("stream") is True
+            if is_stream:
+                opts = body_json.setdefault("stream_options", {})
+                opts.setdefault("include_usage", True)
+                body = json.dumps(body_json).encode()
+        except Exception:
+            pass  # body não-JSON: segue como não-streaming
 
         if is_stream:
             upstream_req = client.build_request(
@@ -183,15 +223,32 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
             upstream = await client.send(upstream_req, stream=True)
 
             async def stream_and_close():
+                usage = None
+                buffer = b""
                 try:
                     async for chunk in upstream.aiter_bytes():
                         yield chunk
+                        # o chunk com usage é o último; basta guardar o final
+                        buffer = (buffer + chunk)[-16384:]
                 finally:
                     await upstream.aclose()
+                    for line in buffer.split(b"\n"):
+                        line = line.strip()
+                        if line.startswith(b"data:") and b'"usage"' in line:
+                            try:
+                                payload = json.loads(line[5:])
+                                if payload.get("usage"):
+                                    usage = payload["usage"]
+                            except Exception:
+                                pass
                     global concurrent_now
                     concurrent_now -= 1
-                    track_usage(prefix, None)
-                    log_line(prefix, account, f"stream concluído ({upstream.status_code})")
+                    track_usage(prefix, usage)
+                    log_line(
+                        prefix, account,
+                        f"stream concluído ({upstream.status_code}) · "
+                        f"{usage.get('total_tokens', '?') if usage else '?'} tokens",
+                    )
 
             return StreamingResponse(
                 stream_and_close(),
