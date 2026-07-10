@@ -12,9 +12,11 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -28,6 +30,8 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "")
 # O enforcement real é do painel (emissão de chaves) — aqui é só informativo.
 MAX_USERS = int(os.environ.get("MAX_USERS", "0") or 0)
 VLLM_LOG_FILE = os.environ.get("VLLM_LOG_FILE", "/var/log/vllm.log")
+# diretório local onde adapters LoRA baixados do storage ficam antes do load
+LORA_DIR = os.environ.get("LORA_DIR", "/workspace/loras")
 
 STARTED_AT = time.time()
 
@@ -148,6 +152,149 @@ async def get_metrics(
 async def admin_health(x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
     return {"ok": True, "model": MODEL_NAME, "max_users": MAX_USERS}
+
+
+# Insere/atualiza chaves SEM limpar as existentes (diferente do sync-keys).
+# Usado pelo gateway para garantir a chave do cliente na máquina alocada
+# antes do primeiro proxy, sem sobrescrever o estado do painel.
+@app.post("/admin/upsert-keys")
+async def upsert_keys(body: SyncKeysBody, x_admin_secret: str | None = Header(None)):
+    require_admin(x_admin_secret)
+    for k in body.keys:
+        keys_by_hash[k["key_hash"]] = {
+            "key_prefix": k["key_prefix"],
+            "account_name": k.get("account_name", "?"),
+        }
+    return {"ok": True, "count": len(keys_by_hash)}
+
+
+# ---------- Rotas admin: adapters LoRA ----------
+
+
+class LoraFile(BaseModel):
+    name: str
+    url: str
+
+
+# Whitelist explícita dos arquivos aceitos num adapter PEFT — mais restritivo
+# que só bloquear path traversal: mesmo que o chamador mude no futuro, nada
+# fora desta lista é gravado em disco.
+LORA_REQUIRED_FILES = {"adapter_config.json", "adapter_model.safetensors"}
+LORA_ALLOWED_FILES = LORA_REQUIRED_FILES | {
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "chat_template.jinja",
+}
+
+
+class LoadLoraBody(BaseModel):
+    lora_name: str
+    files: list[LoraFile]
+
+
+class UnloadLoraBody(BaseModel):
+    lora_name: str
+
+
+def _lora_local_dir(lora_name: str) -> Path:
+    # nome vem do painel/gateway (acct-<uuid>), mas sanitiza contra path traversal
+    safe = os.path.basename(lora_name)
+    if not safe or safe != lora_name or safe in (".", ".."):
+        raise HTTPException(status_code=400, detail="lora_name inválido")
+    return Path(LORA_DIR) / safe
+
+
+# Baixa os arquivos do adapter (signed URLs geradas pelo chamador) para disco
+# local e carrega no vLLM em runtime. Idempotente: adapter já carregado = ok.
+@app.post("/admin/load-lora")
+async def load_lora(body: LoadLoraBody, x_admin_secret: str | None = Header(None)):
+    require_admin(x_admin_secret)
+    if not body.files:
+        raise HTTPException(status_code=400, detail="lista de arquivos vazia")
+
+    names = {f.name for f in body.files}
+    missing = LORA_REQUIRED_FILES - names
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"adapter incompleto — faltam: {', '.join(sorted(missing))}",
+        )
+    unknown = names - LORA_ALLOWED_FILES
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"arquivos fora da whitelist PEFT: {', '.join(sorted(unknown))}",
+        )
+
+    target = _lora_local_dir(body.lora_name)
+    target.mkdir(parents=True, exist_ok=True)
+
+    t0 = time.time()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as dl:
+        for f in body.files:
+            fname = f.name  # já validado contra a whitelist acima
+            try:
+                async with dl.stream("GET", f.url) as r:
+                    if r.status_code != 200:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"download de {fname} falhou ({r.status_code})",
+                        )
+                    with open(target / fname, "wb") as out:
+                        async for chunk in r.aiter_bytes():
+                            out.write(chunk)
+            except httpx.HTTPError as e:
+                raise HTTPException(status_code=502, detail=f"download de {fname} falhou: {e}")
+    download_s = time.time() - t0
+
+    t1 = time.time()
+    resp = await client.post(
+        "/v1/load_lora_adapter",
+        json={"lora_name": body.lora_name, "lora_path": str(target)},
+    )
+    load_s = time.time() - t1
+
+    if resp.status_code != 200:
+        text = resp.text
+        # vLLM 0.24: load duplicado → 400 "has already been loaded" — idempotência
+        if "already" in text.lower():
+            return {"ok": True, "lora_name": body.lora_name,
+                    "download_s": round(download_s, 2), "load_s": round(load_s, 2),
+                    "already_loaded": True}
+        raise HTTPException(status_code=502, detail=f"vLLM load_lora_adapter falhou: {text}")
+
+    return {"ok": True, "lora_name": body.lora_name,
+            "download_s": round(download_s, 2), "load_s": round(load_s, 2)}
+
+
+# Descarrega o adapter da VRAM e remove os arquivos locais. Idempotente.
+@app.post("/admin/unload-lora")
+async def unload_lora(body: UnloadLoraBody, x_admin_secret: str | None = Header(None)):
+    require_admin(x_admin_secret)
+    target = _lora_local_dir(body.lora_name)
+
+    resp = await client.post("/v1/unload_lora_adapter", json={"lora_name": body.lora_name})
+    # vLLM 0.24: adapter não carregado → 404 "cannot be found" = já descarregado,
+    # segue como sucesso (idempotência). Qualquer outro erro é propagado.
+    if resp.status_code not in (200, 404):
+        raise HTTPException(status_code=502, detail=f"vLLM unload_lora_adapter falhou: {resp.text}")
+
+    shutil.rmtree(target, ignore_errors=True)
+    return {"ok": True, "lora_name": body.lora_name}
+
+
+# Lista os adapters atualmente carregados no vLLM (exclui o modelo base).
+@app.get("/admin/loras")
+async def list_loras(x_admin_secret: str | None = Header(None)):
+    require_admin(x_admin_secret)
+    try:
+        resp = await client.get("/v1/models", timeout=5.0)
+        models = [m["id"] for m in resp.json().get("data", [])]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"vLLM indisponível: {e}")
+    return {"loras": [m for m in models if m != MODEL_NAME]}
 
 
 # ---------- Health público ----------

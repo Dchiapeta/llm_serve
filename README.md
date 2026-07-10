@@ -65,6 +65,22 @@ curl https://<pod-id>-8000.proxy.runpod.net/v1/chat/completions \
    detalhe da máquina mostra slots, uso por conta, logs e variáveis, com ações
    de desativar/iniciar/apagar.
 
+## Adapters LoRA
+
+Adapters LoRA por conta ficam no Supabase Storage, em um bucket privado
+chamado `loras`, seguindo a convenção de path:
+
+```
+loras/{account_id}/{version}/adapter_config.json
+loras/{account_id}/{version}/adapter_model.safetensors
+```
+
+O treino do adapter acontece fora deste sistema — o painel apenas registra
+adapters já existentes no bucket (tabela `lora_adapters`, migration
+[0004_lora_adapters.sql](supabase/migrations/0004_lora_adapters.sql)). O
+registro valida que o prefixo contém arquivos antes de gravar. Formato
+esperado: PEFT (`adapter_config.json` + `adapter_model.safetensors`).
+
 ## Slots por capacidade
 
 `slots_max = floor((VRAM da GPU − footprint do modelo) / reserva por usuário)`

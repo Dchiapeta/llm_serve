@@ -24,6 +24,12 @@ export type AgentMetricsSnapshot = {
   uptime_s: number
 }
 
+// Arquivo de adapter LoRA a baixar no pod: nome local + signed URL do storage.
+export type LoraSignedFile = {
+  name: string
+  url: string
+}
+
 async function agentFetch<T>(
   machine: Pick<Machine, "public_url" | "admin_secret">,
   path: string,
@@ -76,4 +82,32 @@ export const agent = {
       `/metrics${opts?.reset ? "?reset=true" : ""}`,
       { timeoutMs: 5_000 }
     ),
+  // Insere/atualiza chaves sem limpar as existentes (usado pelo gateway na
+  // alocação/migração — o sync-keys continua sendo o fluxo do painel).
+  upsertKeys: (m: Pick<Machine, "public_url" | "admin_secret">, keys: AgentKeyEntry[]) =>
+    agentFetch<{ ok: boolean; count: number }>(m, "/upsert-keys", {
+      method: "POST",
+      json: { keys },
+    }),
+  // Baixa o adapter (signed URLs) e carrega no vLLM em runtime.
+  // Timeout largo: download do storage + load em VRAM podem levar minutos.
+  loadLora: (
+    m: Pick<Machine, "public_url" | "admin_secret">,
+    body: { lora_name: string; files: LoraSignedFile[] }
+  ) =>
+    agentFetch<{
+      ok: boolean
+      lora_name: string
+      download_s: number
+      load_s: number
+      already_loaded?: boolean
+    }>(m, "/load-lora", { method: "POST", json: body, timeoutMs: 120_000 }),
+  unloadLora: (m: Pick<Machine, "public_url" | "admin_secret">, loraName: string) =>
+    agentFetch<{ ok: boolean; lora_name: string }>(m, "/unload-lora", {
+      method: "POST",
+      json: { lora_name: loraName },
+      timeoutMs: 30_000,
+    }),
+  listLoras: (m: Pick<Machine, "public_url" | "admin_secret">) =>
+    agentFetch<{ loras: string[] }>(m, "/loras", { timeoutMs: 10_000 }),
 }

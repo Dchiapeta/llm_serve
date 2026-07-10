@@ -1,7 +1,7 @@
 import Link from "next/link"
 
 import { createSupabaseAdmin } from "@/lib/supabase/server"
-import type { Account, ApiKey, Machine } from "@/lib/types"
+import type { Account, ApiKey, LoraAdapter, Machine } from "@/lib/types"
 import { Badge } from "@/components/ui/badge"
 import {
   Card,
@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/table"
 import { CreateAccountDialog } from "@/components/accounts/create-account-dialog"
 import { CreateKeyDialog } from "@/components/accounts/create-key-dialog"
+import { RegisterLoraDialog } from "@/components/accounts/register-lora-dialog"
 import { RevokeKeyButton } from "@/components/accounts/revoke-key-button"
 
 export const dynamic = "force-dynamic"
@@ -29,22 +30,35 @@ type KeyRow = ApiKey & {
   machines: { name: string; id: string } | null
 }
 
+type LoraRow = LoraAdapter & {
+  accounts: { name: string } | null
+}
+
 export default async function AccountsPage() {
   const db = createSupabaseAdmin()
 
-  const [{ data: accountsData }, { data: machinesData }, { data: keysData }] =
-    await Promise.all([
-      db.from("accounts").select("*").order("name"),
-      db.from("machines").select("*").in("status", ["running", "stopped", "creating"]),
-      db
-        .from("api_keys")
-        .select("*, accounts(name), machines(id, name)")
-        .order("created_at", { ascending: false }),
-    ])
+  const [
+    { data: accountsData },
+    { data: machinesData },
+    { data: keysData },
+    { data: lorasData },
+  ] = await Promise.all([
+    db.from("accounts").select("*").order("name"),
+    db.from("machines").select("*").in("status", ["running", "stopped", "creating"]),
+    db
+      .from("api_keys")
+      .select("*, accounts(name), machines(id, name)")
+      .order("created_at", { ascending: false }),
+    db
+      .from("lora_adapters")
+      .select("*, accounts(name)")
+      .order("created_at", { ascending: false }),
+  ])
 
   const accounts = (accountsData ?? []) as Account[]
   const machines = (machinesData ?? []) as Machine[]
   const keys = (keysData ?? []) as KeyRow[]
+  const loras = (lorasData ?? []) as LoraRow[]
 
   return (
     <div className="flex flex-col gap-6">
@@ -56,6 +70,7 @@ export default async function AccountsPage() {
           </p>
         </div>
         <div className="flex gap-2">
+          <RegisterLoraDialog accounts={accounts} />
           <CreateKeyDialog accounts={accounts} machines={machines} />
           <CreateAccountDialog />
         </div>
@@ -156,6 +171,54 @@ export default async function AccountsPage() {
           </CardContent>
         </Card>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Adapters LoRA</CardTitle>
+          <CardDescription>
+            {loras.length} adapter(s) registrado(s) no bucket <code>loras</code>
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Conta</TableHead>
+                <TableHead>Versão</TableHead>
+                <TableHead>Path no storage</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Registrado em</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {loras.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={5} className="text-center text-muted-foreground">
+                    Nenhum adapter registrado.
+                  </TableCell>
+                </TableRow>
+              )}
+              {loras.map((l) => (
+                <TableRow key={l.id}>
+                  <TableCell className="font-medium">{l.accounts?.name ?? "—"}</TableCell>
+                  <TableCell>{l.version}</TableCell>
+                  <TableCell className="font-mono text-xs">loras/{l.storage_path}</TableCell>
+                  <TableCell>
+                    {l.status === "ready" ? (
+                      <Badge variant="secondary">pronto</Badge>
+                    ) : (
+                      <Badge variant="destructive">inválido</Badge>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {new Date(l.created_at).toLocaleDateString("pt-BR")}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
     </div>
   )
 }

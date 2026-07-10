@@ -51,6 +51,17 @@ export type ApiKey = {
   created_at: string
 }
 
+// Adapter LoRA de uma conta, já treinado e armazenado no Supabase Storage
+// (bucket "loras", prefixo {account_id}/{version}/).
+export type LoraAdapter = {
+  id: string
+  account_id: string
+  storage_path: string
+  version: string
+  status: "ready" | "invalid"
+  created_at: string
+}
+
 export type UsageMetric = {
   id: string
   api_key_id: string | null

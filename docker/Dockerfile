@@ -1,5 +1,7 @@
 # Imagem: vLLM (servidor OpenAI-compatible) + agent de autenticação/telemetria
-FROM vllm/vllm-openai:latest
+# Versão pinada: o load/unload dinâmico de LoRA depende do comportamento
+# desta versão — não usar "latest".
+FROM vllm/vllm-openai:v0.24.0
 
 WORKDIR /opt/agent
 

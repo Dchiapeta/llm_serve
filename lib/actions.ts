@@ -4,12 +4,12 @@ import { revalidatePath } from "next/cache"
 import { redirect } from "next/navigation"
 import { randomBytes } from "crypto"
 
-import { agent, type AgentKeyEntry } from "./agent"
+import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
 import { listGpuTypes, podProxyUrl, runpod } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import type { ApiKey, Machine, Template } from "./types"
+import type { ApiKey, LoraAdapter, Machine, Template } from "./types"
 
 // ---------- Auth ----------
 
@@ -549,6 +549,140 @@ export async function revokeKey(keyId: string) {
     revalidatePath("/accounts")
     revalidatePath(`/machines/${key.machine_id}`)
   }
+}
+
+// ---------- Adapters LoRA ----------
+
+// Bucket privado no Supabase Storage onde os adapters ficam armazenados.
+// Convenção de path dentro do bucket: {account_id}/{version}/adapter_*.safetensors
+const LORA_BUCKET = "loras"
+
+// Arquivos obrigatórios de um adapter no formato PEFT.
+const LORA_REQUIRED_FILES = ["adapter_config.json", "adapter_model.safetensors"]
+
+// Whitelist completa aceita pelo agent (/admin/load-lora) — manter em sincronia
+// com LORA_ALLOWED_FILES em docker/agent/main.py.
+const LORA_ALLOWED_FILES = new Set([
+  ...LORA_REQUIRED_FILES,
+  "tokenizer.json",
+  "tokenizer_config.json",
+  "special_tokens_map.json",
+  "added_tokens.json",
+  "chat_template.jinja",
+])
+
+// Registra um adapter LoRA já existente no bucket (o treino acontece fora
+// deste sistema). Valida que o prefixo contém os arquivos do formato PEFT
+// antes de registrar — melhor falhar aqui do que na hora de servir o cliente.
+export async function registerLoraAdapter(formData: FormData) {
+  const db = createSupabaseAdmin()
+  const accountId = String(formData.get("account_id"))
+  const version = String(formData.get("version") || "").trim()
+  if (!accountId) throw new Error("Conta não informada")
+  if (!version) throw new Error("Versão não informada")
+
+  const storagePath = `${accountId}/${version}`
+  const { data: files, error: listErr } = await db.storage
+    .from(LORA_BUCKET)
+    .list(storagePath)
+  if (listErr) throw new Error(`Falha ao acessar o bucket "${LORA_BUCKET}": ${listErr.message}`)
+
+  const names = new Set((files ?? []).map((f) => f.name))
+  const missing = LORA_REQUIRED_FILES.filter((f) => !names.has(f))
+  if (missing.length > 0) {
+    throw new Error(
+      `Adapter incompleto em ${LORA_BUCKET}/${storagePath} — faltam: ${missing.join(", ")} (formato PEFT esperado)`
+    )
+  }
+
+  const { error } = await db.from("lora_adapters").insert({
+    account_id: accountId,
+    storage_path: storagePath,
+    version,
+    status: "ready",
+  })
+  if (error) throw new Error(error.message)
+  revalidatePath("/accounts")
+}
+
+export async function listLoraAdapters(accountId?: string): Promise<LoraAdapter[]> {
+  const db = createSupabaseAdmin()
+  let query = db
+    .from("lora_adapters")
+    .select("*")
+    .order("created_at", { ascending: false })
+  if (accountId) query = query.eq("account_id", accountId)
+  const { data, error } = await query
+  if (error) throw new Error(error.message)
+  return (data ?? []) as LoraAdapter[]
+}
+
+// Nome canônico do adapter dentro do vLLM: determinístico por conta, usado
+// pelo gateway para reescrever o campo "model" da request.
+function loraName(accountId: string): string {
+  return `acct-${accountId}`
+}
+
+// Gera signed URLs (TTL curto) para os arquivos do adapter no bucket —
+// o pod baixa direto do storage sem precisar de credenciais Supabase.
+async function buildLoraSignedFiles(adapter: LoraAdapter): Promise<LoraSignedFile[]> {
+  const db = createSupabaseAdmin()
+  const { data: files, error: listErr } = await db.storage
+    .from(LORA_BUCKET)
+    .list(adapter.storage_path)
+  if (listErr) throw new Error(`Falha ao listar o adapter no bucket: ${listErr.message}`)
+  if (!files || files.length === 0) {
+    throw new Error(`Adapter sem arquivos em ${LORA_BUCKET}/${adapter.storage_path}`)
+  }
+
+  const signed: LoraSignedFile[] = []
+  // só assina arquivos da whitelist PEFT — o agent rejeita qualquer outro
+  const wanted = files.filter((f) => LORA_ALLOWED_FILES.has(f.name))
+  for (const f of wanted) {
+    const { data, error } = await db.storage
+      .from(LORA_BUCKET)
+      .createSignedUrl(`${adapter.storage_path}/${f.name}`, 600)
+    if (error || !data) {
+      throw new Error(`Falha ao assinar URL de ${f.name}: ${error?.message}`)
+    }
+    signed.push({ name: f.name, url: data.signedUrl })
+  }
+  return signed
+}
+
+// Carrega o adapter de uma conta numa máquina específica (teste manual via
+// painel/script; o fluxo automático chega com o gateway).
+export async function loadLoraOnMachine(machineId: string, adapterId: string) {
+  const db = createSupabaseAdmin()
+  const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
+  if (!m) throw new Error("Máquina não encontrada")
+  const { data: adapter } = await db
+    .from("lora_adapters")
+    .select("*")
+    .eq("id", adapterId)
+    .single<LoraAdapter>()
+  if (!adapter) throw new Error("Adapter não encontrado")
+  if (adapter.status !== "ready") throw new Error("Adapter marcado como inválido")
+
+  const files = await buildLoraSignedFiles(adapter)
+  const result = await agent.loadLora(m, { lora_name: loraName(adapter.account_id), files })
+  await logEvent(
+    machineId,
+    "sync",
+    `Adapter ${loraName(adapter.account_id)} carregado (download ${result.download_s}s, load ${result.load_s}s)`
+  )
+  revalidatePath(`/machines/${machineId}`)
+  return result
+}
+
+export async function unloadLoraOnMachine(machineId: string, accountId: string) {
+  const db = createSupabaseAdmin()
+  const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
+  if (!m) throw new Error("Máquina não encontrada")
+  const result = await agent.unloadLora(m, loraName(accountId))
+  await logEvent(machineId, "sync", `Adapter ${loraName(accountId)} descarregado`)
+  revalidatePath(`/machines/${machineId}`)
+  return result
 }
 
 // Push da lista de chaves ativas para o agent da máquina
