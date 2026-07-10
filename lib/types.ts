@@ -62,6 +62,18 @@ export type LoraAdapter = {
   created_at: string
 }
 
+// Estado de roteamento de uma conta: onde está (ou deveria estar) seu adapter.
+// Durante migração (lora_status = "migrating"), machine_id continua apontando
+// para a origem, que segue servindo até o flip pós-load no destino.
+export type RoutingState = {
+  account_id: string
+  machine_id: string | null
+  lora_adapter_id: string | null
+  lora_status: "unloaded" | "loading" | "loaded" | "migrating"
+  last_used_at: string | null
+  updated_at: string
+}
+
 export type UsageMetric = {
   id: string
   api_key_id: string | null
