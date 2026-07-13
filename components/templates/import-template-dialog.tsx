@@ -119,6 +119,17 @@ export function ImportTemplateDialog({
                 placeholder="automático (VRAM)"
               />
             </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor={`gpu-count-${runpodTemplateId}`}>Quantidade de GPUs</Label>
+              <Input
+                id={`gpu-count-${runpodTemplateId}`}
+                name="gpu_count"
+                type="number"
+                min={1}
+                step={1}
+                defaultValue={1}
+              />
+            </div>
           </div>
 
           <div className="flex flex-col gap-2">

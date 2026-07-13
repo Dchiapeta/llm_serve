@@ -61,6 +61,17 @@ async function logEvent(machineId: string | null, type: string, message: string)
   await db.from("machine_events").insert({ machine_id: machineId, type, message })
 }
 
+// Quantidade de GPUs por máquina do template; padrão 1.
+function parseGpuCount(formData: FormData): number {
+  const raw = String(formData.get("gpu_count") ?? "").trim()
+  if (!raw) return 1
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error("Quantidade de GPUs deve ser um número inteiro maior que zero")
+  }
+  return n
+}
+
 // Teto manual de usuários: campo opcional; vazio = sem teto (só VRAM).
 function parseMaxUsers(formData: FormData): number | null {
   const raw = String(formData.get("max_users") ?? "").trim()
@@ -106,6 +117,7 @@ export async function createTemplate(formData: FormData) {
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
   const loraFootprint = Number(formData.get("lora_footprint_gb") || 0.5)
   const maxUsers = parseMaxUsers(formData)
+  const gpuCount = parseGpuCount(formData)
   const startCommand = String(formData.get("start_command") || "").trim() || null
   const volumeGb = Number(formData.get("volume_gb") || 0)
   const volumeMountPath =
@@ -148,6 +160,7 @@ export async function createTemplate(formData: FormData) {
     image,
     model_name: modelName,
     gpu_types: gpuTypes,
+    gpu_count: gpuCount,
     env,
     start_command: startCommand,
     disk_gb: diskGb,
@@ -182,6 +195,7 @@ export async function importTemplate(formData: FormData) {
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
   const loraFootprint = Number(formData.get("lora_footprint_gb") || 0.5)
   const maxUsers = parseMaxUsers(formData)
+  const gpuCount = parseGpuCount(formData)
   const gpuTypes = formData
     .getAll("gpu_types")
     .map((s) => String(s).trim())
@@ -201,6 +215,7 @@ export async function importTemplate(formData: FormData) {
     image: remote.imageName,
     model_name: modelName,
     gpu_types: gpuTypes,
+    gpu_count: gpuCount,
     env: remote.env ?? {},
     start_command: (remote.dockerStartCmd ?? []).join(" ") || null,
     disk_gb: remote.containerDiskInGb ?? 40,
@@ -230,6 +245,7 @@ export async function updateTemplate(formData: FormData) {
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
   const loraFootprint = Number(formData.get("lora_footprint_gb") || 0.5)
   const maxUsers = parseMaxUsers(formData)
+  const gpuCount = parseGpuCount(formData)
   const startCommand = String(formData.get("start_command") || "").trim() || null
   const volumeGb = Number(formData.get("volume_gb") || 0)
   const volumeMountPath =
@@ -275,6 +291,7 @@ export async function updateTemplate(formData: FormData) {
       image,
       model_name: modelName,
       gpu_types: gpuTypes,
+      gpu_count: gpuCount,
       env,
       start_command: startCommand,
       disk_gb: diskGb,
@@ -328,16 +345,18 @@ export async function createMachine(formData: FormData) {
 
   const gpus = await listGpuTypes()
   const gpu = gpus.find((g) => g.id === gpuTypeId)
+  const gpuCount = tpl.gpu_count ?? 1
+  const totalVramGb = gpu?.memoryInGb != null ? gpu.memoryInGb * gpuCount : null
 
-  if (maxUsers !== null && gpu?.memoryInGb != null) {
+  if (maxUsers !== null && totalVramGb != null) {
     const cap = vramSlots({
-      vramGb: gpu.memoryInGb,
+      vramGb: totalVramGb,
       modelFootprintGb: tpl.model_footprint_gb,
       kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
     })
     if (maxUsers > cap) {
       return {
-        error: `A GPU ${gpu.displayName} comporta no máximo ${cap} usuário(s) para este modelo (pedido: ${maxUsers})`,
+        error: `A GPU ${gpu?.displayName ?? gpuTypeId} comporta no máximo ${cap} usuário(s) para este modelo (pedido: ${maxUsers})`,
       }
     }
   }
@@ -350,7 +369,7 @@ export async function createMachine(formData: FormData) {
       name,
       imageName: tpl.image,
       gpuTypeIds: [gpuTypeId],
-      gpuCount: 1,
+      gpuCount,
       containerDiskInGb: tpl.disk_gb,
       volumeInGb: tpl.volume_gb ?? 0,
       volumeMountPath: tpl.volume_mount_path || "/workspace",
@@ -381,12 +400,15 @@ export async function createMachine(formData: FormData) {
     .insert({
       runpod_pod_id: pod.id,
       name,
-      gpu_type: gpu?.displayName ?? gpuTypeId,
+      gpu_type:
+        gpuCount > 1
+          ? `${gpu?.displayName ?? gpuTypeId} ×${gpuCount}`
+          : gpu?.displayName ?? gpuTypeId,
       status: "creating",
       template_id: tpl.id,
       admin_secret: adminSecret,
       model_name: tpl.model_name,
-      vram_gb: gpu?.memoryInGb ?? null,
+      vram_gb: totalVramGb,
       cost_per_hr: pod.costPerHr ?? null,
       public_url: podProxyUrl(pod.id, 8000),
       max_users: maxUsers,

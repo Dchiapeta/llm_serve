@@ -107,7 +107,7 @@ export function EditTemplateDialog({
               separados por espaço.
             </p>
           </div>
-          <div className="grid grid-cols-4 gap-4">
+          <div className="grid grid-cols-2 gap-4">
             <div className="flex flex-col gap-2">
               <Label htmlFor="edit-model_footprint_gb">Modelo (GB VRAM)</Label>
               <Input
@@ -148,6 +148,17 @@ export function EditTemplateDialog({
                 step={1}
                 placeholder="automático (VRAM)"
                 defaultValue={template.max_users ?? ""}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="edit-gpu_count">Quantidade de GPUs</Label>
+              <Input
+                id="edit-gpu_count"
+                name="gpu_count"
+                type="number"
+                min={1}
+                step={1}
+                defaultValue={template.gpu_count ?? 1}
               />
             </div>
           </div>

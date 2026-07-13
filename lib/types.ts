@@ -5,6 +5,7 @@ export type Template = {
   image: string
   model_name: string
   gpu_types: string[]
+  gpu_count: number
   env: Record<string, string>
   start_command: string | null
   disk_gb: number

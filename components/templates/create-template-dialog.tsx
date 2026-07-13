@@ -93,7 +93,7 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
               separados por espaço.
             </p>
           </div>
-          <div className="grid grid-cols-4 gap-4">
+          <div className="grid grid-cols-2 gap-4">
             <div className="flex flex-col gap-2">
               <Label htmlFor="model_footprint_gb">Modelo (GB VRAM)</Label>
               <Input
@@ -133,6 +133,17 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
                 min={1}
                 step={1}
                 placeholder="automático (VRAM)"
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="gpu_count">Quantidade de GPUs</Label>
+              <Input
+                id="gpu_count"
+                name="gpu_count"
+                type="number"
+                min={1}
+                step={1}
+                defaultValue={1}
               />
             </div>
           </div>
