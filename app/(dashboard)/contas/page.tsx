@@ -1,9 +1,8 @@
-import Link from "next/link"
 import { KeyRound, Server, ServerCog, Users } from "lucide-react"
+import Link from "next/link"
 
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type { Account, ApiKey, LoraAdapter, Machine, RoutingState } from "@/lib/types"
-import { Badge } from "@/components/reui/badge"
 import {
   Card,
   CardContent,
@@ -11,16 +10,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
 import { CreateAccountDialog } from "@/components/accounts/create-account-dialog"
-import { ContaRowActions } from "@/components/contas/conta-row-actions"
+import { ContasTable, type ContaRow } from "@/components/contas/contas-table"
 
 export const dynamic = "force-dynamic"
 
@@ -110,6 +101,18 @@ export default async function ContasPage({
     { label: "Máquinas (total)", value: activeMachines.length, icon: ServerCog },
   ]
 
+  const rows: ContaRow[] = accounts.map((account) => {
+    const route = routeByAccount.get(account.id)
+    const currentMachine = route?.machine_id ? machineById.get(route.machine_id) : undefined
+    return {
+      account,
+      route,
+      currentMachine,
+      plan: readyAdapterAccounts.has(account.id) ? "Avançado" : "Básico",
+      tokens: tokensByAccount.get(account.id) ?? 0,
+    }
+  })
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
@@ -159,77 +162,7 @@ export default async function ContasPage({
           </div>
         </CardHeader>
         <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Conta</TableHead>
-                <TableHead>Plano</TableHead>
-                <TableHead>Máquina atual</TableHead>
-                <TableHead>Consumo de tokens ({periodDef.label.toLowerCase()})</TableHead>
-                <TableHead className="w-10" />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {accounts.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={5} className="text-center text-muted-foreground">
-                    Nenhuma conta ainda.
-                  </TableCell>
-                </TableRow>
-              )}
-              {accounts.map((a) => {
-                const route = routeByAccount.get(a.id)
-                const currentMachine = route?.machine_id
-                  ? machineById.get(route.machine_id)
-                  : undefined
-                const advanced = readyAdapterAccounts.has(a.id)
-                const tokens = tokensByAccount.get(a.id) ?? 0
-
-                return (
-                  <TableRow key={a.id}>
-                    <TableCell>
-                      <p className="text-sm font-medium">{a.name}</p>
-                      {a.email && (
-                        <p className="text-xs text-muted-foreground">{a.email}</p>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={advanced ? "info-light" : "secondary"} size="sm">
-                        {advanced ? "Avançado" : "Básico"}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>
-                      {currentMachine ? (
-                        <Link
-                          href={`/machines/${currentMachine.id}`}
-                          className="text-sm hover:underline"
-                        >
-                          {currentMachine.name}
-                        </Link>
-                      ) : (
-                        <span className="text-sm text-muted-foreground">—</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-sm tabular-nums">
-                      {tokens.toLocaleString("pt-BR")}
-                    </TableCell>
-                    <TableCell>
-                      <ContaRowActions
-                        account={a}
-                        route={route}
-                        currentMachineName={currentMachine?.name}
-                        plan={advanced ? "Avançado" : "Básico"}
-                        eligibleMachines={runningMachines.filter(
-                          (m) => m.id !== route?.machine_id
-                        )}
-                        hasReadyAdapter={advanced}
-                      />
-                    </TableCell>
-                  </TableRow>
-                )
-              })}
-            </TableBody>
-          </Table>
+          <ContasTable rows={rows} runningMachines={runningMachines} periodLabel={periodDef.label} />
         </CardContent>
       </Card>
     </div>
