@@ -22,6 +22,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { CreateMachineDialog } from "@/components/machines/create-machine-dialog"
+import { MachineRowActions } from "@/components/machines/machine-row-actions"
 import { StatusBadge } from "@/components/machines/status-badge"
 
 export const dynamic = "force-dynamic"
@@ -96,12 +97,13 @@ export default async function MachinesPage() {
                 <TableHead>Modelo</TableHead>
                 <TableHead>Slots</TableHead>
                 <TableHead>Custo/h</TableHead>
+                <TableHead className="w-10" />
               </TableRow>
             </TableHeader>
             <TableBody>
               {machines.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center text-muted-foreground">
+                  <TableCell colSpan={7} className="text-center text-muted-foreground">
                     Nenhuma máquina ativa.
                   </TableCell>
                 </TableRow>
@@ -140,6 +142,14 @@ export default async function MachinesPage() {
                     </TableCell>
                     <TableCell className="text-sm">
                       {m.cost_per_hr ? `$${m.cost_per_hr.toFixed(2)}` : "—"}
+                    </TableCell>
+                    <TableCell>
+                      <MachineRowActions
+                        machine={m}
+                        displayStatus={displayStatusById.get(m.id) ?? m.status}
+                        templateName={tpl?.name}
+                        capacity={cap}
+                      />
                     </TableCell>
                   </TableRow>
                 )

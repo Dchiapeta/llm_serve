@@ -138,6 +138,16 @@ class SupaClient:
     # ---------- lora_adapters ----------
 
     async def latest_ready_adapter(self, account_id: str) -> dict | None:
+        """Adapter 'ready' mais recente da conta, confirmado contra o Storage.
+
+        O status salvo no banco sozinho não é confiável: pode ter sido gravado
+        fora da validação (bug já corrigido em registerLoraAdapter, que antes
+        contava pastas do dashboard como se fossem os arquivos do adapter) ou
+        os arquivos podem ter sumido do bucket depois do registro. Aqui
+        confirmamos a presença real dos arquivos antes de devolver e
+        invalidamos no banco qualquer linha que falhe, pra não ficar
+        retentando o mesmo adapter quebrado a cada request.
+        """
         r = await self._rest.get(
             "/lora_adapters",
             params={
@@ -145,12 +155,15 @@ class SupaClient:
                 "status": "eq.ready",
                 "select": "*",
                 "order": "created_at.desc",
-                "limit": "1",
             },
         )
         r.raise_for_status()
-        rows = r.json()
-        return rows[0] if rows else None
+        for row in r.json():
+            names = await self._list_storage_names(row["storage_path"])
+            if LORA_REQUIRED_FILES.issubset(names):
+                return row
+            await self.mark_adapter_invalid(row["id"])
+        return None
 
     async def mark_adapter_invalid(self, adapter_id: str) -> None:
         r = await self._rest.patch(
@@ -162,18 +175,19 @@ class SupaClient:
 
     # ---------- storage (signed URLs) ----------
 
-    async def signed_lora_files(self, storage_path: str, ttl_s: int = 600) -> list[dict]:
-        """Lista o prefixo do adapter e assina só arquivos da whitelist PEFT."""
+    async def _list_storage_names(self, storage_path: str) -> set[str]:
+        """Nomes de arquivos reais no prefixo — entradas sem id são pastas e não contam."""
         r = await self._storage.post(
             f"/object/list/{self._bucket}",
             json={"prefix": storage_path, "limit": 100},
         )
         r.raise_for_status()
-        # entradas sem id são "pastas" — só objetos reais contam
-        names = [
-            f["name"] for f in r.json()
-            if f.get("id") and f.get("name") in LORA_ALLOWED_FILES
-        ]
+        return {f["name"] for f in r.json() if f.get("id")}
+
+    async def signed_lora_files(self, storage_path: str, ttl_s: int = 600) -> list[dict]:
+        """Lista o prefixo do adapter e assina só arquivos da whitelist PEFT."""
+        all_names = await self._list_storage_names(storage_path)
+        names = [n for n in all_names if n in LORA_ALLOWED_FILES]
 
         missing = LORA_REQUIRED_FILES - set(names)
         if missing:

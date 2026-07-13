@@ -20,7 +20,8 @@ export function IconPlaceholder({
   remixicon: _remixicon,
   ...props
 }: IconPlaceholderProps) {
-  const Icon = lucide ? icons[lucide as keyof typeof icons] : null
+  const name = lucide?.replace(/Icon$/, "")
+  const Icon = name ? icons[name as keyof typeof icons] : null
   if (!Icon) return null
   return <Icon {...props} />
 }
