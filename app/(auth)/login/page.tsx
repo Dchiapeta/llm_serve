@@ -11,6 +11,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
+import { PasswordInput } from "@/components/ui/password-input"
 import { Label } from "@/components/ui/label"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 
@@ -48,7 +49,7 @@ export default async function LoginPage({
             </div>
             <div className="flex flex-col gap-2">
               <Label htmlFor="password">Senha</Label>
-              <Input id="password" name="password" type="password" required />
+              <PasswordInput id="password" name="password" required />
             </div>
             <Button type="submit" className="w-full">
               Entrar
