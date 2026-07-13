@@ -1,0 +1,194 @@
+"""
+Cliente Supabase do gateway: consultas PostgREST (api_keys, machines,
+lora_adapters) e signed URLs do Storage para os arquivos dos adapters.
+
+Toda a comunicação usa a service role key — o gateway é o único componente
+fora do painel com esse acesso; os pods nunca recebem credenciais Supabase.
+"""
+
+import httpx
+
+# Manter em sincronia com LORA_ALLOWED_FILES em docker/agent/main.py
+# e lib/actions.ts — o agent rejeita qualquer arquivo fora desta lista.
+LORA_REQUIRED_FILES = {"adapter_config.json", "adapter_model.safetensors"}
+LORA_ALLOWED_FILES = LORA_REQUIRED_FILES | {
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "chat_template.jinja",
+}
+
+
+class SupaClient:
+    def __init__(self, supabase_url: str, service_role_key: str, lora_bucket: str = "loras"):
+        headers = {
+            "apikey": service_role_key,
+            "Authorization": f"Bearer {service_role_key}",
+            "Content-Type": "application/json",
+        }
+        self._rest = httpx.AsyncClient(
+            base_url=f"{supabase_url}/rest/v1", headers=headers,
+            timeout=httpx.Timeout(10.0),
+        )
+        self._storage = httpx.AsyncClient(
+            base_url=f"{supabase_url}/storage/v1", headers=headers,
+            timeout=httpx.Timeout(30.0),
+        )
+        self._supabase_url = supabase_url
+        self._bucket = lora_bucket
+
+    async def aclose(self):
+        await self._rest.aclose()
+        await self._storage.aclose()
+
+    # ---------- api_keys ----------
+
+    async def find_active_key(self, key_hash: str) -> dict | None:
+        """Retorna {account_id, key_prefix, account_name} da chave ativa, ou None."""
+        r = await self._rest.get(
+            "/api_keys",
+            params={
+                "key_hash": f"eq.{key_hash}",
+                "status": "eq.active",
+                "select": "account_id,key_prefix,key_hash,accounts(name)",
+                "limit": "1",
+            },
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "account_id": row["account_id"],
+            "key_prefix": row["key_prefix"],
+            "key_hash": row["key_hash"],
+            "account_name": (row.get("accounts") or {}).get("name", "?"),
+        }
+
+    async def list_active_keys_for_account(self, account_id: str) -> list[dict]:
+        """Entradas de chave ativas da conta, no formato do /admin/upsert-keys."""
+        r = await self._rest.get(
+            "/api_keys",
+            params={
+                "account_id": f"eq.{account_id}",
+                "status": "eq.active",
+                "select": "key_hash,key_prefix,accounts(name)",
+            },
+        )
+        r.raise_for_status()
+        return [
+            {
+                "key_hash": row["key_hash"],
+                "key_prefix": row["key_prefix"],
+                "account_name": (row.get("accounts") or {}).get("name", "?"),
+            }
+            for row in r.json()
+        ]
+
+    # ---------- machines ----------
+
+    async def get_machine(self, machine_id: str) -> dict | None:
+        r = await self._rest.get(
+            "/machines",
+            params={"id": f"eq.{machine_id}", "select": "*", "limit": "1"},
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    async def list_running_machines(self) -> list[dict]:
+        r = await self._rest.get(
+            "/machines",
+            params={
+                "status": "eq.running",
+                "public_url": "not.is.null",
+                "select": "*",
+                "order": "created_at.asc",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def count_active_routes(self, machine_id: str) -> int:
+        """Rotas ocupando slot LoRA na máquina (loading, loaded ou migrating)."""
+        r = await self._rest.get(
+            "/routing_state",
+            params={
+                "machine_id": f"eq.{machine_id}",
+                "lora_status": "in.(loading,loaded,migrating)",
+                "select": "account_id",
+            },
+            headers={"Prefer": "count=exact"},
+        )
+        r.raise_for_status()
+        content_range = r.headers.get("content-range", "/0")
+        return int(content_range.split("/")[-1])
+
+    async def machine_lora_slots(self, machine_id: str) -> int | None:
+        """Slots LoRA da máquina pela fórmula de capacidade (função SQL única,
+        compartilhada com o painel). None = capacidade desconhecida."""
+        r = await self._rest.post(
+            "/rpc/machine_lora_slots", json={"p_machine_id": machine_id}
+        )
+        r.raise_for_status()
+        return r.json()
+
+    # ---------- lora_adapters ----------
+
+    async def latest_ready_adapter(self, account_id: str) -> dict | None:
+        r = await self._rest.get(
+            "/lora_adapters",
+            params={
+                "account_id": f"eq.{account_id}",
+                "status": "eq.ready",
+                "select": "*",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    async def mark_adapter_invalid(self, adapter_id: str) -> None:
+        r = await self._rest.patch(
+            "/lora_adapters",
+            params={"id": f"eq.{adapter_id}"},
+            json={"status": "invalid"},
+        )
+        r.raise_for_status()
+
+    # ---------- storage (signed URLs) ----------
+
+    async def signed_lora_files(self, storage_path: str, ttl_s: int = 600) -> list[dict]:
+        """Lista o prefixo do adapter e assina só arquivos da whitelist PEFT."""
+        r = await self._storage.post(
+            f"/object/list/{self._bucket}",
+            json={"prefix": storage_path, "limit": 100},
+        )
+        r.raise_for_status()
+        # entradas sem id são "pastas" — só objetos reais contam
+        names = [
+            f["name"] for f in r.json()
+            if f.get("id") and f.get("name") in LORA_ALLOWED_FILES
+        ]
+
+        missing = LORA_REQUIRED_FILES - set(names)
+        if missing:
+            raise RuntimeError(
+                f"adapter incompleto em {self._bucket}/{storage_path} — faltam: {', '.join(sorted(missing))}"
+            )
+
+        signed: list[dict] = []
+        for name in names:
+            resp = await self._storage.post(
+                f"/object/sign/{self._bucket}/{storage_path}/{name}",
+                json={"expiresIn": ttl_s},
+            )
+            resp.raise_for_status()
+            # a API devolve um path relativo ("/object/sign/...?token=...")
+            rel = resp.json()["signedURL"].lstrip("/")
+            signed.append({"name": name, "url": f"{self._supabase_url}/storage/v1/{rel}"})
+        return signed

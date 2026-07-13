@@ -61,9 +61,39 @@ async function adminPost(path, body) {
 console.log(`\n== Medição de load do adapter ${LORA_NAME} (${LORA_BUCKET}/${storagePath}) ==\n`)
 
 // 1. Signed URLs dos arquivos do adapter
-const { data: files, error: listErr } = await db.storage.from(LORA_BUCKET).list(storagePath)
-if (listErr || !files?.length) {
-  console.error(`Nenhum arquivo em ${LORA_BUCKET}/${storagePath}: ${listErr?.message ?? "vazio"}`)
+// Whitelist PEFT — manter em sincronia com docker/agent/main.py e lib/actions.ts
+const REQUIRED = ["adapter_config.json", "adapter_model.safetensors"]
+const ALLOWED = new Set([
+  ...REQUIRED,
+  "tokenizer.json",
+  "tokenizer_config.json",
+  "special_tokens_map.json",
+  "added_tokens.json",
+  "chat_template.jinja",
+])
+
+const { data: entries, error: listErr } = await db.storage.from(LORA_BUCKET).list(storagePath)
+if (listErr) {
+  console.error(`Falha ao listar ${LORA_BUCKET}/${storagePath}: ${listErr.message}`)
+  process.exit(1)
+}
+// entradas com id são objetos reais; sem id são "pastas" (inclusive as criadas
+// por engano via "Create folder" no dashboard — já aconteceu, fica o aviso)
+const objects = (entries ?? []).filter((f) => f.id)
+const folders = (entries ?? []).filter((f) => !f.id)
+if (folders.length > 0) {
+  console.warn(
+    `Aviso: ${LORA_BUCKET}/${storagePath} contém pastas (${folders.map((f) => f.name || "(sem nome)").join(", ")}) — pastas são ignoradas; os adapters devem ser ARQUIVOS neste prefixo`
+  )
+}
+const files = objects.filter((f) => ALLOWED.has(f.name))
+const missing = REQUIRED.filter((r) => !files.some((f) => f.name === r))
+if (missing.length > 0) {
+  console.error(
+    `Adapter incompleto em ${LORA_BUCKET}/${storagePath} — faltam: ${missing.join(", ")}\n` +
+      `Objetos encontrados no prefixo: ${objects.map((f) => f.name).join(", ") || "(nenhum)"}\n` +
+      `Faça upload dos ARQUIVOS do adapter (formato PEFT) diretamente em ${LORA_BUCKET}/${storagePath}/`
+  )
   process.exit(1)
 }
 const signed = []

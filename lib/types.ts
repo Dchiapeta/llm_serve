@@ -14,6 +14,7 @@ export type Template = {
   tcp_ports: string[]
   model_footprint_gb: number
   kv_reserve_gb_per_user: number
+  lora_footprint_gb: number
   max_users: number | null
   created_at: string
 }

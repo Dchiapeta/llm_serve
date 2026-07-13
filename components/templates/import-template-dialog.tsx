@@ -99,6 +99,16 @@ export function ImportTemplateDialog({
               />
             </div>
             <div className="flex flex-col gap-2">
+              <Label htmlFor={`lora-${runpodTemplateId}`}>Adapter LoRA (GB)</Label>
+              <Input
+                id={`lora-${runpodTemplateId}`}
+                name="lora_footprint_gb"
+                type="number"
+                step="0.1"
+                defaultValue={0.5}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
               <Label htmlFor={`max-users-${runpodTemplateId}`}>Máx. usuários</Label>
               <Input
                 id={`max-users-${runpodTemplateId}`}

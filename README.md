@@ -81,6 +81,21 @@ adapters já existentes no bucket (tabela `lora_adapters`, migration
 registro valida que o prefixo contém arquivos antes de gravar. Formato
 esperado: PEFT (`adapter_config.json` + `adapter_model.safetensors`).
 
+Para subir um adapter use [scripts/upload-lora.mjs](scripts/upload-lora.mjs)
+(o dashboard do Supabase cria pastas em vez de arquivos com facilidade).
+
+> **⚠️ Risco conhecido — validação em GPU pendente.** O fluxo dinâmico de
+> LoRA (Fase 2: load/unload em runtime no vLLM v0.24.0, medição de tempo de
+> load via [scripts/test-lora-load.mjs](scripts/test-lora-load.mjs)) ainda
+> **não foi validado contra um pod real com GPU** — bloqueado por limite de
+> storage do Supabase (sem adapter real no bucket). As flags/endpoints foram
+> confirmados no código-fonte da tag v0.24.0, mas a idempotência de
+> load/unload e os tempos reais são comportamento assumido até o teste rodar.
+> Quando o teste de GPU acontecer, validar em conjunto o **lifecycle inteiro
+> da Fase 5** (idle reaper + migração ativa com
+> [scripts/test-migration.py](scripts/test-migration.py)), não só a Fase 2
+> isolada.
+
 ## Slots por capacidade
 
 `slots_max = floor((VRAM da GPU − footprint do modelo) / reserva por usuário)`

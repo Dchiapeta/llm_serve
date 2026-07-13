@@ -93,7 +93,7 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
               separados por espaço.
             </p>
           </div>
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-4 gap-4">
             <div className="flex flex-col gap-2">
               <Label htmlFor="model_footprint_gb">Modelo (GB VRAM)</Label>
               <Input
@@ -115,6 +115,16 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
               />
             </div>
             <div className="flex flex-col gap-2">
+              <Label htmlFor="lora_footprint_gb">Adapter LoRA (GB)</Label>
+              <Input
+                id="lora_footprint_gb"
+                name="lora_footprint_gb"
+                type="number"
+                step="0.1"
+                defaultValue={0.5}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
               <Label htmlFor="max_users">Máx. usuários</Label>
               <Input
                 id="max_users"
@@ -128,7 +138,9 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
           </div>
           <p className="text-xs text-muted-foreground">
             Máx. usuários limita quantas chaves ativas a máquina aceita. Vazio =
-            calculado pela VRAM da GPU.
+            calculado pela VRAM da GPU. Adapter LoRA (GB) é o custo de VRAM por
+            adapter carregado (depende do rank; meça com scripts/test-lora-load.mjs
+            + nvidia-smi).
           </p>
           <div className="flex flex-col gap-2">
             <Label>GPUs compatíveis</Label>

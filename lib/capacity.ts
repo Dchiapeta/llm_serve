@@ -51,3 +51,44 @@ export function computeCapacity({
   const usagePct = slotsMax > 0 ? Math.round((slotsUsed / slotsMax) * 100) : 0
   return { slotsMax, slotsUsed, slotsFree, usagePct }
 }
+
+// ---------- Capacidade multi-LoRA ----------
+// Com 1 modelo base carregado, cada cliente ativo custa o footprint do seu
+// adapter LoRA + a reserva de KV-cache. O footprint por adapter depende do
+// rank — vem do template (lora_footprint_gb), medido na prática com
+// scripts/test-lora-load.mjs + nvidia-smi (diff de VRAM antes/depois do load).
+// A MESMA fórmula existe no banco como machine_lora_slots() (migration 0006),
+// usada pelo gateway na alocação — manter as duas em sincronia.
+
+export type LoraCapacityInput = {
+  vramGb: number | null
+  baseModelFootprintGb: number
+  loraFootprintGb: number
+  kvReserveGbPerUser: number
+  // rotas em loading | loaded | migrating na máquina (routing_state)
+  activeAdapters: number
+  // teto do --max-loras do pod (MAX_LORAS); null = sem teto conhecido
+  maxLoras?: number | null
+}
+
+export function loraSlots({
+  vramGb,
+  baseModelFootprintGb,
+  loraFootprintGb,
+  kvReserveGbPerUser,
+  maxLoras,
+}: Omit<LoraCapacityInput, "activeAdapters">): number {
+  const perAdapter = loraFootprintGb + kvReserveGbPerUser
+  if (perAdapter <= 0) return 0
+  const usable = Math.max((vramGb ?? 0) - baseModelFootprintGb, 0)
+  const byVram = Math.floor(usable / perAdapter)
+  return maxLoras != null ? Math.min(byVram, maxLoras) : byVram
+}
+
+export function computeLoraCapacity(input: LoraCapacityInput): CapacityResult {
+  const slotsMax = loraSlots(input)
+  const slotsUsed = input.activeAdapters
+  const slotsFree = Math.max(slotsMax - slotsUsed, 0)
+  const usagePct = slotsMax > 0 ? Math.round((slotsUsed / slotsMax) * 100) : 0
+  return { slotsMax, slotsUsed, slotsFree, usagePct }
+}

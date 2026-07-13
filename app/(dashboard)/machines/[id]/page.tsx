@@ -2,7 +2,7 @@ import Link from "next/link"
 import { notFound } from "next/navigation"
 import { ExternalLink } from "lucide-react"
 
-import { computeCapacity } from "@/lib/capacity"
+import { computeCapacity, computeLoraCapacity } from "@/lib/capacity"
 import { machineDisplayStatus, reconcileMachineStatuses } from "@/lib/machines"
 import { collectUsageMetrics } from "@/lib/metrics"
 import { runpod, runpodConsoleUrl } from "@/lib/runpod"
@@ -112,13 +112,33 @@ export default async function MachineDetailPage({
       ? formatRuntime(Date.now() - new Date(lastStartedAt).getTime())
       : null
 
-  const cap = computeCapacity({
-    vramGb: machine.vram_gb,
-    modelFootprintGb: template?.model_footprint_gb ?? 16,
-    kvReserveGbPerUser: template?.kv_reserve_gb_per_user ?? 2,
-    activeKeys: activeKeys.length,
-    maxUsers: machine.max_users,
-  })
+  // Pod multi-LoRA: os slots passam a ser "quantos adapters cabem em VRAM
+  // com o modelo base carregado", ocupados pelas rotas ativas (routing_state).
+  const loraMode = podEnv.ENABLE_LORA === "true"
+  let cap
+  if (loraMode) {
+    const { count: activeAdapters } = await db
+      .from("routing_state")
+      .select("account_id", { count: "exact", head: true })
+      .eq("machine_id", id)
+      .in("lora_status", ["loading", "loaded", "migrating"])
+    cap = computeLoraCapacity({
+      vramGb: machine.vram_gb,
+      baseModelFootprintGb: template?.model_footprint_gb ?? 16,
+      loraFootprintGb: template?.lora_footprint_gb ?? 0.5,
+      kvReserveGbPerUser: template?.kv_reserve_gb_per_user ?? 2,
+      activeAdapters: activeAdapters ?? 0,
+      maxLoras: podEnv.MAX_LORAS ? Number(podEnv.MAX_LORAS) : 8,
+    })
+  } else {
+    cap = computeCapacity({
+      vramGb: machine.vram_gb,
+      modelFootprintGb: template?.model_footprint_gb ?? 16,
+      kvReserveGbPerUser: template?.kv_reserve_gb_per_user ?? 2,
+      activeKeys: activeKeys.length,
+      maxUsers: machine.max_users,
+    })
+  }
 
   const usageByKey = new Map<string, { requests: number; tokensIn: number; tokensOut: number }>()
   for (const u of usage) {
@@ -180,13 +200,16 @@ export default async function MachineDetailPage({
         </Card>
         <Card>
           <CardHeader>
-            <CardDescription>Alocação de capacidade</CardDescription>
+            <CardDescription>
+              {loraMode ? "Alocação de adapters LoRA" : "Alocação de capacidade"}
+            </CardDescription>
             <CardTitle className="text-2xl">{cap.usagePct}%</CardTitle>
           </CardHeader>
           <CardContent>
             <CapacityBar used={cap.slotsUsed} max={cap.slotsMax} />
             <p className="mt-2 text-xs text-muted-foreground">
-              {cap.slotsUsed} de {cap.slotsMax} slots · {cap.slotsFree} livres
+              {cap.slotsUsed} de {cap.slotsMax}{" "}
+              {loraMode ? "adapters em VRAM" : "slots"} · {cap.slotsFree} livres
             </p>
           </CardContent>
         </Card>

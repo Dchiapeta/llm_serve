@@ -74,6 +74,20 @@ class RoutingStore:
         )
         r.raise_for_status()
 
+    async def list_idle_routes(self, cutoff_iso: str) -> list[dict]:
+        """Rotas 'loaded' sem uso desde o cutoff — candidatas a unload.
+        Rotas em 'migrating' nunca entram aqui (o status protege do reaper)."""
+        r = await self._client.get(
+            "/routing_state",
+            params={
+                "lora_status": "eq.loaded",
+                "last_used_at": f"lt.{cutoff_iso}",
+                "select": "*",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def list_routes_by_machine(self, machine_id: str) -> list[dict]:
         r = await self._client.get(
             "/routing_state",

@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# test fixtures (downloaded model artifacts, too large for git)
+/test-lora-adapter

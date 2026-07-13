@@ -103,6 +103,7 @@ export async function createTemplate(formData: FormData) {
   const diskGb = Number(formData.get("disk_gb") || 40)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
+  const loraFootprint = Number(formData.get("lora_footprint_gb") || 0.5)
   const maxUsers = parseMaxUsers(formData)
   const startCommand = String(formData.get("start_command") || "").trim() || null
   const volumeGb = Number(formData.get("volume_gb") || 0)
@@ -155,6 +156,7 @@ export async function createTemplate(formData: FormData) {
     tcp_ports: tcpPorts,
     model_footprint_gb: footprint,
     kv_reserve_gb_per_user: kvReserve,
+    lora_footprint_gb: loraFootprint,
     max_users: maxUsers,
   })
   if (error) throw new Error(error.message)
@@ -177,6 +179,7 @@ export async function importTemplate(formData: FormData) {
   const modelName = String(formData.get("model_name"))
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
+  const loraFootprint = Number(formData.get("lora_footprint_gb") || 0.5)
   const maxUsers = parseMaxUsers(formData)
   const gpuTypes = formData
     .getAll("gpu_types")
@@ -206,6 +209,7 @@ export async function importTemplate(formData: FormData) {
     tcp_ports: tcpPorts,
     model_footprint_gb: footprint,
     kv_reserve_gb_per_user: kvReserve,
+    lora_footprint_gb: loraFootprint,
     max_users: maxUsers,
   })
   if (error) throw new Error(error.message)
@@ -223,6 +227,7 @@ export async function updateTemplate(formData: FormData) {
   const diskGb = Number(formData.get("disk_gb") || 40)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
+  const loraFootprint = Number(formData.get("lora_footprint_gb") || 0.5)
   const maxUsers = parseMaxUsers(formData)
   const startCommand = String(formData.get("start_command") || "").trim() || null
   const volumeGb = Number(formData.get("volume_gb") || 0)
@@ -278,6 +283,7 @@ export async function updateTemplate(formData: FormData) {
       tcp_ports: tcpPorts,
       model_footprint_gb: footprint,
       kv_reserve_gb_per_user: kvReserve,
+      lora_footprint_gb: loraFootprint,
       max_users: maxUsers,
     })
     .eq("id", id)
@@ -533,6 +539,19 @@ export async function createKey(input: {
   return { plainKey }
 }
 
+// Invalida o cache de chaves do gateway (best-effort) — sem isso, uma chave
+// revogada continuaria válida no gateway até o TTL do cache expirar.
+async function flushGatewayKeyCache() {
+  const url = process.env.GATEWAY_URL
+  const secret = process.env.GATEWAY_ADMIN_SECRET
+  if (!url || !secret) return // gateway ainda não configurado
+  await fetch(`${url.replace(/\/$/, "")}/admin/flush-key-cache`, {
+    method: "POST",
+    headers: { "X-Admin-Secret": secret },
+    signal: AbortSignal.timeout(5_000),
+  })
+}
+
 export async function revokeKey(keyId: string) {
   const db = createSupabaseAdmin()
   const { data: key } = await db
@@ -545,6 +564,9 @@ export async function revokeKey(keyId: string) {
     await logEvent(key.machine_id, "key_revoked", `Chave ${key.key_prefix}… revogada`)
     await syncMachineKeys(key.machine_id).catch((e) =>
       console.error("Sync com agent falhou (a chave foi revogada no banco):", e)
+    )
+    await flushGatewayKeyCache().catch((e) =>
+      console.error("Flush do cache do gateway falhou (a chave foi revogada no banco):", e)
     )
     revalidatePath("/accounts")
     revalidatePath(`/machines/${key.machine_id}`)
@@ -587,11 +609,13 @@ export async function registerLoraAdapter(formData: FormData) {
     .list(storagePath)
   if (listErr) throw new Error(`Falha ao acessar o bucket "${LORA_BUCKET}": ${listErr.message}`)
 
-  const names = new Set((files ?? []).map((f) => f.name))
+  // entradas sem id são "pastas" — uma pasta chamada adapter_config.json não
+  // conta como arquivo (o dashboard do Supabase facilita esse engano)
+  const names = new Set((files ?? []).filter((f) => f.id).map((f) => f.name))
   const missing = LORA_REQUIRED_FILES.filter((f) => !names.has(f))
   if (missing.length > 0) {
     throw new Error(
-      `Adapter incompleto em ${LORA_BUCKET}/${storagePath} — faltam: ${missing.join(", ")} (formato PEFT esperado)`
+      `Adapter incompleto em ${LORA_BUCKET}/${storagePath} — faltam: ${missing.join(", ")} (formato PEFT esperado; use scripts/upload-lora.mjs)`
     )
   }
 

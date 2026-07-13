@@ -107,7 +107,7 @@ export function EditTemplateDialog({
               separados por espaço.
             </p>
           </div>
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-4 gap-4">
             <div className="flex flex-col gap-2">
               <Label htmlFor="edit-model_footprint_gb">Modelo (GB VRAM)</Label>
               <Input
@@ -126,6 +126,16 @@ export function EditTemplateDialog({
                 type="number"
                 step="0.5"
                 defaultValue={template.kv_reserve_gb_per_user}
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="edit-lora_footprint_gb">Adapter LoRA (GB)</Label>
+              <Input
+                id="edit-lora_footprint_gb"
+                name="lora_footprint_gb"
+                type="number"
+                step="0.1"
+                defaultValue={template.lora_footprint_gb ?? 0.5}
               />
             </div>
             <div className="flex flex-col gap-2">
