@@ -3,10 +3,10 @@ FROM python:3.12-slim
 
 WORKDIR /opt/gateway
 
-COPY requirements.txt .
+COPY docker/gateway/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py routing.py supa.py .
+COPY docker/gateway/main.py docker/gateway/routing.py docker/gateway/supa.py .
 
 EXPOSE 8080
 
