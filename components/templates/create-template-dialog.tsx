@@ -17,8 +17,16 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { CollapsibleSection } from "@/components/templates/collapsible-section"
+import { TEMPLATE_PLANS } from "@/lib/types"
 
 export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
   const [open, setOpen] = React.useState(false)
@@ -54,6 +62,21 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
           <div className="flex flex-col gap-2">
             <Label htmlFor="name">Nome</Label>
             <Input id="name" name="name" placeholder="vllm-qwen-7b" required />
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="plan">Plano</Label>
+            <Select name="plan" defaultValue="VibeCoder">
+              <SelectTrigger id="plan" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {TEMPLATE_PLANS.map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {p}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="model_name">Modelo (Hugging Face)</Label>

@@ -1,9 +1,19 @@
+export type TemplatePlan = "VibeCoder" | "Pro" | "Max" | "Enterprise"
+
+export const TEMPLATE_PLANS: TemplatePlan[] = [
+  "VibeCoder",
+  "Pro",
+  "Max",
+  "Enterprise",
+]
+
 export type Template = {
   id: string
   runpod_template_id: string | null
   name: string
   image: string
   model_name: string
+  plan: TemplatePlan
   gpu_types: string[]
   gpu_count: number
   env: Record<string, string>

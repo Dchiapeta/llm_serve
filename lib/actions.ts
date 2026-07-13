@@ -10,7 +10,7 @@ import { generateHexKey, hashKey, keyPrefix } from "./keys"
 import { getClientLocation, setClientLocation } from "./routing"
 import { listGpuTypes, podProxyUrl, runpod } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import type { ApiKey, LoraAdapter, Machine, Template } from "./types"
+import { TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Template, type TemplatePlan } from "./types"
 
 // ---------- Auth ----------
 
@@ -59,6 +59,15 @@ export async function logout() {
 async function logEvent(machineId: string | null, type: string, message: string) {
   const db = createSupabaseAdmin()
   await db.from("machine_events").insert({ machine_id: machineId, type, message })
+}
+
+// Plano/tier do template: VibeCoder, Pro, Max ou Enterprise.
+function parsePlan(formData: FormData): TemplatePlan {
+  const raw = String(formData.get("plan") || "").trim()
+  if (!TEMPLATE_PLANS.includes(raw as TemplatePlan)) {
+    throw new Error("Plano inválido")
+  }
+  return raw as TemplatePlan
 }
 
 // Quantidade de GPUs por máquina do template; padrão 1.
@@ -112,6 +121,7 @@ export async function createTemplate(formData: FormData) {
   const name = String(formData.get("name"))
   const image = String(formData.get("image"))
   const modelName = String(formData.get("model_name"))
+  const plan = parsePlan(formData)
   const diskGb = Number(formData.get("disk_gb") || 40)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
@@ -159,6 +169,7 @@ export async function createTemplate(formData: FormData) {
     name,
     image,
     model_name: modelName,
+    plan,
     gpu_types: gpuTypes,
     gpu_count: gpuCount,
     env,
@@ -191,6 +202,7 @@ export async function importTemplate(formData: FormData) {
   if (!remote) throw new Error("Template não encontrado no RunPod")
 
   const modelName = String(formData.get("model_name"))
+  const plan = parsePlan(formData)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
   const loraFootprint = Number(formData.get("lora_footprint_gb") || 0.5)
@@ -214,6 +226,7 @@ export async function importTemplate(formData: FormData) {
     name: remote.name,
     image: remote.imageName,
     model_name: modelName,
+    plan,
     gpu_types: gpuTypes,
     gpu_count: gpuCount,
     env: remote.env ?? {},
@@ -240,6 +253,7 @@ export async function updateTemplate(formData: FormData) {
   const name = String(formData.get("name"))
   const image = String(formData.get("image"))
   const modelName = String(formData.get("model_name"))
+  const plan = parsePlan(formData)
   const diskGb = Number(formData.get("disk_gb") || 40)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
@@ -290,6 +304,7 @@ export async function updateTemplate(formData: FormData) {
       name,
       image,
       model_name: modelName,
+      plan,
       gpu_types: gpuTypes,
       gpu_count: gpuCount,
       env,

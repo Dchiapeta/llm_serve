@@ -16,8 +16,16 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { CollapsibleSection } from "@/components/templates/collapsible-section"
+import { TEMPLATE_PLANS } from "@/lib/types"
 
 export function EditTemplateDialog({
   template,
@@ -65,6 +73,21 @@ export function EditTemplateDialog({
               defaultValue={template.name}
               required
             />
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="edit-plan">Plano</Label>
+            <Select name="plan" defaultValue={template.plan}>
+              <SelectTrigger id="edit-plan" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {TEMPLATE_PLANS.map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {p}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="edit-model_name">Modelo (Hugging Face)</Label>

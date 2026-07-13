@@ -17,6 +17,14 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { TEMPLATE_PLANS } from "@/lib/types"
 
 export function ImportTemplateDialog({
   runpodTemplateId,
@@ -65,6 +73,22 @@ export function ImportTemplateDialog({
           <div className="flex flex-col gap-2">
             <Label>Imagem Docker (do RunPod)</Label>
             <Input value={image} readOnly className="font-mono text-xs" />
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <Label htmlFor={`plan-${runpodTemplateId}`}>Plano</Label>
+            <Select name="plan" defaultValue="VibeCoder">
+              <SelectTrigger id={`plan-${runpodTemplateId}`} className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {TEMPLATE_PLANS.map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {p}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
 
           <div className="flex flex-col gap-2">

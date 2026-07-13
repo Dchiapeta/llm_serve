@@ -83,6 +83,7 @@ export default async function TemplatesPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Nome</TableHead>
+                <TableHead>Plano</TableHead>
                 <TableHead>Modelo</TableHead>
                 <TableHead>Imagem</TableHead>
                 <TableHead>Disco</TableHead>
@@ -95,7 +96,7 @@ export default async function TemplatesPage() {
             <TableBody>
               {templates.length === 0 && notImported.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={8} className="text-center text-muted-foreground">
+                  <TableCell colSpan={9} className="text-center text-muted-foreground">
                     Nenhum template ainda. Crie o primeiro.
                   </TableCell>
                 </TableRow>
@@ -104,6 +105,9 @@ export default async function TemplatesPage() {
               {templates.map((t) => (
                 <TableRow key={t.id}>
                   <TableCell className="font-medium">{t.name}</TableCell>
+                  <TableCell>
+                    <Badge variant="outline">{t.plan}</Badge>
+                  </TableCell>
                   <TableCell className="font-mono text-xs">{t.model_name}</TableCell>
                   <TableCell className="font-mono text-xs">{t.image}</TableCell>
                   <TableCell>{t.disk_gb} GB</TableCell>
@@ -134,6 +138,7 @@ export default async function TemplatesPage() {
               {notImported.map((t) => (
                 <TableRow key={t.id} className="text-muted-foreground">
                   <TableCell className="font-medium">{t.name}</TableCell>
+                  <TableCell className="text-xs">—</TableCell>
                   <TableCell className="text-xs">—</TableCell>
                   <TableCell className="font-mono text-xs">{t.imageName}</TableCell>
                   <TableCell>{t.containerDiskInGb ?? "—"} GB</TableCell>
