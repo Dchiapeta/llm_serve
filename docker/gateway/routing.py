@@ -45,7 +45,38 @@ class RoutingStore:
         rows = r.json()
         if not rows:
             raise RuntimeError("claim_route não retornou estado")
-        return rows[0]
+        row = rows[0]
+        if row.get("claimed"):
+            await self._record_routing_history(
+                account_id=account_id,
+                event="allocated",
+                machine_id=row.get("machine_id"),
+                lora_adapter_id=row.get("lora_adapter_id"),
+            )
+        return row
+
+    async def _record_routing_history(
+        self,
+        *,
+        account_id: str,
+        event: str,
+        machine_id: str | None = None,
+        from_machine_id: str | None = None,
+        lora_adapter_id: str | None = None,
+    ) -> None:
+        """Espelho de recordRoutingHistory em lib/routing.ts — mesma tabela,
+        mesma semântica de eventos (allocated/migrated/released)."""
+        r = await self._client.post(
+            "/routing_history",
+            json={
+                "account_id": account_id,
+                "event": event,
+                "machine_id": machine_id,
+                "from_machine_id": from_machine_id,
+                "lora_adapter_id": lora_adapter_id,
+            },
+        )
+        r.raise_for_status()
 
     async def set_client_location(self, account_id: str, **patch) -> None:
         """Atualiza machine_id / lora_adapter_id / lora_status da rota."""
@@ -63,9 +94,17 @@ class RoutingStore:
 
     async def mark_slot_idle(self, account_id: str) -> None:
         """Libera o slot: sem adapter em VRAM e sem máquina — apto a novo claim."""
+        previous = await self.get_client_location(account_id)
         await self.set_client_location(
             account_id, machine_id=None, lora_status="unloaded"
         )
+        if previous and previous.get("machine_id"):
+            await self._record_routing_history(
+                account_id=account_id,
+                event="released",
+                from_machine_id=previous.get("machine_id"),
+                lora_adapter_id=previous.get("lora_adapter_id"),
+            )
 
     async def touch(self, account_id: str) -> None:
         """Marca uso recente (o chamador é responsável pelo throttling)."""

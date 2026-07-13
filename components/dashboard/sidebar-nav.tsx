@@ -7,6 +7,7 @@ import {
   KeyRound,
   LayoutDashboard,
   Server,
+  Users,
 } from "lucide-react"
 
 import { cn } from "@/lib/utils"
@@ -15,7 +16,8 @@ const items = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/machines", label: "Máquinas", icon: Server },
   { href: "/templates", label: "Templates", icon: Boxes },
-  { href: "/accounts", label: "Contas & Chaves", icon: KeyRound },
+  { href: "/contas", label: "Contas", icon: Users },
+  { href: "/accounts", label: "Chaves", icon: KeyRound },
 ]
 
 export function SidebarNav() {

@@ -7,6 +7,7 @@ import { randomBytes } from "crypto"
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
+import { getClientLocation, setClientLocation } from "./routing"
 import { listGpuTypes, podProxyUrl, runpod } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
 import type { ApiKey, LoraAdapter, Machine, Template } from "./types"
@@ -730,5 +731,53 @@ export async function syncMachineKeys(machineId: string) {
 
   await agent.syncKeys(m, entries)
   await logEvent(machineId, "sync", `${entries.length} chave(s) sincronizada(s) com o agent`)
+}
+
+// ---------- Migração de conta ----------
+
+// Move o adapter LoRA de uma conta da máquina atual para outra: descarrega
+// na origem, carrega no destino, atualiza routing_state e grava o evento em
+// routing_history. Ação manual via painel — o fluxo automático (rebalance)
+// não existe ainda.
+export async function migrateAccountToMachine(accountId: string, targetMachineId: string) {
+  const db = createSupabaseAdmin()
+
+  const current = await getClientLocation(accountId)
+  const { data: adapter } = await db
+    .from("lora_adapters")
+    .select("*")
+    .eq("account_id", accountId)
+    .eq("status", "ready")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle<LoraAdapter>()
+  if (!adapter) throw new Error("Conta não tem adapter LoRA pronto para migrar")
+
+  const fromMachineId = current?.machine_id ?? null
+  if (fromMachineId === targetMachineId) {
+    throw new Error("A conta já está nessa máquina")
+  }
+
+  if (fromMachineId) {
+    await unloadLoraOnMachine(fromMachineId, accountId)
+  }
+  await loadLoraOnMachine(targetMachineId, adapter.id)
+
+  await setClientLocation(accountId, {
+    machine_id: targetMachineId,
+    lora_adapter_id: adapter.id,
+    lora_status: "loaded",
+  })
+  await db.from("routing_history").insert({
+    account_id: accountId,
+    event: "migrated",
+    machine_id: targetMachineId,
+    from_machine_id: fromMachineId,
+    lora_adapter_id: adapter.id,
+  })
+
+  revalidatePath("/contas")
+  if (fromMachineId) revalidatePath(`/machines/${fromMachineId}`)
+  revalidatePath(`/machines/${targetMachineId}`)
 }
 

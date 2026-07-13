@@ -4,7 +4,16 @@
 // docker/gateway/routing.py.
 
 import { createSupabaseAdmin } from "./supabase/server"
-import type { RoutingState } from "./types"
+import type { RoutingHistory, RoutingState } from "./types"
+
+async function recordRoutingHistory(
+  entry: Pick<RoutingHistory, "account_id" | "event"> &
+    Partial<Pick<RoutingHistory, "machine_id" | "from_machine_id" | "lora_adapter_id">>
+): Promise<void> {
+  const db = createSupabaseAdmin()
+  const { error } = await db.from("routing_history").insert(entry)
+  if (error) throw new Error(error.message)
+}
 
 export async function getClientLocation(
   accountId: string
@@ -34,6 +43,14 @@ export async function claimClientLocation(
   const row = (data as (RoutingState & { claimed: boolean })[] | null)?.[0]
   if (!row) throw new Error("claim_route não retornou estado")
   const { claimed, ...state } = row
+  if (claimed) {
+    await recordRoutingHistory({
+      account_id: accountId,
+      event: "allocated",
+      machine_id: state.machine_id,
+      lora_adapter_id: state.lora_adapter_id,
+    })
+  }
   return { claimed, state }
 }
 
@@ -53,10 +70,19 @@ export async function setClientLocation(
 
 // Libera o slot: sem adapter em VRAM e sem máquina — apto a novo claim.
 export async function markSlotIdle(accountId: string): Promise<void> {
+  const previous = await getClientLocation(accountId)
   await setClientLocation(accountId, {
     machine_id: null,
     lora_status: "unloaded",
   })
+  if (previous?.machine_id) {
+    await recordRoutingHistory({
+      account_id: accountId,
+      event: "released",
+      from_machine_id: previous.machine_id,
+      lora_adapter_id: previous.lora_adapter_id,
+    })
+  }
 }
 
 export async function touchClientLocation(accountId: string): Promise<void> {

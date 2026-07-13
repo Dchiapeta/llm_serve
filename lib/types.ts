@@ -75,6 +75,18 @@ export type RoutingState = {
   updated_at: string
 }
 
+// Log de alocação/migração de máquina por conta — routing_state só guarda
+// o estado atual, este é o histórico (um registro por evento).
+export type RoutingHistory = {
+  id: string
+  account_id: string
+  machine_id: string | null
+  from_machine_id: string | null
+  lora_adapter_id: string | null
+  event: "allocated" | "migrated" | "released"
+  created_at: string
+}
+
 export type UsageMetric = {
   id: string
   api_key_id: string | null
