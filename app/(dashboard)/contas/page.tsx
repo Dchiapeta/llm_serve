@@ -11,7 +11,7 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { CreateStackDialog } from "@/components/contas/create-stack-dialog"
-import { ContasTable, type ContaRow } from "@/components/contas/contas-table"
+import { ContasTable, type StackRow } from "@/components/contas/contas-table"
 
 export const dynamic = "force-dynamic"
 
@@ -119,31 +119,22 @@ export default async function ContasPage({
       activeKeys: activeKeysByMachine.get(m.id) ?? 0,
     }))
   const routeByAccount = new Map(routes.map((r) => [r.account_id, r]))
-  const accountIdByKeyId = new Map(keys.map((k) => [k.id, k.account_id]))
 
-  const tokensByAccount = new Map<string, number>()
   const usageByKeyId = new Map<
     string,
     { tokensIn: number; tokensOut: number; requests: number }
   >()
   for (const u of usage) {
-    if (u.api_key_id) {
-      const agg = usageByKeyId.get(u.api_key_id) ?? {
-        tokensIn: 0,
-        tokensOut: 0,
-        requests: 0,
-      }
-      agg.tokensIn += u.tokens_in
-      agg.tokensOut += u.tokens_out
-      agg.requests += u.requests
-      usageByKeyId.set(u.api_key_id, agg)
+    if (!u.api_key_id) continue
+    const agg = usageByKeyId.get(u.api_key_id) ?? {
+      tokensIn: 0,
+      tokensOut: 0,
+      requests: 0,
     }
-    const accountId = u.api_key_id ? accountIdByKeyId.get(u.api_key_id) : undefined
-    if (!accountId) continue
-    tokensByAccount.set(
-      accountId,
-      (tokensByAccount.get(accountId) ?? 0) + u.tokens_in + u.tokens_out
-    )
+    agg.tokensIn += u.tokens_in
+    agg.tokensOut += u.tokens_out
+    agg.requests += u.requests
+    usageByKeyId.set(u.api_key_id, agg)
   }
 
   const templateById = new Map(templates.map((t) => [t.id, t]))
@@ -174,34 +165,32 @@ export default async function ContasPage({
     { label: "Máquinas (total)", value: activeMachines.length, icon: ServerCog },
   ]
 
-  const rows: ContaRow[] = accounts.map((account) => {
+  // Uma linha por stack; contas sem stack não aparecem na tabela (os KPIs
+  // continuam contando todas, e criar stack pra elas segue possível pelo
+  // botão do header).
+  const rows: StackRow[] = accounts.flatMap((account) => {
     const route = routeByAccount.get(account.id)
     const currentMachine = route?.machine_id ? machineById.get(route.machine_id) : undefined
+    const hasReadyAdapter = readyAdapterAccounts.has(account.id)
     const knowledgeFiles = Array.from(
       knowledgeFilesByAccount.get(account.id) ?? [],
       ([storage_path, chunks]) => ({ storage_path, chunks })
     )
-    return {
-      account,
-      route,
-      currentMachine,
-      hasReadyAdapter: readyAdapterAccounts.has(account.id),
-      knowledgeFiles,
-      tokens: tokensByAccount.get(account.id) ?? 0,
-      stacks: (stacksByAccount.get(account.id) ?? []).map((s) => {
-        const machine = s.machine_id ? machineById.get(s.machine_id) : undefined
-        const stackKeys = keys.filter(
-          (k) => k.account_id === account.id && k.machine_id === s.machine_id
-        )
-        const stackUsage = { tokensIn: 0, tokensOut: 0, requests: 0 }
-        for (const k of stackKeys) {
-          const agg = usageByKeyId.get(k.id)
-          if (!agg) continue
-          stackUsage.tokensIn += agg.tokensIn
-          stackUsage.tokensOut += agg.tokensOut
-          stackUsage.requests += agg.requests
-        }
-        return {
+    return (stacksByAccount.get(account.id) ?? []).map((s) => {
+      const machine = s.machine_id ? machineById.get(s.machine_id) : undefined
+      const stackKeys = keys.filter(
+        (k) => k.account_id === account.id && k.machine_id === s.machine_id
+      )
+      const stackUsage = { tokensIn: 0, tokensOut: 0, requests: 0 }
+      for (const k of stackKeys) {
+        const agg = usageByKeyId.get(k.id)
+        if (!agg) continue
+        stackUsage.tokensIn += agg.tokensIn
+        stackUsage.tokensOut += agg.tokensOut
+        stackUsage.requests += agg.requests
+      }
+      return {
+        stack: {
           ...s,
           machineName: machine?.name,
           // Pick explícito — nunca a Machine inteira, para não vazar
@@ -228,9 +217,14 @@ export default async function ContasPage({
             created_at: k.created_at,
           })),
           usage: stackUsage,
-        }
-      }),
-    }
+        },
+        account,
+        route,
+        currentMachine,
+        hasReadyAdapter,
+        knowledgeFiles,
+      }
+    })
   })
 
   return (
@@ -266,8 +260,8 @@ export default async function ContasPage({
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <div>
-            <CardTitle>Contas</CardTitle>
-            <CardDescription>{accounts.length} conta(s)</CardDescription>
+            <CardTitle>Stacks</CardTitle>
+            <CardDescription>{rows.length} stack(s)</CardDescription>
           </div>
           <div className="flex items-center gap-1 rounded-lg border p-1">
             {PERIODS.map((p) => (

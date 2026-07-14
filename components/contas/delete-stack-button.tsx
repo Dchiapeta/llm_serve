@@ -1,7 +1,6 @@
 "use client"
 
 import * as React from "react"
-import { Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { deleteStack } from "@/lib/actions"
@@ -15,31 +14,22 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
-import { Button } from "@/components/ui/button"
 
-export function DeleteStackButton({
+export function DeleteStackDialog({
   stackId,
   slug,
+  open,
+  onOpenChange,
 }: {
   stackId: string
   slug: string
+  open: boolean
+  onOpenChange: (open: boolean) => void
 }) {
-  const [open, setOpen] = React.useState(false)
   const [pending, startTransition] = React.useTransition()
 
   return (
-    <>
-      <Button
-        variant="ghost"
-        size="icon"
-        className="size-6 text-muted-foreground hover:text-destructive"
-        onClick={() => setOpen(true)}
-        aria-label={`Deletar stack ${slug}`}
-      >
-        <Trash2 className="size-3.5" />
-      </Button>
-
-      <AlertDialog open={open} onOpenChange={setOpen}>
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Apagar stack?</AlertDialogTitle>
@@ -58,7 +48,7 @@ export function DeleteStackButton({
                   try {
                     await deleteStack(stackId)
                     toast.success("Stack apagada")
-                    setOpen(false)
+                    onOpenChange(false)
                   } catch (err) {
                     toast.error(
                       err instanceof Error ? err.message : "Erro ao apagar"
@@ -70,8 +60,7 @@ export function DeleteStackButton({
               Apagar
             </AlertDialogAction>
           </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </>
+      </AlertDialogContent>
+    </AlertDialog>
   )
 }

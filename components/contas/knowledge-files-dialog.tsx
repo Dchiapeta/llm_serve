@@ -31,7 +31,7 @@ export function KnowledgeFilesDialog({
   onOpenChange: (open: boolean) => void
 }) {
   // initialFiles vem do server component (contas/page.tsx); o remount por
-  // key (ver conta-row-actions.tsx) garante que reabrir pega os dados mais
+  // key (ver stack-row-actions.tsx) garante que reabrir pega os dados mais
   // recentes da última navegação, sem precisar buscar de novo num effect.
   const [files, setFiles] = React.useState<KnowledgeFile[]>(initialFiles)
   const [pending, startTransition] = React.useTransition()

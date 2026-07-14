@@ -14,14 +14,17 @@ import {
   type StackInfo,
 } from "@/components/contas/contas-table"
 
-export function StackInfoButton({
+export function StackInfoDialog({
   stack,
   periodLabel,
+  open,
+  onOpenChange,
 }: {
   stack: StackInfo
   periodLabel: string
+  open: boolean
+  onOpenChange: (open: boolean) => void
 }) {
-  const [open, setOpen] = React.useState(false)
   const machine = stack.machine
 
   // Copia a chave completa quando ela existe (chaves criadas após a
@@ -37,18 +40,7 @@ export function StackInfoButton({
   }
 
   return (
-    <>
-      <Button
-        variant="ghost"
-        size="icon"
-        className="size-6 text-muted-foreground"
-        onClick={() => setOpen(true)}
-        aria-label={`Informações da stack ${stack.slug}`}
-      >
-        <Info className="size-3.5" />
-      </Button>
-
-      <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent className="sm:max-w-sm">
           <DialogTitle className="sr-only">
             Informações da stack {stack.slug}
@@ -186,8 +178,7 @@ export function StackInfoButton({
               </a>
             )}
           </div>
-        </DialogContent>
-      </Dialog>
-    </>
+      </DialogContent>
+    </Dialog>
   )
 }

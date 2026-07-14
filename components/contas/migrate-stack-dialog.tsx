@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { ArrowRightLeft, Check, Copy, TriangleAlert } from "lucide-react"
+import { Check, Copy, TriangleAlert } from "lucide-react"
 import { toast } from "sonner"
 
 import { migrateStack } from "@/lib/actions"
@@ -35,21 +35,21 @@ const NEW_MACHINE = "__new__"
 
 type Result = { machineCreated: boolean; plainKey: string | null }
 
-export function MigrateStackButton({
+// O chamador deve remontar via `key` a cada abertura para resetar o
+// estado interno (alvo, resultado, copiado) — padrão dos dialogs de conta.
+export function MigrateStackDialog({
   stack,
   machines,
   templates,
+  open,
+  onOpenChange,
 }: {
   stack: StackInfo
   machines: StackMachine[]
   templates: StackTemplate[]
+  open: boolean
+  onOpenChange: (open: boolean) => void
 }) {
-  const [open, setOpen] = React.useState(false)
-  const [target, setTarget] = React.useState<string>("")
-  const [result, setResult] = React.useState<Result | null>(null)
-  const [copied, setCopied] = React.useState(false)
-  const [pending, startTransition] = React.useTransition()
-
   // Mesmo template de referência da action: o da máquina atual; sem
   // máquina, o produto cadastrado com o plano da stack.
   const templateId =
@@ -75,6 +75,13 @@ export function MigrateStackButton({
     })
   }, [machines, template, stack.machine_id])
 
+  const [target, setTarget] = React.useState<string>(
+    () => eligible[0]?.id ?? NEW_MACHINE
+  )
+  const [result, setResult] = React.useState<Result | null>(null)
+  const [copied, setCopied] = React.useState(false)
+  const [pending, startTransition] = React.useTransition()
+
   function slotsLabel(m: StackMachine) {
     if (!template) return ""
     const cap = computeCapacity({
@@ -85,15 +92,6 @@ export function MigrateStackButton({
       maxUsers: m.max_users,
     })
     return cap.slotsMax > 0 ? ` (${cap.slotsFree} vaga(s))` : ""
-  }
-
-  function onOpenChange(next: boolean) {
-    setOpen(next)
-    if (next) {
-      setTarget(eligible[0]?.id ?? NEW_MACHINE)
-      setResult(null)
-      setCopied(false)
-    }
   }
 
   function onConfirm() {
@@ -119,18 +117,7 @@ export function MigrateStackButton({
   }
 
   return (
-    <>
-      <Button
-        variant="ghost"
-        size="icon"
-        className="size-6 text-muted-foreground"
-        onClick={() => onOpenChange(true)}
-        aria-label={`Migrar stack ${stack.slug}`}
-      >
-        <ArrowRightLeft className="size-3.5" />
-      </Button>
-
-      <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>Migrar stack</DialogTitle>
@@ -177,7 +164,7 @@ export function MigrateStackButton({
                 {result.machineCreated &&
                   "A máquina está subindo — a chave será sincronizada quando o pod ficar pronto."}
               </p>
-              <Button onClick={() => setOpen(false)}>Concluir</Button>
+              <Button onClick={() => onOpenChange(false)}>Concluir</Button>
             </div>
           ) : (
             <div className="flex flex-col gap-4">
@@ -214,8 +201,7 @@ export function MigrateStackButton({
               </Button>
             </div>
           )}
-        </DialogContent>
-      </Dialog>
-    </>
+      </DialogContent>
+    </Dialog>
   )
 }
