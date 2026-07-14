@@ -32,12 +32,12 @@ export default async function DashboardPage() {
   const [
     { data: machinesData },
     { data: templatesData },
-    { data: keysData },
+    { data: stacksData },
     { data: eventsData },
   ] = await Promise.all([
     db.from("machines").select("*").neq("status", "terminated"),
     db.from("templates").select("*"),
-    db.from("api_keys").select("machine_id, status").eq("status", "active"),
+    db.from("stacks").select("machine_id").not("machine_id", "is", null),
     db
       .from("machine_events")
       .select("*")
@@ -69,11 +69,12 @@ export default async function DashboardPage() {
   const usage = (usageData ?? []) as UsageMetric[]
   const events = (eventsData ?? []) as MachineEvent[]
 
-  const activeKeysByMachine = new Map<string, number>()
-  for (const k of keysData ?? []) {
-    activeKeysByMachine.set(
-      k.machine_id,
-      (activeKeysByMachine.get(k.machine_id) ?? 0) + 1
+  // Ocupação = stacks hospedadas (1 stack = 1 slot), não chaves ativas.
+  const stacksByMachine = new Map<string, number>()
+  for (const s of stacksData ?? []) {
+    stacksByMachine.set(
+      s.machine_id,
+      (stacksByMachine.get(s.machine_id) ?? 0) + 1
     )
   }
 
@@ -86,7 +87,7 @@ export default async function DashboardPage() {
         vramGb: m.vram_gb,
         modelFootprintGb: tpl?.model_footprint_gb ?? 16,
         kvReserveGbPerUser: tpl?.kv_reserve_gb_per_user ?? 2,
-        activeKeys: activeKeysByMachine.get(m.id) ?? 0,
+        occupied: stacksByMachine.get(m.id) ?? 0,
         maxUsers: m.max_users,
       }),
     }

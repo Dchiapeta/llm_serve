@@ -1,10 +1,15 @@
 "use client"
 
 import * as React from "react"
-import { Info, MoreVertical, Pause, Play, Trash2 } from "lucide-react"
+import { Info, MoreVertical, Pause, Play, RotateCcw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
-import { startMachine, stopMachine, terminateMachine } from "@/lib/actions"
+import {
+  recreateMachine,
+  startMachine,
+  stopMachine,
+  terminateMachine,
+} from "@/lib/actions"
 import type { MachineDisplayStatus } from "@/lib/machines"
 import type { Machine } from "@/lib/types"
 import {
@@ -40,12 +45,22 @@ export function MachineRowActions({
 }) {
   const [infoOpen, setInfoOpen] = React.useState(false)
   const [deleteOpen, setDeleteOpen] = React.useState(false)
+  const [recreateOpen, setRecreateOpen] = React.useState(false)
   const [pending, startTransition] = React.useTransition()
 
-  function run(fn: () => Promise<void>, success: string) {
+  function run(
+    fn: () => Promise<{ error: string; code?: string } | void>,
+    success: string
+  ) {
     startTransition(async () => {
       try {
-        await fn()
+        const result = await fn()
+        if (result?.error) {
+          toast.error(result.error)
+          // Host sem GPU livre: oferece recriar o pod em outro host
+          if (result.code === "no_gpu_on_host") setRecreateOpen(true)
+          return
+        }
         toast.success(success)
       } catch (e) {
         if (e && typeof e === "object" && "digest" in e) throw e
@@ -88,6 +103,12 @@ export function MachineRowActions({
               Iniciar
             </DropdownMenuItem>
           ) : null}
+          {(machine.status === "stopped" || machine.status === "error") && (
+            <DropdownMenuItem onSelect={() => setRecreateOpen(true)}>
+              <RotateCcw className="size-4" />
+              Recriar
+            </DropdownMenuItem>
+          )}
           <DropdownMenuSeparator />
           <DropdownMenuItem
             variant="destructive"
@@ -107,6 +128,36 @@ export function MachineRowActions({
         open={infoOpen}
         onOpenChange={setInfoOpen}
       />
+
+      <AlertDialog open={recreateOpen} onOpenChange={setRecreateOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Recriar máquina em outro host?</AlertDialogTitle>
+            <AlertDialogDescription>
+              O pod atual de “{machine.name}” será terminado e um novo será
+              criado com o mesmo template e GPU. O disco do container é perdido
+              e o modelo baixa de novo no boot; as chaves de API são reenviadas
+              automaticamente quando a máquina ficar pronta.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancelar</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={pending}
+              onClick={(e) => {
+                e.preventDefault()
+                run(
+                  () => recreateMachine(machine.id),
+                  "Máquina recriada — novo pod subindo"
+                )
+                setRecreateOpen(false)
+              }}
+            >
+              Recriar máquina
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <AlertDialogContent>

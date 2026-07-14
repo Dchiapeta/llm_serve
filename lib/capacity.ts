@@ -9,7 +9,9 @@ export type CapacityInput = {
   vramGb: number | null
   modelFootprintGb: number
   kvReserveGbPerUser: number
-  activeKeys: number
+  // Slots ocupados. Ocupação padrão = stacks hospedadas na máquina (1 stack
+  // = 1 slot, mesmo quando contas repetidas compartilham a mesma chave).
+  occupied: number
   maxUsers?: number | null
 }
 
@@ -36,7 +38,7 @@ export function computeCapacity({
   vramGb,
   modelFootprintGb,
   kvReserveGbPerUser,
-  activeKeys,
+  occupied,
   maxUsers,
 }: CapacityInput): CapacityResult {
   const byVram = vramSlots({ vramGb, modelFootprintGb, kvReserveGbPerUser })
@@ -46,7 +48,7 @@ export function computeCapacity({
         ? Math.min(byVram, maxUsers)
         : maxUsers
       : byVram
-  const slotsUsed = activeKeys
+  const slotsUsed = occupied
   const slotsFree = Math.max(slotsMax - slotsUsed, 0)
   const usagePct = slotsMax > 0 ? Math.round((slotsUsed / slotsMax) * 100) : 0
   return { slotsMax, slotsUsed, slotsFree, usagePct }

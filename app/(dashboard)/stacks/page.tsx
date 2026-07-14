@@ -100,10 +100,12 @@ export default async function ContasPage({
 
   const machineById = new Map(machines.map((m) => [m.id, m]))
 
-  const activeKeysByMachine = new Map<string, number>()
-  for (const k of keys) {
-    if (k.status !== "active") continue
-    activeKeysByMachine.set(k.machine_id, (activeKeysByMachine.get(k.machine_id) ?? 0) + 1)
+  // Ocupação = stacks hospedadas (1 stack = 1 slot), não chaves ativas:
+  // stacks da mesma conta compartilham uma chave e sumiriam da contagem.
+  const stacksCountByMachine = new Map<string, number>()
+  for (const s of stacks) {
+    if (!s.machine_id) continue
+    stacksCountByMachine.set(s.machine_id, (stacksCountByMachine.get(s.machine_id) ?? 0) + 1)
   }
 
   // Máquinas candidatas a hospedar uma stack nova — sem admin_secret (client).
@@ -116,7 +118,7 @@ export default async function ContasPage({
       model_name: m.model_name,
       vram_gb: m.vram_gb,
       max_users: m.max_users,
-      activeKeys: activeKeysByMachine.get(m.id) ?? 0,
+      occupied: stacksCountByMachine.get(m.id) ?? 0,
     }))
   const routeByAccount = new Map(routes.map((r) => [r.account_id, r]))
 

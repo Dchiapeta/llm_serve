@@ -31,7 +31,9 @@ cp .env.example .env.local
 
 Preencha:
 
-- `RUNPOD_API_KEY` — em [runpod.io → Settings → API Keys](https://www.runpod.io/console/user/settings)
+- `RUNPOD_API_KEY` — em [runpod.io → Settings → API Keys](https://www.runpod.io/console/user/settings).
+  Também deve ir no env do **gateway** ([docker/gateway/README.md](docker/gateway/README.md))
+  para habilitar a auto-pausa de máquinas ociosas.
 - `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
   `SUPABASE_SERVICE_ROLE_KEY` — em Project Settings → API do Supabase
 

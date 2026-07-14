@@ -59,8 +59,13 @@ advisory lock.
 | `LORA_BUCKET`             | não         | Bucket dos adapters (default `loras`)            |
 | `MAX_LORAS_PER_MACHINE`   | não         | Teto de adapters por máquina (default 8)         |
 | `LOAD_WAIT_TIMEOUT_S`     | não         | Espera por load de outro request (default 20)    |
-| `IDLE_UNLOAD_MINUTES`     | não         | Ociosidade até o unload do adapter (default 30; 0 desliga o reaper) |
+| `IDLE_RELEASE_MINUTES`    | não         | Ociosidade até liberar o slot (unload + rota livre; default 60; 0 desliga o reaper). Fallback: `IDLE_UNLOAD_MINUTES` |
 | `MIGRATION_DRAIN_TIMEOUT_S` | não       | Espera máx. pelos streams da origem na migração (default 600) |
+| `RUNPOD_API_KEY`          | não*        | API key do RunPod — sem ela, a auto-pausa de máquinas ociosas fica desligada (warning no boot) |
+| `MACHINE_IDLE_STOP_MINUTES` | não       | Máquina sem nenhuma atividade por esse tempo (e sem rotas) → stopPod (default 60; 0 desliga) |
+| `CONSOLIDATION_INTERVAL_S` | não        | Intervalo do loop de consolidação + auto-pausa (default 300) |
+| `CONSOLIDATION_MAX_ORIGIN_ROUTES` | não | Máx. de rotas para uma máquina ser candidata a esvaziar (default 2) |
+| `STOP_RECHECK_GRACE_S`    | não         | Grace entre o flip `stopped` e o stopPod, para re-checar claims (default 5) |
 | `OPENAI_API_KEY`          | não*        | Embeddings do RAG — sem ela, a injeção de contexto é pulada (best-effort) |
 | `EMBEDDING_MODEL`         | não         | Modelo de embedding (default `text-embedding-3-small`, precisa bater com a indexação do painel) |
 | `RAG_TOP_K`               | não         | Quantidade de chunks injetados como contexto (default 4)       |
@@ -93,15 +98,35 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
 - `POST /admin/migrate` — `{account_id, target_machine_id}`: migra o adapter
   sem perder request (migrating → load no destino → flip → drain → unload)
 - `POST /admin/reap-idle` — dispara um ciclo do idle reaper (útil em teste)
+- `POST /admin/consolidate` — dispara um ciclo de consolidação (útil em teste)
+- `POST /admin/stop-idle-machines` — dispara um ciclo de auto-pausa (útil em teste)
 
 ## Lifecycle
 
 - **Idle reaper** (task asyncio, a cada 60s): rotas `loaded` sem uso além de
-  `IDLE_UNLOAD_MINUTES` e sem request em voo → unload no agent + slot livre.
-  Falha no unload mantém `loaded` e tenta no próximo ciclo. O request
-  seguinte da conta recarrega o adapter de forma transparente.
+  `IDLE_RELEASE_MINUTES` e sem request em voo → unload no agent + slot livre
+  (rota volta a `unloaded` com `machine_id` nulo). Falha no unload mantém
+  `loaded` e tenta no próximo ciclo. O request seguinte da conta realoca em
+  qualquer máquina com vaga, de forma transparente.
 - **Migração ativa**: nunca corta um stream — a origem continua servindo
   durante todo o load no destino (o roteamento segue o `machine_id`); o flip
   só acontece com o load confirmado, e o unload da origem espera os requests
   em voo terminarem (`MIGRATION_DRAIN_TIMEOUT_S`). Teste de não-perda:
   [scripts/test-migration.py](../../scripts/test-migration.py).
+- **Consolidação** (task asyncio, a cada `CONSOLIDATION_INTERVAL_S`): máquina
+  running com poucas rotas (`1..CONSOLIDATION_MAX_ORIGIN_ROUTES`, todas
+  `loaded` e sem request em voo) e outra máquina do MESMO template com vagas
+  para todas → migra conta a conta (com o drain acima) para a máquina mais
+  cheia que caiba. Ex.: A=16, B=1 → A=17, B=0. Máx. 1 máquina-origem por
+  ciclo. A origem esvaziada pausa depois pela regra abaixo.
+- **Auto-pausa**: máquina running sem nenhuma atividade
+  (`machines.last_activity_at`, tocada a cada request proxied) há
+  `MACHINE_IDLE_STOP_MINUTES`, sem rotas ativas e sem request em voo →
+  `machines.status='stopped'` no banco (novos claims param de enxergá-la) →
+  grace de `STOP_RECHECK_GRACE_S` + re-checagem (claim que escapou → revert
+  para `running`) → stopPod na API RunPod (falha → revert + retry no próximo
+  ciclo). **Religar é sempre manual** pelo painel: requests de contas cuja
+  máquina pausou alocam em qualquer máquina running com vaga.
+  - Janela residual: um claim que passe depois da re-checagem cria uma rota
+    `loading` para a máquina pausada; o load falha (503), o slot é liberado
+    e o retry do cliente aloca em outra máquina — degradação auto-corretiva.

@@ -1,8 +1,9 @@
 """
-Lifecycle dos adapters LoRA: unload por ociosidade e migração ativa.
+Lifecycle dos adapters LoRA e das máquinas: unload por ociosidade, migração
+ativa, consolidação de máquinas quase vazias e auto-pausa de pods ociosos.
 
 Roda dentro do gateway (réplica única — ver README) porque só o gateway
-conhece os requests in-flight: nunca descarrega/migra com stream em voo.
+conhece os requests in-flight: nunca descarrega/migra/pausa com stream em voo.
 """
 
 import asyncio
@@ -27,6 +28,11 @@ class LifecycleManager:
         idle_unload_minutes: float,
         drain_timeout_s: float,
         lora_load_timeout_s: float,
+        machine_free_slots=None,
+        runpod=None,
+        machine_idle_stop_minutes: float = 0.0,
+        consolidation_max_origin_routes: int = 2,
+        stop_recheck_grace_s: float = 5.0,
     ):
         self.store = store
         self.supa = supa
@@ -35,9 +41,18 @@ class LifecycleManager:
         self.idle_unload_minutes = idle_unload_minutes
         self.drain_timeout_s = drain_timeout_s
         self.lora_load_timeout_s = lora_load_timeout_s
+        # capacidade injetada por main.py (mesma conta do pick_machine_with_free_slot)
+        self.machine_free_slots = machine_free_slots
+        self.runpod = runpod
+        self.machine_idle_stop_minutes = machine_idle_stop_minutes
+        self.consolidation_max_origin_routes = consolidation_max_origin_routes
+        self.stop_recheck_grace_s = stop_recheck_grace_s
 
     def _in_flight_count(self, account_id: str, machine_id: str) -> int:
         return self.in_flight.get((account_id, machine_id), 0)
+
+    def _machine_in_flight(self, machine_id: str) -> int:
+        return sum(n for (_, m), n in self.in_flight.items() if m == machine_id and n > 0)
 
     # ---------- Idle reaper ----------
 
@@ -171,6 +186,144 @@ class LifecycleManager:
             "drained": drained,
             "origin_unloaded": unloaded,
         }
+
+
+    # ---------- Consolidação de máquinas ----------
+
+    async def consolidate_once(self) -> list[dict]:
+        """Esvazia uma máquina quase vazia migrando suas contas para a máquina
+        mais cheia (mesmo template) que ainda caiba todas. Ex.: A=16, B=1 →
+        A=17, B=0. A origem esvaziada pausa depois via stop_idle_machines_once.
+
+        No máximo 1 máquina-origem por ciclo — mantém o sistema calmo.
+        """
+        if self.machine_free_slots is None:
+            return []
+        machines = await self.supa.list_running_machines()
+
+        by_template: dict[str, list[dict]] = {}
+        for m in machines:
+            if m.get("template_id"):
+                by_template.setdefault(m["template_id"], []).append(m)
+
+        for group in by_template.values():
+            if len(group) < 2:
+                continue
+            counts = {m["id"]: await self.supa.count_active_routes(m["id"]) for m in group}
+
+            # origem: a MENOS cheia, com 1..N rotas — candidata a esvaziar
+            origins = sorted(
+                (m for m in group if 1 <= counts[m["id"]] <= self.consolidation_max_origin_routes),
+                key=lambda m: counts[m["id"]],
+            )
+            for origin in origins:
+                routes = await self.store.list_routes_by_machine(origin["id"])
+                # estado transitório (loading/migrating) ou stream em voo →
+                # decide no próximo ciclo, nunca força
+                if any(r["lora_status"] != "loaded" for r in routes):
+                    continue
+                if any(self._in_flight_count(r["account_id"], origin["id"]) > 0 for r in routes):
+                    continue
+
+                # destino: a MAIS cheia que ainda caiba TODAS as rotas da origem
+                target = None
+                for m in sorted(group, key=lambda m: counts[m["id"]], reverse=True):
+                    if m["id"] == origin["id"]:
+                        continue
+                    if await self.machine_free_slots(m) >= len(routes):
+                        target = m
+                        break
+                if not target:
+                    continue
+
+                moved: list[dict] = []
+                for route in routes:
+                    try:
+                        result = await self.migrate(route["account_id"], target["id"])
+                        moved.append(result)
+                    except Exception as e:
+                        logger.warning(
+                            "consolidação: migração de %s (%s → %s) falhou (%s) — interrompe a origem",
+                            route["account_id"], origin["id"], target["id"], e,
+                        )
+                        break
+                if moved:
+                    try:
+                        await self.supa.log_machine_event(
+                            origin["id"], "sync",
+                            f"Consolidação: {len(moved)} conta(s) migrada(s) para {target.get('name') or target['id']}",
+                        )
+                    except Exception:
+                        pass
+                    logger.info(
+                        "consolidação: %d conta(s) migrada(s) de %s para %s",
+                        len(moved), origin["id"], target["id"],
+                    )
+                return moved
+        return []
+
+    # ---------- Auto-pausa de máquinas ociosas ----------
+
+    async def stop_idle_machines_once(self) -> list[str]:
+        """Pausa (stopPod) máquinas running sem nenhuma atividade há
+        machine_idle_stop_minutes e sem rotas ativas. Religar é só manual.
+        """
+        if self.runpod is None or self.machine_idle_stop_minutes <= 0:
+            return []
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.machine_idle_stop_minutes)
+        stopped: list[str] = []
+        for m in await self.supa.list_running_machines():
+            machine_id, pod_id = m["id"], m.get("runpod_pod_id")
+            raw = m.get("last_activity_at")
+            if not pod_id or not raw:
+                continue
+            last_activity = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if last_activity >= cutoff:
+                continue
+            if await self.supa.count_active_routes(machine_id) > 0:
+                continue
+            if self._machine_in_flight(machine_id) > 0:
+                continue
+
+            # flip primeiro: picks filtram status=running, então novos claims
+            # param de enxergar a máquina antes do stop de verdade
+            await self.supa.set_machine_status(machine_id, "stopped")
+            await asyncio.sleep(self.stop_recheck_grace_s)
+            if (
+                await self.supa.count_active_routes(machine_id) > 0
+                or self._machine_in_flight(machine_id) > 0
+            ):
+                # um claim escapou na janela pick→claim — desiste desta rodada
+                await self.supa.set_machine_status(machine_id, "running")
+                continue
+            try:
+                await self.runpod.stop_pod(pod_id)
+            except Exception as e:
+                await self.supa.set_machine_status(machine_id, "running")
+                logger.warning("auto-pausa: stopPod de %s falhou (%s)", machine_id, e)
+                continue
+            try:
+                await self.supa.log_machine_event(
+                    machine_id, "stopped",
+                    f"Auto-pausa: sem atividade há {self.machine_idle_stop_minutes:g} min",
+                )
+            except Exception:
+                pass
+            logger.info("auto-pausa: máquina %s (pod %s) pausada por ociosidade", machine_id, pod_id)
+            stopped.append(machine_id)
+        return stopped
+
+    async def machine_lifecycle_loop(self, interval_s: float = 300.0):
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                await self.consolidate_once()
+            except Exception as e:
+                logger.warning("consolidação: ciclo falhou (%s)", e)
+            try:
+                await self.stop_idle_machines_once()
+            except Exception as e:
+                logger.warning("auto-pausa: ciclo falhou (%s)", e)
 
 
 class MigrationError(Exception):

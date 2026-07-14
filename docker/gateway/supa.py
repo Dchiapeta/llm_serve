@@ -6,6 +6,8 @@ Toda a comunicação usa a service role key — o gateway é o único componente
 fora do painel com esse acesso; os pods nunca recebem credenciais Supabase.
 """
 
+from datetime import datetime, timezone
+
 import httpx
 
 # Manter em sincronia com LORA_ALLOWED_FILES em docker/agent/main.py
@@ -136,6 +138,30 @@ class SupaClient:
         )
         r.raise_for_status()
         return r.json()
+
+    async def set_machine_status(self, machine_id: str, status: str) -> None:
+        r = await self._rest.patch(
+            "/machines",
+            params={"id": f"eq.{machine_id}"},
+            json={"status": status},
+        )
+        r.raise_for_status()
+
+    async def touch_machine_activity(self, machine_id: str) -> None:
+        r = await self._rest.patch(
+            "/machines",
+            params={"id": f"eq.{machine_id}"},
+            json={"last_activity_at": datetime.now(timezone.utc).isoformat()},
+        )
+        r.raise_for_status()
+
+    async def log_machine_event(self, machine_id: str, type_: str, message: str) -> None:
+        """Espelho do logEvent do painel — eventos do lifecycle aparecem na UI."""
+        r = await self._rest.post(
+            "/machine_events",
+            json={"machine_id": machine_id, "type": type_, "message": message},
+        )
+        r.raise_for_status()
 
     async def count_active_routes(self, machine_id: str) -> int:
         """Rotas ocupando slot LoRA na máquina (loading, loaded ou migrating)."""

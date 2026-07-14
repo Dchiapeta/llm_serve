@@ -27,6 +27,7 @@ streams durante migração. Ver README.md.
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import time
 from collections import defaultdict
@@ -38,6 +39,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from lifecycle import LifecycleManager, MigrationError
 from routing import RoutingStore
+from runpod_api import RunPodClient
 from supa import SupaClient
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
@@ -58,9 +60,21 @@ MAX_LORAS_PER_MACHINE = int(os.environ.get("MAX_LORAS_PER_MACHINE", "8"))
 # quanto tempo um request espera por um load em andamento de outro request
 LOAD_WAIT_TIMEOUT_S = float(os.environ.get("LOAD_WAIT_TIMEOUT_S", "20"))
 TOUCH_THROTTLE_S = 15.0
-# lifecycle: unload por ociosidade (0 = desligado) e drain da migração
-IDLE_UNLOAD_MINUTES = float(os.environ.get("IDLE_UNLOAD_MINUTES", "30"))
+# lifecycle: liberação do slot por ociosidade (0 = desligado) e drain da
+# migração. IDLE_RELEASE_MINUTES substitui IDLE_UNLOAD_MINUTES (fallback
+# mantido pra não quebrar deploy existente).
+IDLE_RELEASE_MINUTES = float(
+    os.environ.get("IDLE_RELEASE_MINUTES", os.environ.get("IDLE_UNLOAD_MINUTES", "60"))
+)
 MIGRATION_DRAIN_TIMEOUT_S = float(os.environ.get("MIGRATION_DRAIN_TIMEOUT_S", "600"))
+# lifecycle de máquinas: consolidação (esvaziar máquina quase vazia migrando
+# as contas pra outra do mesmo template) e auto-pausa (stopPod) de máquina
+# sem nenhuma atividade. Auto-pausa exige RUNPOD_API_KEY; religar é manual.
+MACHINE_IDLE_STOP_MINUTES = float(os.environ.get("MACHINE_IDLE_STOP_MINUTES", "60"))
+CONSOLIDATION_INTERVAL_S = float(os.environ.get("CONSOLIDATION_INTERVAL_S", "300"))
+CONSOLIDATION_MAX_ORIGIN_ROUTES = int(os.environ.get("CONSOLIDATION_MAX_ORIGIN_ROUTES", "2"))
+STOP_RECHECK_GRACE_S = float(os.environ.get("STOP_RECHECK_GRACE_S", "5"))
+RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 
 STARTED_AT = time.time()
 
@@ -79,16 +93,19 @@ key_cache: dict[str, tuple[dict | None, float]] = {}
 # Em memória: válido apenas com réplica única do gateway.
 in_flight: dict[tuple[str, str], int] = defaultdict(int)
 
-# último touch por conta (throttle)
+# último touch por conta e por máquina (throttle)
 last_touch: dict[str, float] = {}
+last_machine_touch: dict[str, float] = {}
 
+logger = logging.getLogger("gateway")
 
 lifecycle_mgr: "LifecycleManager"
+runpod_client: RunPodClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supa, store, proxy_client, openai_client, lifecycle_mgr
+    global supa, store, proxy_client, openai_client, lifecycle_mgr, runpod_client
     supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
     proxy_client = httpx.AsyncClient(
@@ -99,22 +116,38 @@ async def lifespan(app: FastAPI):
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
         timeout=httpx.Timeout(20.0, connect=5.0),
     )
+    if RUNPOD_API_KEY:
+        runpod_client = RunPodClient(RUNPOD_API_KEY)
+    else:
+        runpod_client = None
+        logger.warning("RUNPOD_API_KEY ausente — auto-pausa de máquinas ociosas desligada")
     lifecycle_mgr = LifecycleManager(
         store=store,
         supa=supa,
         call_agent=call_agent,
         in_flight=in_flight,
-        idle_unload_minutes=IDLE_UNLOAD_MINUTES,
+        idle_unload_minutes=IDLE_RELEASE_MINUTES,
         drain_timeout_s=MIGRATION_DRAIN_TIMEOUT_S,
         lora_load_timeout_s=LORA_LOAD_TIMEOUT_S,
+        machine_free_slots=machine_free_slots,
+        runpod=runpod_client,
+        machine_idle_stop_minutes=MACHINE_IDLE_STOP_MINUTES,
+        consolidation_max_origin_routes=CONSOLIDATION_MAX_ORIGIN_ROUTES,
+        stop_recheck_grace_s=STOP_RECHECK_GRACE_S,
     )
     reaper_task = asyncio.create_task(lifecycle_mgr.idle_reaper_loop())
+    machine_task = asyncio.create_task(
+        lifecycle_mgr.machine_lifecycle_loop(CONSOLIDATION_INTERVAL_S)
+    )
     yield
     reaper_task.cancel()
+    machine_task.cancel()
     await proxy_client.aclose()
     await openai_client.aclose()
     await store.aclose()
     await supa.aclose()
+    if runpod_client:
+        await runpod_client.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -170,22 +203,27 @@ async def call_agent(machine: dict, path: str, body: dict, timeout_s: float = 30
     return r.json()
 
 
-async def pick_machine_with_free_slot(plan: str) -> dict:
-    """Alocação placeholder: primeira máquina running (do template do plano
-    da conta) com slot LoRA livre.
+async def machine_free_slots(machine: dict) -> int:
+    """Slots LoRA livres da máquina.
 
     Slots por VRAM via machine_lora_slots() (mesma fórmula do painel);
     MAX_LORAS_PER_MACHINE atua como teto (espelho do --max-loras do pod) e
     como fallback quando a capacidade é desconhecida (sem VRAM/template).
     """
+    by_vram = await supa.machine_lora_slots(machine["id"])
+    slots = MAX_LORAS_PER_MACHINE if by_vram is None else min(by_vram, MAX_LORAS_PER_MACHINE)
+    used = await supa.count_active_routes(machine["id"])
+    return slots - used
+
+
+async def pick_machine_with_free_slot(plan: str) -> dict:
+    """Alocação placeholder: primeira máquina running (do template do plano
+    da conta) com slot LoRA livre."""
     machines = await supa.list_running_machines_for_plan(plan)
     if not machines:
         raise HTTPException(status_code=503, detail="nenhuma máquina disponível")
     for m in machines:
-        by_vram = await supa.machine_lora_slots(m["id"])
-        slots = MAX_LORAS_PER_MACHINE if by_vram is None else min(by_vram, MAX_LORAS_PER_MACHINE)
-        used = await supa.count_active_routes(m["id"])
-        if used < slots:
+        if await machine_free_slots(m) > 0:
             return m
     raise HTTPException(status_code=503, detail="sem capacidade: todas as máquinas estão cheias")
 
@@ -293,7 +331,7 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
 # ---------- Proxy ----------
 
 
-async def maybe_touch(account_id: str):
+async def maybe_touch(account_id: str, machine_id: str | None = None):
     now = time.time()
     if now - last_touch.get(account_id, 0) >= TOUCH_THROTTLE_S:
         last_touch[account_id] = now
@@ -301,6 +339,14 @@ async def maybe_touch(account_id: str):
             await store.touch(account_id)
         except Exception:
             pass  # touch é best-effort, nunca derruba o request
+    # atividade por máquina (base da auto-pausa) — cobre também requests de
+    # modelo base sem rota, que não tocam routing_state
+    if machine_id and now - last_machine_touch.get(machine_id, 0) >= TOUCH_THROTTLE_S:
+        last_machine_touch[machine_id] = now
+        try:
+            await supa.touch_machine_activity(machine_id)
+        except Exception:
+            pass
 
 
 async def embed_query(text: str) -> list[float] | None:
@@ -357,7 +403,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     account_id = entry["account_id"]
 
     machine, rewrite_model = await resolve_route(account_id, entry)
-    await maybe_touch(account_id)
+    await maybe_touch(account_id, machine["id"])
 
     body = await request.body()
     if body:
@@ -457,3 +503,19 @@ async def admin_reap_idle(x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
     reaped = await lifecycle_mgr.reap_idle_once()
     return {"ok": True, "reaped": reaped}
+
+
+@app.post("/admin/consolidate")
+async def admin_consolidate(x_admin_secret: str | None = Header(None)):
+    """Dispara um ciclo de consolidação manualmente (útil em teste)."""
+    require_admin(x_admin_secret)
+    moved = await lifecycle_mgr.consolidate_once()
+    return {"ok": True, "moved": moved}
+
+
+@app.post("/admin/stop-idle-machines")
+async def admin_stop_idle_machines(x_admin_secret: str | None = Header(None)):
+    """Dispara um ciclo de auto-pausa manualmente (útil em teste)."""
+    require_admin(x_admin_secret)
+    stopped = await lifecycle_mgr.stop_idle_machines_once()
+    return {"ok": True, "stopped": stopped}

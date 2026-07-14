@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/table"
 import { CreateMachineDialog } from "@/components/machines/create-machine-dialog"
 import { MachineRowActions } from "@/components/machines/machine-row-actions"
+import { PlanBadge } from "@/components/machines/plan-badge"
 import { StatusBadge } from "@/components/machines/status-badge"
 
 export const dynamic = "force-dynamic"
@@ -58,15 +59,17 @@ export default async function MachinesPage() {
     machines.map((m, i) => [m.id, displayStatuses[i]])
   )
 
-  const { data: keyCounts } = await db
-    .from("api_keys")
+  // Ocupação = stacks hospedadas (1 stack = 1 slot), não chaves ativas:
+  // stacks da mesma conta compartilham uma chave e sumiriam da contagem.
+  const { data: stackRows } = await db
+    .from("stacks")
     .select("machine_id")
-    .eq("status", "active")
-  const activeKeysByMachine = new Map<string, number>()
-  for (const k of keyCounts ?? []) {
-    activeKeysByMachine.set(
-      k.machine_id,
-      (activeKeysByMachine.get(k.machine_id) ?? 0) + 1
+    .not("machine_id", "is", null)
+  const stacksByMachine = new Map<string, number>()
+  for (const s of stackRows ?? []) {
+    stacksByMachine.set(
+      s.machine_id,
+      (stacksByMachine.get(s.machine_id) ?? 0) + 1
     )
   }
 
@@ -92,6 +95,7 @@ export default async function MachinesPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Nome</TableHead>
+                <TableHead>Plano</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>GPU</TableHead>
                 <TableHead>Modelo</TableHead>
@@ -103,7 +107,7 @@ export default async function MachinesPage() {
             <TableBody>
               {machines.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={7} className="text-center text-muted-foreground">
+                  <TableCell colSpan={8} className="text-center text-muted-foreground">
                     Nenhuma máquina ativa.
                   </TableCell>
                 </TableRow>
@@ -114,7 +118,7 @@ export default async function MachinesPage() {
                   vramGb: m.vram_gb,
                   modelFootprintGb: tpl?.model_footprint_gb ?? 16,
                   kvReserveGbPerUser: tpl?.kv_reserve_gb_per_user ?? 2,
-                  activeKeys: activeKeysByMachine.get(m.id) ?? 0,
+                  occupied: stacksByMachine.get(m.id) ?? 0,
                   maxUsers: m.max_users,
                 })
                 return (
@@ -126,6 +130,9 @@ export default async function MachinesPage() {
                       >
                         {m.name}
                       </Link>
+                    </TableCell>
+                    <TableCell>
+                      <PlanBadge plan={tpl?.plan} />
                     </TableCell>
                     <TableCell>
                       <StatusBadge status={displayStatusById.get(m.id) ?? m.status} />

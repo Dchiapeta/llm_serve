@@ -38,6 +38,10 @@ const config: Record<
     label: "Erro",
     className: "bg-red-100! text-red-700! dark:bg-red-950! dark:text-red-300!",
   },
+  failed: {
+    label: "Falha",
+    className: "bg-red-100! text-red-700! dark:bg-red-950! dark:text-red-300!",
+  },
 }
 
 export function StatusBadge({ status }: { status: MachineDisplayStatus }) {

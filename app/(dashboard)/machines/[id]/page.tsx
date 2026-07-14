@@ -70,24 +70,33 @@ export default async function MachineDetailPage({
   // Puxa os contadores do agent para o banco antes de ler o uso.
   await collectUsageMetrics([machine], db)
 
-  const [{ data: tplData }, { data: keysData }, { data: accountsData }, { data: usageData }] =
-    await Promise.all([
-      machine.template_id
-        ? db.from("templates").select("*").eq("id", machine.template_id).single<Template>()
-        : Promise.resolve({ data: null }),
-      db
-        .from("api_keys")
-        .select("*, accounts(name)")
-        .eq("machine_id", id)
-        .order("created_at", { ascending: false }),
-      db.from("accounts").select("*").order("name"),
-      db
-        .from("usage_metrics")
-        .select("*")
-        .eq("machine_id", id)
-        .order("window_start", { ascending: false })
-        .limit(500),
-    ])
+  const [
+    { data: tplData },
+    { data: keysData },
+    { data: accountsData },
+    { data: usageData },
+    { count: stacksCount },
+  ] = await Promise.all([
+    machine.template_id
+      ? db.from("templates").select("*").eq("id", machine.template_id).single<Template>()
+      : Promise.resolve({ data: null }),
+    db
+      .from("api_keys")
+      .select("*, accounts(name)")
+      .eq("machine_id", id)
+      .order("created_at", { ascending: false }),
+    db.from("accounts").select("*").order("name"),
+    db
+      .from("usage_metrics")
+      .select("*")
+      .eq("machine_id", id)
+      .order("window_start", { ascending: false })
+      .limit(500),
+    db
+      .from("stacks")
+      .select("id", { count: "exact", head: true })
+      .eq("machine_id", id),
+  ])
 
   const template = tplData as Template | null
   const keys = (keysData ?? []) as KeyWithAccount[]
@@ -135,7 +144,8 @@ export default async function MachineDetailPage({
       vramGb: machine.vram_gb,
       modelFootprintGb: template?.model_footprint_gb ?? 16,
       kvReserveGbPerUser: template?.kv_reserve_gb_per_user ?? 2,
-      activeKeys: activeKeys.length,
+      // 1 stack = 1 slot; chaves são por conta e não medem ocupação
+      occupied: stacksCount ?? 0,
       maxUsers: machine.max_users,
     })
   }
@@ -256,7 +266,8 @@ export default async function MachineDetailPage({
               <div>
                 <CardTitle>Contas nesta máquina</CardTitle>
                 <CardDescription>
-                  {activeKeys.length} chave(s) ativa(s) · {cap.slotsFree} slot(s) livre(s)
+                  {stacksCount ?? 0} stack(s) · {activeKeys.length} chave(s)
+                  ativa(s) · {cap.slotsFree} slot(s) livre(s)
                 </CardDescription>
               </div>
               <CreateKeyDialog

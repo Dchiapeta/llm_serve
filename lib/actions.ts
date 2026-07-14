@@ -9,7 +9,7 @@ import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
 import { getClientLocation, setClientLocation } from "./routing"
 import { generateStackSlug, STACK_SLUG_RE } from "./slug"
-import { listGpuTypes, podProxyUrl, runpod } from "./runpod"
+import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
 import { TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Stack, type Template, type TemplatePlan } from "./types"
 
@@ -341,6 +341,41 @@ export async function deleteTemplate(id: string) {
 
 // ---------- Machines ----------
 
+// Monta o input de createPod a partir do template — compartilhado entre o
+// provisionamento e a recriação de máquina (mesmos parâmetros, pod novo).
+function podInputFromTemplate(input: {
+  name: string
+  tpl: Template
+  gpuTypeId: string
+  adminSecret: string
+  maxUsers: number | null
+}): CreatePodInput {
+  const { tpl } = input
+  const gpuCount = tpl.gpu_count ?? 1
+  const startCmd = parseStartCommand(tpl.start_command)
+  const ports = toRunpodPorts(tpl.http_ports ?? [], tpl.tcp_ports ?? [])
+  return {
+    name: input.name,
+    imageName: tpl.image,
+    gpuTypeIds: [input.gpuTypeId],
+    gpuCount,
+    containerDiskInGb: tpl.disk_gb,
+    volumeInGb: tpl.volume_gb ?? 0,
+    volumeMountPath: tpl.volume_mount_path || "/workspace",
+    ports: ports.length > 0 ? ports : ["8000/http"],
+    cloudType: "SECURE",
+    // só sobrescreve o entrypoint da imagem quando o template define um comando
+    ...(startCmd.length > 0 ? { dockerStartCmd: startCmd } : {}),
+    env: {
+      ...tpl.env,
+      MODEL_NAME: tpl.model_name,
+      AGENT_ADMIN_SECRET: input.adminSecret,
+      GPU_COUNT: String(gpuCount),
+      ...(input.maxUsers !== null ? { MAX_USERS: String(input.maxUsers) } : {}),
+    },
+  }
+}
+
 // Núcleo de provisionamento: cria o pod no RunPod + registro em machines.
 // Sem redirect — reutilizado por createMachine (painel) e createStack.
 async function provisionMachine(input: {
@@ -382,30 +417,11 @@ async function provisionMachine(input: {
     }
   }
 
-  const startCmd = parseStartCommand(tpl.start_command)
-  const ports = toRunpodPorts(tpl.http_ports ?? [], tpl.tcp_ports ?? [])
   let pod: Awaited<ReturnType<typeof runpod.createPod>>
   try {
-    pod = await runpod.createPod({
-      name,
-      imageName: tpl.image,
-      gpuTypeIds: [gpuTypeId],
-      gpuCount,
-      containerDiskInGb: tpl.disk_gb,
-      volumeInGb: tpl.volume_gb ?? 0,
-      volumeMountPath: tpl.volume_mount_path || "/workspace",
-      ports: ports.length > 0 ? ports : ["8000/http"],
-      cloudType: "SECURE",
-      // só sobrescreve o entrypoint da imagem quando o template define um comando
-      ...(startCmd.length > 0 ? { dockerStartCmd: startCmd } : {}),
-      env: {
-        ...tpl.env,
-        MODEL_NAME: tpl.model_name,
-        AGENT_ADMIN_SECRET: adminSecret,
-        GPU_COUNT: String(gpuCount),
-        ...(maxUsers !== null ? { MAX_USERS: String(maxUsers) } : {}),
-      },
-    })
+    pod = await runpod.createPod(
+      podInputFromTemplate({ name, tpl, gpuTypeId, adminSecret, maxUsers })
+    )
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     // Falta de estoque no RunPod é um erro esperado — devolve mensagem amigável
@@ -503,13 +519,119 @@ export async function stopMachine(machineId: string) {
   revalidatePath("/machines")
 }
 
-export async function startMachine(machineId: string) {
+export async function startMachine(
+  machineId: string
+): Promise<{ error: string; code?: "no_gpu_on_host" } | void> {
   const db = createSupabaseAdmin()
   const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
-  if (!m?.runpod_pod_id) throw new Error("Máquina sem pod associado")
-  await runpod.startPod(m.runpod_pod_id)
+  if (!m?.runpod_pod_id) return { error: "Máquina sem pod associado" }
+  try {
+    await runpod.startPod(m.runpod_pod_id)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    // Pod pausado não reserva GPU: o host pode tê-la cedido a outro cliente,
+    // e aí o RunPod recusa o start até liberar (ou até recriarmos o pod).
+    if (msg.includes("not enough free GPUs")) {
+      return {
+        error: `O host do pod "${m.name}" está sem GPU livre no momento.`,
+        code: "no_gpu_on_host",
+      }
+    }
+    return { error: `Falha ao iniciar a máquina: ${msg}` }
+  }
   await db.from("machines").update({ status: "running" }).eq("id", machineId)
   await logEvent(machineId, "started", `Máquina "${m.name}" iniciada`)
+  revalidatePath(`/machines/${machineId}`)
+  revalidatePath("/machines")
+}
+
+// Recria o pod de uma máquina do zero (mesmo template e GPU, host novo),
+// mantendo o registro em machines — stacks e chaves seguem apontando para a
+// mesma máquina e são reenviadas pelo sync quando o pod novo fica pronto.
+// Caminho de recuperação para quando o host do pod pausado ficou sem GPU.
+export async function recreateMachine(
+  machineId: string
+): Promise<{ error: string } | void> {
+  const db = createSupabaseAdmin()
+  const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
+  if (!m) return { error: "Máquina não encontrada" }
+  if (!m.template_id) {
+    return { error: "Máquina sem template associado — crie uma máquina nova" }
+  }
+
+  const { data: tpl } = await db
+    .from("templates")
+    .select("*")
+    .eq("id", m.template_id)
+    .single<Template>()
+  if (!tpl) {
+    return { error: "O template desta máquina não existe mais — crie uma máquina nova" }
+  }
+
+  // machines.gpu_type guarda o displayName (com sufixo "×N" em multi-GPU)
+  const gpuName = m.gpu_type.replace(/\s*×\d+$/, "")
+  const gpus = await listGpuTypes()
+  const gpu = gpus.find((g) => g.displayName === gpuName)
+  if (!gpu) return { error: `GPU "${gpuName}" não encontrada no RunPod` }
+
+  if (m.runpod_pod_id) {
+    try {
+      await runpod.deletePod(m.runpod_pod_id)
+    } catch (e) {
+      if (!String(e).includes("404")) {
+        return {
+          error: `Falha ao terminar o pod antigo: ${e instanceof Error ? e.message : String(e)}`,
+        }
+      }
+    }
+  }
+
+  let pod: Awaited<ReturnType<typeof runpod.createPod>>
+  try {
+    pod = await runpod.createPod(
+      podInputFromTemplate({
+        name: m.name,
+        tpl,
+        gpuTypeId: gpu.id,
+        adminSecret: m.admin_secret,
+        maxUsers: m.max_users,
+      })
+    )
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    // O pod antigo já foi terminado — marca "error" (sem pod) para a UI
+    // oferecer nova tentativa de recriação em vez de um start impossível.
+    await db
+      .from("machines")
+      .update({ status: "error", runpod_pod_id: null })
+      .eq("id", machineId)
+    await logEvent(machineId, "error", `Recriação da máquina "${m.name}" falhou: ${msg}`)
+    revalidatePath(`/machines/${machineId}`)
+    revalidatePath("/machines")
+    if (msg.includes("no instances currently available")) {
+      return {
+        error: `O pod antigo foi terminado, mas não há GPUs ${gpu.displayName} disponíveis no RunPod agora. Tente recriar de novo em alguns minutos.`,
+      }
+    }
+    return {
+      error: `O pod antigo foi terminado, mas a criação do novo falhou: ${msg}. Tente recriar de novo.`,
+    }
+  }
+
+  await db
+    .from("machines")
+    .update({
+      runpod_pod_id: pod.id,
+      status: "creating",
+      cost_per_hr: pod.costPerHr ?? m.cost_per_hr,
+      public_url: podProxyUrl(pod.id, 8000),
+    })
+    .eq("id", machineId)
+  await logEvent(
+    machineId,
+    "recreated",
+    `Máquina "${m.name}" recriada em novo host (pod ${pod.id})`
+  )
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
 }
@@ -552,6 +674,39 @@ async function nextStackMachineName(
     if (m) max = Math.max(max, Number(m[1]))
   }
   return `llm-stack-${max + 1}`
+}
+
+// Slots de uma máquina contando as stacks hospedadas nela (1 stack = 1
+// slot, mesmo quando stacks da mesma conta compartilham a chave). Retorna
+// null se a máquina não existir; slotsMax 0 = capacidade desconhecida.
+async function machineStackCapacity(
+  db: ReturnType<typeof createSupabaseAdmin>,
+  machineId: string
+): Promise<ReturnType<typeof computeCapacity> | null> {
+  const { data: m } = await db
+    .from("machines")
+    .select("vram_gb, max_users, template_id")
+    .eq("id", machineId)
+    .single<Pick<Machine, "vram_gb" | "max_users" | "template_id">>()
+  if (!m) return null
+  const { data: tpl } = m.template_id
+    ? await db
+        .from("templates")
+        .select("model_footprint_gb, kv_reserve_gb_per_user")
+        .eq("id", m.template_id)
+        .single<Pick<Template, "model_footprint_gb" | "kv_reserve_gb_per_user">>()
+    : { data: null }
+  const { count } = await db
+    .from("stacks")
+    .select("id", { count: "exact", head: true })
+    .eq("machine_id", machineId)
+  return computeCapacity({
+    vramGb: m.vram_gb,
+    modelFootprintGb: tpl?.model_footprint_gb ?? 16,
+    kvReserveGbPerUser: tpl?.kv_reserve_gb_per_user ?? 2,
+    occupied: count ?? 0,
+    maxUsers: m.max_users,
+  })
 }
 
 // GPUs do template que comportam o max_users configurado — validação feita
@@ -638,8 +793,8 @@ export async function createStack(formData: FormData): Promise<{
     viableGpuIds = await viableGpuIdsForTemplate(tpl)
   }
 
-  // Máquina escolhida pelo admin: precisa estar rodando e ser do mesmo
-  // template. A capacidade é validada adiante por createKey.
+  // Máquina escolhida pelo admin: precisa estar rodando, ser do mesmo
+  // template e ter slot livre (1 stack = 1 slot).
   if (chosenMachineId) {
     const { data: m } = await db
       .from("machines")
@@ -650,6 +805,12 @@ export async function createStack(formData: FormData): Promise<{
     if (m.status !== "running") throw new Error("A máquina escolhida não está rodando")
     if (m.template_id !== templateId) {
       throw new Error("A máquina escolhida não usa o produto selecionado")
+    }
+    const cap = await machineStackCapacity(db, chosenMachineId)
+    if (cap && cap.slotsMax > 0 && cap.slotsFree < 1) {
+      throw new Error(
+        `A máquina escolhida está lotada (${cap.slotsUsed}/${cap.slotsMax} slots)`
+      )
     }
   }
 
@@ -800,6 +961,14 @@ export async function migrateStack(input: {
     if (target.template_id !== templateId) {
       throw new Error("A máquina de destino não usa o mesmo produto da stack")
     }
+    // Lotação por stacks (1 stack = 1 slot) — a checagem de createKey não
+    // cobre stacks da mesma conta, que reutilizam a chave existente.
+    const cap = await machineStackCapacity(db, targetMachineId)
+    if (cap && cap.slotsMax > 0 && cap.slotsFree < 1) {
+      throw new Error(
+        `A máquina de destino está lotada (${cap.slotsUsed}/${cap.slotsMax} slots)`
+      )
+    }
   } else {
     const { data: tpl } = await db
       .from("templates")
@@ -943,7 +1112,9 @@ export async function createKey(input: {
     vramGb: m.vram_gb,
     modelFootprintGb: tpl?.model_footprint_gb ?? 16,
     kvReserveGbPerUser: tpl?.kv_reserve_gb_per_user ?? 2,
-    activeKeys: activeKeys ?? 0,
+    // Backstop por chaves (1 chave por conta): a lotação por stacks é
+    // validada em createStack/migrateStack via machineStackCapacity.
+    occupied: activeKeys ?? 0,
     maxUsers: m.max_users,
   })
   // slotsMax = 0 significa capacidade desconhecida (sem VRAM nem teto) — não bloqueia

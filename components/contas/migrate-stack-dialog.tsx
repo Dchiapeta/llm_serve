@@ -68,7 +68,7 @@ export function MigrateStackDialog({
         vramGb: m.vram_gb,
         modelFootprintGb: template.model_footprint_gb ?? 16,
         kvReserveGbPerUser: template.kv_reserve_gb_per_user ?? 2,
-        activeKeys: m.activeKeys,
+        occupied: m.occupied,
         maxUsers: m.max_users,
       })
       return !(cap.slotsMax > 0 && cap.slotsUsed >= cap.slotsMax)
@@ -88,7 +88,7 @@ export function MigrateStackDialog({
       vramGb: m.vram_gb,
       modelFootprintGb: template.model_footprint_gb ?? 16,
       kvReserveGbPerUser: template.kv_reserve_gb_per_user ?? 2,
-      activeKeys: m.activeKeys,
+      occupied: m.occupied,
       maxUsers: m.max_users,
     })
     return cap.slotsMax > 0 ? ` (${cap.slotsFree} vaga(s))` : ""

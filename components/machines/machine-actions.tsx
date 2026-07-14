@@ -1,10 +1,11 @@
 "use client"
 
 import * as React from "react"
-import { Play, RefreshCw, Square, Trash2 } from "lucide-react"
+import { Play, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import {
+  recreateMachine,
   refreshMachineStatus,
   startMachine,
   stopMachine,
@@ -25,12 +26,22 @@ import {
 import { Button } from "@/components/ui/button"
 
 export function MachineActions({ machine }: { machine: Machine }) {
+  const [recreateOpen, setRecreateOpen] = React.useState(false)
   const [pending, startTransition] = React.useTransition()
 
-  function run(fn: () => Promise<void>, success: string) {
+  function run(
+    fn: () => Promise<{ error: string; code?: string } | void>,
+    success: string
+  ) {
     startTransition(async () => {
       try {
-        await fn()
+        const result = await fn()
+        if (result?.error) {
+          toast.error(result.error)
+          // Host sem GPU livre: oferece recriar o pod em outro host
+          if (result.code === "no_gpu_on_host") setRecreateOpen(true)
+          return
+        }
         toast.success(success)
       } catch (e) {
         if (e && typeof e === "object" && "digest" in e) throw e
@@ -69,6 +80,47 @@ export function MachineActions({ machine }: { machine: Machine }) {
           <Play className="size-4" /> Iniciar
         </Button>
       ) : null}
+
+      {(machine.status === "stopped" || machine.status === "error") && (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={pending}
+          onClick={() => setRecreateOpen(true)}
+        >
+          <RotateCcw className="size-4" /> Recriar
+        </Button>
+      )}
+
+      <AlertDialog open={recreateOpen} onOpenChange={setRecreateOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Recriar máquina em outro host?</AlertDialogTitle>
+            <AlertDialogDescription>
+              O pod atual de “{machine.name}” será terminado e um novo será
+              criado com o mesmo template e GPU. O disco do container é perdido
+              e o modelo baixa de novo no boot; as chaves de API são reenviadas
+              automaticamente quando a máquina ficar pronta.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancelar</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={pending}
+              onClick={(e) => {
+                e.preventDefault()
+                run(
+                  () => recreateMachine(machine.id),
+                  "Máquina recriada — novo pod subindo"
+                )
+                setRecreateOpen(false)
+              }}
+            >
+              Recriar máquina
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog>
         <AlertDialogTrigger asChild>

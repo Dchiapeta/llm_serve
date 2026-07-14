@@ -307,17 +307,39 @@ async def root():
     return {"ok": True, "service": "agent"}
 
 
+def _vllm_process_alive() -> bool:
+    # O entrypoint sobe o vLLM como processo irmão; se ele morrer (ex.: OOM
+    # na inicialização), o pod continua RUNNING mas nunca ficará pronto.
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            continue
+        if b"vllm.entrypoints.openai.api_server" in cmdline:
+            return True
+    return False
+
+
 @app.get("/health")
 async def health():
     # vLLM só responde ao /health quando o modelo terminou de carregar;
     # enquanto baixa/carrega, o painel usa isso para mostrar "Subindo".
+    # vllm_alive=False com vllm_ready=False indica crash → painel mostra "Falha".
     vllm_ready = False
     try:
         r = await client.get("/health", timeout=2.0)
         vllm_ready = r.status_code == 200
     except Exception:
         pass
-    return {"ok": True, "vllm_ready": vllm_ready, "model": MODEL_NAME}
+    vllm_alive = vllm_ready or _vllm_process_alive()
+    return {
+        "ok": True,
+        "vllm_ready": vllm_ready,
+        "vllm_alive": vllm_alive,
+        "model": MODEL_NAME,
+    }
 
 
 # ---------- Proxy OpenAI-compatible ----------

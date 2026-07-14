@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Check, Copy, Plus, RefreshCw, TriangleAlert } from "lucide-react"
+import { Check, Copy, Plus, RefreshCw, Server, TriangleAlert } from "lucide-react"
 import { toast } from "sonner"
 
 import { createStack } from "@/lib/actions"
@@ -22,6 +22,7 @@ import {
   AutocompleteList,
 } from "@/components/reui/autocomplete"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -33,13 +34,23 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Progress } from "@/components/ui/progress"
 import {
   Select,
   SelectContent,
   SelectItem,
+  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 
 export type StackTemplate = Pick<
   Template,
@@ -53,10 +64,30 @@ export type StackMachine = {
   model_name: string | null
   vram_gb: number | null
   max_users: number | null
-  activeKeys: number
+  // stacks hospedadas na máquina (1 stack = 1 slot)
+  occupied: number
 }
 
 type Phase = "form" | "confirm" | "done"
+
+// Sentinela do select de destino: provisiona uma máquina nova em vez de usar
+// uma existente (Radix Select não aceita item com value vazio).
+const NEW_MACHINE = "__new__"
+
+// Capacidade de uma máquina segundo o template dela (mesma conta do painel
+// de máquinas).
+function machineCapacity(
+  m: StackMachine,
+  tpl: Pick<StackTemplate, "model_footprint_gb" | "kv_reserve_gb_per_user"> | undefined
+) {
+  return computeCapacity({
+    vramGb: m.vram_gb,
+    modelFootprintGb: tpl?.model_footprint_gb ?? 16,
+    kvReserveGbPerUser: tpl?.kv_reserve_gb_per_user ?? 2,
+    occupied: m.occupied,
+    maxUsers: m.max_users,
+  })
+}
 
 type StackResult = {
   slug: string
@@ -114,26 +145,14 @@ export function CreateStackDialog({
     if (!template) return []
     return machines.filter((m) => {
       if (m.template_id !== template.id) return false
-      const cap = computeCapacity({
-        vramGb: m.vram_gb,
-        modelFootprintGb: template.model_footprint_gb ?? 16,
-        kvReserveGbPerUser: template.kv_reserve_gb_per_user ?? 2,
-        activeKeys: m.activeKeys,
-        maxUsers: m.max_users,
-      })
+      const cap = machineCapacity(m, template)
       return !(cap.slotsMax > 0 && cap.slotsUsed >= cap.slotsMax)
     })
   }, [machines, template])
 
   function slotsLabel(m: StackMachine) {
     if (!template) return ""
-    const cap = computeCapacity({
-      vramGb: m.vram_gb,
-      modelFootprintGb: template.model_footprint_gb ?? 16,
-      kvReserveGbPerUser: template.kv_reserve_gb_per_user ?? 2,
-      activeKeys: m.activeKeys,
-      maxUsers: m.max_users,
-    })
+    const cap = machineCapacity(m, template)
     return cap.slotsMax > 0 ? ` (${cap.slotsFree} vaga(s))` : ""
   }
 
@@ -348,7 +367,14 @@ export function CreateStackDialog({
               <div className="flex flex-col gap-4">
                 {eligible.length > 0 ? (
                   <div className="flex flex-col gap-2">
-                    <Label>Máquina de destino</Label>
+                    <div className="flex items-center justify-between">
+                      <Label>Máquina de destino</Label>
+                      <MachineSlotsDialog
+                        machines={machines}
+                        templates={templates}
+                        currentTemplateId={template?.id}
+                      />
+                    </div>
                     <Select value={machineId} onValueChange={setMachineId}>
                       <SelectTrigger>
                         <SelectValue placeholder="Escolha a máquina" />
@@ -360,21 +386,34 @@ export function CreateStackDialog({
                             {slotsLabel(m)}
                           </SelectItem>
                         ))}
+                        <SelectSeparator />
+                        <SelectItem value={NEW_MACHINE}>
+                          <Plus className="size-4" /> Criar nova máquina
+                        </SelectItem>
                       </SelectContent>
                     </Select>
                     <p className="text-xs text-muted-foreground">
-                      Máquinas rodando com o produto selecionado e vaga livre.
+                      {machineId === NEW_MACHINE
+                        ? `Uma máquina nova será provisionada com o produto ${template?.name ?? "selecionado"} (~1 min).`
+                        : "Máquinas rodando com o produto selecionado e vaga livre."}
                     </p>
                   </div>
                 ) : (
-                  <Alert>
-                    <TriangleAlert />
-                    <AlertTitle>Nenhuma máquina disponível</AlertTitle>
-                    <AlertDescription>
-                      Será criada uma nova máquina com o produto{" "}
-                      {template?.name ?? "selecionado"}.
-                    </AlertDescription>
-                  </Alert>
+                  <>
+                    <Alert>
+                      <TriangleAlert />
+                      <AlertTitle>Nenhuma máquina disponível</AlertTitle>
+                      <AlertDescription>
+                        Será criada uma nova máquina com o produto{" "}
+                        {template?.name ?? "selecionado"}.
+                      </AlertDescription>
+                    </Alert>
+                    <MachineSlotsDialog
+                      machines={machines}
+                      templates={templates}
+                      currentTemplateId={template?.id}
+                    />
+                  </>
                 )}
                 <div className="flex gap-2">
                   <Button
@@ -392,7 +431,7 @@ export function CreateStackDialog({
                     disabled={pending || (eligible.length > 0 && !machineId)}
                   >
                     {pending
-                      ? machineId
+                      ? machineId && machineId !== NEW_MACHINE
                         ? "Criando…"
                         : "Criando máquina… (~1 min)"
                       : "Confirmar"}
@@ -407,10 +446,105 @@ export function CreateStackDialog({
             <input type="hidden" name="template_id" value={templateId} />
             <input type="hidden" name="slug" value={slug} />
             {phase === "confirm" && eligible.length > 0 && (
-              <input type="hidden" name="machine_id" value={machineId} />
+              <input
+                type="hidden"
+                name="machine_id"
+                // vazio = createStack provisiona uma máquina nova
+                value={machineId === NEW_MACHINE ? "" : machineId}
+              />
             )}
           </form>
         )}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// Visão geral das máquinas rodando e seus slots livres, para o admin decidir
+// entre reaproveitar uma existente ou criar uma nova. Dialog aninhado ao de
+// criação de stack (o Radix empilha modais sem conflito de pointer-events).
+function MachineSlotsDialog({
+  machines,
+  templates,
+  currentTemplateId,
+}: {
+  machines: StackMachine[]
+  templates: StackTemplate[]
+  currentTemplateId: string | undefined
+}) {
+  const templateById = new Map(templates.map((t) => [t.id, t]))
+  // Máquinas do produto selecionado primeiro, depois por nome.
+  const sorted = [...machines].sort((a, b) => {
+    const aCurrent = a.template_id === currentTemplateId ? 0 : 1
+    const bCurrent = b.template_id === currentTemplateId ? 0 : 1
+    return aCurrent - bCurrent || a.name.localeCompare(b.name)
+  })
+
+  return (
+    <Dialog>
+      <DialogTrigger asChild>
+        <Button type="button" variant="outline" size="sm">
+          <Server className="size-4" /> Ver máquinas e slots
+        </Button>
+      </DialogTrigger>
+      {/* `!` porque .style-nova .cn-dialog-content (sm:max-w-sm) tem
+          especificidade maior que utilitários — mesmo caso do StatusBadge. */}
+      <DialogContent className="sm:max-w-4xl!">
+        <DialogHeader>
+          <DialogTitle>Máquinas e slots disponíveis</DialogTitle>
+          <DialogDescription>
+            Máquinas rodando e quantas vagas cada uma ainda tem. Apenas as do
+            produto selecionado podem hospedar esta stack.
+          </DialogDescription>
+        </DialogHeader>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Nome</TableHead>
+              <TableHead>Produto</TableHead>
+              <TableHead>Modelo</TableHead>
+              <TableHead>Slots</TableHead>
+              <TableHead className="text-right">Vagas</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {sorted.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={5} className="text-center text-muted-foreground">
+                  Nenhuma máquina rodando.
+                </TableCell>
+              </TableRow>
+            )}
+            {sorted.map((m) => {
+              const tpl = templateById.get(m.template_id)
+              const cap = machineCapacity(m, tpl)
+              const isCurrent = m.template_id === currentTemplateId
+              return (
+                <TableRow key={m.id}>
+                  <TableCell className="font-medium">
+                    <span className="flex items-center gap-2">
+                      {m.name}
+                      {isCurrent && <Badge variant="outline">produto atual</Badge>}
+                    </span>
+                  </TableCell>
+                  <TableCell className="text-sm">{tpl?.name ?? "—"}</TableCell>
+                  <TableCell className="font-mono text-xs">{m.model_name}</TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-2">
+                      <Progress value={cap.usagePct} className="w-24" />
+                      <span className="text-xs text-muted-foreground">
+                        {cap.slotsUsed}/{cap.slotsMax}
+                      </span>
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-right text-sm">
+                    {cap.slotsMax > 0 ? cap.slotsFree : "—"}
+                  </TableCell>
+                </TableRow>
+              )
+            })}
+          </TableBody>
+        </Table>
       </DialogContent>
     </Dialog>
   )

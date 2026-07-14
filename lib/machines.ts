@@ -5,25 +5,36 @@ import type { Machine } from "./types"
 type SupabaseAdmin = ReturnType<typeof createSupabaseAdmin>
 
 // Status exibido na UI: além dos status do banco, "starting" indica que o
-// pod está de pé mas o vLLM ainda não respondeu (baixando/carregando modelo).
-export type MachineDisplayStatus = Machine["status"] | "starting"
+// pod está de pé mas o vLLM ainda não respondeu (baixando/carregando modelo)
+// e "failed" que o processo do vLLM morreu (ex.: OOM no boot) com o pod vivo.
+export type MachineDisplayStatus = Machine["status"] | "starting" | "failed"
 
 // Sonda o /health público do agent para saber se o vLLM já está servindo.
+// Também sonda máquinas em "creating": se o agent já responde, o pod está de
+// pé mesmo que a reconciliação com o RunPod ainda não tenha promovido o banco.
 export async function machineDisplayStatus(m: Machine): Promise<MachineDisplayStatus> {
-  if (m.status !== "running") return m.status
-  if (!m.public_url) return "running"
+  if (m.status !== "running" && m.status !== "creating") return m.status
+  if (!m.public_url) return m.status
   try {
     const res = await fetch(`${m.public_url}/health`, {
       cache: "no-store",
       signal: AbortSignal.timeout(3_000),
     })
-    if (!res.ok) return "starting"
-    const body = (await res.json()) as { ok?: boolean; vllm_ready?: boolean }
+    if (!res.ok) return m.status === "creating" ? "creating" : "starting"
+    const body = (await res.json()) as {
+      ok?: boolean
+      vllm_ready?: boolean
+      vllm_alive?: boolean
+    }
     // agents antigos não reportam vllm_ready; se respondem, consideramos pronto
-    return body.vllm_ready === false ? "starting" : "running"
+    if (body.vllm_ready !== false) return "running"
+    // vLLM não responde E o processo morreu = crash (agents antigos não
+    // reportam vllm_alive e continuam caindo em "starting")
+    return body.vllm_alive === false ? "failed" : "starting"
   } catch {
-    // agent inacessível com pod RUNNING = ainda puxando imagem / subindo
-    return "starting"
+    // agent inacessível: pod ainda puxando imagem / subindo (ou, em
+    // "creating", nem alocado ainda)
+    return m.status === "creating" ? "creating" : "starting"
   }
 }
 
