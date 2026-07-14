@@ -45,10 +45,10 @@ export function EditTemplateDialog({
     startTransition(async () => {
       try {
         await updateTemplate(formData)
-        toast.success("Template atualizado")
+        toast.success("Produto atualizado")
         onOpenChange(false)
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : "Erro ao atualizar template")
+        toast.error(e instanceof Error ? e.message : "Erro ao atualizar produto")
       }
     })
   }
@@ -57,7 +57,7 @@ export function EditTemplateDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90vh] grid-rows-[auto_1fr] overflow-hidden sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Editar template</DialogTitle>
+          <DialogTitle>Editar produto</DialogTitle>
           <DialogDescription>
             Ajuste a imagem Docker, o modelo e os parâmetros de capacidade.
           </DialogDescription>

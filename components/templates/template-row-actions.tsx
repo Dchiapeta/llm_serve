@@ -91,7 +91,7 @@ export function TemplateRowActions({
                 startTransition(async () => {
                   try {
                     await deleteTemplate(template.id)
-                    toast.success("Template apagado")
+                    toast.success("Produto apagado")
                     setDeleteOpen(false)
                   } catch (err) {
                     toast.error(

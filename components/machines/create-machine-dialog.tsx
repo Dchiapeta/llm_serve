@@ -122,7 +122,7 @@ export function CreateMachineDialog({
               className="w-full"
             >
               <NativeSelectOption value="" disabled>
-                Escolha um template
+                Escolha um produto
               </NativeSelectOption>
               {templates.map((t) => (
                 <NativeSelectOption key={t.id} value={t.id}>
@@ -148,7 +148,7 @@ export function CreateMachineDialog({
               <NativeSelectOption value="" disabled>
                 {selectedTemplate
                   ? "Escolha a GPU"
-                  : "Escolha um template primeiro"}
+                  : "Escolha um produto primeiro"}
               </NativeSelectOption>
               {availableGpus.map((g) => (
                 <NativeSelectOption key={g.id} value={g.id}>
@@ -159,7 +159,7 @@ export function CreateMachineDialog({
             </NativeSelect>
             {selectedTemplate && availableGpus.length === 0 && (
               <p className="text-xs text-muted-foreground">
-                Este template não tem GPUs compatíveis cadastradas.
+                Este produto não tem GPUs compatíveis cadastradas.
               </p>
             )}
           </div>
@@ -205,7 +205,7 @@ export function CreateMachineDialog({
           </Button>
           {templates.length === 0 && (
             <p className="text-xs text-muted-foreground">
-              Crie um template primeiro.
+              Crie um produto primeiro.
             </p>
           )}
         </form>

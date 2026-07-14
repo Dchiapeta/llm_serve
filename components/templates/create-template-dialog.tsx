@@ -36,10 +36,10 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
     startTransition(async () => {
       try {
         await createTemplate(formData)
-        toast.success("Template criado")
+        toast.success("Produto criado")
         setOpen(false)
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : "Erro ao criar template")
+        toast.error(e instanceof Error ? e.message : "Erro ao criar produto")
       }
     })
   }
@@ -48,12 +48,12 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
         <Button>
-          <Plus /> Novo template
+          <Plus /> Novo produto
         </Button>
       </DialogTrigger>
       <DialogContent className="max-h-[90vh] grid-rows-[auto_1fr] overflow-hidden sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Novo template</DialogTitle>
+          <DialogTitle>Novo produto</DialogTitle>
           <DialogDescription>
             Define a imagem Docker, o modelo e os parâmetros de capacidade.
           </DialogDescription>
@@ -281,7 +281,7 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
           </CollapsibleSection>
 
           <Button type="submit" disabled={pending}>
-            {pending ? "Criando…" : "Criar template"}
+            {pending ? "Criando…" : "Criar produto"}
           </Button>
         </form>
       </DialogContent>

@@ -11,7 +11,7 @@ import { getClientLocation, setClientLocation } from "./routing"
 import { generateStackSlug, STACK_SLUG_RE } from "./slug"
 import { listGpuTypes, podProxyUrl, runpod } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import { TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Template, type TemplatePlan } from "./types"
+import { TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Stack, type Template, type TemplatePlan } from "./types"
 
 // ---------- Auth ----------
 
@@ -249,7 +249,7 @@ export async function importTemplate(formData: FormData) {
 export async function updateTemplate(formData: FormData) {
   const db = createSupabaseAdmin()
   const id = String(formData.get("id"))
-  if (!id) throw new Error("Template não informado")
+  if (!id) throw new Error("Produto não informado")
 
   const name = String(formData.get("name"))
   const image = String(formData.get("image"))
@@ -357,7 +357,7 @@ async function provisionMachine(input: {
     .select("*")
     .eq("id", templateId)
     .single<Template>()
-  if (tplErr || !tpl) return { error: "Template não encontrado" }
+  if (tplErr || !tpl) return { error: "Produto não encontrado" }
 
   // teto manual: valor informado, com fallback para o padrão do template
   const maxUsers = input.maxUsers ?? tpl.max_users
@@ -536,10 +536,69 @@ export async function terminateMachine(machineId: string) {
 // e-mail, cria a conta junto — o plan da conta nova é o plano da primeira
 // stack; accounts.plan segue alimentando o roteamento e não muda para
 // contas existentes. A stack nasce hospedada numa máquina: ou na escolhida
+// Nome padrão das máquinas de stack: llm-stack-1, llm-stack-2, …
+// Continua do maior sufixo existente (contando terminadas) para nunca
+// reaproveitar nome.
+async function nextStackMachineName(
+  db: ReturnType<typeof createSupabaseAdmin>
+): Promise<string> {
+  const { data } = await db
+    .from("machines")
+    .select("name")
+    .like("name", "llm-stack-%")
+  let max = 0
+  for (const row of (data ?? []) as { name: string }[]) {
+    const m = /^llm-stack-(\d+)$/.exec(row.name)
+    if (m) max = Math.max(max, Number(m[1]))
+  }
+  return `llm-stack-${max + 1}`
+}
+
+// GPUs do template que comportam o max_users configurado — validação feita
+// ANTES de provisionar, para não deixar stack órfã quando nenhuma GPU serve.
+async function viableGpuIdsForTemplate(
+  tpl: Pick<
+    Template,
+    "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
+  >
+): Promise<string[]> {
+  if (!tpl.gpu_types?.length) {
+    throw new Error("O produto não tem tipos de GPU configurados")
+  }
+  const gpus = await listGpuTypes()
+  const gpuCount = tpl.gpu_count ?? 1
+  const rejections: string[] = []
+  const viable = tpl.gpu_types.filter((gpuTypeId) => {
+    const gpu = gpus.find((g) => g.id === gpuTypeId)
+    const totalVramGb = gpu?.memoryInGb != null ? gpu.memoryInGb * gpuCount : null
+    // VRAM desconhecida ou sem teto de usuários: não dá para validar — aceita.
+    if (tpl.max_users === null || totalVramGb == null) return true
+    const cap = vramSlots({
+      vramGb: totalVramGb,
+      modelFootprintGb: tpl.model_footprint_gb,
+      kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
+    })
+    if (tpl.max_users > cap) {
+      rejections.push(
+        `${gpu?.displayName ?? gpuTypeId}: ${cap} vaga(s) — ${totalVramGb}GB VRAM − ${tpl.model_footprint_gb}GB modelo, ${tpl.kv_reserve_gb_per_user}GB/usuário`
+      )
+      return false
+    }
+    return true
+  })
+  if (viable.length === 0) {
+    throw new Error(
+      `Nenhuma GPU do produto comporta ${tpl.max_users} usuário(s): ${rejections.join("; ")}. ` +
+        "Ajuste o max_users ou os valores de VRAM do produto."
+    )
+  }
+  return viable
+}
+
 // pelo admin (machine_id do form), ou numa recém-provisionada com o
-// template selecionado (nome = slug, GPU = primeira compatível). Em ambos
-// os casos emite a chave HEX da conta na máquina; a plainKey é retornada
-// UMA única vez.
+// template selecionado (nome = llm-stack-N, GPU = primeira compatível). Em
+// ambos os casos emite a chave HEX da conta na máquina; a plainKey é
+// retornada UMA única vez.
 export async function createStack(formData: FormData): Promise<{
   slug: string
   machineId: string
@@ -557,7 +616,7 @@ export async function createStack(formData: FormData): Promise<{
 
   if (!name) throw new Error("Informe o nome do cliente")
   if (!email) throw new Error("Informe o e-mail do cliente")
-  if (!templateId) throw new Error("Selecione um template")
+  if (!templateId) throw new Error("Selecione um produto")
   if (!STACK_SLUG_RE.test(slug)) slug = generateStackSlug()
 
   const { data: tpl } = await db
@@ -570,43 +629,13 @@ export async function createStack(formData: FormData): Promise<{
         "id" | "plan" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
       >
     >()
-  if (!tpl) throw new Error("Template não encontrado")
+  if (!tpl) throw new Error("Produto não encontrado")
 
   // Sem máquina escolhida, uma será provisionada — valida ANTES de criar a
-  // stack quais GPUs do template comportam o max_users configurado, para não
-  // deixar stack órfã quando nenhuma GPU serve.
+  // stack quais GPUs do template comportam o max_users configurado.
   let viableGpuIds: string[] = []
   if (!chosenMachineId) {
-    if (!tpl.gpu_types?.length) {
-      throw new Error("O template não tem tipos de GPU configurados")
-    }
-    const gpus = await listGpuTypes()
-    const gpuCount = tpl.gpu_count ?? 1
-    const rejections: string[] = []
-    viableGpuIds = tpl.gpu_types.filter((gpuTypeId) => {
-      const gpu = gpus.find((g) => g.id === gpuTypeId)
-      const totalVramGb = gpu?.memoryInGb != null ? gpu.memoryInGb * gpuCount : null
-      // VRAM desconhecida ou sem teto de usuários: não dá para validar — aceita.
-      if (tpl.max_users === null || totalVramGb == null) return true
-      const cap = vramSlots({
-        vramGb: totalVramGb,
-        modelFootprintGb: tpl.model_footprint_gb,
-        kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
-      })
-      if (tpl.max_users > cap) {
-        rejections.push(
-          `${gpu?.displayName ?? gpuTypeId}: ${cap} vaga(s) — ${totalVramGb}GB VRAM − ${tpl.model_footprint_gb}GB modelo, ${tpl.kv_reserve_gb_per_user}GB/usuário`
-        )
-        return false
-      }
-      return true
-    })
-    if (viableGpuIds.length === 0) {
-      throw new Error(
-        `Nenhuma GPU do template comporta ${tpl.max_users} usuário(s): ${rejections.join("; ")}. ` +
-          "Ajuste o max_users ou os valores de VRAM do template."
-      )
-    }
+    viableGpuIds = await viableGpuIdsForTemplate(tpl)
   }
 
   // Máquina escolhida pelo admin: precisa estar rodando e ser do mesmo
@@ -620,7 +649,7 @@ export async function createStack(formData: FormData): Promise<{
     if (!m) throw new Error("Máquina não encontrada")
     if (m.status !== "running") throw new Error("A máquina escolhida não está rodando")
     if (m.template_id !== templateId) {
-      throw new Error("A máquina escolhida não usa o template selecionado")
+      throw new Error("A máquina escolhida não usa o produto selecionado")
     }
   }
 
@@ -644,7 +673,6 @@ export async function createStack(formData: FormData): Promise<{
   }
 
   // Insert com retry: colisão do unique de slug (Postgres 23505) regenera.
-  // A stack é criada antes da máquina porque o slug final vira o nome dela.
   let stackId: string | null = null
   for (let attempt = 0; attempt < 5; attempt++) {
     const { data: stack, error } = await db
@@ -672,7 +700,11 @@ export async function createStack(formData: FormData): Promise<{
     // Tenta as GPUs viáveis em ordem — cobre falta de estoque de um tipo.
     let lastError = ""
     for (const gpuTypeId of viableGpuIds) {
-      const prov = await provisionMachine({ name: slug, templateId, gpuTypeId })
+      const prov = await provisionMachine({
+        name: await nextStackMachineName(db),
+        templateId,
+        gpuTypeId,
+      })
       if (!("error" in prov)) {
         machineId = prov.machineId
         break
@@ -706,6 +738,159 @@ export async function deleteStack(id: string) {
   if (error) throw new Error(error.message)
   revalidatePath("/contas")
   revalidatePath("/accounts")
+}
+
+// Migra uma stack para outra máquina: garante a chave da conta no destino
+// (reutiliza uma ativa ou emite nova — a plainKey é retornada UMA única
+// vez), reaponta stacks.machine_id e revoga as chaves da conta na origem
+// quando nenhuma outra stack dela continua lá. targetMachineId null =
+// provisiona uma máquina nova (nome llm-stack-N) com o produto da stack.
+export async function migrateStack(input: {
+  stackId: string
+  targetMachineId: string | null
+}): Promise<{ machineId: string; machineCreated: boolean; plainKey: string | null }> {
+  const db = createSupabaseAdmin()
+
+  const { data: stack } = await db
+    .from("stacks")
+    .select("id, account_id, machine_id, plan, slug")
+    .eq("id", input.stackId)
+    .single<Pick<Stack, "id" | "account_id" | "machine_id" | "plan" | "slug">>()
+  if (!stack) throw new Error("Stack não encontrada")
+
+  const fromMachineId = stack.machine_id
+  if (input.targetMachineId && input.targetMachineId === fromMachineId) {
+    throw new Error("A stack já está nessa máquina")
+  }
+
+  // Template de referência: o da máquina atual; sem máquina, o produto
+  // cadastrado com o plano da stack (mesma regra do createStack).
+  let templateId: string | null = null
+  if (fromMachineId) {
+    const { data: m } = await db
+      .from("machines")
+      .select("template_id")
+      .eq("id", fromMachineId)
+      .single<Pick<Machine, "template_id">>()
+    templateId = m?.template_id ?? null
+  }
+  if (!templateId) {
+    const { data: tpl } = await db
+      .from("templates")
+      .select("id")
+      .eq("plan", stack.plan)
+      .limit(1)
+      .maybeSingle<{ id: string }>()
+    templateId = tpl?.id ?? null
+  }
+  if (!templateId) throw new Error(`Nenhum produto ${stack.plan} cadastrado`)
+
+  const machineCreated = !input.targetMachineId
+  let targetMachineId = input.targetMachineId
+  if (targetMachineId) {
+    const { data: target } = await db
+      .from("machines")
+      .select("id, status, template_id")
+      .eq("id", targetMachineId)
+      .single<Pick<Machine, "id" | "status" | "template_id">>()
+    if (!target) throw new Error("Máquina de destino não encontrada")
+    if (target.status !== "running") {
+      throw new Error("A máquina de destino não está rodando")
+    }
+    if (target.template_id !== templateId) {
+      throw new Error("A máquina de destino não usa o mesmo produto da stack")
+    }
+  } else {
+    const { data: tpl } = await db
+      .from("templates")
+      .select("id, gpu_types, gpu_count, max_users, model_footprint_gb, kv_reserve_gb_per_user")
+      .eq("id", templateId)
+      .single<
+        Pick<
+          Template,
+          "id" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
+        >
+      >()
+    if (!tpl) throw new Error("Produto não encontrado")
+    const viableGpuIds = await viableGpuIdsForTemplate(tpl)
+    // Tenta as GPUs viáveis em ordem — cobre falta de estoque de um tipo.
+    let lastError = ""
+    for (const gpuTypeId of viableGpuIds) {
+      const prov = await provisionMachine({
+        name: await nextStackMachineName(db),
+        templateId,
+        gpuTypeId,
+      })
+      if (!("error" in prov)) {
+        targetMachineId = prov.machineId
+        break
+      }
+      lastError = prov.error
+    }
+    if (!targetMachineId) {
+      throw new Error(`Falhou ao criar a máquina de destino: ${lastError}`)
+    }
+  }
+
+  // Chave no destino ANTES de reapontar a stack — se a emissão falhar
+  // (máquina lotada), a migração é abortada sem efeito colateral.
+  const { data: existingKey } = await db
+    .from("api_keys")
+    .select("id")
+    .eq("account_id", stack.account_id)
+    .eq("machine_id", targetMachineId)
+    .eq("status", "active")
+    .limit(1)
+    .maybeSingle<{ id: string }>()
+
+  let plainKey: string | null = null
+  if (!existingKey) {
+    const created = await createKey({
+      accountId: stack.account_id,
+      machineId: targetMachineId,
+    })
+    plainKey = created.plainKey
+  }
+
+  const { error } = await db
+    .from("stacks")
+    .update({ machine_id: targetMachineId })
+    .eq("id", stack.id)
+  if (error) throw new Error(error.message)
+
+  await logEvent(
+    targetMachineId,
+    "stack_migrated",
+    `Stack ${stack.slug} migrada para esta máquina`
+  )
+
+  // Origem: revoga as chaves da conta quando nenhuma outra stack dela
+  // continua na máquina antiga.
+  if (fromMachineId) {
+    const { count: remaining } = await db
+      .from("stacks")
+      .select("id", { count: "exact", head: true })
+      .eq("account_id", stack.account_id)
+      .eq("machine_id", fromMachineId)
+    if (!remaining) {
+      const { data: oldKeys } = await db
+        .from("api_keys")
+        .select("id")
+        .eq("account_id", stack.account_id)
+        .eq("machine_id", fromMachineId)
+        .eq("status", "active")
+      for (const k of (oldKeys ?? []) as { id: string }[]) {
+        await revokeKey(k.id)
+      }
+    }
+  }
+
+  revalidatePath("/contas")
+  revalidatePath("/accounts")
+  if (fromMachineId) revalidatePath(`/machines/${fromMachineId}`)
+  revalidatePath(`/machines/${targetMachineId}`)
+  if (machineCreated) revalidatePath("/machines")
+  return { machineId: targetMachineId, machineCreated, plainKey }
 }
 
 // Atualiza plano e/ou system prompt de uma conta já existente.
@@ -773,6 +958,7 @@ export async function createKey(input: {
     machine_id: input.machineId,
     key_hash: hashKey(plainKey),
     key_prefix: keyPrefix(plainKey),
+    plain_key: plainKey,
     status: "active",
   })
   if (error) throw new Error(error.message)

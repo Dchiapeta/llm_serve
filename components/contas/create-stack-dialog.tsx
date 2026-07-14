@@ -78,7 +78,6 @@ export function CreateStackDialog({
   const [email, setEmail] = React.useState("")
   const [name, setName] = React.useState("")
   const [plan, setPlan] = React.useState<TemplatePlan>("VibeCoder")
-  const [templateId, setTemplateId] = React.useState("")
   const [machineId, setMachineId] = React.useState("")
   const [slug, setSlug] = React.useState(generateStackSlug)
   const [result, setResult] = React.useState<StackResult | null>(null)
@@ -104,7 +103,10 @@ export function CreateStackDialog({
     (a) => a.email?.toLowerCase() === email.trim().toLowerCase()
   )
 
-  const template = templates.find((t) => t.id === templateId)
+  // O produto escolhido (VibeCoder/Pro/Max/Enterprise) determina o template:
+  // o cadastrado em /templates com aquele plano.
+  const template = templates.find((t) => t.plan === plan)
+  const templateId = template?.id ?? ""
 
   // Máquinas elegíveis: rodando, do template escolhido, com slot livre —
   // mesma semântica de createKey (slotsMax 0 = desconhecida, não bloqueia).
@@ -142,7 +144,6 @@ export function CreateStackDialog({
       setEmail("")
       setName("")
       setPlan("VibeCoder")
-      setTemplateId("")
       setMachineId("")
       setSlug(generateStackSlug())
       setResult(null)
@@ -160,8 +161,8 @@ export function CreateStackDialog({
 
   function toConfirm() {
     if (!formRef.current?.reportValidity()) return
-    if (!templateId) {
-      toast.error("Selecione um template")
+    if (!template) {
+      toast.error(`Nenhum produto ${plan} cadastrado`)
       return
     }
     setMachineId(eligible[0]?.id ?? "")
@@ -282,42 +283,33 @@ export function CreateStackDialog({
                   readOnly={!!existing}
                 />
               </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="flex min-w-0 flex-col gap-2">
-                  <Label>Produto</Label>
-                  <Select value={plan} onValueChange={(v) => setPlan(v as TemplatePlan)}>
-                    <SelectTrigger className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {TEMPLATE_PLANS.map((p) => (
-                        <SelectItem key={p} value={p}>
-                          {p}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="flex min-w-0 flex-col gap-2">
-                  <Label>Template</Label>
-                  <Select value={templateId} onValueChange={setTemplateId}>
-                    <SelectTrigger className="w-full">
-                      <SelectValue placeholder="Escolha" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {templates.length === 0 && (
-                        <SelectItem value="__none__" disabled>
-                          Nenhum template cadastrado
-                        </SelectItem>
-                      )}
-                      {templates.map((t) => (
-                        <SelectItem key={t.id} value={t.id}>
-                          {t.name} — {t.model_name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+              <div className="flex flex-col gap-2">
+                <Label>Produto</Label>
+                <Select value={plan} onValueChange={(v) => setPlan(v as TemplatePlan)}>
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {TEMPLATE_PLANS.map((p) => (
+                      <SelectItem
+                        key={p}
+                        value={p}
+                        disabled={!templates.some((t) => t.plan === p)}
+                      >
+                        {p}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {template ? (
+                  <p className="text-xs text-muted-foreground">
+                    Modelo: <span className="font-mono">{template.model_name}</span>
+                  </p>
+                ) : (
+                  <p className="text-xs text-destructive">
+                    Nenhum produto {plan} cadastrado. Cadastre em Produtos.
+                  </p>
+                )}
               </div>
               <div className="flex flex-col gap-2">
                 <Label htmlFor="purchase_date">Data da compra</Label>
@@ -371,7 +363,7 @@ export function CreateStackDialog({
                       </SelectContent>
                     </Select>
                     <p className="text-xs text-muted-foreground">
-                      Máquinas rodando com o template selecionado e vaga livre.
+                      Máquinas rodando com o produto selecionado e vaga livre.
                     </p>
                   </div>
                 ) : (
@@ -379,7 +371,7 @@ export function CreateStackDialog({
                     <TriangleAlert />
                     <AlertTitle>Nenhuma máquina disponível</AlertTitle>
                     <AlertDescription>
-                      Será criada uma nova máquina com o template{" "}
+                      Será criada uma nova máquina com o produto{" "}
                       {template?.name ?? "selecionado"}.
                     </AlertDescription>
                   </Alert>

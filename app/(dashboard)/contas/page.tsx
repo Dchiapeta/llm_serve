@@ -52,10 +52,10 @@ export default async function ContasPage({
     db.from("machines").select("*").neq("status", "terminated"),
     db.from("routing_state").select("*"),
     db.from("lora_adapters").select("account_id, status"),
-    db.from("api_keys").select("id, account_id, machine_id, status"),
+    db.from("api_keys").select("id, account_id, machine_id, status, key_prefix, plain_key, created_at"),
     db
       .from("usage_metrics")
-      .select("api_key_id, tokens_in, tokens_out, window_start")
+      .select("api_key_id, tokens_in, tokens_out, requests, window_start")
       .gte("window_start", periodStart),
     db.from("knowledge_chunks").select("account_id, storage_path"),
     db.from("stacks").select("*").order("created_at"),
@@ -69,11 +69,15 @@ export default async function ContasPage({
   const machines = (machinesData ?? []) as Machine[]
   const routes = (routingData ?? []) as RoutingState[]
   const loras = (lorasData ?? []) as Pick<LoraAdapter, "account_id" | "status">[]
-  const keys = (keysData ?? []) as Pick<ApiKey, "id" | "account_id" | "machine_id" | "status">[]
+  const keys = (keysData ?? []) as Pick<
+    ApiKey,
+    "id" | "account_id" | "machine_id" | "status" | "key_prefix" | "plain_key" | "created_at"
+  >[]
   const usage = (usageData ?? []) as {
     api_key_id: string | null
     tokens_in: number
     tokens_out: number
+    requests: number
     window_start: string
   }[]
   const knowledgeChunks = (knowledgeData ?? []) as {
@@ -118,7 +122,22 @@ export default async function ContasPage({
   const accountIdByKeyId = new Map(keys.map((k) => [k.id, k.account_id]))
 
   const tokensByAccount = new Map<string, number>()
+  const usageByKeyId = new Map<
+    string,
+    { tokensIn: number; tokensOut: number; requests: number }
+  >()
   for (const u of usage) {
+    if (u.api_key_id) {
+      const agg = usageByKeyId.get(u.api_key_id) ?? {
+        tokensIn: 0,
+        tokensOut: 0,
+        requests: 0,
+      }
+      agg.tokensIn += u.tokens_in
+      agg.tokensOut += u.tokens_out
+      agg.requests += u.requests
+      usageByKeyId.set(u.api_key_id, agg)
+    }
     const accountId = u.api_key_id ? accountIdByKeyId.get(u.api_key_id) : undefined
     if (!accountId) continue
     tokensByAccount.set(
@@ -126,6 +145,8 @@ export default async function ContasPage({
       (tokensByAccount.get(accountId) ?? 0) + u.tokens_in + u.tokens_out
     )
   }
+
+  const templateById = new Map(templates.map((t) => [t.id, t]))
 
   const readyAdapterAccounts = new Set(
     loras.filter((l) => l.status === "ready").map((l) => l.account_id)
@@ -167,10 +188,48 @@ export default async function ContasPage({
       hasReadyAdapter: readyAdapterAccounts.has(account.id),
       knowledgeFiles,
       tokens: tokensByAccount.get(account.id) ?? 0,
-      stacks: (stacksByAccount.get(account.id) ?? []).map((s) => ({
-        ...s,
-        machineName: s.machine_id ? machineById.get(s.machine_id)?.name : undefined,
-      })),
+      stacks: (stacksByAccount.get(account.id) ?? []).map((s) => {
+        const machine = s.machine_id ? machineById.get(s.machine_id) : undefined
+        const stackKeys = keys.filter(
+          (k) => k.account_id === account.id && k.machine_id === s.machine_id
+        )
+        const stackUsage = { tokensIn: 0, tokensOut: 0, requests: 0 }
+        for (const k of stackKeys) {
+          const agg = usageByKeyId.get(k.id)
+          if (!agg) continue
+          stackUsage.tokensIn += agg.tokensIn
+          stackUsage.tokensOut += agg.tokensOut
+          stackUsage.requests += agg.requests
+        }
+        return {
+          ...s,
+          machineName: machine?.name,
+          // Pick explícito — nunca a Machine inteira, para não vazar
+          // admin_secret ao client.
+          machine: machine && {
+            id: machine.id,
+            name: machine.name,
+            gpu_type: machine.gpu_type,
+            status: machine.status,
+            model_name: machine.model_name,
+            vram_gb: machine.vram_gb,
+            cost_per_hr: machine.cost_per_hr,
+            public_url: machine.public_url,
+            max_users: machine.max_users,
+            template_id: machine.template_id,
+          },
+          templateName: machine?.template_id
+            ? templateById.get(machine.template_id)?.name
+            : undefined,
+          keys: stackKeys.map((k) => ({
+            key_prefix: k.key_prefix,
+            plain_key: k.plain_key,
+            status: k.status,
+            created_at: k.created_at,
+          })),
+          usage: stackUsage,
+        }
+      }),
     }
   })
 
@@ -227,7 +286,13 @@ export default async function ContasPage({
           </div>
         </CardHeader>
         <CardContent>
-          <ContasTable rows={rows} runningMachines={runningMachines} periodLabel={periodDef.label} />
+          <ContasTable
+            rows={rows}
+            runningMachines={runningMachines}
+            periodLabel={periodDef.label}
+            stackMachines={stackMachines}
+            templates={templates}
+          />
         </CardContent>
       </Card>
     </div>

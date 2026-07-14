@@ -55,7 +55,7 @@ export function MachineInfoDialog({
               {machine.model_name ?? "—"}
             </dd>
 
-            <dt className="text-muted-foreground">Template</dt>
+            <dt className="text-muted-foreground">Produto</dt>
             <dd>{templateName ?? "—"}</dd>
 
             <dt className="text-muted-foreground">VRAM</dt>

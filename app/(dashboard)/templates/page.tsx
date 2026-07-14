@@ -55,7 +55,7 @@ export default async function TemplatesPage() {
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold">Templates</h1>
+          <h1 className="text-2xl font-semibold">Produtos</h1>
           <p className="text-sm text-muted-foreground">
             Configurações de imagem e modelo para criar máquinas
           </p>
@@ -71,7 +71,7 @@ export default async function TemplatesPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Todos os templates</CardTitle>
+          <CardTitle>Todos os produtos</CardTitle>
           <CardDescription>
             {templates.length} local(is)
             {notImported.length > 0 &&
@@ -97,7 +97,7 @@ export default async function TemplatesPage() {
               {templates.length === 0 && notImported.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={9} className="text-center text-muted-foreground">
-                    Nenhum template ainda. Crie o primeiro.
+                    Nenhum produto ainda. Crie o primeiro.
                   </TableCell>
                 </TableRow>
               )}

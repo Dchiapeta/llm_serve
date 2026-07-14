@@ -5,7 +5,7 @@ import Link from "next/link"
 import { ChevronDown, ChevronRight, Copy } from "lucide-react"
 import { toast } from "sonner"
 
-import type { Account, Machine, RoutingState, Stack } from "@/lib/types"
+import type { Account, ApiKey, Machine, RoutingState, Stack } from "@/lib/types"
 import {
   Autocomplete,
   AutocompleteContent,
@@ -25,15 +25,46 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { ContaRowActions } from "@/components/contas/conta-row-actions"
+import type {
+  StackMachine,
+  StackTemplate,
+} from "@/components/contas/create-stack-dialog"
 import { DeleteStackButton } from "@/components/contas/delete-stack-button"
+import { MigrateStackButton } from "@/components/contas/migrate-stack-dialog"
+import { StackInfoButton } from "@/components/contas/stack-info-dialog"
 
 // Cor do badge por plano de produto — mantém a mesma paleta usada em
 // components/templates para o plano do template.
-const PLAN_BADGE_VARIANT: Record<Account["plan"], "secondary" | "info-light" | "success-light" | "warning-light"> = {
+export const PLAN_BADGE_VARIANT: Record<Account["plan"], "secondary" | "info-light" | "success-light" | "warning-light"> = {
   VibeCoder: "secondary",
   Pro: "info-light",
   Max: "success-light",
   Enterprise: "warning-light",
+}
+
+export type StackInfo = Stack & {
+  machineName?: string
+  machine?: Pick<
+    Machine,
+    | "id"
+    | "name"
+    | "gpu_type"
+    | "status"
+    | "model_name"
+    | "vram_gb"
+    | "cost_per_hr"
+    | "public_url"
+    | "max_users"
+    | "template_id"
+  >
+  templateName?: string
+  keys: {
+    key_prefix: string
+    plain_key: string | null
+    status: ApiKey["status"]
+    created_at: string
+  }[]
+  usage: { tokensIn: number; tokensOut: number; requests: number }
 }
 
 export type ContaRow = {
@@ -43,12 +74,12 @@ export type ContaRow = {
   hasReadyAdapter: boolean
   knowledgeFiles: { storage_path: string; chunks: number }[]
   tokens: number
-  stacks: (Stack & { machineName?: string })[]
+  stacks: StackInfo[]
 }
 
 // purchase_date é date puro ("YYYY-MM-DD"); anexar meia-noite local evita
 // o off-by-one de fuso ao formatar.
-function formatPurchaseDate(date: string) {
+export function formatPurchaseDate(date: string) {
   return new Date(`${date}T00:00:00`).toLocaleDateString("pt-BR")
 }
 
@@ -56,10 +87,14 @@ export function ContasTable({
   rows,
   runningMachines,
   periodLabel,
+  stackMachines,
+  templates,
 }: {
   rows: ContaRow[]
   runningMachines: Machine[]
   periodLabel: string
+  stackMachines: StackMachine[]
+  templates: StackTemplate[]
 }) {
   const [query, setQuery] = React.useState("")
   const [expanded, setExpanded] = React.useState<Set<string>>(new Set())
@@ -287,7 +322,15 @@ export function ContasTable({
                               {formatPurchaseDate(stack.purchase_date)}
                             </TableCell>
                             <TableCell>
-                              <DeleteStackButton stackId={stack.id} slug={stack.slug} />
+                              <div className="flex items-center gap-1">
+                                <StackInfoButton stack={stack} periodLabel={periodLabel} />
+                                <MigrateStackButton
+                                  stack={stack}
+                                  machines={stackMachines}
+                                  templates={templates}
+                                />
+                                <DeleteStackButton stackId={stack.id} slug={stack.slug} />
+                              </div>
                             </TableCell>
                           </TableRow>
                         ))}

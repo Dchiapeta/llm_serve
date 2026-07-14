@@ -44,10 +44,10 @@ export function ImportTemplateDialog({
     startTransition(async () => {
       try {
         await importTemplate(formData)
-        toast.success("Template importado")
+        toast.success("Produto importado")
         setOpen(false)
       } catch (e) {
-        toast.error(e instanceof Error ? e.message : "Erro ao importar template")
+        toast.error(e instanceof Error ? e.message : "Erro ao importar produto")
       }
     })
   }
@@ -187,7 +187,7 @@ export function ImportTemplateDialog({
           </div>
 
           <Button type="submit" disabled={pending}>
-            {pending ? "Importando…" : "Importar template"}
+            {pending ? "Importando…" : "Importar produto"}
           </Button>
         </form>
       </DialogContent>
