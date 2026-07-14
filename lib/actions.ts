@@ -724,7 +724,7 @@ export async function createStack(formData: FormData): Promise<{
 
   const { plainKey } = await createKey({ accountId, machineId })
 
-  revalidatePath("/contas")
+  revalidatePath("/stacks")
   revalidatePath("/accounts")
   if (machineCreated) revalidatePath("/machines")
   return { slug, machineId, machineCreated, plainKey }
@@ -736,7 +736,7 @@ export async function deleteStack(id: string) {
   const db = createSupabaseAdmin()
   const { error } = await db.from("stacks").delete().eq("id", id)
   if (error) throw new Error(error.message)
-  revalidatePath("/contas")
+  revalidatePath("/stacks")
   revalidatePath("/accounts")
 }
 
@@ -885,7 +885,7 @@ export async function migrateStack(input: {
     }
   }
 
-  revalidatePath("/contas")
+  revalidatePath("/stacks")
   revalidatePath("/accounts")
   if (fromMachineId) revalidatePath(`/machines/${fromMachineId}`)
   revalidatePath(`/machines/${targetMachineId}`)
@@ -907,7 +907,7 @@ export async function updateAccountConfig(formData: FormData) {
     .update({ plan, system_prompt: systemPrompt })
     .eq("id", accountId)
   if (error) throw new Error(error.message)
-  revalidatePath("/contas")
+  revalidatePath("/stacks")
   revalidatePath("/accounts")
 }
 
@@ -1249,7 +1249,7 @@ export async function uploadKnowledgeFile(formData: FormData) {
   )
   if (insertErr) throw new Error(`Falha ao indexar chunks: ${insertErr.message}`)
 
-  revalidatePath("/contas")
+  revalidatePath("/stacks")
 }
 
 export async function listKnowledgeFiles(
@@ -1278,7 +1278,7 @@ export async function deleteKnowledgeFile(accountId: string, storagePath: string
     .eq("account_id", accountId)
     .eq("storage_path", storagePath)
   if (error) throw new Error(error.message)
-  revalidatePath("/contas")
+  revalidatePath("/stacks")
 }
 
 // ---------- Migração de conta ----------
@@ -1324,7 +1324,7 @@ export async function migrateAccountToMachine(accountId: string, targetMachineId
     lora_adapter_id: adapter.id,
   })
 
-  revalidatePath("/contas")
+  revalidatePath("/stacks")
   if (fromMachineId) revalidatePath(`/machines/${fromMachineId}`)
   revalidatePath(`/machines/${targetMachineId}`)
 }

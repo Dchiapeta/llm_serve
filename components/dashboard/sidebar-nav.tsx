@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation"
 import {
   Boxes,
   KeyRound,
+  Layers,
   LayoutDashboard,
   Server,
   Users,
@@ -16,6 +17,7 @@ const items = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/machines", label: "Máquinas", icon: Server },
   { href: "/templates", label: "Produtos", icon: Boxes },
+  { href: "/stacks", label: "Stacks", icon: Layers },
   { href: "/contas", label: "Contas", icon: Users },
   { href: "/accounts", label: "Chaves", icon: KeyRound },
 ]
