@@ -61,8 +61,9 @@ advisory lock.
 | `LOAD_WAIT_TIMEOUT_S`     | não         | Espera por load de outro request (default 20)    |
 | `IDLE_RELEASE_MINUTES`    | não         | Ociosidade até liberar o slot (unload + rota livre; default 60; 0 desliga o reaper). Fallback: `IDLE_UNLOAD_MINUTES` |
 | `MIGRATION_DRAIN_TIMEOUT_S` | não       | Espera máx. pelos streams da origem na migração (default 600) |
-| `RUNPOD_API_KEY`          | não*        | API key do RunPod — sem ela, a auto-pausa de máquinas ociosas fica desligada (warning no boot) |
+| `RUNPOD_API_KEY`          | não*        | API key do RunPod — sem ela, a auto-pausa e o auto-wake de máquinas ficam desligados (warning no boot) |
 | `MACHINE_IDLE_STOP_MINUTES` | não       | Máquina sem nenhuma atividade por esse tempo (e sem rotas) → stopPod (default 60; 0 desliga) |
+| `WAKE_COOLDOWN_S`         | não         | Intervalo mínimo entre tentativas de startPod na mesma máquina (default 120) |
 | `CONSOLIDATION_INTERVAL_S` | não        | Intervalo do loop de consolidação + auto-pausa (default 300) |
 | `CONSOLIDATION_MAX_ORIGIN_ROUTES` | não | Máx. de rotas para uma máquina ser candidata a esvaziar (default 2) |
 | `STOP_RECHECK_GRACE_S`    | não         | Grace entre o flip `stopped` e o stopPod, para re-checar claims (default 5) |
@@ -125,8 +126,21 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
   `machines.status='stopped'` no banco (novos claims param de enxergá-la) →
   grace de `STOP_RECHECK_GRACE_S` + re-checagem (claim que escapou → revert
   para `running`) → stopPod na API RunPod (falha → revert + retry no próximo
-  ciclo). **Religar é sempre manual** pelo painel: requests de contas cuja
-  máquina pausou alocam em qualquer máquina running com vaga.
+  ciclo). Requests de contas cuja máquina pausou alocam em qualquer máquina
+  running com vaga; sem nenhuma vaga, entra o auto-wake abaixo.
   - Janela residual: um claim que passe depois da re-checagem cria uma rota
     `loading` para a máquina pausada; o load falha (503), o slot é liberado
     e o retry do cliente aloca em outra máquina — degradação auto-corretiva.
+- **Auto-wake**: request chega e NENHUMA máquina running do template do plano
+  tem slot livre → o gateway religa (startPod) a máquina `stopped` mais antiga
+  do plano que aceitar o start e responde `503` + `Retry-After: 60` ("máquina
+  religando"). O `last_activity_at` é tocado antes do flip para `running` —
+  senão a auto-pausa pararia a máquina de novo durante o warm-up do vLLM
+  (~3–8 min); nesse warm-up, retries recebem 503 "máquina indisponível" até o
+  agent responder, e então a alocação + load do adapter seguem o fluxo normal.
+  `WAKE_COOLDOWN_S` impede tempestade de startPod (requests concorrentes ou
+  host sem GPU livre — nesse caso tenta as demais pausadas; nenhuma subiu →
+  503 simples, recuperação via `recreateMachine` no painel). Rota que ainda
+  aponta para máquina parada manualmente (stop pelo painel) é liberada
+  (`mark_slot_idle`) e a conta realoca — o restart zera a VRAM de qualquer
+  forma. Religar manualmente pelo painel continua funcionando igual.

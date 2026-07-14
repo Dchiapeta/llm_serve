@@ -139,6 +139,24 @@ class SupaClient:
         r.raise_for_status()
         return r.json()
 
+    async def list_stopped_machines_for_plan(self, plan: str) -> list[dict]:
+        """Máquinas pausadas (stopPod) cujo template serve o plano — candidatas
+        a auto-wake quando chega request e não há capacidade running. O proxy
+        URL do RunPod não muda entre stop/start, então public_url segue válido."""
+        r = await self._rest.get(
+            "/machines",
+            params={
+                "status": "eq.stopped",
+                "public_url": "not.is.null",
+                "runpod_pod_id": "not.is.null",
+                "select": "*,templates!inner(plan)",
+                "templates.plan": f"eq.{plan}",
+                "order": "created_at.asc",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def set_machine_status(self, machine_id: str, status: str) -> None:
         r = await self._rest.patch(
             "/machines",

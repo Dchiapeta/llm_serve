@@ -266,7 +266,8 @@ class LifecycleManager:
 
     async def stop_idle_machines_once(self) -> list[str]:
         """Pausa (stopPod) máquinas running sem nenhuma atividade há
-        machine_idle_stop_minutes e sem rotas ativas. Religar é só manual.
+        machine_idle_stop_minutes e sem rotas ativas. Religar acontece pelo
+        auto-wake do gateway (request sem capacidade) ou manualmente no painel.
         """
         if self.runpod is None or self.machine_idle_stop_minutes <= 0:
             return []

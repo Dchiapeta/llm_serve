@@ -1,8 +1,8 @@
 """
 Cliente mínimo da API REST do RunPod para o gateway (espelho de lib/runpod.ts).
 
-Só o necessário para a auto-pausa por ociosidade: stop_pod. Religar é sempre
-manual pelo painel — start_pod fica de fora de propósito.
+Só o necessário para o lifecycle de máquinas: stop_pod (auto-pausa por
+ociosidade) e start_pod (auto-wake quando chega request sem capacidade).
 """
 
 import httpx
@@ -23,4 +23,12 @@ class RunPodClient:
         r = await self._client.post(f"/pods/{pod_id}/stop")
         if r.status_code >= 400:
             raise RuntimeError(f"RunPod POST /pods/{pod_id}/stop → {r.status_code}: {r.text}")
+        return r.json() if r.content else {}
+
+    async def start_pod(self, pod_id: str) -> dict:
+        # Pode falhar com "not enough free GPUs": pod pausado não reserva GPU
+        # e o host pode tê-la cedido (mesmo caso do startMachine do painel)
+        r = await self._client.post(f"/pods/{pod_id}/start")
+        if r.status_code >= 400:
+            raise RuntimeError(f"RunPod POST /pods/{pod_id}/start → {r.status_code}: {r.text}")
         return r.json() if r.content else {}

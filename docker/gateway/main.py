@@ -18,6 +18,9 @@ Fluxo por request:
      contexto da base de conhecimento (RAG básico do VibeCoder, embeddings
      via OpenAI).
   5. Máquina fora do ar → 503 imediato, nunca pendura o request.
+  6. Sem nenhuma máquina running com vaga → auto-wake: religa (startPod) um
+     pod pausado do template do plano e responde 503 + Retry-After; o retry
+     do cliente aloca normalmente quando o vLLM estiver de pé.
 
 Limitação aceita (MVP): réplica ÚNICA. O contador in-flight e (na Fase 5) o
 idle reaper vivem em memória do processo — múltiplas réplicas cortariam
@@ -68,9 +71,11 @@ IDLE_RELEASE_MINUTES = float(
 )
 MIGRATION_DRAIN_TIMEOUT_S = float(os.environ.get("MIGRATION_DRAIN_TIMEOUT_S", "600"))
 # lifecycle de máquinas: consolidação (esvaziar máquina quase vazia migrando
-# as contas pra outra do mesmo template) e auto-pausa (stopPod) de máquina
-# sem nenhuma atividade. Auto-pausa exige RUNPOD_API_KEY; religar é manual.
+# as contas pra outra do mesmo template), auto-pausa (stopPod) de máquina sem
+# nenhuma atividade e auto-wake (startPod) quando chega request sem nenhuma
+# máquina running com vaga. Ambos exigem RUNPOD_API_KEY.
 MACHINE_IDLE_STOP_MINUTES = float(os.environ.get("MACHINE_IDLE_STOP_MINUTES", "60"))
+WAKE_COOLDOWN_S = float(os.environ.get("WAKE_COOLDOWN_S", "120"))
 CONSOLIDATION_INTERVAL_S = float(os.environ.get("CONSOLIDATION_INTERVAL_S", "300"))
 CONSOLIDATION_MAX_ORIGIN_ROUTES = int(os.environ.get("CONSOLIDATION_MAX_ORIGIN_ROUTES", "2"))
 STOP_RECHECK_GRACE_S = float(os.environ.get("STOP_RECHECK_GRACE_S", "5"))
@@ -97,6 +102,10 @@ in_flight: dict[tuple[str, str], int] = defaultdict(int)
 last_touch: dict[str, float] = {}
 last_machine_touch: dict[str, float] = {}
 
+# última tentativa de auto-wake por máquina — evita tempestade de startPod
+# com requests concorrentes ou falhas repetidas (ex.: host sem GPU livre)
+last_wake_attempt: dict[str, float] = {}
+
 logger = logging.getLogger("gateway")
 
 lifecycle_mgr: "LifecycleManager"
@@ -120,7 +129,9 @@ async def lifespan(app: FastAPI):
         runpod_client = RunPodClient(RUNPOD_API_KEY)
     else:
         runpod_client = None
-        logger.warning("RUNPOD_API_KEY ausente — auto-pausa de máquinas ociosas desligada")
+        logger.warning(
+            "RUNPOD_API_KEY ausente — auto-pausa e auto-wake de máquinas desligados"
+        )
     lifecycle_mgr = LifecycleManager(
         store=store,
         supa=supa,
@@ -216,15 +227,70 @@ async def machine_free_slots(machine: dict) -> int:
     return slots - used
 
 
+async def wake_machine(machine: dict, reason: str) -> bool:
+    """Religa um pod pausado (startPod) e o devolve ao pool de roteamento.
+
+    O touch de atividade vem ANTES do flip para running: sem ele, o
+    last_activity_at velho faria a auto-pausa parar a máquina de novo no
+    próximo ciclo, enquanto o vLLM ainda carrega o modelo."""
+    if runpod_client is None or not machine.get("runpod_pod_id"):
+        return False
+    now = time.time()
+    if now - last_wake_attempt.get(machine["id"], 0) < WAKE_COOLDOWN_S:
+        return False
+    # marca a tentativa antes do primeiro await — atômico dentro do event loop
+    last_wake_attempt[machine["id"]] = now
+    try:
+        await runpod_client.start_pod(machine["runpod_pod_id"])
+    except Exception as e:
+        # ex.: "not enough free GPUs" — host cedeu a GPU; o chamador tenta outra
+        logger.warning("auto-wake: startPod de %s falhou (%s)", machine["id"], e)
+        return False
+    try:
+        await supa.touch_machine_activity(machine["id"])
+    except Exception:
+        pass
+    await supa.set_machine_status(machine["id"], "running")
+    try:
+        await supa.log_machine_event(machine["id"], "started", f"Auto-wake: {reason}")
+    except Exception:
+        pass
+    logger.info(
+        "auto-wake: máquina %s (pod %s) religada — %s",
+        machine["id"], machine["runpod_pod_id"], reason,
+    )
+    return True
+
+
+async def wake_some_machine_for_plan(plan: str) -> bool:
+    """Religa a primeira máquina pausada do template do plano que aceitar o
+    start. Só é chamado quando não há NENHUMA máquina running com vaga."""
+    for m in await supa.list_stopped_machines_for_plan(plan):
+        if await wake_machine(m, "requisição recebida sem máquina disponível"):
+            return True
+    return False
+
+
+def waking_503() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="máquina religando, tente novamente em alguns minutos",
+        headers={"Retry-After": "60"},
+    )
+
+
 async def pick_machine_with_free_slot(plan: str) -> dict:
     """Alocação placeholder: primeira máquina running (do template do plano
-    da conta) com slot LoRA livre."""
+    da conta) com slot LoRA livre. Sem capacidade → tenta religar um pod
+    pausado do plano (auto-wake) antes de desistir."""
     machines = await supa.list_running_machines_for_plan(plan)
-    if not machines:
-        raise HTTPException(status_code=503, detail="nenhuma máquina disponível")
     for m in machines:
         if await machine_free_slots(m) > 0:
             return m
+    if await wake_some_machine_for_plan(plan):
+        raise waking_503()
+    if not machines:
+        raise HTTPException(status_code=503, detail="nenhuma máquina disponível")
     raise HTTPException(status_code=503, detail="sem capacidade: todas as máquinas estão cheias")
 
 
@@ -275,7 +341,16 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
         machine = await supa.get_machine(route["machine_id"])
         if not machine:
             raise HTTPException(status_code=503, detail="máquina da rota não existe mais")
-        return machine, True
+        if machine.get("status") == "stopped":
+            # stop manual pelo painel com a rota ainda apontando pra máquina
+            # (a auto-pausa exige 0 rotas, então nunca cria este estado). O
+            # restart zera a VRAM — o adapter não está mais carregado mesmo —
+            # então libera o slot e cai no fluxo sem-rota: realoca em máquina
+            # running com vaga ou dispara o auto-wake.
+            await store.mark_slot_idle(account_id)
+            route = None
+        else:
+            return machine, True
 
     if route and route["lora_status"] == "loading":
         waited = await wait_until_routed(account_id)
@@ -297,6 +372,8 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
         # cair numa máquina servindo o modelo do Pro/Max, e vice-versa)
         machines = await supa.list_running_machines_for_plan(entry["plan"])
         if not machines:
+            if await wake_some_machine_for_plan(entry["plan"]):
+                raise waking_503()
             raise HTTPException(
                 status_code=503, detail=f"nenhuma máquina disponível para o plano {entry['plan']}"
             )
