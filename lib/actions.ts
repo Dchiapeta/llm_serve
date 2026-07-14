@@ -8,6 +8,7 @@ import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
 import { getClientLocation, setClientLocation } from "./routing"
+import { generateStackSlug, STACK_SLUG_RE } from "./slug"
 import { listGpuTypes, podProxyUrl, runpod } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
 import { TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Template, type TemplatePlan } from "./types"
@@ -508,16 +509,59 @@ export async function terminateMachine(machineId: string) {
 
 // ---------- Contas e chaves ----------
 
-export async function createAccount(formData: FormData) {
+// Cria uma stack (produto/LLM contratado). Se não existir conta com o
+// e-mail, cria a conta junto — o plan da conta nova é o plano da primeira
+// stack; accounts.plan segue alimentando o roteamento e não muda para
+// contas existentes. Retorna o slug final (pode ter sido regenerado em
+// colisão) para o toast exibir.
+export async function createStack(formData: FormData): Promise<{ slug: string }> {
   const db = createSupabaseAdmin()
-  const { error } = await db.from("accounts").insert({
-    name: String(formData.get("name")),
-    email: String(formData.get("email") || "") || null,
-    plan: parsePlan(formData),
-  })
-  if (error) throw new Error(error.message)
-  revalidatePath("/accounts")
-  revalidatePath("/contas")
+  const name = String(formData.get("name") || "").trim()
+  const email = String(formData.get("email") || "").trim().toLowerCase()
+  const plan = parsePlan(formData)
+  const purchaseDate = String(formData.get("purchase_date") || "")
+  let slug = String(formData.get("slug") || "").trim()
+
+  if (!name) throw new Error("Informe o nome do cliente")
+  if (!email) throw new Error("Informe o e-mail do cliente")
+  if (!STACK_SLUG_RE.test(slug)) slug = generateStackSlug()
+
+  // Conta existente por e-mail (case-insensitive); senão cria.
+  const { data: existing } = await db
+    .from("accounts")
+    .select("id")
+    .ilike("email", email)
+    .limit(1)
+    .maybeSingle<{ id: string }>()
+
+  let accountId = existing?.id
+  if (!accountId) {
+    const { data: created, error } = await db
+      .from("accounts")
+      .insert({ name, email, plan })
+      .select("id")
+      .single<{ id: string }>()
+    if (error) throw new Error(error.message)
+    accountId = created.id
+  }
+
+  // Insert com retry: colisão do unique de slug (Postgres 23505) regenera.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const { error } = await db.from("stacks").insert({
+      account_id: accountId,
+      plan,
+      slug,
+      ...(purchaseDate ? { purchase_date: purchaseDate } : {}),
+    })
+    if (!error) {
+      revalidatePath("/contas")
+      revalidatePath("/accounts")
+      return { slug }
+    }
+    if (error.code !== "23505") throw new Error(error.message)
+    slug = generateStackSlug()
+  }
+  throw new Error("Não foi possível gerar um ID único; tente novamente")
 }
 
 // Atualiza plano e/ou system prompt de uma conta já existente.

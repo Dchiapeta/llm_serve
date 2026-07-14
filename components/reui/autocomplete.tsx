@@ -183,6 +183,10 @@ export interface AutocompleteContentProps extends React.ComponentProps<
   side?: AutocompletePrimitive.Positioner.Props["side"]
   anchor?: AutocompletePrimitive.Positioner.Props["anchor"]
   showBackdrop?: boolean
+  // Onde portalizar o popup. Necessário dentro de um Dialog modal do Radix:
+  // o react-remove-scroll aplica pointer-events:none fora do conteúdo do
+  // dialog, então o popup no <body> não recebe cliques.
+  container?: AutocompletePrimitive.Portal.Props["container"]
 }
 
 function AutocompleteContent({
@@ -194,10 +198,11 @@ function AutocompleteContent({
   alignOffset = 0,
   side = "bottom",
   anchor,
+  container,
   ...props
 }: AutocompleteContentProps) {
   return (
-    <AutocompletePortal>
+    <AutocompletePortal container={container}>
       {showBackdrop && <AutocompleteBackdrop />}
       <AutocompletePositioner
         align={align}

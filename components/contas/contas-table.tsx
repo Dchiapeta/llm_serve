@@ -2,8 +2,10 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { ChevronDown, ChevronRight, Copy } from "lucide-react"
+import { toast } from "sonner"
 
-import type { Account, Machine, RoutingState } from "@/lib/types"
+import type { Account, Machine, RoutingState, Stack } from "@/lib/types"
 import {
   Autocomplete,
   AutocompleteContent,
@@ -13,6 +15,7 @@ import {
   AutocompleteList,
 } from "@/components/reui/autocomplete"
 import { Badge } from "@/components/reui/badge"
+import { Button } from "@/components/ui/button"
 import {
   Table,
   TableBody,
@@ -39,6 +42,13 @@ export type ContaRow = {
   hasReadyAdapter: boolean
   knowledgeFiles: { storage_path: string; chunks: number }[]
   tokens: number
+  stacks: Stack[]
+}
+
+// purchase_date é date puro ("YYYY-MM-DD"); anexar meia-noite local evita
+// o off-by-one de fuso ao formatar.
+function formatPurchaseDate(date: string) {
+  return new Date(`${date}T00:00:00`).toLocaleDateString("pt-BR")
 }
 
 export function ContasTable({
@@ -51,6 +61,21 @@ export function ContasTable({
   periodLabel: string
 }) {
   const [query, setQuery] = React.useState("")
+  const [expanded, setExpanded] = React.useState<Set<string>>(new Set())
+
+  function toggleExpanded(accountId: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(accountId)) next.delete(accountId)
+      else next.add(accountId)
+      return next
+    })
+  }
+
+  function copySlug(slug: string) {
+    navigator.clipboard.writeText(slug)
+    toast.success("ID copiado")
+  }
 
   const emailItems = React.useMemo(
     () =>
@@ -70,7 +95,17 @@ export function ContasTable({
 
   return (
     <div className="flex flex-col gap-4">
-      <Autocomplete items={emailItems} value={query} onValueChange={setQuery}>
+      <Autocomplete
+        items={emailItems}
+        value={query}
+        onValueChange={setQuery}
+        // Ao clicar num item, preenche o input com o e-mail (sem isso,
+        // itens {value,label} usariam o label "Nome — e-mail").
+        itemToStringValue={(item) => item.value}
+        filter={(item, q) =>
+          item.label.toLowerCase().includes(q.trim().toLowerCase())
+        }
+      >
         <AutocompleteInput
           placeholder="Buscar por e-mail…"
           showClear
@@ -80,7 +115,7 @@ export function ContasTable({
           <AutocompleteEmpty>Nenhuma conta com esse e-mail.</AutocompleteEmpty>
           <AutocompleteList>
             {(item) => (
-              <AutocompleteItem key={item.value} value={item.value}>
+              <AutocompleteItem key={item.value} value={item}>
                 {item.label}
               </AutocompleteItem>
             )}
@@ -91,6 +126,7 @@ export function ContasTable({
       <Table>
         <TableHeader>
           <TableRow>
+            <TableHead className="w-8" />
             <TableHead>Conta</TableHead>
             <TableHead>Plano</TableHead>
             <TableHead>Máquina atual</TableHead>
@@ -101,7 +137,7 @@ export function ContasTable({
         <TableBody>
           {filteredRows.length === 0 && (
             <TableRow>
-              <TableCell colSpan={5} className="text-center text-muted-foreground">
+              <TableCell colSpan={6} className="text-center text-muted-foreground">
                 {rows.length === 0
                   ? "Nenhuma conta ainda."
                   : "Nenhuma conta encontrada para esse e-mail."}
@@ -109,10 +145,33 @@ export function ContasTable({
             </TableRow>
           )}
           {filteredRows.map(
-            ({ account, route, currentMachine, hasReadyAdapter, knowledgeFiles, tokens }) => (
-            <TableRow key={account.id}>
+            ({ account, route, currentMachine, hasReadyAdapter, knowledgeFiles, tokens, stacks }) => (
+            <React.Fragment key={account.id}>
+            <TableRow>
+              <TableCell className="pr-0">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-6"
+                  onClick={() => toggleExpanded(account.id)}
+                  aria-label={
+                    expanded.has(account.id) ? "Recolher stacks" : "Expandir stacks"
+                  }
+                >
+                  {expanded.has(account.id) ? (
+                    <ChevronDown className="size-4" />
+                  ) : (
+                    <ChevronRight className="size-4" />
+                  )}
+                </Button>
+              </TableCell>
               <TableCell>
-                <p className="text-sm font-medium">{account.name}</p>
+                <div className="flex items-center gap-2">
+                  <p className="text-sm font-medium">{account.name}</p>
+                  <Badge variant="secondary" size="sm">
+                    {stacks.length} stack{stacks.length === 1 ? "" : "s"}
+                  </Badge>
+                </div>
                 {account.email && (
                   <p className="text-xs text-muted-foreground">{account.email}</p>
                 )}
@@ -150,6 +209,56 @@ export function ContasTable({
                 />
               </TableCell>
             </TableRow>
+            {expanded.has(account.id) && (
+              <TableRow className="hover:bg-transparent">
+                <TableCell colSpan={6} className="bg-muted/30 p-0">
+                  {stacks.length === 0 ? (
+                    <p className="px-10 py-3 text-sm text-muted-foreground">
+                      Nenhuma stack.
+                    </p>
+                  ) : (
+                    <Table>
+                      <TableHeader>
+                        <TableRow className="hover:bg-transparent">
+                          <TableHead className="pl-10">Produto</TableHead>
+                          <TableHead>ID (subdomínio)</TableHead>
+                          <TableHead>Data da compra</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {stacks.map((stack) => (
+                          <TableRow key={stack.id} className="hover:bg-transparent">
+                            <TableCell className="pl-10">
+                              <Badge variant={PLAN_BADGE_VARIANT[stack.plan]} size="sm">
+                                {stack.plan}
+                              </Badge>
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex items-center gap-1">
+                                <code className="font-mono text-xs">{stack.slug}</code>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="size-6"
+                                  onClick={() => copySlug(stack.slug)}
+                                  aria-label="Copiar ID"
+                                >
+                                  <Copy className="size-3" />
+                                </Button>
+                              </div>
+                            </TableCell>
+                            <TableCell className="text-sm">
+                              {formatPurchaseDate(stack.purchase_date)}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  )}
+                </TableCell>
+              </TableRow>
+            )}
+            </React.Fragment>
             )
           )}
         </TableBody>

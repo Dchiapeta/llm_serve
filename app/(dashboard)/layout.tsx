@@ -1,15 +1,20 @@
-import { Cpu, LogOut } from "lucide-react"
+import { Cpu } from "lucide-react"
 
-import { logout } from "@/lib/actions"
-import { Button } from "@/components/ui/button"
+import { createSupabaseServerClient } from "@/lib/supabase/server"
 import { Separator } from "@/components/ui/separator"
 import { SidebarNav } from "@/components/dashboard/sidebar-nav"
+import { SidebarUserMenu } from "@/components/dashboard/sidebar-user-menu"
 
-export default function DashboardLayout({
+export default async function DashboardLayout({
   children,
 }: {
   children: React.ReactNode
 }) {
+  const supabase = await createSupabaseServerClient()
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
   return (
     <div className="flex min-h-screen">
       <aside className="fixed inset-y-0 left-0 z-30 flex w-60 flex-col border-r bg-background p-4">
@@ -26,12 +31,7 @@ export default function DashboardLayout({
         <SidebarNav />
         <div className="mt-auto">
           <Separator className="my-3" />
-          <form action={logout}>
-            <Button variant="ghost" className="w-full justify-start gap-3" type="submit">
-              <LogOut className="size-4" />
-              Sair
-            </Button>
-          </form>
+          <SidebarUserMenu email={user?.email ?? "Conta"} />
         </div>
       </aside>
       <main className="ml-60 flex-1 p-6 lg:p-8">{children}</main>

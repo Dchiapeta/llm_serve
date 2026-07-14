@@ -55,6 +55,18 @@ export type Account = {
   created_at: string
 }
 
+// Stack = um produto/LLM contratado por uma conta. Uma conta pode ter várias.
+// slug é o subdomínio de acesso do cliente ao manager (roteamento por
+// subdomínio ainda não implementado).
+export type Stack = {
+  id: string
+  account_id: string
+  plan: TemplatePlan
+  purchase_date: string // date "YYYY-MM-DD"
+  slug: string
+  created_at: string
+}
+
 // Chunk de texto da base de conhecimento (RAG) de uma conta, com embedding
 // já calculado (OpenAI text-embedding-3-small, 1536 dimensões).
 export type KnowledgeChunk = {

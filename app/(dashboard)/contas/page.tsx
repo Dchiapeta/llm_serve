@@ -2,7 +2,7 @@ import { KeyRound, Server, ServerCog, Users } from "lucide-react"
 import Link from "next/link"
 
 import { createSupabaseAdmin } from "@/lib/supabase/server"
-import type { Account, ApiKey, LoraAdapter, Machine, RoutingState } from "@/lib/types"
+import type { Account, ApiKey, LoraAdapter, Machine, RoutingState, Stack } from "@/lib/types"
 import {
   Card,
   CardContent,
@@ -10,7 +10,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { CreateAccountDialog } from "@/components/accounts/create-account-dialog"
+import { CreateStackDialog } from "@/components/contas/create-stack-dialog"
 import { ContasTable, type ContaRow } from "@/components/contas/contas-table"
 
 export const dynamic = "force-dynamic"
@@ -45,6 +45,7 @@ export default async function ContasPage({
     { data: keysData },
     { data: usageData },
     { data: knowledgeData },
+    { data: stacksData },
   ] = await Promise.all([
     db.from("accounts").select("*").order("name"),
     db.from("machines").select("*").neq("status", "terminated"),
@@ -56,6 +57,7 @@ export default async function ContasPage({
       .select("api_key_id, tokens_in, tokens_out, window_start")
       .gte("window_start", periodStart),
     db.from("knowledge_chunks").select("account_id, storage_path"),
+    db.from("stacks").select("*").order("created_at"),
   ])
 
   const accounts = (accountsData ?? []) as Account[]
@@ -73,6 +75,15 @@ export default async function ContasPage({
     account_id: string
     storage_path: string
   }[]
+
+  const stacks = (stacksData ?? []) as Stack[]
+
+  const stacksByAccount = new Map<string, Stack[]>()
+  for (const stack of stacks) {
+    const list = stacksByAccount.get(stack.account_id) ?? []
+    list.push(stack)
+    stacksByAccount.set(stack.account_id, list)
+  }
 
   const machineById = new Map(machines.map((m) => [m.id, m]))
   const routeByAccount = new Map(routes.map((r) => [r.account_id, r]))
@@ -128,6 +139,7 @@ export default async function ContasPage({
       hasReadyAdapter: readyAdapterAccounts.has(account.id),
       knowledgeFiles,
       tokens: tokensByAccount.get(account.id) ?? 0,
+      stacks: stacksByAccount.get(account.id) ?? [],
     }
   })
 
@@ -140,7 +152,7 @@ export default async function ContasPage({
             Contas, alocação de máquina e consumo de tokens
           </p>
         </div>
-        <CreateAccountDialog />
+        <CreateStackDialog accounts={accounts} />
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
