@@ -5,13 +5,19 @@ conhece. Resolve em qual máquina está o adapter LoRA da conta e faz o proxy
 qual pod está.
 
 Fluxo por request:
-  1. Autentica a chave HEX (Bearer) contra api_keys no Supabase (cache TTL).
+  1. Autentica a chave HEX (Bearer) contra api_keys no Supabase (cache TTL),
+     junto com o plano e o system_prompt configurado da conta.
   2. Resolve a rota (routing_state). Regra primária: machine_id definido →
      proxy direto, independente do status (em 'migrating' a origem segue
-     servindo até o flip). Só espera quando não há máquina servindo.
+     servindo até o flip). Só espera quando não há máquina servindo. Sem
+     adapter, a alocação é restrita às máquinas do template do plano da
+     conta (accounts.plan) — nunca cai no modelo base de outro plano.
   3. Sem rota: alocação placeholder (primeira máquina running com slot livre),
      claim atômico, upsert da chave no agent, load do adapter, proxy.
-  4. Máquina fora do ar → 503 imediato, nunca pendura o request.
+  4. Injeta no body (chat completions): system prompt da conta + top-k de
+     contexto da base de conhecimento (RAG básico do VibeCoder, embeddings
+     via OpenAI).
+  5. Máquina fora do ar → 503 imediato, nunca pendura o request.
 
 Limitação aceita (MVP): réplica ÚNICA. O contador in-flight e (na Fase 5) o
 idle reaper vivem em memória do processo — múltiplas réplicas cortariam
@@ -41,6 +47,11 @@ KEY_CACHE_TTL_S = float(os.environ.get("KEY_CACHE_TTL_S", "60"))
 KEY_CACHE_NEGATIVE_TTL_S = 5.0
 LORA_LOAD_TIMEOUT_S = float(os.environ.get("LORA_LOAD_TIMEOUT_S", "120"))
 LORA_BUCKET = os.environ.get("LORA_BUCKET", "loras")
+# embeddings do RAG (VibeCoder) — mesmo modelo/dimensão usado na indexação
+# pelo painel (lib/actions.ts), senão a similaridade de cosseno não faz sentido
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "4"))
 # teto de adapters por máquina usado na alocação placeholder; a Fase 6 troca
 # isso pelo cálculo de capacidade por VRAM (machine_lora_slots)
 MAX_LORAS_PER_MACHINE = int(os.environ.get("MAX_LORAS_PER_MACHINE", "8"))
@@ -58,6 +69,8 @@ store: RoutingStore
 # proxy para os agents: connect curto (máquina fora do ar → 503 rápido),
 # read longo (streams de inferência podem durar minutos)
 proxy_client: httpx.AsyncClient
+# client curto pra API de embeddings da OpenAI (RAG do VibeCoder)
+openai_client: httpx.AsyncClient
 
 # cache de chaves: key_hash -> (entry | None, expira_em)
 key_cache: dict[str, tuple[dict | None, float]] = {}
@@ -75,11 +88,16 @@ lifecycle_mgr: "LifecycleManager"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supa, store, proxy_client, lifecycle_mgr
+    global supa, store, proxy_client, openai_client, lifecycle_mgr
     supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
     proxy_client = httpx.AsyncClient(
         timeout=httpx.Timeout(600.0, connect=5.0)
+    )
+    openai_client = httpx.AsyncClient(
+        base_url="https://api.openai.com/v1",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        timeout=httpx.Timeout(20.0, connect=5.0),
     )
     lifecycle_mgr = LifecycleManager(
         store=store,
@@ -94,6 +112,7 @@ async def lifespan(app: FastAPI):
     yield
     reaper_task.cancel()
     await proxy_client.aclose()
+    await openai_client.aclose()
     await store.aclose()
     await supa.aclose()
 
@@ -151,14 +170,15 @@ async def call_agent(machine: dict, path: str, body: dict, timeout_s: float = 30
     return r.json()
 
 
-async def pick_machine_with_free_slot() -> dict:
-    """Alocação placeholder: primeira máquina running com slot LoRA livre.
+async def pick_machine_with_free_slot(plan: str) -> dict:
+    """Alocação placeholder: primeira máquina running (do template do plano
+    da conta) com slot LoRA livre.
 
     Slots por VRAM via machine_lora_slots() (mesma fórmula do painel);
     MAX_LORAS_PER_MACHINE atua como teto (espelho do --max-loras do pod) e
     como fallback quando a capacidade é desconhecida (sem VRAM/template).
     """
-    machines = await supa.list_running_machines()
+    machines = await supa.list_running_machines_for_plan(plan)
     if not machines:
         raise HTTPException(status_code=503, detail="nenhuma máquina disponível")
     for m in machines:
@@ -234,13 +254,17 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
     # sem rota ativa: conta tem adapter?
     adapter = await supa.latest_ready_adapter(account_id)
     if not adapter:
-        # sem adapter registrado → serve o modelo base em qualquer máquina
-        machines = await supa.list_running_machines()
+        # sem adapter registrado → serve o modelo base, mas só numa máquina
+        # do template compatível com o plano da conta (VibeCoder não pode
+        # cair numa máquina servindo o modelo do Pro/Max, e vice-versa)
+        machines = await supa.list_running_machines_for_plan(entry["plan"])
         if not machines:
-            raise HTTPException(status_code=503, detail="nenhuma máquina disponível")
+            raise HTTPException(
+                status_code=503, detail=f"nenhuma máquina disponível para o plano {entry['plan']}"
+            )
         return machines[0], False
 
-    machine = await pick_machine_with_free_slot()
+    machine = await pick_machine_with_free_slot(entry["plan"])
     result = await store.claim_client_location(account_id, machine["id"])
     if not result["claimed"]:
         # outro request venceu a corrida — espera o load dele
@@ -279,6 +303,54 @@ async def maybe_touch(account_id: str):
             pass  # touch é best-effort, nunca derruba o request
 
 
+async def embed_query(text: str) -> list[float] | None:
+    """Embedding da última mensagem do usuário, pro retrieval do RAG.
+    None em qualquer falha (sem OPENAI_API_KEY, API fora do ar, etc.) —
+    RAG é best-effort, nunca derruba o request de inferência."""
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        r = await openai_client.post(
+            "/embeddings", json={"model": EMBEDDING_MODEL, "input": text}
+        )
+        r.raise_for_status()
+        return r.json()["data"][0]["embedding"]
+    except Exception:
+        return None
+
+
+async def augment_body(body_json: dict, entry: dict) -> dict:
+    """Injeta system prompt configurado da conta e contexto de RAG (top-k da
+    base de conhecimento) antes de repassar ao vLLM. Só se aplica a chamadas
+    de chat completions (body com "messages")."""
+    messages = body_json.get("messages")
+    if not isinstance(messages, list):
+        return body_json
+
+    if entry.get("system_prompt"):
+        messages.insert(0, {"role": "system", "content": entry["system_prompt"]})
+
+    last_user = next(
+        (m for m in reversed(messages) if m.get("role") == "user"), None
+    )
+    if last_user and isinstance(last_user.get("content"), str):
+        embedding = await embed_query(last_user["content"])
+        if embedding:
+            chunks = await supa.match_knowledge_chunks(
+                entry["account_id"], embedding, RAG_TOP_K
+            )
+            if chunks:
+                context_msg = {
+                    "role": "system",
+                    "content": "Contexto relevante da base de conhecimento:\n"
+                    + "\n---\n".join(chunks),
+                }
+                messages.insert(messages.index(last_user), context_msg)
+
+    body_json["messages"] = messages
+    return body_json
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request, authorization: str | None = Header(None)):
     entry = await authenticate(authorization)
@@ -288,12 +360,16 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     await maybe_touch(account_id)
 
     body = await request.body()
-    if rewrite_model and body:
+    if body:
         try:
             body_json = json.loads(body)
-            if "model" in body_json:
+            if rewrite_model and "model" in body_json:
                 body_json["model"] = lora_name(account_id)
-                body = json.dumps(body_json).encode()
+            # augment_body é no-op se a conta não tem system_prompt nem
+            # chunks indexados — sempre tentar é mais simples do que checar
+            # plano aqui (a mesma injeção serve VibeCoder/Pro/Max igual)
+            body_json = await augment_body(body_json, entry)
+            body = json.dumps(body_json).encode()
         except Exception:
             pass  # body não-JSON segue como está
 

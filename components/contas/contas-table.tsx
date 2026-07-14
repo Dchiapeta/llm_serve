@@ -23,11 +23,21 @@ import {
 } from "@/components/ui/table"
 import { ContaRowActions } from "@/components/contas/conta-row-actions"
 
+// Cor do badge por plano de produto — mantém a mesma paleta usada em
+// components/templates para o plano do template.
+const PLAN_BADGE_VARIANT: Record<Account["plan"], "secondary" | "info-light" | "success-light" | "warning-light"> = {
+  VibeCoder: "secondary",
+  Pro: "info-light",
+  Max: "success-light",
+  Enterprise: "warning-light",
+}
+
 export type ContaRow = {
   account: Account
   route: RoutingState | undefined
   currentMachine: Pick<Machine, "id" | "name"> | undefined
-  plan: "Básico" | "Avançado"
+  hasReadyAdapter: boolean
+  knowledgeFiles: { storage_path: string; chunks: number }[]
   tokens: number
 }
 
@@ -98,7 +108,8 @@ export function ContasTable({
               </TableCell>
             </TableRow>
           )}
-          {filteredRows.map(({ account, route, currentMachine, plan, tokens }) => (
+          {filteredRows.map(
+            ({ account, route, currentMachine, hasReadyAdapter, knowledgeFiles, tokens }) => (
             <TableRow key={account.id}>
               <TableCell>
                 <p className="text-sm font-medium">{account.name}</p>
@@ -107,8 +118,8 @@ export function ContasTable({
                 )}
               </TableCell>
               <TableCell>
-                <Badge variant={plan === "Avançado" ? "info-light" : "secondary"} size="sm">
-                  {plan}
+                <Badge variant={PLAN_BADGE_VARIANT[account.plan]} size="sm">
+                  {account.plan}
                 </Badge>
               </TableCell>
               <TableCell>
@@ -131,15 +142,16 @@ export function ContasTable({
                   account={account}
                   route={route}
                   currentMachineName={currentMachine?.name}
-                  plan={plan}
                   eligibleMachines={runningMachines.filter(
                     (m) => m.id !== route?.machine_id
                   )}
-                  hasReadyAdapter={plan === "Avançado"}
+                  hasReadyAdapter={hasReadyAdapter}
+                  knowledgeFiles={knowledgeFiles}
                 />
               </TableCell>
             </TableRow>
-          ))}
+            )
+          )}
         </TableBody>
       </Table>
     </div>

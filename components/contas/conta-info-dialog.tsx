@@ -10,14 +10,12 @@ export function ContaInfoDialog({
   account,
   route,
   currentMachineName,
-  plan,
   open,
   onOpenChange,
 }: {
   account: Account
   route: RoutingState | undefined
   currentMachineName: string | undefined
-  plan: "Básico" | "Avançado"
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
@@ -36,8 +34,8 @@ export function ContaInfoDialog({
 
           <dt className="text-muted-foreground">Plano</dt>
           <dd>
-            <Badge variant={plan === "Avançado" ? "info-light" : "secondary"} size="sm">
-              {plan}
+            <Badge variant="secondary" size="sm">
+              {account.plan}
             </Badge>
           </dd>
 
@@ -57,6 +55,15 @@ export function ContaInfoDialog({
           <dt className="text-muted-foreground">Conta criada em</dt>
           <dd>{new Date(account.created_at).toLocaleString("pt-BR")}</dd>
         </dl>
+
+        {account.system_prompt && (
+          <div className="text-sm">
+            <p className="text-muted-foreground mb-1">System prompt</p>
+            <p className="max-h-32 overflow-y-auto rounded-md border p-2 whitespace-pre-wrap">
+              {account.system_prompt}
+            </p>
+          </div>
+        )}
       </DialogContent>
     </Dialog>
   )

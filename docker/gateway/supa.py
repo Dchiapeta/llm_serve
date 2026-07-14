@@ -45,13 +45,14 @@ class SupaClient:
     # ---------- api_keys ----------
 
     async def find_active_key(self, key_hash: str) -> dict | None:
-        """Retorna {account_id, key_prefix, account_name} da chave ativa, ou None."""
+        """Retorna {account_id, key_prefix, account_name, plan, system_prompt}
+        da chave ativa, ou None."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
-                "select": "account_id,key_prefix,key_hash,accounts(name)",
+                "select": "account_id,key_prefix,key_hash,accounts(name,plan,system_prompt)",
                 "limit": "1",
             },
         )
@@ -60,11 +61,14 @@ class SupaClient:
         if not rows:
             return None
         row = rows[0]
+        account = row.get("accounts") or {}
         return {
             "account_id": row["account_id"],
             "key_prefix": row["key_prefix"],
             "key_hash": row["key_hash"],
-            "account_name": (row.get("accounts") or {}).get("name", "?"),
+            "account_name": account.get("name", "?"),
+            "plan": account.get("plan", "VibeCoder"),
+            "system_prompt": account.get("system_prompt"),
         }
 
     async def list_active_keys_for_account(self, account_id: str) -> list[dict]:
@@ -105,6 +109,28 @@ class SupaClient:
                 "status": "eq.running",
                 "public_url": "not.is.null",
                 "select": "*",
+                "order": "created_at.asc",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def list_running_machines_for_plan(self, plan: str) -> list[dict]:
+        """Máquinas running cujo template serve o plano da conta.
+
+        Sem este filtro, uma conta sem adapter cairia em QUALQUER máquina
+        running (ver list_running_machines) — inofensivo com um único
+        modelo base em produção, mas quebra assim que existir mais de um
+        template/modelo simultâneo (ex: VibeCoder em Qwen3.5-9B e Pro/Max em
+        Qwen3.6-35B). O join usa a FK machines.template_id → templates.id.
+        """
+        r = await self._rest.get(
+            "/machines",
+            params={
+                "status": "eq.running",
+                "public_url": "not.is.null",
+                "select": "*,templates!inner(plan)",
+                "templates.plan": f"eq.{plan}",
                 "order": "created_at.asc",
             },
         )
@@ -172,6 +198,24 @@ class SupaClient:
             json={"status": "invalid"},
         )
         r.raise_for_status()
+
+    # ---------- knowledge_chunks (RAG) ----------
+
+    async def match_knowledge_chunks(
+        self, account_id: str, query_embedding: list[float], top_k: int = 4
+    ) -> list[str]:
+        """Top-k chunks da base de conhecimento da conta por similaridade de
+        cosseno (RPC match_knowledge_chunks, mesma função usada pelo painel)."""
+        r = await self._rest.post(
+            "/rpc/match_knowledge_chunks",
+            json={
+                "p_account_id": account_id,
+                "p_query_embedding": query_embedding,
+                "p_top_k": top_k,
+            },
+        )
+        r.raise_for_status()
+        return [row["content"] for row in r.json()]
 
     # ---------- storage (signed URLs) ----------
 

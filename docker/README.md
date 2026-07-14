@@ -21,6 +21,7 @@ docker push SEU_USUARIO/vllm-agent:latest
 | -------------------- | ----------- | -------------------------------------------- |
 | `MODEL_NAME`         | sim         | Modelo HF servido pelo vLLM                  |
 | `AGENT_ADMIN_SECRET` | sim         | Secret que o painel usa nas rotas `/admin/*` |
+| `GPU_COUNT`          | não         | Nº de GPUs do pod (default 1). >1 liga `--tensor-parallel-size` automaticamente |
 | `VLLM_EXTRA_ARGS`    | não         | Args extras do vLLM (ex: `--max-model-len 8192`) |
 | `HF_TOKEN`           | não         | Token HuggingFace para modelos gated         |
 | `ENABLE_LORA`        | não         | `true` habilita multi-LoRA dinâmico (default `false`) |
@@ -28,8 +29,9 @@ docker push SEU_USUARIO/vllm-agent:latest
 | `MAX_LORA_RANK`      | não         | Rank máximo aceito nos adapters (default 64; o vLLM 0.24 só aceita 1, 8, 16, 32, 64, 128, 256, 320 ou 512) |
 | `LORA_DIR`           | não         | Diretório local dos adapters baixados (default `/workspace/loras`) |
 
-O painel injeta `MODEL_NAME` e `AGENT_ADMIN_SECRET` automaticamente ao criar a
-máquina a partir de um template. Com `ENABLE_LORA=true`, o entrypoint exporta
+O painel injeta `MODEL_NAME`, `AGENT_ADMIN_SECRET` e `GPU_COUNT` (a partir de
+`templates.gpu_count`) automaticamente ao criar a máquina a partir de um
+template. Com `ENABLE_LORA=true`, o entrypoint exporta
 `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True` e sobe o vLLM com
 `--enable-lora --max-loras --max-lora-rank`, permitindo carregar/descarregar
 adapters em runtime sem reiniciar o pod.

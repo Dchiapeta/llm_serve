@@ -44,6 +44,7 @@ export default async function ContasPage({
     { data: lorasData },
     { data: keysData },
     { data: usageData },
+    { data: knowledgeData },
   ] = await Promise.all([
     db.from("accounts").select("*").order("name"),
     db.from("machines").select("*").neq("status", "terminated"),
@@ -54,6 +55,7 @@ export default async function ContasPage({
       .from("usage_metrics")
       .select("api_key_id, tokens_in, tokens_out, window_start")
       .gte("window_start", periodStart),
+    db.from("knowledge_chunks").select("account_id, storage_path"),
   ])
 
   const accounts = (accountsData ?? []) as Account[]
@@ -66,6 +68,10 @@ export default async function ContasPage({
     tokens_in: number
     tokens_out: number
     window_start: string
+  }[]
+  const knowledgeChunks = (knowledgeData ?? []) as {
+    account_id: string
+    storage_path: string
   }[]
 
   const machineById = new Map(machines.map((m) => [m.id, m]))
@@ -86,6 +92,13 @@ export default async function ContasPage({
     loras.filter((l) => l.status === "ready").map((l) => l.account_id)
   )
 
+  const knowledgeFilesByAccount = new Map<string, Map<string, number>>()
+  for (const chunk of knowledgeChunks) {
+    const byPath = knowledgeFilesByAccount.get(chunk.account_id) ?? new Map()
+    byPath.set(chunk.storage_path, (byPath.get(chunk.storage_path) ?? 0) + 1)
+    knowledgeFilesByAccount.set(chunk.account_id, byPath)
+  }
+
   const runningMachines = machines.filter((m) => m.status === "running")
   const activeMachines = machines.filter((m) =>
     ["running", "stopped"].includes(m.status)
@@ -104,11 +117,16 @@ export default async function ContasPage({
   const rows: ContaRow[] = accounts.map((account) => {
     const route = routeByAccount.get(account.id)
     const currentMachine = route?.machine_id ? machineById.get(route.machine_id) : undefined
+    const knowledgeFiles = Array.from(
+      knowledgeFilesByAccount.get(account.id) ?? [],
+      ([storage_path, chunks]) => ({ storage_path, chunks })
+    )
     return {
       account,
       route,
       currentMachine,
-      plan: readyAdapterAccounts.has(account.id) ? "Avançado" : "Básico",
+      hasReadyAdapter: readyAdapterAccounts.has(account.id),
+      knowledgeFiles,
       tokens: tokensByAccount.get(account.id) ?? 0,
     }
   })

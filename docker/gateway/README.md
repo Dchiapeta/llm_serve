@@ -24,10 +24,18 @@ cliente → gateway (:8080) → agent do pod (:8000) → vLLM (:8001)
   `loaded`. Falha no load → slot liberado + 503. A Fase 6 troca o teto fixo
   pelo cálculo por VRAM.
 - **Conta sem adapter registrado**: roteia para o modelo base (sem reescrever
-  `model`) na primeira máquina running.
+  `model`) na primeira máquina running **do template compatível com o plano
+  da conta** (`accounts.plan` × `templates.plan`) — necessário desde que
+  existe mais de um modelo base em produção (VibeCoder × Pro/Max).
 - **Proxy**: reescreve `body.model = "acct-{account_id}"` quando o adapter
   está ativo e repassa a Bearer original — o agent continua validando e
   contando uso por chave. Máquina fora do ar → 503 imediato (connect 5s).
+- **System prompt + RAG**: em chat completions, injeta o `system_prompt`
+  configurado da conta como primeira mensagem e, se a conta tiver arquivos
+  indexados na base de conhecimento, embeda a última mensagem do usuário
+  (OpenAI `text-embedding-3-small`) e injeta o top-k mais similar
+  (`match_knowledge_chunks`) como contexto antes da mensagem do usuário.
+  Best-effort: falha na API de embeddings não derruba o request.
 
 ## Limitação aceita: réplica única
 
@@ -53,6 +61,9 @@ advisory lock.
 | `LOAD_WAIT_TIMEOUT_S`     | não         | Espera por load de outro request (default 20)    |
 | `IDLE_UNLOAD_MINUTES`     | não         | Ociosidade até o unload do adapter (default 30; 0 desliga o reaper) |
 | `MIGRATION_DRAIN_TIMEOUT_S` | não       | Espera máx. pelos streams da origem na migração (default 600) |
+| `OPENAI_API_KEY`          | não*        | Embeddings do RAG — sem ela, a injeção de contexto é pulada (best-effort) |
+| `EMBEDDING_MODEL`         | não         | Modelo de embedding (default `text-embedding-3-small`, precisa bater com a indexação do painel) |
+| `RAG_TOP_K`               | não         | Quantidade de chunks injetados como contexto (default 4)       |
 
 ## Rodar local
 

@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { ArrowRightLeft, Info, MoreVertical } from "lucide-react"
+import { ArrowRightLeft, BookOpen, Info, MoreVertical, Settings } from "lucide-react"
 
 import type { Account, Machine, RoutingState } from "@/lib/types"
 import { Button } from "@/components/ui/button"
@@ -12,24 +12,28 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { ContaInfoDialog } from "@/components/contas/conta-info-dialog"
+import { EditAccountConfigDialog } from "@/components/contas/edit-account-config-dialog"
+import { KnowledgeFilesDialog } from "@/components/contas/knowledge-files-dialog"
 import { MigrateAccountDialog } from "@/components/contas/migrate-account-dialog"
 
 export function ContaRowActions({
   account,
   route,
   currentMachineName,
-  plan,
   eligibleMachines,
   hasReadyAdapter,
+  knowledgeFiles,
 }: {
   account: Account
   route: RoutingState | undefined
   currentMachineName: string | undefined
-  plan: "Básico" | "Avançado"
   eligibleMachines: Machine[]
   hasReadyAdapter: boolean
+  knowledgeFiles: { storage_path: string; chunks: number }[]
 }) {
   const [infoOpen, setInfoOpen] = React.useState(false)
+  const [configOpen, setConfigOpen] = React.useState(false)
+  const [knowledgeOpen, setKnowledgeOpen] = React.useState(false)
   const [migrateOpen, setMigrateOpen] = React.useState(false)
 
   return (
@@ -49,6 +53,14 @@ export function ContaRowActions({
             <Info className="size-4" />
             Info
           </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setConfigOpen(true)}>
+            <Settings className="size-4" />
+            Plano / system prompt
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setKnowledgeOpen(true)}>
+            <BookOpen className="size-4" />
+            Base de conhecimento
+          </DropdownMenuItem>
           <DropdownMenuItem
             disabled={!hasReadyAdapter}
             onSelect={() => setMigrateOpen(true)}
@@ -63,9 +75,27 @@ export function ContaRowActions({
         account={account}
         route={route}
         currentMachineName={currentMachineName}
-        plan={plan}
         open={infoOpen}
         onOpenChange={setInfoOpen}
+      />
+
+      {/* key força remount a cada abertura: reseta o form pros valores
+          atuais da conta em vez de arrastar o que sobrou de uma edição
+          anterior cancelada, sem precisar sincronizar via effect */}
+      <EditAccountConfigDialog
+        key={configOpen ? "config-open" : "config-closed"}
+        account={account}
+        open={configOpen}
+        onOpenChange={setConfigOpen}
+      />
+
+      <KnowledgeFilesDialog
+        key={knowledgeOpen ? "knowledge-open" : "knowledge-closed"}
+        accountId={account.id}
+        accountName={account.name}
+        initialFiles={knowledgeFiles}
+        open={knowledgeOpen}
+        onOpenChange={setKnowledgeOpen}
       />
 
       <MigrateAccountDialog

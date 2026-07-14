@@ -396,6 +396,7 @@ export async function createMachine(formData: FormData) {
         ...tpl.env,
         MODEL_NAME: tpl.model_name,
         AGENT_ADMIN_SECRET: adminSecret,
+        GPU_COUNT: String(gpuCount),
         ...(maxUsers !== null ? { MAX_USERS: String(maxUsers) } : {}),
       },
     })
@@ -512,8 +513,28 @@ export async function createAccount(formData: FormData) {
   const { error } = await db.from("accounts").insert({
     name: String(formData.get("name")),
     email: String(formData.get("email") || "") || null,
+    plan: parsePlan(formData),
   })
   if (error) throw new Error(error.message)
+  revalidatePath("/accounts")
+  revalidatePath("/contas")
+}
+
+// Atualiza plano e/ou system prompt de uma conta já existente.
+export async function updateAccountConfig(formData: FormData) {
+  const db = createSupabaseAdmin()
+  const accountId = String(formData.get("account_id"))
+  if (!accountId) throw new Error("Conta não informada")
+
+  const plan = parsePlan(formData)
+  const systemPrompt = String(formData.get("system_prompt") || "").trim() || null
+
+  const { error } = await db
+    .from("accounts")
+    .update({ plan, system_prompt: systemPrompt })
+    .eq("id", accountId)
+  if (error) throw new Error(error.message)
+  revalidatePath("/contas")
   revalidatePath("/accounts")
 }
 
@@ -768,6 +789,122 @@ export async function syncMachineKeys(machineId: string) {
 
   await agent.syncKeys(m, entries)
   await logEvent(machineId, "sync", `${entries.length} chave(s) sincronizada(s) com o agent`)
+}
+
+// ---------- Base de conhecimento (RAG) ----------
+
+// Bucket privado no Supabase Storage onde os arquivos crus da base de
+// conhecimento ficam armazenados. Convenção de path: {account_id}/{filename}
+const KNOWLEDGE_BUCKET = "knowledge"
+
+// Modelo de embedding da OpenAI usado tanto aqui (indexação) quanto no
+// gateway (embed da query) — precisam ser o mesmo modelo/dimensão (1536).
+const EMBEDDING_MODEL = "text-embedding-3-small"
+
+// Chunking fixo por tamanho de caractere com overlap — suficiente para o
+// RAG básico do VibeCoder; nada de chunking semântico/estrutural por ora.
+const CHUNK_SIZE = 1000
+const CHUNK_OVERLAP = 100
+
+function chunkText(text: string): string[] {
+  const chunks: string[] = []
+  let start = 0
+  while (start < text.length) {
+    const end = Math.min(start + CHUNK_SIZE, text.length)
+    const chunk = text.slice(start, end).trim()
+    if (chunk) chunks.push(chunk)
+    if (end === text.length) break
+    start = end - CHUNK_OVERLAP
+  }
+  return chunks
+}
+
+async function embedTexts(texts: string[]): Promise<number[][]> {
+  const apiKey = process.env.OPENAI_API_KEY
+  if (!apiKey) throw new Error("OPENAI_API_KEY não configurada")
+
+  const resp = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ model: EMBEDDING_MODEL, input: texts }),
+  })
+  if (!resp.ok) {
+    throw new Error(`Falha ao gerar embeddings: ${resp.status} ${await resp.text()}`)
+  }
+  const data = (await resp.json()) as { data: { embedding: number[] }[] }
+  return data.data.map((d) => d.embedding)
+}
+
+// Sobe um arquivo de texto pro bucket de conhecimento, chunka e indexa os
+// embeddings — só texto puro/Markdown (sem parsing de PDF/DOCX nesta rodada).
+export async function uploadKnowledgeFile(formData: FormData) {
+  const db = createSupabaseAdmin()
+  const accountId = String(formData.get("account_id"))
+  const file = formData.get("file")
+  if (!accountId) throw new Error("Conta não informada")
+  if (!(file instanceof File) || file.size === 0) throw new Error("Arquivo não informado")
+  if (!/\.(txt|md)$/i.test(file.name)) {
+    throw new Error("Só arquivos .txt ou .md são aceitos por enquanto")
+  }
+
+  const text = await file.text()
+  const chunks = chunkText(text)
+  if (chunks.length === 0) throw new Error("Arquivo vazio")
+
+  const storagePath = `${accountId}/${file.name}`
+  const { error: uploadErr } = await db.storage
+    .from(KNOWLEDGE_BUCKET)
+    .upload(storagePath, file, { upsert: true, contentType: "text/plain" })
+  if (uploadErr) throw new Error(`Falha ao subir arquivo: ${uploadErr.message}`)
+
+  const embeddings = await embedTexts(chunks)
+
+  // substitui qualquer indexação anterior deste mesmo arquivo
+  await db.from("knowledge_chunks").delete().eq("storage_path", storagePath)
+  const { error: insertErr } = await db.from("knowledge_chunks").insert(
+    chunks.map((content, i) => ({
+      account_id: accountId,
+      storage_path: storagePath,
+      chunk_index: i,
+      content,
+      embedding: embeddings[i],
+    }))
+  )
+  if (insertErr) throw new Error(`Falha ao indexar chunks: ${insertErr.message}`)
+
+  revalidatePath("/contas")
+}
+
+export async function listKnowledgeFiles(
+  accountId: string
+): Promise<{ storage_path: string; chunks: number }[]> {
+  const db = createSupabaseAdmin()
+  const { data, error } = await db
+    .from("knowledge_chunks")
+    .select("storage_path")
+    .eq("account_id", accountId)
+  if (error) throw new Error(error.message)
+
+  const counts = new Map<string, number>()
+  for (const row of data ?? []) {
+    counts.set(row.storage_path, (counts.get(row.storage_path) ?? 0) + 1)
+  }
+  return Array.from(counts, ([storage_path, chunks]) => ({ storage_path, chunks }))
+}
+
+export async function deleteKnowledgeFile(accountId: string, storagePath: string) {
+  const db = createSupabaseAdmin()
+  await db.storage.from(KNOWLEDGE_BUCKET).remove([storagePath])
+  const { error } = await db
+    .from("knowledge_chunks")
+    .delete()
+    .eq("account_id", accountId)
+    .eq("storage_path", storagePath)
+  if (error) throw new Error(error.message)
+  revalidatePath("/contas")
 }
 
 // ---------- Migração de conta ----------

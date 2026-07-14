@@ -8,6 +8,16 @@ VLLM_PORT="${VLLM_PORT:-8001}"
 AGENT_PORT="${AGENT_PORT:-8000}"
 VLLM_LOG_FILE="${VLLM_LOG_FILE:-/var/log/vllm.log}"
 
+# GPU_COUNT é injetada pelo painel a partir de templates.gpu_count. >1 liga
+# tensor parallelism automaticamente — sem isso o vLLM só enxergava a GPU 0
+# mesmo em pods com múltiplas GPUs.
+GPU_COUNT="${GPU_COUNT:-1}"
+TP_ARGS=""
+if [ "${GPU_COUNT}" -gt 1 ] 2>/dev/null; then
+  TP_ARGS="--tensor-parallel-size ${GPU_COUNT}"
+  echo "[entrypoint] tensor parallelism habilitado (${TP_ARGS})"
+fi
+
 # Multi-LoRA dinâmico (opt-in): ENABLE_LORA=true habilita adapters carregados
 # em runtime via /v1/load_lora_adapter, sem reiniciar o pod.
 ENABLE_LORA="${ENABLE_LORA:-false}"
@@ -26,6 +36,7 @@ python3 -m vllm.entrypoints.openai.api_server \
   --model "${MODEL_NAME}" \
   --host 127.0.0.1 \
   --port "${VLLM_PORT}" \
+  ${TP_ARGS} \
   ${LORA_ARGS} \
   ${VLLM_EXTRA_ARGS:-} \
   2>&1 | sed -u 's/^/[vllm] /' | tee "${VLLM_LOG_FILE}" &

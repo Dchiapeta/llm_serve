@@ -16,9 +16,18 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { TEMPLATE_PLANS, type TemplatePlan } from "@/lib/types"
 
 export function CreateAccountDialog() {
   const [open, setOpen] = React.useState(false)
+  const [plan, setPlan] = React.useState<TemplatePlan>("VibeCoder")
   const [pending, startTransition] = React.useTransition()
 
   function onSubmit(formData: FormData) {
@@ -55,6 +64,22 @@ export function CreateAccountDialog() {
           <div className="flex flex-col gap-2">
             <Label htmlFor="email">E-mail (opcional)</Label>
             <Input id="email" name="email" type="email" />
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label>Plano</Label>
+            <Select value={plan} onValueChange={(v) => setPlan(v as TemplatePlan)}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {TEMPLATE_PLANS.map((p) => (
+                  <SelectItem key={p} value={p}>
+                    {p}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <input type="hidden" name="plan" value={plan} />
           </div>
           <Button type="submit" disabled={pending}>
             {pending ? "Criando…" : "Criar conta"}

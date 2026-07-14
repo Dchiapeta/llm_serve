@@ -50,6 +50,19 @@ export type Account = {
   id: string
   name: string
   email: string | null
+  plan: TemplatePlan
+  system_prompt: string | null
+  created_at: string
+}
+
+// Chunk de texto da base de conhecimento (RAG) de uma conta, com embedding
+// já calculado (OpenAI text-embedding-3-small, 1536 dimensões).
+export type KnowledgeChunk = {
+  id: string
+  account_id: string
+  storage_path: string
+  chunk_index: number
+  content: string
   created_at: string
 }
 
