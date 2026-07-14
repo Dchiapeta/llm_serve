@@ -25,6 +25,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { ContaRowActions } from "@/components/contas/conta-row-actions"
+import { DeleteStackButton } from "@/components/contas/delete-stack-button"
 
 // Cor do badge por plano de produto — mantém a mesma paleta usada em
 // components/templates para o plano do template.
@@ -42,7 +43,7 @@ export type ContaRow = {
   hasReadyAdapter: boolean
   knowledgeFiles: { storage_path: string; chunks: number }[]
   tokens: number
-  stacks: Stack[]
+  stacks: (Stack & { machineName?: string })[]
 }
 
 // purchase_date é date puro ("YYYY-MM-DD"); anexar meia-noite local evita
@@ -129,6 +130,7 @@ export function ContasTable({
             <TableHead className="w-8" />
             <TableHead>Conta</TableHead>
             <TableHead>Plano</TableHead>
+            <TableHead>Stacks (subdomínio)</TableHead>
             <TableHead>Máquina atual</TableHead>
             <TableHead>Consumo de tokens ({periodLabel.toLowerCase()})</TableHead>
             <TableHead className="w-10" />
@@ -137,7 +139,7 @@ export function ContasTable({
         <TableBody>
           {filteredRows.length === 0 && (
             <TableRow>
-              <TableCell colSpan={6} className="text-center text-muted-foreground">
+              <TableCell colSpan={7} className="text-center text-muted-foreground">
                 {rows.length === 0
                   ? "Nenhuma conta ainda."
                   : "Nenhuma conta encontrada para esse e-mail."}
@@ -182,6 +184,26 @@ export function ContasTable({
                 </Badge>
               </TableCell>
               <TableCell>
+                {stacks.length === 0 ? (
+                  <span className="text-sm text-muted-foreground">—</span>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-1">
+                    {stacks.map((stack) => (
+                      <Badge
+                        key={stack.id}
+                        variant="outline"
+                        size="sm"
+                        className="cursor-pointer font-mono"
+                        onClick={() => copySlug(stack.slug)}
+                        title="Clique para copiar"
+                      >
+                        {stack.slug}
+                      </Badge>
+                    ))}
+                  </div>
+                )}
+              </TableCell>
+              <TableCell>
                 {currentMachine ? (
                   <Link
                     href={`/machines/${currentMachine.id}`}
@@ -211,7 +233,7 @@ export function ContasTable({
             </TableRow>
             {expanded.has(account.id) && (
               <TableRow className="hover:bg-transparent">
-                <TableCell colSpan={6} className="bg-muted/30 p-0">
+                <TableCell colSpan={7} className="bg-muted/30 p-0">
                   {stacks.length === 0 ? (
                     <p className="px-10 py-3 text-sm text-muted-foreground">
                       Nenhuma stack.
@@ -222,7 +244,9 @@ export function ContasTable({
                         <TableRow className="hover:bg-transparent">
                           <TableHead className="pl-10">Produto</TableHead>
                           <TableHead>ID (subdomínio)</TableHead>
+                          <TableHead>Máquina</TableHead>
                           <TableHead>Data da compra</TableHead>
+                          <TableHead className="w-10" />
                         </TableRow>
                       </TableHeader>
                       <TableBody>
@@ -247,8 +271,23 @@ export function ContasTable({
                                 </Button>
                               </div>
                             </TableCell>
+                            <TableCell>
+                              {stack.machine_id ? (
+                                <Link
+                                  href={`/machines/${stack.machine_id}`}
+                                  className="text-sm hover:underline"
+                                >
+                                  {stack.machineName ?? "ver máquina"}
+                                </Link>
+                              ) : (
+                                <span className="text-sm text-muted-foreground">—</span>
+                              )}
+                            </TableCell>
                             <TableCell className="text-sm">
                               {formatPurchaseDate(stack.purchase_date)}
+                            </TableCell>
+                            <TableCell>
+                              <DeleteStackButton stackId={stack.id} slug={stack.slug} />
                             </TableCell>
                           </TableRow>
                         ))}

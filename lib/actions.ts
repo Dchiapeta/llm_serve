@@ -341,11 +341,16 @@ export async function deleteTemplate(id: string) {
 
 // ---------- Machines ----------
 
-export async function createMachine(formData: FormData) {
+// Núcleo de provisionamento: cria o pod no RunPod + registro em machines.
+// Sem redirect — reutilizado por createMachine (painel) e createStack.
+async function provisionMachine(input: {
+  name: string
+  templateId: string
+  gpuTypeId: string
+  maxUsers?: number | null // null/undefined = usar o padrão do template
+}): Promise<{ machineId: string } | { error: string }> {
   const db = createSupabaseAdmin()
-  const name = String(formData.get("name"))
-  const templateId = String(formData.get("template_id"))
-  const gpuTypeId = String(formData.get("gpu_type"))
+  const { name, templateId, gpuTypeId } = input
 
   const { data: tpl, error: tplErr } = await db
     .from("templates")
@@ -354,8 +359,8 @@ export async function createMachine(formData: FormData) {
     .single<Template>()
   if (tplErr || !tpl) return { error: "Template não encontrado" }
 
-  // teto manual: valor do form, com fallback para o padrão do template
-  const maxUsers = parseMaxUsers(formData) ?? tpl.max_users
+  // teto manual: valor informado, com fallback para o padrão do template
+  const maxUsers = input.maxUsers ?? tpl.max_users
 
   const adminSecret = randomBytes(24).toString("hex")
 
@@ -440,7 +445,18 @@ export async function createMachine(formData: FormData) {
 
   await logEvent(machine.id, "created", `Máquina "${name}" criada (${gpu?.displayName ?? gpuTypeId})`)
   revalidatePath("/machines")
-  redirect(`/machines/${machine.id}`)
+  return { machineId: machine.id }
+}
+
+export async function createMachine(formData: FormData) {
+  const result = await provisionMachine({
+    name: String(formData.get("name")),
+    templateId: String(formData.get("template_id")),
+    gpuTypeId: String(formData.get("gpu_type")),
+    maxUsers: parseMaxUsers(formData),
+  })
+  if ("error" in result) return { error: result.error }
+  redirect(`/machines/${result.machineId}`)
 }
 
 export async function refreshMachineStatus(machineId: string) {
@@ -459,6 +475,13 @@ export async function refreshMachineStatus(machineId: string) {
       .from("machines")
       .update({ status, cost_per_hr: pod.costPerHr ?? m.cost_per_hr })
       .eq("id", machineId)
+    // Pod acabou de ficar pronto: empurra chaves emitidas durante o boot
+    // (createStack pode criar a chave com a máquina ainda em "creating").
+    if (m.status !== "running" && status === "running") {
+      await syncMachineKeys(machineId).catch((e) =>
+        console.error("Sync pós-boot falhou (tenta de novo no próximo refresh):", e)
+      )
+    }
   } catch (e) {
     const msg = String(e)
     if (msg.includes("404")) {
@@ -512,19 +535,94 @@ export async function terminateMachine(machineId: string) {
 // Cria uma stack (produto/LLM contratado). Se não existir conta com o
 // e-mail, cria a conta junto — o plan da conta nova é o plano da primeira
 // stack; accounts.plan segue alimentando o roteamento e não muda para
-// contas existentes. Retorna o slug final (pode ter sido regenerado em
-// colisão) para o toast exibir.
-export async function createStack(formData: FormData): Promise<{ slug: string }> {
+// contas existentes. A stack nasce hospedada numa máquina: ou na escolhida
+// pelo admin (machine_id do form), ou numa recém-provisionada com o
+// template selecionado (nome = slug, GPU = primeira compatível). Em ambos
+// os casos emite a chave HEX da conta na máquina; a plainKey é retornada
+// UMA única vez.
+export async function createStack(formData: FormData): Promise<{
+  slug: string
+  machineId: string
+  machineCreated: boolean
+  plainKey: string
+}> {
   const db = createSupabaseAdmin()
   const name = String(formData.get("name") || "").trim()
   const email = String(formData.get("email") || "").trim().toLowerCase()
   const plan = parsePlan(formData)
   const purchaseDate = String(formData.get("purchase_date") || "")
+  const templateId = String(formData.get("template_id") || "")
+  const chosenMachineId = String(formData.get("machine_id") || "")
   let slug = String(formData.get("slug") || "").trim()
 
   if (!name) throw new Error("Informe o nome do cliente")
   if (!email) throw new Error("Informe o e-mail do cliente")
+  if (!templateId) throw new Error("Selecione um template")
   if (!STACK_SLUG_RE.test(slug)) slug = generateStackSlug()
+
+  const { data: tpl } = await db
+    .from("templates")
+    .select("id, plan, gpu_types, gpu_count, max_users, model_footprint_gb, kv_reserve_gb_per_user")
+    .eq("id", templateId)
+    .single<
+      Pick<
+        Template,
+        "id" | "plan" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
+      >
+    >()
+  if (!tpl) throw new Error("Template não encontrado")
+
+  // Sem máquina escolhida, uma será provisionada — valida ANTES de criar a
+  // stack quais GPUs do template comportam o max_users configurado, para não
+  // deixar stack órfã quando nenhuma GPU serve.
+  let viableGpuIds: string[] = []
+  if (!chosenMachineId) {
+    if (!tpl.gpu_types?.length) {
+      throw new Error("O template não tem tipos de GPU configurados")
+    }
+    const gpus = await listGpuTypes()
+    const gpuCount = tpl.gpu_count ?? 1
+    const rejections: string[] = []
+    viableGpuIds = tpl.gpu_types.filter((gpuTypeId) => {
+      const gpu = gpus.find((g) => g.id === gpuTypeId)
+      const totalVramGb = gpu?.memoryInGb != null ? gpu.memoryInGb * gpuCount : null
+      // VRAM desconhecida ou sem teto de usuários: não dá para validar — aceita.
+      if (tpl.max_users === null || totalVramGb == null) return true
+      const cap = vramSlots({
+        vramGb: totalVramGb,
+        modelFootprintGb: tpl.model_footprint_gb,
+        kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
+      })
+      if (tpl.max_users > cap) {
+        rejections.push(
+          `${gpu?.displayName ?? gpuTypeId}: ${cap} vaga(s) — ${totalVramGb}GB VRAM − ${tpl.model_footprint_gb}GB modelo, ${tpl.kv_reserve_gb_per_user}GB/usuário`
+        )
+        return false
+      }
+      return true
+    })
+    if (viableGpuIds.length === 0) {
+      throw new Error(
+        `Nenhuma GPU do template comporta ${tpl.max_users} usuário(s): ${rejections.join("; ")}. ` +
+          "Ajuste o max_users ou os valores de VRAM do template."
+      )
+    }
+  }
+
+  // Máquina escolhida pelo admin: precisa estar rodando e ser do mesmo
+  // template. A capacidade é validada adiante por createKey.
+  if (chosenMachineId) {
+    const { data: m } = await db
+      .from("machines")
+      .select("id, status, template_id")
+      .eq("id", chosenMachineId)
+      .single<Pick<Machine, "id" | "status" | "template_id">>()
+    if (!m) throw new Error("Máquina não encontrada")
+    if (m.status !== "running") throw new Error("A máquina escolhida não está rodando")
+    if (m.template_id !== templateId) {
+      throw new Error("A máquina escolhida não usa o template selecionado")
+    }
+  }
 
   // Conta existente por e-mail (case-insensitive); senão cria.
   const { data: existing } = await db
@@ -546,22 +644,68 @@ export async function createStack(formData: FormData): Promise<{ slug: string }>
   }
 
   // Insert com retry: colisão do unique de slug (Postgres 23505) regenera.
+  // A stack é criada antes da máquina porque o slug final vira o nome dela.
+  let stackId: string | null = null
   for (let attempt = 0; attempt < 5; attempt++) {
-    const { error } = await db.from("stacks").insert({
-      account_id: accountId,
-      plan,
-      slug,
-      ...(purchaseDate ? { purchase_date: purchaseDate } : {}),
-    })
-    if (!error) {
-      revalidatePath("/contas")
-      revalidatePath("/accounts")
-      return { slug }
+    const { data: stack, error } = await db
+      .from("stacks")
+      .insert({
+        account_id: accountId,
+        plan,
+        slug,
+        ...(purchaseDate ? { purchase_date: purchaseDate } : {}),
+      })
+      .select("id")
+      .single<{ id: string }>()
+    if (!error && stack) {
+      stackId = stack.id
+      break
     }
-    if (error.code !== "23505") throw new Error(error.message)
+    if (error && error.code !== "23505") throw new Error(error.message)
     slug = generateStackSlug()
   }
-  throw new Error("Não foi possível gerar um ID único; tente novamente")
+  if (!stackId) throw new Error("Não foi possível gerar um ID único; tente novamente")
+
+  const machineCreated = !chosenMachineId
+  let machineId = chosenMachineId
+  if (!machineId) {
+    // Tenta as GPUs viáveis em ordem — cobre falta de estoque de um tipo.
+    let lastError = ""
+    for (const gpuTypeId of viableGpuIds) {
+      const prov = await provisionMachine({ name: slug, templateId, gpuTypeId })
+      if (!("error" in prov)) {
+        machineId = prov.machineId
+        break
+      }
+      lastError = prov.error
+    }
+    if (!machineId) {
+      throw new Error(`Stack ${slug} criada, mas falhou ao criar a máquina: ${lastError}`)
+    }
+  }
+
+  const { error: linkError } = await db
+    .from("stacks")
+    .update({ machine_id: machineId })
+    .eq("id", stackId)
+  if (linkError) throw new Error(linkError.message)
+
+  const { plainKey } = await createKey({ accountId, machineId })
+
+  revalidatePath("/contas")
+  revalidatePath("/accounts")
+  if (machineCreated) revalidatePath("/machines")
+  return { slug, machineId, machineCreated, plainKey }
+}
+
+// Remove uma stack do painel. A máquina que a hospeda (se houver) não é
+// afetada — descomissionar máquina é uma ação separada em /machines.
+export async function deleteStack(id: string) {
+  const db = createSupabaseAdmin()
+  const { error } = await db.from("stacks").delete().eq("id", id)
+  if (error) throw new Error(error.message)
+  revalidatePath("/contas")
+  revalidatePath("/accounts")
 }
 
 // Atualiza plano e/ou system prompt de uma conta já existente.

@@ -2,7 +2,7 @@ import { KeyRound, Server, ServerCog, Users } from "lucide-react"
 import Link from "next/link"
 
 import { createSupabaseAdmin } from "@/lib/supabase/server"
-import type { Account, ApiKey, LoraAdapter, Machine, RoutingState, Stack } from "@/lib/types"
+import type { Account, ApiKey, LoraAdapter, Machine, RoutingState, Stack, Template } from "@/lib/types"
 import {
   Card,
   CardContent,
@@ -46,25 +46,30 @@ export default async function ContasPage({
     { data: usageData },
     { data: knowledgeData },
     { data: stacksData },
+    { data: templatesData },
   ] = await Promise.all([
     db.from("accounts").select("*").order("name"),
     db.from("machines").select("*").neq("status", "terminated"),
     db.from("routing_state").select("*"),
     db.from("lora_adapters").select("account_id, status"),
-    db.from("api_keys").select("id, account_id"),
+    db.from("api_keys").select("id, account_id, machine_id, status"),
     db
       .from("usage_metrics")
       .select("api_key_id, tokens_in, tokens_out, window_start")
       .gte("window_start", periodStart),
     db.from("knowledge_chunks").select("account_id, storage_path"),
     db.from("stacks").select("*").order("created_at"),
+    db
+      .from("templates")
+      .select("id, name, plan, model_name, model_footprint_gb, kv_reserve_gb_per_user, gpu_types")
+      .order("name"),
   ])
 
   const accounts = (accountsData ?? []) as Account[]
   const machines = (machinesData ?? []) as Machine[]
   const routes = (routingData ?? []) as RoutingState[]
   const loras = (lorasData ?? []) as Pick<LoraAdapter, "account_id" | "status">[]
-  const keys = (keysData ?? []) as Pick<ApiKey, "id" | "account_id">[]
+  const keys = (keysData ?? []) as Pick<ApiKey, "id" | "account_id" | "machine_id" | "status">[]
   const usage = (usageData ?? []) as {
     api_key_id: string | null
     tokens_in: number
@@ -77,6 +82,10 @@ export default async function ContasPage({
   }[]
 
   const stacks = (stacksData ?? []) as Stack[]
+  const templates = (templatesData ?? []) as Pick<
+    Template,
+    "id" | "name" | "plan" | "model_name" | "model_footprint_gb" | "kv_reserve_gb_per_user" | "gpu_types"
+  >[]
 
   const stacksByAccount = new Map<string, Stack[]>()
   for (const stack of stacks) {
@@ -86,6 +95,25 @@ export default async function ContasPage({
   }
 
   const machineById = new Map(machines.map((m) => [m.id, m]))
+
+  const activeKeysByMachine = new Map<string, number>()
+  for (const k of keys) {
+    if (k.status !== "active") continue
+    activeKeysByMachine.set(k.machine_id, (activeKeysByMachine.get(k.machine_id) ?? 0) + 1)
+  }
+
+  // Máquinas candidatas a hospedar uma stack nova — sem admin_secret (client).
+  const stackMachines = machines
+    .filter((m) => m.status === "running" && m.template_id)
+    .map((m) => ({
+      id: m.id,
+      name: m.name,
+      template_id: m.template_id as string,
+      model_name: m.model_name,
+      vram_gb: m.vram_gb,
+      max_users: m.max_users,
+      activeKeys: activeKeysByMachine.get(m.id) ?? 0,
+    }))
   const routeByAccount = new Map(routes.map((r) => [r.account_id, r]))
   const accountIdByKeyId = new Map(keys.map((k) => [k.id, k.account_id]))
 
@@ -139,7 +167,10 @@ export default async function ContasPage({
       hasReadyAdapter: readyAdapterAccounts.has(account.id),
       knowledgeFiles,
       tokens: tokensByAccount.get(account.id) ?? 0,
-      stacks: stacksByAccount.get(account.id) ?? [],
+      stacks: (stacksByAccount.get(account.id) ?? []).map((s) => ({
+        ...s,
+        machineName: s.machine_id ? machineById.get(s.machine_id)?.name : undefined,
+      })),
     }
   })
 
@@ -152,7 +183,11 @@ export default async function ContasPage({
             Contas, alocação de máquina e consumo de tokens
           </p>
         </div>
-        <CreateStackDialog accounts={accounts} />
+        <CreateStackDialog
+          accounts={accounts}
+          templates={templates}
+          machines={stackMachines}
+        />
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">

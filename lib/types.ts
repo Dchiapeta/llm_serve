@@ -61,6 +61,7 @@ export type Account = {
 export type Stack = {
   id: string
   account_id: string
+  machine_id: string | null
   plan: TemplatePlan
   purchase_date: string // date "YYYY-MM-DD"
   slug: string
