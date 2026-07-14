@@ -8,7 +8,11 @@ import { toast } from "sonner"
 import type { Account, ApiKey, Machine, RoutingState, Stack } from "@/lib/types"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupInput,
+} from "@/components/ui/input-group"
 import {
   Table,
   TableBody,
@@ -119,15 +123,16 @@ export function ContasTable({
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="relative max-w-xs">
-        <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-        <Input
+      <InputGroup className="max-w-xs">
+        <InputGroupAddon>
+          <Search className="size-4 text-muted-foreground" />
+        </InputGroupAddon>
+        <InputGroupInput
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Buscar por stack, cliente ou e-mail…"
-          className="pl-8"
         />
-      </div>
+      </InputGroup>
 
       <Table>
         <TableHeader>
