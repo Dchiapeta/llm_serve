@@ -120,6 +120,14 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
   para todas → migra conta a conta (com o drain acima) para a máquina mais
   cheia que caiba. Ex.: A=16, B=1 → A=17, B=0. Máx. 1 máquina-origem por
   ciclo. A origem esvaziada pausa depois pela regra abaixo.
+- **Reconciliação de status** (início de cada ciclo do lifecycle): alinha
+  `machines.status` com o `desiredStatus` real dos pods no RunPod (RUNNING →
+  running, EXITED → stopped, TERMINATED → terminated), espelho do
+  `reconcileMachineStatuses` do painel — que só roda quando alguém abre uma
+  página. Sem isso, máquina recém-criada fica `creating` no banco para sempre
+  e a auto-pausa nunca a enxerga, mesmo com o pod cobrando GPU. Na promoção
+  `creating → running`, o `last_activity_at` é tocado: o relógio de ociosidade
+  conta a partir de quando a máquina ficou DE PÉ, não da criação.
 - **Auto-pausa**: máquina running sem nenhuma atividade
   (`machines.last_activity_at`, tocada a cada request proxied) há
   `MACHINE_IDLE_STOP_MINUTES`, sem rotas ativas e sem request em voo →

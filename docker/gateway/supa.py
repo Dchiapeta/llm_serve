@@ -157,6 +157,20 @@ class SupaClient:
         r.raise_for_status()
         return r.json()
 
+    async def list_machines_with_pod(self) -> list[dict]:
+        """Máquinas não-terminadas com pod associado — alvo da reconciliação
+        de status do lifecycle (espelho do reconcileMachineStatuses do painel)."""
+        r = await self._rest.get(
+            "/machines",
+            params={
+                "status": "in.(creating,running,stopped)",
+                "runpod_pod_id": "not.is.null",
+                "select": "id,status,runpod_pod_id",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def set_machine_status(self, machine_id: str, status: str) -> None:
         r = await self._rest.patch(
             "/machines",

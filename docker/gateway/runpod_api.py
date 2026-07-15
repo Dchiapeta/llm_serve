@@ -25,6 +25,12 @@ class RunPodClient:
             raise RuntimeError(f"RunPod POST /pods/{pod_id}/stop → {r.status_code}: {r.text}")
         return r.json() if r.content else {}
 
+    async def list_pods(self) -> list[dict]:
+        r = await self._client.get("/pods")
+        if r.status_code >= 400:
+            raise RuntimeError(f"RunPod GET /pods → {r.status_code}: {r.text}")
+        return r.json() or []
+
     async def start_pod(self, pod_id: str) -> dict:
         # Pode falhar com "not enough free GPUs": pod pausado não reserva GPU
         # e o host pode tê-la cedido (mesmo caso do startMachine do painel)

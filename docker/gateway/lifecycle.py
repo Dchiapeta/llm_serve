@@ -1,6 +1,7 @@
 """
 Lifecycle dos adapters LoRA e das máquinas: unload por ociosidade, migração
-ativa, consolidação de máquinas quase vazias e auto-pausa de pods ociosos.
+ativa, consolidação de máquinas quase vazias, reconciliação de status com o
+RunPod e auto-pausa de pods ociosos.
 
 Roda dentro do gateway (réplica única — ver README) porque só o gateway
 conhece os requests in-flight: nunca descarrega/migra/pausa com stream em voo.
@@ -262,6 +263,57 @@ class LifecycleManager:
                 return moved
         return []
 
+    # ---------- Reconciliação de status com o RunPod ----------
+
+    # Espelho do POD_STATUS_MAP de lib/machines.ts
+    POD_STATUS_MAP = {"RUNNING": "running", "EXITED": "stopped", "TERMINATED": "terminated"}
+
+    async def reconcile_statuses_once(self) -> list[tuple[str, str]]:
+        """Alinha machines.status com o estado real dos pods no RunPod.
+
+        O painel só reconcilia quando alguém abre uma página; sem isso, uma
+        máquina recém-criada fica 'creating' no banco para sempre — invisível
+        para a auto-pausa (que filtra status=running) mesmo com o pod cobrando
+        GPU. Aqui o gateway reconcilia sozinho a cada ciclo do lifecycle.
+        """
+        if self.runpod is None:
+            return []
+        machines = await self.supa.list_machines_with_pod()
+        if not machines:
+            return []
+        try:
+            pods = await self.runpod.list_pods()
+        except Exception as e:
+            logger.warning("reconcile: listagem de pods falhou (%s) — mantém o banco", e)
+            return []
+        pod_by_id = {p["id"]: p for p in pods}
+
+        changed: list[tuple[str, str]] = []
+        for m in machines:
+            pod = pod_by_id.get(m["runpod_pod_id"])
+            if pod is None:
+                # pod sumiu da API → terminada; em 'creating' pode só não ter
+                # aparecido ainda (mesma cautela do painel) — não marca
+                if m["status"] == "creating":
+                    continue
+                new_status = "terminated"
+            else:
+                new_status = self.POD_STATUS_MAP.get(pod.get("desiredStatus"), m["status"])
+            if new_status == m["status"]:
+                continue
+            if m["status"] == "creating" and new_status == "running":
+                # o relógio de ociosidade começa quando a máquina fica DE PÉ,
+                # não quando foi criada — um boot demorado (pull da imagem +
+                # load do modelo) não pode desembocar em auto-pausa imediata
+                try:
+                    await self.supa.touch_machine_activity(m["id"])
+                except Exception:
+                    pass
+            await self.supa.set_machine_status(m["id"], new_status)
+            changed.append((m["id"], new_status))
+            logger.info("reconcile: máquina %s %s → %s", m["id"], m["status"], new_status)
+        return changed
+
     # ---------- Auto-pausa de máquinas ociosas ----------
 
     async def stop_idle_machines_once(self) -> list[str]:
@@ -317,6 +369,12 @@ class LifecycleManager:
     async def machine_lifecycle_loop(self, interval_s: float = 300.0):
         while True:
             await asyncio.sleep(interval_s)
+            # reconciliação primeiro: consolidação e auto-pausa decidem em cima
+            # do status real dos pods, não do que o painel deixou no banco
+            try:
+                await self.reconcile_statuses_once()
+            except Exception as e:
+                logger.warning("reconcile: ciclo falhou (%s)", e)
             try:
                 await self.consolidate_once()
             except Exception as e:
