@@ -370,12 +370,13 @@ export default async function MachineDetailPage({
             <CardHeader>
               <CardTitle>Como usar</CardTitle>
               <CardDescription>
-                Exemplos de requisição para esta máquina via terminal e Claude Code CLI
+                Exemplos de requisição via gateway (terminal e Claude Code CLI) — o
+                gateway roteia para a máquina certa e religa pods pausados
               </CardDescription>
             </CardHeader>
             <CardContent>
               <MachineAbout
-                publicUrl={machine.public_url}
+                gatewayUrl={process.env.GATEWAY_URL ?? null}
                 modelName={machine.model_name}
               />
             </CardContent>

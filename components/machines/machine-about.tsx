@@ -35,13 +35,15 @@ function CodeBlock({ code }: { code: string }) {
 }
 
 export function MachineAbout({
-  publicUrl,
+  gatewayUrl,
   modelName,
 }: {
-  publicUrl: string | null
+  gatewayUrl: string | null
   modelName: string | null
 }) {
-  const url = publicUrl ?? "https://<url-da-maquina>"
+  // Sempre o gateway, nunca o proxy do pod: o pod muda/pausa e o cliente não
+  // pode saber disso — realocação e auto-wake só funcionam via gateway.
+  const url = gatewayUrl?.replace(/\/$/, "") ?? "https://<url-do-gateway>"
   const model = modelName ?? "<modelo>"
 
   const curlSnippet = `curl ${url}/v1/chat/completions \\
