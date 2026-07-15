@@ -67,14 +67,14 @@ TOUCH_THROTTLE_S = 15.0
 # migração. IDLE_RELEASE_MINUTES substitui IDLE_UNLOAD_MINUTES (fallback
 # mantido pra não quebrar deploy existente).
 IDLE_RELEASE_MINUTES = float(
-    os.environ.get("IDLE_RELEASE_MINUTES", os.environ.get("IDLE_UNLOAD_MINUTES", "60"))
+    os.environ.get("IDLE_RELEASE_MINUTES", os.environ.get("IDLE_UNLOAD_MINUTES", "30"))
 )
 MIGRATION_DRAIN_TIMEOUT_S = float(os.environ.get("MIGRATION_DRAIN_TIMEOUT_S", "600"))
 # lifecycle de máquinas: consolidação (esvaziar máquina quase vazia migrando
 # as contas pra outra do mesmo template), auto-pausa (stopPod) de máquina sem
 # nenhuma atividade e auto-wake (startPod) quando chega request sem nenhuma
 # máquina running com vaga. Ambos exigem RUNPOD_API_KEY.
-MACHINE_IDLE_STOP_MINUTES = float(os.environ.get("MACHINE_IDLE_STOP_MINUTES", "60"))
+MACHINE_IDLE_STOP_MINUTES = float(os.environ.get("MACHINE_IDLE_STOP_MINUTES", "30"))
 WAKE_COOLDOWN_S = float(os.environ.get("WAKE_COOLDOWN_S", "120"))
 CONSOLIDATION_INTERVAL_S = float(os.environ.get("CONSOLIDATION_INTERVAL_S", "300"))
 CONSOLIDATION_MAX_ORIGIN_ROUTES = int(os.environ.get("CONSOLIDATION_MAX_ORIGIN_ROUTES", "2"))

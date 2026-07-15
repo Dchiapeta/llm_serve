@@ -59,10 +59,10 @@ advisory lock.
 | `LORA_BUCKET`             | não         | Bucket dos adapters (default `loras`)            |
 | `MAX_LORAS_PER_MACHINE`   | não         | Teto de adapters por máquina (default 8)         |
 | `LOAD_WAIT_TIMEOUT_S`     | não         | Espera por load de outro request (default 20)    |
-| `IDLE_RELEASE_MINUTES`    | não         | Ociosidade até liberar o slot (unload + rota livre; default 60; 0 desliga o reaper). Fallback: `IDLE_UNLOAD_MINUTES` |
+| `IDLE_RELEASE_MINUTES`    | não         | Ociosidade até liberar o slot (unload + rota livre; default 30; 0 desliga o reaper). Fallback: `IDLE_UNLOAD_MINUTES` |
 | `MIGRATION_DRAIN_TIMEOUT_S` | não       | Espera máx. pelos streams da origem na migração (default 600) |
 | `RUNPOD_API_KEY`          | não*        | API key do RunPod — sem ela, a auto-pausa e o auto-wake de máquinas ficam desligados (warning no boot) |
-| `MACHINE_IDLE_STOP_MINUTES` | não       | Máquina sem nenhuma atividade por esse tempo (e sem rotas) → stopPod (default 60; 0 desliga) |
+| `MACHINE_IDLE_STOP_MINUTES` | não       | Máquina sem nenhuma atividade por esse tempo (e sem rotas) → stopPod (default 30; 0 desliga) |
 | `WAKE_COOLDOWN_S`         | não         | Intervalo mínimo entre tentativas de startPod na mesma máquina (default 120) |
 | `CONSOLIDATION_INTERVAL_S` | não        | Intervalo do loop de consolidação + auto-pausa (default 300) |
 | `CONSOLIDATION_MAX_ORIGIN_ROUTES` | não | Máx. de rotas para uma máquina ser candidata a esvaziar (default 2) |
