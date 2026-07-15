@@ -53,7 +53,10 @@ export async function proxy(request: NextRequest) {
 
 export const config = {
   matcher: [
-    // protege tudo exceto assets estáticos e a rota de sync do agent
-    "/((?!_next/static|_next/image|favicon.ico|api/agent).*)",
+    // protege tudo exceto assets estáticos e rotas chamadas por serviços
+    // externos sem sessão de usuário (autenticadas pelo próprio secret no
+    // handler): a rota de sync do agent e a de provisionamento automático,
+    // chamada pelo gateway com X-Admin-Secret/PANEL_ADMIN_SECRET.
+    "/((?!_next/static|_next/image|favicon.ico|api/agent|api/machines/provision).*)",
   ],
 }
