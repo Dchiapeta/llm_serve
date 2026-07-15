@@ -70,6 +70,15 @@ advisory lock.
 | `OPENAI_API_KEY`          | não*        | Embeddings do RAG — sem ela, a injeção de contexto é pulada (best-effort) |
 | `EMBEDDING_MODEL`         | não         | Modelo de embedding (default `text-embedding-3-small`, precisa bater com a indexação do painel) |
 | `RAG_TOP_K`               | não         | Quantidade de chunks injetados como contexto (default 4)       |
+| `PANEL_URL`               | não*        | URL base do painel Next.js — sem ela, o provisionamento automático de máquina fica desligado (warning no boot) |
+| `PANEL_ADMIN_SECRET`      | não*        | Secret enviado como `X-Admin-Secret` para `POST {PANEL_URL}/api/machines/provision` — dedicado, não reaproveita `GATEWAY_ADMIN_SECRET` |
+| `PANEL_PROVISION_TIMEOUT_S` | não      | Timeout da chamada ao painel pra criar máquina (default 60)    |
+| `PROVISION_COOLDOWN_S`    | não         | Intervalo mínimo entre tentativas de criação por plano (default 180) |
+| `PROVISION_RETRY_AFTER_S` | não         | `Retry-After` do 503 "provisionando" (default 120 — maior que o do wake, já que criar é mais lento que só religar) |
+| `MACHINE_POOL_WATERMARK_SLOTS` | não    | Soma mínima de slots livres do plano (running + reserva pausada) antes de disparar reposição proativa (default 5) |
+| `MACHINE_HEALTH_TIMEOUT_S` | não        | Prazo máx. esperando `vllm_ready` numa máquina recém-criada antes de desistir (default 900) |
+| `MACHINE_HEALTH_POLL_INTERVAL_S` | não  | Intervalo entre polls de `/health` na máquina recém-criada (default 10) |
+| `SETTINGS_CACHE_TTL_S`    | não         | TTL do cache em memória do interruptor liga/desliga (`system_settings.auto_provision_enabled`, default 30) |
 
 ## Rodar local
 
@@ -101,6 +110,7 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
 - `POST /admin/reap-idle` — dispara um ciclo do idle reaper (útil em teste)
 - `POST /admin/consolidate` — dispara um ciclo de consolidação (útil em teste)
 - `POST /admin/stop-idle-machines` — dispara um ciclo de auto-pausa (útil em teste)
+- `POST /admin/ensure-capacity` — dispara um ciclo de reposição proativa (útil em teste; também chamado pelo painel na hora em que o interruptor liga)
 
 ## Lifecycle
 
@@ -154,3 +164,31 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
   aponta para máquina parada manualmente (stop pelo painel) é liberada
   (`mark_slot_idle`) e a conta realoca — o restart zera a VRAM de qualquer
   forma. Religar manualmente pelo painel continua funcionando igual.
+- **Provisionamento automático de máquina** (3º nível da cascata de
+  alocação, além de rodando-com-vaga e despausar): controlado por um
+  interruptor liga/desliga (`system_settings.auto_provision_enabled` no
+  Supabase, toggle no painel em Máquinas) — **nasce desligado**, é uma
+  automação que gasta GPU sozinha. O gateway nunca fala com a API de criação
+  da RunPod diretamente: chama de volta o painel Next.js
+  (`POST {PANEL_URL}/api/machines/provision`), que já tem toda a lógica de
+  GPU/template/stockout (`provisionMachine`, `viableGpuIdsForTemplate`).
+  Duas formas, uma trava compartilhada (`provisioning_in_progress` por
+  plano, evita criação concorrente/repetida):
+  - **Reativa**: dentro de uma request, quando nem máquina running com vaga
+    nem pausada resolvem → dispara a criação e responde `503` +
+    `Retry-After: PROVISION_RETRY_AFTER_S` (maior que o do wake — criar+subir
+    pode incluir pull de imagem e download de pesos do zero num host novo).
+    A máquina fica `running` depois de saudável — o retry do cliente precisa
+    dela de pé.
+  - **Proativa** (`ensure_capacity_once`, mais um passo do
+    `machine_lifecycle_loop` a cada `CONSOLIDATION_INTERVAL_S`): por plano,
+    soma os slots livres de TODAS as máquinas não-terminadas (running +
+    stopped — uma pausada vazia entra com a capacidade CHEIA, já que está
+    "disponível via despausar"). Abaixo de `MACHINE_POOL_WATERMARK_SLOTS`,
+    cria uma máquina nova e, assim que `GET {public_url}/health` confirmar
+    `vllm_ready`, PAUSA ela — vira a próxima reserva, minimizando custo de
+    GPU ociosa. Regra única e autolimitante: assim que existe 1 reserva
+    pausada (capacidade cheia), a soma já fica bem acima do watermark, então
+    não dispara outra criação — sem precisar de um teto numérico separado de
+    "quantas máquinas". Máquinas já servindo carga real não têm limite
+    algum — crescem conforme a demanda via a própria cascata.

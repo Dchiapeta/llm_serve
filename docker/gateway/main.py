@@ -81,6 +81,31 @@ CONSOLIDATION_MAX_ORIGIN_ROUTES = int(os.environ.get("CONSOLIDATION_MAX_ORIGIN_R
 STOP_RECHECK_GRACE_S = float(os.environ.get("STOP_RECHECK_GRACE_S", "5"))
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 
+# provisionamento automático de máquina (3º nível da cascata de alocação,
+# além de rodando-com-vaga e despausar): o gateway nunca fala com a API de
+# criação da RunPod diretamente — chama de volta o painel Next.js (que já
+# tem toda a lógica de GPU/template/stockout), via PANEL_URL protegido por
+# um secret dedicado (não reaproveita GATEWAY_ADMIN_SECRET — ver README).
+# Sem PANEL_URL/PANEL_ADMIN_SECRET, esse nível fica desligado (mesmo padrão
+# de RUNPOD_API_KEY ausente).
+PANEL_URL = os.environ.get("PANEL_URL", "").rstrip("/")
+PANEL_ADMIN_SECRET = os.environ.get("PANEL_ADMIN_SECRET", "")
+PANEL_PROVISION_TIMEOUT_S = float(os.environ.get("PANEL_PROVISION_TIMEOUT_S", "60"))
+# intervalo mínimo entre tentativas de criação por plano — evita bombardear
+# o painel/RunPod com requests concorrentes ou stockout repetido
+PROVISION_COOLDOWN_S = float(os.environ.get("PROVISION_COOLDOWN_S", "180"))
+# criar+subir é mais lento que só religar (pode incluir pull de imagem e
+# download de pesos do zero num host novo) — Retry-After maior que o do wake
+PROVISION_RETRY_AFTER_S = float(os.environ.get("PROVISION_RETRY_AFTER_S", "120"))
+# soma mínima de slots livres do plano (running + a capacidade cheia de uma
+# reserva pausada) — abaixo disso, o loop proativo cria+pausa uma máquina nova
+MACHINE_POOL_WATERMARK_SLOTS = float(os.environ.get("MACHINE_POOL_WATERMARK_SLOTS", "5"))
+MACHINE_HEALTH_TIMEOUT_S = float(os.environ.get("MACHINE_HEALTH_TIMEOUT_S", "900"))
+MACHINE_HEALTH_POLL_INTERVAL_S = float(os.environ.get("MACHINE_HEALTH_POLL_INTERVAL_S", "10"))
+# TTL do cache em memória do interruptor liga/desliga (system_settings) —
+# evita 1 round-trip ao Supabase por request na hot path
+SETTINGS_CACHE_TTL_S = float(os.environ.get("SETTINGS_CACHE_TTL_S", "30"))
+
 STARTED_AT = time.time()
 
 supa: SupaClient
@@ -90,9 +115,14 @@ store: RoutingStore
 proxy_client: httpx.AsyncClient
 # client curto pra API de embeddings da OpenAI (RAG do VibeCoder)
 openai_client: httpx.AsyncClient
+# client pra chamar de volta o painel Next.js (POST /api/machines/provision)
+panel_client: httpx.AsyncClient
 
 # cache de chaves: key_hash -> (entry | None, expira_em)
 key_cache: dict[str, tuple[dict | None, float]] = {}
+
+# cache do interruptor liga/desliga (system_settings.auto_provision_enabled)
+auto_provision_cache: tuple[bool, float] | None = None
 
 # requests em voo por (account_id, machine_id) — base do drain da Fase 5.
 # Em memória: válido apenas com réplica única do gateway.
@@ -106,6 +136,12 @@ last_machine_touch: dict[str, float] = {}
 # com requests concorrentes ou falhas repetidas (ex.: host sem GPU livre)
 last_wake_attempt: dict[str, float] = {}
 
+# provisionamento automático: plano -> criação em andamento (cascata reativa
+# e reposição proativa compartilham essa trava, pra nunca criar 2 máquinas
+# concorrentes pro mesmo plano) e última tentativa (cooldown)
+provisioning_in_progress: set[str] = set()
+last_provision_attempt: dict[str, float] = {}
+
 logger = logging.getLogger("gateway")
 
 lifecycle_mgr: "LifecycleManager"
@@ -114,7 +150,7 @@ runpod_client: RunPodClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supa, store, proxy_client, openai_client, lifecycle_mgr, runpod_client
+    global supa, store, proxy_client, openai_client, panel_client, lifecycle_mgr, runpod_client
     supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
     proxy_client = httpx.AsyncClient(
@@ -125,12 +161,19 @@ async def lifespan(app: FastAPI):
         headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
         timeout=httpx.Timeout(20.0, connect=5.0),
     )
+    panel_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(PANEL_PROVISION_TIMEOUT_S, connect=5.0)
+    )
     if RUNPOD_API_KEY:
         runpod_client = RunPodClient(RUNPOD_API_KEY)
     else:
         runpod_client = None
         logger.warning(
             "RUNPOD_API_KEY ausente — auto-pausa e auto-wake de máquinas desligados"
+        )
+    if not PANEL_URL or not PANEL_ADMIN_SECRET:
+        logger.warning(
+            "PANEL_URL/PANEL_ADMIN_SECRET ausente — provisionamento automático de máquina desligado"
         )
     lifecycle_mgr = LifecycleManager(
         store=store,
@@ -145,6 +188,9 @@ async def lifespan(app: FastAPI):
         machine_idle_stop_minutes=MACHINE_IDLE_STOP_MINUTES,
         consolidation_max_origin_routes=CONSOLIDATION_MAX_ORIGIN_ROUTES,
         stop_recheck_grace_s=STOP_RECHECK_GRACE_S,
+        try_provision_for_pool=try_provision_for_pool,
+        pool_watermark_slots=MACHINE_POOL_WATERMARK_SLOTS,
+        auto_provision_enabled=auto_provision_enabled,
     )
     reaper_task = asyncio.create_task(lifecycle_mgr.idle_reaper_loop())
     machine_task = asyncio.create_task(
@@ -155,6 +201,7 @@ async def lifespan(app: FastAPI):
     machine_task.cancel()
     await proxy_client.aclose()
     await openai_client.aclose()
+    await panel_client.aclose()
     await store.aclose()
     await supa.aclose()
     if runpod_client:
@@ -227,6 +274,23 @@ async def machine_free_slots(machine: dict) -> int:
     return slots - used
 
 
+async def auto_provision_enabled() -> bool:
+    """Interruptor liga/desliga do provisionamento automático (system_settings,
+    controlado pelo painel). Cache curto em memória — mesmo padrão do
+    key_cache, evita 1 round-trip ao Supabase por request na hot path sem
+    deixar o toggle demorar minutos pra fazer efeito."""
+    global auto_provision_cache
+    now = time.time()
+    if auto_provision_cache and auto_provision_cache[1] > now:
+        return auto_provision_cache[0]
+    try:
+        value = await supa.get_setting("auto_provision_enabled", False)
+    except Exception:
+        value = False  # Supabase fora do ar: nunca provisiona por engano
+    auto_provision_cache = (value, now + SETTINGS_CACHE_TTL_S)
+    return value
+
+
 async def wake_machine(machine: dict, reason: str) -> bool:
     """Religa um pod pausado (startPod) e o devolve ao pool de roteamento.
 
@@ -279,16 +343,156 @@ def waking_503() -> HTTPException:
     )
 
 
+def provisioning_503() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="provisionando uma máquina nova, tente novamente em alguns minutos",
+        headers={"Retry-After": str(int(PROVISION_RETRY_AFTER_S))},
+    )
+
+
+async def provision_machine_for_plan(plan: str) -> dict | None:
+    """POST {PANEL_URL}/api/machines/provision — pede ao painel Next.js pra
+    criar uma máquina nova do plano (o gateway nunca fala com a API de
+    criação da RunPod diretamente, ver comentário das env vars no topo).
+    None em qualquer falha (painel desligado/fora do ar, timeout, painel
+    recusou) — o chamador decide o fallback, nunca propaga exceção."""
+    if not PANEL_URL or not PANEL_ADMIN_SECRET:
+        return None
+    try:
+        r = await panel_client.post(
+            f"{PANEL_URL}/api/machines/provision",
+            json={"plan": plan},
+            headers={"X-Admin-Secret": PANEL_ADMIN_SECRET},
+        )
+    except httpx.HTTPError as e:
+        logger.warning("provisionamento: chamada ao painel (%s) falhou (%s)", plan, e)
+        return None
+    if r.status_code != 200:
+        logger.warning(
+            "provisionamento: painel recusou %s (%s): %s", plan, r.status_code, r.text
+        )
+        return None
+    return r.json()
+
+
+async def _wait_machine_healthy(
+    machine_id: str, timeout_s: float, poll_interval_s: float = 10.0
+) -> bool:
+    """Poll em GET {public_url}/health (sem auth — endpoint do agent) até o
+    vLLM confirmar modelo carregado (vllm_ready) ou o timeout esgotar."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        machine = await supa.get_machine(machine_id)
+        if machine and machine.get("public_url"):
+            try:
+                r = await proxy_client.get(
+                    f"{machine['public_url']}/health",
+                    timeout=httpx.Timeout(5.0, connect=5.0),
+                )
+                if r.status_code == 200 and r.json().get("vllm_ready"):
+                    return True
+            except Exception:
+                pass
+        await asyncio.sleep(poll_interval_s)
+    return False
+
+
+async def _provision_and_track(plan: str, reason: str, pause_when_healthy: bool) -> None:
+    """Task de background: cria -> espera saudável -> opcionalmente pausa
+    (reposição proativa) — nunca deixa exceção escapar (fire-and-forget)."""
+    try:
+        machine = await provision_machine_for_plan(plan)
+        if not machine:
+            return
+        try:
+            await supa.log_machine_event(
+                machine["machine_id"], "created", f"Provisionamento automático: {reason}"
+            )
+        except Exception:
+            pass
+        healthy = await _wait_machine_healthy(
+            machine["machine_id"], MACHINE_HEALTH_TIMEOUT_S, MACHINE_HEALTH_POLL_INTERVAL_S
+        )
+        if healthy and pause_when_healthy and runpod_client is not None:
+            m = await supa.get_machine(machine["machine_id"])
+            if m and m.get("runpod_pod_id"):
+                try:
+                    await runpod_client.stop_pod(m["runpod_pod_id"])
+                    await supa.set_machine_status(machine["machine_id"], "stopped")
+                    await supa.log_machine_event(
+                        machine["machine_id"], "stopped",
+                        "Reposição proativa: pausada assim que ficou saudável",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "provisionamento: pausa pós-boot de %s falhou (%s)",
+                        machine["machine_id"], e,
+                    )
+    except Exception as e:
+        logger.warning("provisionamento automático (%s) falhou (%s)", plan, e)
+    finally:
+        provisioning_in_progress.discard(plan)
+
+
+async def _try_provision_machine_for_plan(
+    plan: str, reason: str, pause_when_healthy: bool
+) -> bool:
+    """Dispara a criação em background se o interruptor estiver ligado, o
+    painel estiver configurado, não houver uma criação em andamento pro
+    plano e o cooldown já tiver passado. Fonte única de verdade do
+    interruptor — os 3 chamadores (cascata reativa x2, ensure_capacity_once)
+    não precisam checar auto_provision_enabled() cada um por conta própria.
+    A decisão de SE vale a pena criar (dado que está ligado) é toda do
+    chamador — aqui só há as travas."""
+    if not await auto_provision_enabled():
+        return False
+    if not PANEL_URL or not PANEL_ADMIN_SECRET:
+        # sem painel configurado, provision_machine_for_plan sempre devolve
+        # None — sem essa checagem aqui, o chamador levantaria um
+        # provisioning_503() mentiroso (promete retry, mas nunca vai criar)
+        return False
+    if plan in provisioning_in_progress:
+        return False
+    now = time.time()
+    if now - last_provision_attempt.get(plan, 0) < PROVISION_COOLDOWN_S:
+        return False
+    # daqui pra baixo não há mais nenhum await antes de marcar a trava —
+    # checagem + marcação são atômicas dentro do event loop (mesmo cuidado
+    # do wake_machine existente)
+    last_provision_attempt[plan] = now
+    provisioning_in_progress.add(plan)
+    asyncio.create_task(_provision_and_track(plan, reason, pause_when_healthy))
+    return True
+
+
+async def try_provision_for_request(plan: str, reason: str) -> bool:
+    """Cascata reativa (3º nível): não pausa ao ficar saudável — o próprio
+    request que disparou precisa da máquina de pé pro retry."""
+    return await _try_provision_machine_for_plan(plan, reason, pause_when_healthy=False)
+
+
+async def try_provision_for_pool(plan: str, reason: str) -> bool:
+    """Reposição proativa: pausa ao ficar saudável — ninguém está esperando,
+    minimiza custo de GPU ociosa."""
+    return await _try_provision_machine_for_plan(plan, reason, pause_when_healthy=True)
+
+
 async def pick_machine_with_free_slot(plan: str) -> dict:
     """Alocação placeholder: primeira máquina running (do template do plano
     da conta) com slot LoRA livre. Sem capacidade → tenta religar um pod
-    pausado do plano (auto-wake) antes de desistir."""
+    pausado do plano (auto-wake); sem pausada, tenta provisionar uma nova
+    (3º nível, se o interruptor estiver ligado) antes de desistir."""
     machines = await supa.list_running_machines_for_plan(plan)
     for m in machines:
         if await machine_free_slots(m) > 0:
             return m
     if await wake_some_machine_for_plan(plan):
         raise waking_503()
+    if plan in provisioning_in_progress or await try_provision_for_request(
+        plan, "sem máquina com vaga nem pausada"
+    ):
+        raise provisioning_503()
     if not machines:
         raise HTTPException(status_code=503, detail="nenhuma máquina disponível")
     raise HTTPException(status_code=503, detail="sem capacidade: todas as máquinas estão cheias")
@@ -374,6 +578,11 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
         if not machines:
             if await wake_some_machine_for_plan(entry["plan"]):
                 raise waking_503()
+            plan = entry["plan"]
+            if plan in provisioning_in_progress or await try_provision_for_request(
+                plan, "sem máquina para o modelo base"
+            ):
+                raise provisioning_503()
             raise HTTPException(
                 status_code=503, detail=f"nenhuma máquina disponível para o plano {entry['plan']}"
             )
@@ -549,6 +758,7 @@ async def admin_routes(x_admin_secret: str | None = Header(None)):
     return {
         "in_flight": {f"{a}@{m}": n for (a, m), n in in_flight.items() if n > 0},
         "key_cache_size": len(key_cache),
+        "provisioning_in_progress": sorted(provisioning_in_progress),
     }
 
 
@@ -596,3 +806,13 @@ async def admin_stop_idle_machines(x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
     stopped = await lifecycle_mgr.stop_idle_machines_once()
     return {"ok": True, "stopped": stopped}
+
+
+@app.post("/admin/ensure-capacity")
+async def admin_ensure_capacity(x_admin_secret: str | None = Header(None)):
+    """Dispara um ciclo de reposição proativa manualmente (útil em teste e
+    chamado pelo painel na hora em que o interruptor liga, pra não esperar
+    até 5min pelo próximo tick automático)."""
+    require_admin(x_admin_secret)
+    triggered = await lifecycle_mgr.ensure_capacity_once()
+    return {"ok": True, "triggered_plans": triggered}

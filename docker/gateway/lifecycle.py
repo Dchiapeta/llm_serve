@@ -34,6 +34,9 @@ class LifecycleManager:
         machine_idle_stop_minutes: float = 0.0,
         consolidation_max_origin_routes: int = 2,
         stop_recheck_grace_s: float = 5.0,
+        try_provision_for_pool=None,
+        pool_watermark_slots: float = 5.0,
+        auto_provision_enabled=None,
     ):
         self.store = store
         self.supa = supa
@@ -48,6 +51,11 @@ class LifecycleManager:
         self.machine_idle_stop_minutes = machine_idle_stop_minutes
         self.consolidation_max_origin_routes = consolidation_max_origin_routes
         self.stop_recheck_grace_s = stop_recheck_grace_s
+        # reposição proativa (ensure_capacity_once) — callbacks injetados por
+        # main.py, mesmo padrão de machine_free_slots acima
+        self.try_provision_for_pool = try_provision_for_pool
+        self.pool_watermark_slots = pool_watermark_slots
+        self.auto_provision_enabled = auto_provision_enabled
 
     def _in_flight_count(self, account_id: str, machine_id: str) -> int:
         return self.in_flight.get((account_id, machine_id), 0)
@@ -367,6 +375,42 @@ class LifecycleManager:
             stopped.append(machine_id)
         return stopped
 
+    # ---------- Reposição proativa de capacidade ----------
+
+    async def ensure_capacity_once(self) -> list[str]:
+        """Por plano, soma os slots livres de TODAS as máquinas não-terminadas
+        (running + stopped — machine_free_slots é capacidade menos rotas
+        ativas, então uma pausada vazia entra com a capacidade cheia, ex.
+        20, já que ela é "disponível via despausar"). Abaixo do watermark,
+        dispara a criação de 1 máquina nova — que try_provision_for_pool
+        pausa assim que ficar saudável, virando a próxima reserva. Regra
+        única e autolimitante: assim que existe 1 reserva pausada, a soma já
+        fica bem acima do watermark, então não dispara outra criação — sem
+        precisar de um teto numérico separado de "quantas máquinas".
+        """
+        if self.try_provision_for_pool is None or self.machine_free_slots is None:
+            return []
+        if self.auto_provision_enabled is not None and not await self.auto_provision_enabled():
+            return []
+        triggered: list[str] = []
+        for plan in await self.supa.list_distinct_plans():
+            # isolado por plano: uma falha (ex.: RPC do Supabase) não deve
+            # abortar os planos seguintes deste mesmo tick
+            try:
+                running = await self.supa.list_running_machines_for_plan(plan)
+                stopped = await self.supa.list_stopped_machines_for_plan(plan)
+                free_slots_total = 0
+                for m in running + stopped:
+                    free_slots_total += await self.machine_free_slots(m)
+                if free_slots_total >= self.pool_watermark_slots:
+                    continue
+                reason = f"reposição proativa (slots livres do plano: {free_slots_total})"
+                if await self.try_provision_for_pool(plan, reason):
+                    triggered.append(plan)
+            except Exception as e:
+                logger.warning("ensure-capacity: plano %s falhou (%s)", plan, e)
+        return triggered
+
     async def machine_lifecycle_loop(self, interval_s: float = 300.0):
         while True:
             await asyncio.sleep(interval_s)
@@ -384,6 +428,12 @@ class LifecycleManager:
                 await self.stop_idle_machines_once()
             except Exception as e:
                 logger.warning("auto-pausa: ciclo falhou (%s)", e)
+            # depois da auto-pausa: uma máquina recém-pausada por ociosidade
+            # já conta como a reserva vazia do plano nesta mesma rodada
+            try:
+                await self.ensure_capacity_once()
+            except Exception as e:
+                logger.warning("ensure-capacity: ciclo falhou (%s)", e)
 
 
 class MigrationError(Exception):

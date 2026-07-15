@@ -219,6 +219,30 @@ class SupaClient:
         r.raise_for_status()
         return r.json()
 
+    # ---------- templates ----------
+
+    async def list_distinct_plans(self) -> list[str]:
+        """Planos com pelo menos 1 template cadastrado — base do loop de
+        reposição proativa (ensure_capacity_once), que roda por plano.
+        PostgREST não tem DISTINCT para coluna arbitrária sem RPC; a tabela é
+        pequena, então dedup em memória é barato mesmo a cada tick de 300s."""
+        r = await self._rest.get("/templates", params={"select": "plan"})
+        r.raise_for_status()
+        return sorted({row["plan"] for row in r.json()})
+
+    # ---------- system_settings ----------
+
+    async def get_setting(self, key: str, default: bool) -> bool:
+        """Flag booleana global (ex.: auto_provision_enabled). Chamador é
+        responsável por cachear — aqui é sempre uma leitura live."""
+        r = await self._rest.get(
+            "/system_settings",
+            params={"key": f"eq.{key}", "select": "value", "limit": "1"},
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0]["value"] if rows else default
+
     # ---------- lora_adapters ----------
 
     async def latest_ready_adapter(self, account_id: str) -> dict | None:

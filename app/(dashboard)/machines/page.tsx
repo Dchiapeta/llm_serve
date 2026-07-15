@@ -1,5 +1,6 @@
 import Link from "next/link"
 
+import { getAutoProvisionEnabled } from "@/lib/actions"
 import { computeCapacity } from "@/lib/capacity"
 import { machineDisplayStatus, reconcileMachineStatuses } from "@/lib/machines"
 import { listGpuTypes } from "@/lib/runpod"
@@ -21,6 +22,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { AutoProvisionToggle } from "@/components/machines/auto-provision-toggle"
 import { CreateMachineDialog } from "@/components/machines/create-machine-dialog"
 import { MachineRowActions } from "@/components/machines/machine-row-actions"
 import { PlanBadge } from "@/components/machines/plan-badge"
@@ -31,7 +33,7 @@ export const dynamic = "force-dynamic"
 export default async function MachinesPage() {
   const db = createSupabaseAdmin()
 
-  const [{ data: machinesData }, { data: templatesData }, gpus] =
+  const [{ data: machinesData }, { data: templatesData }, gpus, autoProvisionEnabled] =
     await Promise.all([
       db
         .from("machines")
@@ -40,6 +42,7 @@ export default async function MachinesPage() {
         .order("created_at", { ascending: false }),
       db.from("templates").select("*").order("name"),
       listGpuTypes().catch(() => []),
+      getAutoProvisionEnabled(),
     ])
 
   const templates = (templatesData ?? []) as Template[]
@@ -84,6 +87,8 @@ export default async function MachinesPage() {
         </div>
         <CreateMachineDialog templates={templates} gpus={gpus} />
       </div>
+
+      <AutoProvisionToggle initialEnabled={autoProvisionEnabled} />
 
       <Card>
         <CardHeader>

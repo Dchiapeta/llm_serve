@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache"
 import { redirect } from "next/navigation"
+import { after } from "next/server"
 import { randomBytes } from "crypto"
 
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
@@ -475,6 +476,61 @@ export async function createMachine(formData: FormData) {
   redirect(`/machines/${result.machineId}`)
 }
 
+// Ponto de entrada de POST /api/machines/provision — chamado pelo gateway
+// quando decide (via watermark de slots livres) que vale a pena criar uma
+// máquina nova pro plano. Só EXECUTA o provisionamento; a decisão de QUANDO
+// vale a pena é toda do chamador (o gateway nunca cria 2 vezes à toa porque
+// só chama isso quando o watermark do plano já está violado).
+export async function provisionMachineForPlan(input: {
+  plan: TemplatePlan
+  templateId?: string | null
+}): Promise<
+  | { machineId: string; name: string; publicUrl: string | null }
+  | { error: string }
+> {
+  const db = createSupabaseAdmin()
+
+  let tpl: Template | null
+  if (input.templateId) {
+    const { data } = await db
+      .from("templates")
+      .select("*")
+      .eq("id", input.templateId)
+      .single<Template>()
+    tpl = data
+  } else {
+    tpl = await getDefaultTemplateForPlan(db, input.plan)
+  }
+  if (!tpl) return { error: `Nenhum produto ${input.plan} cadastrado` }
+  if (input.templateId && tpl.plan !== input.plan) {
+    return { error: "O template informado não pertence ao plano informado" }
+  }
+
+  let viableGpuIds: string[]
+  try {
+    viableGpuIds = await viableGpuIdsForTemplate(tpl)
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) }
+  }
+
+  // Tenta as GPUs viáveis em ordem — cobre falta de estoque de um tipo.
+  let lastError = ""
+  for (const gpuTypeId of viableGpuIds) {
+    const name = await nextStackMachineName(db)
+    const prov = await provisionMachine({ name, templateId: tpl.id, gpuTypeId })
+    if (!("error" in prov)) {
+      const { data: m } = await db
+        .from("machines")
+        .select("public_url")
+        .eq("id", prov.machineId)
+        .single<Pick<Machine, "public_url">>()
+      return { machineId: prov.machineId, name, publicUrl: m?.public_url ?? null }
+    }
+    lastError = prov.error
+  }
+  return { error: lastError || "Nenhuma GPU disponível para provisionar" }
+}
+
 export async function refreshMachineStatus(machineId: string) {
   const db = createSupabaseAdmin()
   const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
@@ -755,6 +811,94 @@ async function viableGpuIdsForTemplate(
   return viable
 }
 
+// Template "padrão" de um plano — usado quando não há máquina/stack da qual
+// inferir o template. Sem flag de "padrão" no schema hoje: pega o mais
+// antigo cadastrado pro plano (mesma premissa de "1 template ativo por
+// plano" que o resto do sistema já assume; ordena por created_at só pra
+// tornar essa escolha determinística, em vez de arbitrária).
+async function getDefaultTemplateForPlan(
+  db: ReturnType<typeof createSupabaseAdmin>,
+  plan: TemplatePlan
+): Promise<Template | null> {
+  const { data } = await db
+    .from("templates")
+    .select("*")
+    .eq("plan", plan)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle<Template>()
+  return data
+}
+
+// Cascata de 3 níveis usada sempre que uma stack precisa de máquina sem que
+// o admin tenha escolhido uma explicitamente: máquina running do mesmo
+// template com vaga (reaproveita) → máquina pausada do mesmo template com
+// vaga (despausa) → cria uma nova. Espelha, no painel, a mesma cascata que
+// o gateway aplica em runtime (rodando com vaga → despausar → provisionar)
+// — evita criar máquina à toa quando já existe capacidade disponível.
+//
+// excludeMachineId: usado pelo migrateStack (alvo null = "realoque essa
+// stack") pra nunca devolver a própria máquina de origem — sem isso, uma
+// origem ainda com vaga faria a "migração" virar um no-op silencioso.
+async function allocateMachineForTemplate(
+  db: ReturnType<typeof createSupabaseAdmin>,
+  tpl: Pick<
+    Template,
+    "id" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
+  >,
+  excludeMachineId?: string
+): Promise<{ machineId: string; created: boolean }> {
+  let runningQuery = db
+    .from("machines")
+    .select("id")
+    .eq("template_id", tpl.id)
+    .eq("status", "running")
+    .order("created_at", { ascending: true })
+  if (excludeMachineId) runningQuery = runningQuery.neq("id", excludeMachineId)
+  const { data: running } = await runningQuery
+  for (const m of (running ?? []) as Pick<Machine, "id">[]) {
+    const cap = await machineStackCapacity(db, m.id)
+    if (!cap || cap.slotsMax === 0 || cap.slotsFree > 0) {
+      return { machineId: m.id, created: false }
+    }
+  }
+
+  let stoppedQuery = db
+    .from("machines")
+    .select("id")
+    .eq("template_id", tpl.id)
+    .eq("status", "stopped")
+    .not("runpod_pod_id", "is", null)
+    .order("created_at", { ascending: true })
+  if (excludeMachineId) stoppedQuery = stoppedQuery.neq("id", excludeMachineId)
+  const { data: stopped } = await stoppedQuery
+  for (const m of (stopped ?? []) as Pick<Machine, "id">[]) {
+    // Pausada não é necessariamente vazia (as stacks dela continuam
+    // apontando pra ela) — checa vaga ANTES de religar, senão desperdiça um
+    // startPod numa máquina que já está cheia.
+    const cap = await machineStackCapacity(db, m.id)
+    if (cap && cap.slotsMax > 0 && cap.slotsFree < 1) continue
+    // startMachine devolve void em sucesso (falsy) e {error} em falha —
+    // ver definição acima; !result só é true no caso de sucesso.
+    const result = await startMachine(m.id)
+    if (!result) return { machineId: m.id, created: false }
+    // startMachine falhou (ex.: host sem GPU livre) — tenta a próxima pausada
+  }
+
+  const viableGpuIds = await viableGpuIdsForTemplate(tpl)
+  let lastError = ""
+  for (const gpuTypeId of viableGpuIds) {
+    const prov = await provisionMachine({
+      name: await nextStackMachineName(db),
+      templateId: tpl.id,
+      gpuTypeId,
+    })
+    if (!("error" in prov)) return { machineId: prov.machineId, created: true }
+    lastError = prov.error
+  }
+  throw new Error(`Falha ao provisionar máquina: ${lastError}`)
+}
+
 // pelo admin (machine_id do form), ou numa recém-provisionada com o
 // template selecionado (nome = llm-stack-N, GPU = primeira compatível). Em
 // ambos os casos emite a chave HEX da conta na máquina; a plainKey é
@@ -790,13 +934,6 @@ export async function createStack(formData: FormData): Promise<{
       >
     >()
   if (!tpl) throw new Error("Produto não encontrado")
-
-  // Sem máquina escolhida, uma será provisionada — valida ANTES de criar a
-  // stack quais GPUs do template comportam o max_users configurado.
-  let viableGpuIds: string[] = []
-  if (!chosenMachineId) {
-    viableGpuIds = await viableGpuIdsForTemplate(tpl)
-  }
 
   // Máquina escolhida pelo admin: precisa estar rodando, ser do mesmo
   // template e ter slot livre (1 stack = 1 slot).
@@ -860,25 +997,16 @@ export async function createStack(formData: FormData): Promise<{
   }
   if (!stackId) throw new Error("Não foi possível gerar um ID único; tente novamente")
 
-  const machineCreated = !chosenMachineId
   let machineId = chosenMachineId
+  let machineCreated = false
   if (!machineId) {
-    // Tenta as GPUs viáveis em ordem — cobre falta de estoque de um tipo.
-    let lastError = ""
-    for (const gpuTypeId of viableGpuIds) {
-      const prov = await provisionMachine({
-        name: await nextStackMachineName(db),
-        templateId,
-        gpuTypeId,
-      })
-      if (!("error" in prov)) {
-        machineId = prov.machineId
-        break
-      }
-      lastError = prov.error
-    }
-    if (!machineId) {
-      throw new Error(`Stack ${slug} criada, mas falhou ao criar a máquina: ${lastError}`)
+    try {
+      const alloc = await allocateMachineForTemplate(db, tpl)
+      machineId = alloc.machineId
+      machineCreated = alloc.created
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      throw new Error(`Stack ${slug} criada, mas falhou ao alocar máquina: ${msg}`)
     }
   }
 
@@ -909,8 +1037,9 @@ export async function deleteStack(id: string) {
 // Migra uma stack para outra máquina: garante a chave da conta no destino
 // (reutiliza uma ativa ou emite nova — a plainKey é retornada UMA única
 // vez), reaponta stacks.machine_id e revoga as chaves da conta na origem
-// quando nenhuma outra stack dela continua lá. targetMachineId null =
-// provisiona uma máquina nova (nome llm-stack-N) com o produto da stack.
+// quando nenhuma outra stack dela continua lá. targetMachineId null = usa
+// allocateMachineForTemplate (running com vaga → pausada despausada → nova
+// provisionada) com o produto da stack — só cria máquina se de fato precisar.
 export async function migrateStack(input: {
   stackId: string
   targetMachineId: string | null
@@ -941,17 +1070,12 @@ export async function migrateStack(input: {
     templateId = m?.template_id ?? null
   }
   if (!templateId) {
-    const { data: tpl } = await db
-      .from("templates")
-      .select("id")
-      .eq("plan", stack.plan)
-      .limit(1)
-      .maybeSingle<{ id: string }>()
-    templateId = tpl?.id ?? null
+    const defaultTpl = await getDefaultTemplateForPlan(db, stack.plan)
+    templateId = defaultTpl?.id ?? null
   }
   if (!templateId) throw new Error(`Nenhum produto ${stack.plan} cadastrado`)
 
-  const machineCreated = !input.targetMachineId
+  let machineCreated = false
   let targetMachineId = input.targetMachineId
   if (targetMachineId) {
     const { data: target } = await db
@@ -986,23 +1110,13 @@ export async function migrateStack(input: {
         >
       >()
     if (!tpl) throw new Error("Produto não encontrado")
-    const viableGpuIds = await viableGpuIdsForTemplate(tpl)
-    // Tenta as GPUs viáveis em ordem — cobre falta de estoque de um tipo.
-    let lastError = ""
-    for (const gpuTypeId of viableGpuIds) {
-      const prov = await provisionMachine({
-        name: await nextStackMachineName(db),
-        templateId,
-        gpuTypeId,
-      })
-      if (!("error" in prov)) {
-        targetMachineId = prov.machineId
-        break
-      }
-      lastError = prov.error
-    }
-    if (!targetMachineId) {
-      throw new Error(`Falhou ao criar a máquina de destino: ${lastError}`)
+    try {
+      const alloc = await allocateMachineForTemplate(db, tpl, fromMachineId ?? undefined)
+      targetMachineId = alloc.machineId
+      machineCreated = alloc.created
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      throw new Error(`Falhou ao alocar máquina de destino: ${msg}`)
     }
   }
 
@@ -1159,6 +1273,60 @@ async function flushGatewayKeyCache() {
     headers: { "X-Admin-Secret": secret },
     signal: AbortSignal.timeout(5_000),
   })
+}
+
+// ---------- Interruptor de provisionamento automático ----------
+//
+// Liga/desliga a automação de criação de máquina do gateway (cascata reativa
+// numa request + reposição proativa pelo relógio de 5min). Nasce desligada
+// (migration 0016_system_settings.sql) — é uma automação que gasta GPU
+// sozinha, não deve entrar em produção já ativa.
+
+export async function getAutoProvisionEnabled(): Promise<boolean> {
+  const db = createSupabaseAdmin()
+  const { data } = await db
+    .from("system_settings")
+    .select("value")
+    .eq("key", "auto_provision_enabled")
+    .maybeSingle<{ value: boolean }>()
+  return data?.value ?? false
+}
+
+// Erro modelado como retorno, não throw — em produção o Next redige a
+// mensagem de exceções lançadas por Server Actions (troca por genérico +
+// digest), o que esconderia o motivo real do usuário. Mesmo padrão de
+// startMachine/recreateMachine acima.
+export async function setAutoProvisionEnabled(
+  enabled: boolean
+): Promise<{ error: string } | void> {
+  const db = createSupabaseAdmin()
+  const { error } = await db
+    .from("system_settings")
+    .upsert({ key: "auto_provision_enabled", value: enabled, updated_at: new Date().toISOString() })
+  if (error) return { error: error.message }
+
+  // Ao ligar, dispara a reposição das reservas — via after() pra não travar
+  // a resposta da action nem o toggle na UI: é best-effort (falha aqui só
+  // significa que o próximo tick de 5min do gateway cobre), então não faz
+  // sentido o usuário esperar até 10s por um resultado que a gente nem usa.
+  // Um fetch solto sem await morreria junto com a invocação serverless
+  // assim que a action retornasse; after() garante que ele termina.
+  if (enabled) {
+    const url = process.env.GATEWAY_URL
+    const secret = process.env.GATEWAY_ADMIN_SECRET
+    if (url && secret) {
+      after(() =>
+        fetch(`${url.replace(/\/$/, "")}/admin/ensure-capacity`, {
+          method: "POST",
+          headers: { "X-Admin-Secret": secret },
+          signal: AbortSignal.timeout(10_000),
+        }).catch((e) =>
+          console.error("Disparo imediato de ensure-capacity falhou (o próximo tick do gateway cobre):", e)
+        )
+      )
+    }
+  }
+  revalidatePath("/machines")
 }
 
 export async function revokeKey(keyId: string) {
