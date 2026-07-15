@@ -301,10 +301,11 @@ class LifecycleManager:
                 new_status = self.POD_STATUS_MAP.get(pod.get("desiredStatus"), m["status"])
             if new_status == m["status"]:
                 continue
-            if m["status"] == "creating" and new_status == "running":
-                # o relógio de ociosidade começa quando a máquina fica DE PÉ,
-                # não quando foi criada — um boot demorado (pull da imagem +
-                # load do modelo) não pode desembocar em auto-pausa imediata
+            if new_status == "running":
+                # o relógio de ociosidade zera em QUALQUER promoção a running
+                # (creating→running ou stopped→running via console do RunPod):
+                # sem isso, uma máquina religada com last_activity_at velho é
+                # auto-pausada no ciclo seguinte, antes de servir qualquer request
                 try:
                     await self.supa.touch_machine_activity(m["id"])
                 except Exception:

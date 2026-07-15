@@ -125,9 +125,11 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
   running, EXITED → stopped, TERMINATED → terminated), espelho do
   `reconcileMachineStatuses` do painel — que só roda quando alguém abre uma
   página. Sem isso, máquina recém-criada fica `creating` no banco para sempre
-  e a auto-pausa nunca a enxerga, mesmo com o pod cobrando GPU. Na promoção
-  `creating → running`, o `last_activity_at` é tocado: o relógio de ociosidade
-  conta a partir de quando a máquina ficou DE PÉ, não da criação.
+  e a auto-pausa nunca a enxerga, mesmo com o pod cobrando GPU. Em qualquer
+  promoção a `running`, o `last_activity_at` é tocado: o relógio de ociosidade
+  conta a partir de quando a máquina ficou DE PÉ — sem isso, uma máquina
+  religada com atividade velha seria re-pausada no ciclo seguinte (o
+  `startMachine` do painel também toca, pois lá o flip não passa por aqui).
 - **Auto-pausa**: máquina running sem nenhuma atividade
   (`machines.last_activity_at`, tocada a cada request proxied) há
   `MACHINE_IDLE_STOP_MINUTES`, sem rotas ativas e sem request em voo →

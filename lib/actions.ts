@@ -539,7 +539,12 @@ export async function startMachine(
     }
     return { error: `Falha ao iniciar a máquina: ${msg}` }
   }
-  await db.from("machines").update({ status: "running" }).eq("id", machineId)
+  // last_activity_at junto: o relógio de ociosidade do gateway conta a partir
+  // do religamento — sem isso a auto-pausa derruba a máquina no ciclo seguinte
+  await db
+    .from("machines")
+    .update({ status: "running", last_activity_at: new Date().toISOString() })
+    .eq("id", machineId)
   await logEvent(machineId, "started", `Máquina "${m.name}" iniciada`)
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
