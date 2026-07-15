@@ -516,7 +516,14 @@ export async function provisionMachineForPlan(input: {
   // Tenta as GPUs viáveis em ordem — cobre falta de estoque de um tipo.
   let lastError = ""
   for (const gpuTypeId of viableGpuIds) {
-    const name = await nextStackMachineName(db)
+    let name: string
+    try {
+      name = await nextStackMachineName(db)
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      console.error("provisionMachineForPlan: falha ao gerar nome de máquina:", message)
+      return { error: message }
+    }
     const prov = await provisionMachine({ name, templateId: tpl.id, gpuTypeId })
     if (!("error" in prov)) {
       const { data: m } = await db
@@ -720,21 +727,16 @@ export async function terminateMachine(machineId: string) {
 // stack; accounts.plan segue alimentando o roteamento e não muda para
 // contas existentes. A stack nasce hospedada numa máquina: ou na escolhida
 // Nome padrão das máquinas de stack: llm-stack-1, llm-stack-2, …
-// Continua do maior sufixo existente (contando terminadas) para nunca
-// reaproveitar nome.
+// Via RPC (nextval de uma sequence, migration 0017) para ser atômico — duas
+// máquinas provisionadas na mesma rodada (ex.: watermark proativo criando
+// reservas de dois planos ao mesmo tempo) não podem mais nascer com o
+// mesmo nome, o que acontecia calculando o maior sufixo em JS.
 async function nextStackMachineName(
   db: ReturnType<typeof createSupabaseAdmin>
 ): Promise<string> {
-  const { data } = await db
-    .from("machines")
-    .select("name")
-    .like("name", "llm-stack-%")
-  let max = 0
-  for (const row of (data ?? []) as { name: string }[]) {
-    const m = /^llm-stack-(\d+)$/.exec(row.name)
-    if (m) max = Math.max(max, Number(m[1]))
-  }
-  return `llm-stack-${max + 1}`
+  const { data, error } = await db.rpc("next_stack_machine_name")
+  if (error) throw new Error(`Falha ao gerar nome de máquina: ${error.message}`)
+  return data as string
 }
 
 // Slots de uma máquina contando as stacks hospedadas nela (1 stack = 1
