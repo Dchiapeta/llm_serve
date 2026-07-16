@@ -903,6 +903,14 @@ async def embed_query(text: str) -> list[float] | None:
         return None
 
 
+MIN_MAX_TOKENS = 8000  # thinking mode (Qwen3.x) corta o raciocínio no meio quando o
+# cliente manda um teto baixo — comum em ferramentas de terceiro (Cursor, Continue,
+# Cline etc.) que fixam max_tokens curto por padrão. Como o produto é BYOE (o usuário
+# aponta a ferramenta dele direto pro endpoint, sem UI de chat própria controlando
+# esse parâmetro), o gateway impõe o piso aqui pra garantir qualidade consistente
+# independente do cliente.
+
+
 async def augment_body(body_json: dict, entry: dict) -> dict:
     """Injeta system prompt configurado da conta e contexto de RAG (top-k da
     base de conhecimento) antes de repassar ao vLLM. Só se aplica a chamadas
@@ -910,6 +918,10 @@ async def augment_body(body_json: dict, entry: dict) -> dict:
     messages = body_json.get("messages")
     if not isinstance(messages, list):
         return body_json
+
+    current_max_tokens = body_json.get("max_tokens")
+    if not isinstance(current_max_tokens, int) or current_max_tokens < MIN_MAX_TOKENS:
+        body_json["max_tokens"] = MIN_MAX_TOKENS
 
     if entry.get("system_prompt"):
         messages.insert(0, {"role": "system", "content": entry["system_prompt"]})
