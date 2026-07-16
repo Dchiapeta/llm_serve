@@ -1130,8 +1130,30 @@ export async function migrateStack(input: {
     }
   }
 
-  // Chave no destino ANTES de reapontar a stack — se a emissão falhar
-  // (máquina lotada), a migração é abortada sem efeito colateral.
+  // Só é seguro MOVER a chave da origem se nenhuma OUTRA stack da mesma
+  // conta continuar lá depois desta migração (senão essa outra stack
+  // ficaria sem chave). Checado antes de reapontar `stack` pra excluir
+  // ela mesma da contagem.
+  let otherStackRemainsAtOrigin = false
+  if (fromMachineId) {
+    const { count } = await db
+      .from("stacks")
+      .select("id", { count: "exact", head: true })
+      .eq("account_id", stack.account_id)
+      .eq("machine_id", fromMachineId)
+      .neq("id", stack.id)
+    otherStackRemainsAtOrigin = !!count
+  }
+
+  // Chave no destino ANTES de reapontar a stack — se a operação falhar
+  // (máquina lotada), a migração é abortada sem efeito colateral. Se já
+  // existe uma chave ativa lá, não mexe em nada. Senão, MOVE uma chave
+  // ativa da origem pro destino em vez de criar uma nova e revogar a
+  // antiga — a plain key que o cliente já configurou tem que continuar
+  // funcionando (mesmo princípio de move_account_keys no gateway,
+  // usado pela realocação automática). Só cria do zero se não houver
+  // chave pra mover (stack sem máquina de origem, ou outra stack da
+  // conta ainda depende da chave da origem).
   const { data: existingKey } = await db
     .from("api_keys")
     .select("id")
@@ -1143,11 +1165,25 @@ export async function migrateStack(input: {
 
   let plainKey: string | null = null
   if (!existingKey) {
-    const created = await createKey({
-      accountId: stack.account_id,
-      machineId: targetMachineId,
-    })
-    plainKey = created.plainKey
+    let moved = false
+    if (fromMachineId && !otherStackRemainsAtOrigin) {
+      const { data: movedKeys, error: moveError } = await db
+        .from("api_keys")
+        .update({ machine_id: targetMachineId })
+        .eq("account_id", stack.account_id)
+        .eq("machine_id", fromMachineId)
+        .eq("status", "active")
+        .select("id")
+      if (moveError) throw new Error(moveError.message)
+      moved = (movedKeys?.length ?? 0) > 0
+    }
+    if (!moved) {
+      const created = await createKey({
+        accountId: stack.account_id,
+        machineId: targetMachineId,
+      })
+      plainKey = created.plainKey
+    }
   }
 
   const { error } = await db
@@ -1161,27 +1197,6 @@ export async function migrateStack(input: {
     "stack_migrated",
     `Stack ${stack.slug} migrada para esta máquina`
   )
-
-  // Origem: revoga as chaves da conta quando nenhuma outra stack dela
-  // continua na máquina antiga.
-  if (fromMachineId) {
-    const { count: remaining } = await db
-      .from("stacks")
-      .select("id", { count: "exact", head: true })
-      .eq("account_id", stack.account_id)
-      .eq("machine_id", fromMachineId)
-    if (!remaining) {
-      const { data: oldKeys } = await db
-        .from("api_keys")
-        .select("id")
-        .eq("account_id", stack.account_id)
-        .eq("machine_id", fromMachineId)
-        .eq("status", "active")
-      for (const k of (oldKeys ?? []) as { id: string }[]) {
-        await revokeKey(k.id)
-      }
-    }
-  }
 
   revalidatePath("/stacks")
   revalidatePath("/accounts")
