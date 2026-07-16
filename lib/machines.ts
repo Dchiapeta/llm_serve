@@ -4,6 +4,17 @@ import type { Machine } from "./types"
 
 type SupabaseAdmin = ReturnType<typeof createSupabaseAdmin>
 
+// Nome com que o vLLM SERVE o modelo — é o que o cliente manda no campo
+// "model" da request. Com "--served-model-name" (no VLLM_EXTRA_ARGS do env
+// ou no start command do template) o vLLM aceita SÓ o alias, não o repo HF;
+// sem a flag, serve pelo próprio MODEL_NAME. Aceita as formas "--flag nome"
+// e "--flag=nome"; com múltiplos nomes, o primeiro é o canônico.
+export function parseServedModelName(args: string | null | undefined): string | null {
+  if (!args) return null
+  const m = args.match(/--served-model-name[=\s]+(\S+)/)
+  return m ? m[1] : null
+}
+
 // Status exibido na UI: além dos status do banco, "starting" indica que o
 // pod está de pé mas o vLLM ainda não respondeu (baixando/carregando modelo)
 // e "failed" que o processo do vLLM morreu (ex.: OOM no boot) com o pod vivo.

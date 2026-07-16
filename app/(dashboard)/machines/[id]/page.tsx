@@ -3,7 +3,11 @@ import { notFound } from "next/navigation"
 import { ExternalLink } from "lucide-react"
 
 import { computeCapacity, computeLoraCapacity } from "@/lib/capacity"
-import { machineDisplayStatus, reconcileMachineStatuses } from "@/lib/machines"
+import {
+  machineDisplayStatus,
+  parseServedModelName,
+  reconcileMachineStatuses,
+} from "@/lib/machines"
 import { collectUsageMetrics } from "@/lib/metrics"
 import { runpod, runpodConsoleUrl } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
@@ -377,7 +381,14 @@ export default async function MachineDetailPage({
             <CardContent>
               <MachineAbout
                 gatewayUrl={process.env.GATEWAY_URL ?? null}
-                modelName={machine.model_name}
+                // o campo "model" da request precisa ser o nome SERVIDO pelo
+                // vLLM (--served-model-name), não o repo HF — senão 404.
+                // Prioridade: env real do pod > template > repo HF (sem alias)
+                modelName={
+                  parseServedModelName(podEnv.VLLM_EXTRA_ARGS) ??
+                  parseServedModelName(template?.start_command) ??
+                  machine.model_name
+                }
               />
             </CardContent>
           </Card>
