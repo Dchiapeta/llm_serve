@@ -42,7 +42,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from lifecycle import LifecycleManager, MigrationError
 from routing import RoutingStore
@@ -947,6 +947,100 @@ async def augment_body(body_json: dict, entry: dict) -> dict:
     return body_json
 
 
+THINK_CLOSE = "</think>"
+
+# planos cujo modelo padrão roda com "thinking" ligado — o vLLM sobe sem
+# --reasoning-parser (ver docker/entrypoint.sh, bug conhecido dessa combinação
+# com Qwen3.5/3.6), então o raciocínio inteiro vaza pro campo "content" que o
+# cliente exibe. Filtrado aqui porque o produto é BYOE: nenhuma ferramenta
+# cliente (Cursor, Continue etc.) sabe separar isso sozinha.
+REASONING_LEAK_PLANS = {"VibeCoder"}
+
+
+def split_reasoning(text: str) -> tuple[str | None, str]:
+    """Separa o bloco de raciocínio da resposta final. Modelos com thinking
+    ligado não emitem a tag de abertura no texto gerado (o chat template já
+    injeta "<think>\\n" no prompt) — só a de fechamento. Sem </think> na
+    string, devolve (None, texto original): não há nada pra filtrar."""
+    idx = text.find(THINK_CLOSE)
+    if idx == -1:
+        return None, text
+    return text[:idx], text[idx + len(THINK_CLOSE) :].lstrip("\n")
+
+
+async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple):
+    """Envolve o stream SSE bruto do vLLM suprimindo os chunks de raciocínio
+    (antes de </think>) e só repassando ao cliente o que vem depois. Se o
+    teto de tokens for atingido sem nunca fechar </think> (raro, ~0-5% mesmo
+    com o piso de max_tokens), devolve o raciocínio acumulado no chunk final
+    em vez de descartar a resposta em silêncio."""
+    buffer_text = ""
+    in_reasoning = True
+    pending = b""
+    try:
+        async for raw in upstream.aiter_bytes():
+            pending += raw
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                stripped = line.strip()
+                if not in_reasoning or not stripped.startswith(b"data:") or stripped in (
+                    b"data: [DONE]",
+                    b"data:[DONE]",
+                ):
+                    yield line + b"\n"
+                    continue
+
+                payload = stripped[len(b"data:") :].strip()
+                try:
+                    chunk = json.loads(payload)
+                except Exception:
+                    yield line + b"\n"
+                    continue
+
+                choices = chunk.get("choices") or []
+                choice0 = choices[0] if choices and isinstance(choices[0], dict) else None
+                if choice0 is None:
+                    yield line + b"\n"
+                    continue
+
+                delta = choice0.get("delta") or {}
+                content = delta.get("content")
+                finish_reason = choice0.get("finish_reason")
+                if content:
+                    buffer_text += content
+
+                if THINK_CLOSE in buffer_text:
+                    _, visible = split_reasoning(buffer_text)
+                    in_reasoning = False
+                    buffer_text = ""
+                    if visible or finish_reason:
+                        delta = dict(delta)
+                        delta["content"] = visible
+                        delta.setdefault("role", "assistant")
+                        choice0["delta"] = delta
+                        yield b"data: " + json.dumps(chunk).encode() + b"\n"
+                    continue
+
+                if finish_reason:
+                    # bateu finish_reason sem nunca ver </think> — devolve o
+                    # que foi acumulado em vez de sumir com a resposta inteira
+                    delta = dict(delta)
+                    delta["content"] = buffer_text
+                    delta.setdefault("role", "assistant")
+                    choice0["delta"] = delta
+                    buffer_text = ""
+                    in_reasoning = False
+                    yield b"data: " + json.dumps(chunk).encode() + b"\n"
+                    continue
+
+                continue  # ainda dentro do raciocínio, sem finish_reason -> suprime
+        if pending:
+            yield pending
+    finally:
+        await upstream.aclose()
+        in_flight[flight_key] -= 1
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request, authorization: str | None = Header(None)):
     entry = await authenticate(authorization)
@@ -961,6 +1055,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     flight_key = (account_id, machine["id"])
     in_flight[flight_key] += 1
 
+    body_json = None
     try:
         body = await request.body()
         if body:
@@ -996,6 +1091,39 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # in_flight > 0 pra sempre e a auto-pausa nunca mais dispara
         in_flight[flight_key] -= 1
         raise
+
+    filter_reasoning = path == "chat/completions" and entry.get("plan") in REASONING_LEAK_PLANS
+    is_stream_request = isinstance(body_json, dict) and body_json.get("stream") is True
+
+    if filter_reasoning and not is_stream_request:
+        try:
+            raw = await upstream.aread()
+            try:
+                payload = json.loads(raw)
+                for choice in payload.get("choices", []):
+                    message = choice.get("message")
+                    if isinstance(message, dict) and isinstance(message.get("content"), str):
+                        reasoning, visible = split_reasoning(message["content"])
+                        if reasoning is not None:
+                            message["content"] = visible
+                raw = json.dumps(payload).encode()
+            except Exception:
+                pass  # resposta não é o JSON de chat completion esperado -> repassa como veio
+        finally:
+            await upstream.aclose()
+            in_flight[flight_key] -= 1
+        return Response(
+            content=raw,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "application/json"),
+        )
+
+    if filter_reasoning:
+        return StreamingResponse(
+            filtered_reasoning_stream(upstream, flight_key),
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "text/event-stream"),
+        )
 
     async def stream_and_release():
         try:
