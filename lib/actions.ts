@@ -1550,6 +1550,21 @@ const EMBEDDING_MODEL = "text-embedding-3-small"
 const CHUNK_SIZE = 1000
 const CHUNK_OVERLAP = 100
 
+// Supabase Storage rejeita chaves com acentos e outros caracteres fora do
+// alfabeto seguro de S3 ("Invalid key") — normaliza antes de montar o path.
+function sanitizeStorageFileName(name: string): string {
+  const dot = name.lastIndexOf(".")
+  const ext = dot >= 0 ? name.slice(dot).toLowerCase() : ""
+  const base = dot >= 0 ? name.slice(0, dot) : name
+  const safeBase = base
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+  return `${safeBase || "arquivo"}${ext}`
+}
+
 function chunkText(text: string): string[] {
   const chunks: string[] = []
   let start = 0
@@ -1598,7 +1613,7 @@ export async function uploadKnowledgeFile(formData: FormData) {
   const chunks = chunkText(text)
   if (chunks.length === 0) throw new Error("Arquivo vazio")
 
-  const storagePath = `${accountId}/${file.name}`
+  const storagePath = `${accountId}/${sanitizeStorageFileName(file.name)}`
   const { error: uploadErr } = await db.storage
     .from(KNOWLEDGE_BUCKET)
     .upload(storagePath, file, { upsert: true, contentType: "text/plain" })

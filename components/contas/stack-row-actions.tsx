@@ -69,7 +69,7 @@ export function StackRowActions({
             <MoreVertical className="size-4" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
+        <DropdownMenuContent align="end" className="w-56">
           <DropdownMenuLabel>Stack</DropdownMenuLabel>
           <DropdownMenuItem onSelect={() => setStackInfoOpen(true)}>
             <Info className="size-4" />
