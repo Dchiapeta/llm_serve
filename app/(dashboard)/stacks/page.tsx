@@ -1,5 +1,4 @@
 import { KeyRound, Server, ServerCog, Users } from "lucide-react"
-import Link from "next/link"
 
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type { Account, ApiKey, LoraAdapter, Machine, RoutingState, Stack, Template } from "@/lib/types"
@@ -15,25 +14,11 @@ import { ContasTable, type StackRow } from "@/components/contas/contas-table"
 
 export const dynamic = "force-dynamic"
 
-const PERIODS = [
-  { value: "day", label: "Dia", ms: 24 * 60 * 60 * 1000 },
-  { value: "week", label: "Semana", ms: 7 * 24 * 60 * 60 * 1000 },
-  { value: "month", label: "Mês", ms: 30 * 24 * 60 * 60 * 1000 },
-] as const
+const PERIOD_LABEL = "Dia"
+const PERIOD_MS = 24 * 60 * 60 * 1000
 
-type Period = (typeof PERIODS)[number]["value"]
-
-export default async function ContasPage({
-  searchParams,
-}: {
-  searchParams: Promise<{ period?: string }>
-}) {
-  const { period: rawPeriod } = await searchParams
-  const period: Period = PERIODS.some((p) => p.value === rawPeriod)
-    ? (rawPeriod as Period)
-    : "day"
-  const periodDef = PERIODS.find((p) => p.value === period)!
-  const periodStart = new Date(Date.now() - periodDef.ms).toISOString()
+export default async function ContasPage() {
+  const periodStart = new Date(Date.now() - PERIOD_MS).toISOString()
 
   const db = createSupabaseAdmin()
 
@@ -260,32 +245,15 @@ export default async function ContasPage({
       </div>
 
       <Card>
-        <CardHeader className="flex flex-row items-center justify-between">
-          <div>
-            <CardTitle>Stacks</CardTitle>
-            <CardDescription>{rows.length} stack(s)</CardDescription>
-          </div>
-          <div className="flex items-center gap-1 rounded-lg border p-1">
-            {PERIODS.map((p) => (
-              <Link
-                key={p.value}
-                href={`/stacks?period=${p.value}`}
-                className={`rounded-md px-2.5 py-1 text-xs font-medium transition-colors ${
-                  p.value === period
-                    ? "bg-primary text-primary-foreground"
-                    : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-                }`}
-              >
-                {p.label}
-              </Link>
-            ))}
-          </div>
+        <CardHeader>
+          <CardTitle>Stacks</CardTitle>
+          <CardDescription>{rows.length} stack(s)</CardDescription>
         </CardHeader>
         <CardContent>
           <ContasTable
             rows={rows}
             runningMachines={runningMachines}
-            periodLabel={periodDef.label}
+            periodLabel={PERIOD_LABEL}
             stackMachines={stackMachines}
             templates={templates}
           />
