@@ -930,8 +930,14 @@ async def augment_body(body_json: dict, entry: dict) -> dict:
     if not isinstance(current_max_tokens, int) or current_max_tokens < MIN_MAX_TOKENS:
         body_json["max_tokens"] = MIN_MAX_TOKENS
 
+    # system_prompt da conta e contexto do RAG viram UM único system message no
+    # índice 0 — o chat template do Qwen3.x rejeita ("System message must be at
+    # the beginning") qualquer role "system" que não seja a primeira mensagem,
+    # então duas inserções separadas (uma em 0, outra antes do último user)
+    # quebravam toda chamada que tivesse as duas features ativas ao mesmo tempo.
+    system_parts = []
     if entry.get("system_prompt"):
-        messages.insert(0, {"role": "system", "content": entry["system_prompt"]})
+        system_parts.append(entry["system_prompt"])
 
     last_user = next(
         (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -943,12 +949,13 @@ async def augment_body(body_json: dict, entry: dict) -> dict:
                 entry["account_id"], embedding, RAG_TOP_K
             )
             if chunks:
-                context_msg = {
-                    "role": "system",
-                    "content": "Contexto relevante da base de conhecimento:\n"
-                    + "\n---\n".join(chunks),
-                }
-                messages.insert(messages.index(last_user), context_msg)
+                system_parts.append(
+                    "Contexto relevante da base de conhecimento:\n"
+                    + "\n---\n".join(chunks)
+                )
+
+    if system_parts:
+        messages.insert(0, {"role": "system", "content": "\n\n---\n\n".join(system_parts)})
 
     body_json["messages"] = messages
     return body_json
