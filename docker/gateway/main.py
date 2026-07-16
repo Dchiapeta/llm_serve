@@ -1036,6 +1036,19 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple)
                 continue  # ainda dentro do raciocínio, sem finish_reason -> suprime
         if pending:
             yield pending
+        if in_reasoning and buffer_text:
+            # a conexão upstream acabou sem nunca fechar </think> nem mandar um
+            # finish_reason (visto sob concorrência pesada — provável preempção/
+            # aborto do vLLM, não um bug de framing) — melhor devolver o que foi
+            # acumulado do que deixar o cliente sem nenhuma resposta
+            fallback = {
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {"index": 0, "delta": {"role": "assistant", "content": buffer_text}, "finish_reason": "stop"}
+                ],
+            }
+            yield b"data: " + json.dumps(fallback).encode() + b"\n\n"
+            yield b"data: [DONE]\n\n"
     finally:
         await upstream.aclose()
         in_flight[flight_key] -= 1
