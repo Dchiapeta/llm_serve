@@ -10,8 +10,10 @@ Fluxo por request:
   2. Resolve a rota (routing_state). Regra primária: machine_id definido →
      proxy direto, independente do status (em 'migrating' a origem segue
      servindo até o flip). Só espera quando não há máquina servindo. Sem
-     adapter, a alocação é restrita às máquinas do template do plano da
-     conta (accounts.plan) — nunca cai no modelo base de outro plano.
+     adapter, o modelo base é stack-aware: serve na máquina do stack da
+     conta; pausada → realocação automática (reponta stack + move chaves)
+     pra outra running com vaga do MESMO plano, ou religa a própria; sem
+     stack, fallback por plano — nunca cai no modelo base de outro plano.
   3. Sem rota: alocação placeholder (primeira máquina running com slot livre),
      claim atômico, upsert da chave no agent, load do adapter, proxy.
   4. Injeta no body (chat completions): system prompt da conta + top-k de
@@ -20,7 +22,9 @@ Fluxo por request:
   5. Máquina fora do ar → 503 imediato, nunca pendura o request.
   6. Sem nenhuma máquina running com vaga → auto-wake: religa (startPod) um
      pod pausado do template do plano e responde 503 + Retry-After; o retry
-     do cliente aloca normalmente quando o vLLM estiver de pé.
+     do cliente aloca normalmente quando o vLLM estiver de pé. Toda religada
+     agenda o reenvio das chaves ao agent (que reinicia zerado) e o fluxo
+     base ainda garante a chave via upsert lazy antes de cada proxy.
 
 Limitação aceita (MVP): réplica ÚNICA. O contador in-flight e (na Fase 5) o
 idle reaper vivem em memória do processo — múltiplas réplicas cortariam
@@ -105,6 +109,10 @@ MACHINE_HEALTH_POLL_INTERVAL_S = float(os.environ.get("MACHINE_HEALTH_POLL_INTER
 # TTL do cache em memória do interruptor liga/desliga (system_settings) —
 # evita 1 round-trip ao Supabase por request na hot path
 SETTINGS_CACHE_TTL_S = float(os.environ.get("SETTINGS_CACHE_TTL_S", "30"))
+# TTL do cache "chave já upsertada no agent X" — o agent perde as chaves em
+# memória a cada restart do pod, então o fluxo base garante a chave via
+# upsert lazy antes do proxy; o cache evita 1 round-trip ao agent por request
+UPSERT_CACHE_TTL_S = float(os.environ.get("UPSERT_CACHE_TTL_S", "600"))
 
 STARTED_AT = time.time()
 
@@ -135,6 +143,18 @@ last_machine_touch: dict[str, float] = {}
 # última tentativa de auto-wake por máquina — evita tempestade de startPod
 # com requests concorrentes ou falhas repetidas (ex.: host sem GPU livre)
 last_wake_attempt: dict[str, float] = {}
+
+# chaves já garantidas no agent: (key_hash, machine_id) -> expira_em.
+# Invalidado por máquina a cada religada (o agent volta sem chaves).
+agent_key_upserts: dict[tuple[str, str], float] = {}
+
+# máquinas com re-sync de chaves agendado/em andamento (pós-religada) —
+# mesma disciplina do provisioning_in_progress
+key_sync_in_progress: set[str] = set()
+
+# serializa a realocação de stacks por plano: escolher alvo + contar vaga +
+# repontar precisa ser atômico entre requests concorrentes (réplica única)
+realloc_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 # provisionamento automático: plano -> criação em andamento (cascata reativa
 # e reposição proativa compartilham essa trava, pra nunca criar 2 máquinas
@@ -191,6 +211,7 @@ async def lifespan(app: FastAPI):
         try_provision_for_pool=try_provision_for_pool,
         pool_watermark_slots=MACHINE_POOL_WATERMARK_SLOTS,
         auto_provision_enabled=auto_provision_enabled,
+        on_machine_running=handle_machine_running,
     )
     reaper_task = asyncio.create_task(lifecycle_mgr.idle_reaper_loop())
     machine_task = asyncio.create_task(
@@ -274,6 +295,41 @@ async def machine_free_slots(machine: dict) -> int:
     return slots - used
 
 
+def _forget_machine_upserts(machine_id: str) -> None:
+    """Invalida o cache de upserts da máquina — o pod reiniciou e o agent
+    voltou sem nenhuma chave em memória."""
+    for k in [k for k in agent_key_upserts if k[1] == machine_id]:
+        agent_key_upserts.pop(k, None)
+
+
+def handle_machine_running(machine_id: str) -> None:
+    """Callback do reconcile do lifecycle: máquina observada como promovida a
+    running (religada pelo console do RunPod, recreateMachine, etc.) — o pod
+    reiniciou com o agent zerado, então invalida o cache de upserts e agenda
+    o reenvio das chaves."""
+    _forget_machine_upserts(machine_id)
+    schedule_key_sync(machine_id)
+
+
+async def ensure_key_on_machine(entry: dict, machine: dict) -> None:
+    """Garante a chave da conta no agent do pod antes do proxy.
+
+    O agent perde as chaves em memória a cada restart do pod (stop/start) e,
+    no fluxo base, a conta pode ser servida por uma máquina onde a chave
+    nunca foi sincronizada (a chave é vinculada à máquina do stack) — sem o
+    upsert, o pod rejeitaria com 401. Enquanto o pod boota, o call_agent
+    devolve o 503 padrão e o retry do cliente converge sozinho."""
+    cache_key = (entry["key_hash"], machine["id"])
+    if agent_key_upserts.get(cache_key, 0) > time.time():
+        return
+    await call_agent(machine, "/upsert-keys", {"keys": [{
+        "key_hash": entry["key_hash"],
+        "key_prefix": entry["key_prefix"],
+        "account_name": entry["account_name"],
+    }]})
+    agent_key_upserts[cache_key] = time.time() + UPSERT_CACHE_TTL_S
+
+
 async def auto_provision_enabled() -> bool:
     """Interruptor liga/desliga do provisionamento automático (system_settings,
     controlado pelo painel). Cache curto em memória — mesmo padrão do
@@ -315,6 +371,10 @@ async def wake_machine(machine: dict, reason: str) -> bool:
     except Exception:
         pass
     await supa.set_machine_status(machine["id"], "running")
+    # o pod reinicia com o agent zerado — invalida o cache de upserts e
+    # agenda o reenvio das chaves assim que o vLLM ficar de pé
+    _forget_machine_upserts(machine["id"])
+    schedule_key_sync(machine["id"])
     try:
         await supa.log_machine_event(machine["id"], "started", f"Auto-wake: {reason}")
     except Exception:
@@ -396,6 +456,49 @@ async def _wait_machine_healthy(
                 pass
         await asyncio.sleep(poll_interval_s)
     return False
+
+
+def schedule_key_sync(machine_id: str) -> None:
+    """Agenda (fire-and-forget) o reenvio das chaves da máquina ao agent
+    assim que o pod ficar saudável — o agent volta de qualquer restart com
+    zero chaves em memória; sem isso, todo request pós-religada vira 401 até
+    um sync manual. Checagem + marcação sem await no meio (atômicas dentro
+    do event loop, mesma disciplina do provisioning_in_progress)."""
+    if machine_id in key_sync_in_progress:
+        return
+    key_sync_in_progress.add(machine_id)
+    asyncio.create_task(_sync_keys_when_healthy(machine_id))
+
+
+async def _sync_keys_when_healthy(machine_id: str) -> None:
+    """Task de background: espera o vLLM de pé e reenvia em lote todas as
+    chaves ativas da máquina. Usa /upsert-keys (não /sync-keys) pra nunca
+    clobber chaves que o fluxo LoRA/base upsertou enquanto o lote esperava.
+    Nunca deixa exceção escapar (fire-and-forget)."""
+    try:
+        healthy = await _wait_machine_healthy(
+            machine_id, MACHINE_HEALTH_TIMEOUT_S, MACHINE_HEALTH_POLL_INTERVAL_S
+        )
+        if not healthy:
+            logger.warning("key-sync: máquina %s não ficou saudável a tempo", machine_id)
+            return
+        machine = await supa.get_machine(machine_id)
+        if not machine or not machine.get("public_url"):
+            return
+        keys = await supa.list_active_keys_for_machine(machine_id)
+        if keys:
+            await call_agent(machine, "/upsert-keys", {"keys": keys})
+        try:
+            await supa.log_machine_event(
+                machine_id, "sync", f"{len(keys)} chave(s) reenviada(s) após religar"
+            )
+        except Exception:
+            pass
+        logger.info("key-sync: %d chave(s) reenviada(s) para %s", len(keys), machine_id)
+    except Exception as e:
+        logger.warning("key-sync: reenvio de chaves para %s falhou (%s)", machine_id, e)
+    finally:
+        key_sync_in_progress.discard(machine_id)
 
 
 async def _provision_and_track(plan: str, reason: str, pause_when_healthy: bool) -> None:
@@ -500,11 +603,7 @@ async def pick_machine_with_free_slot(plan: str) -> dict:
 
 async def do_load(account_id: str, entry: dict, machine: dict, adapter: dict) -> None:
     """Garante a chave no agent, baixa+carrega o adapter e confirma a rota."""
-    await call_agent(machine, "/upsert-keys", {"keys": [{
-        "key_hash": entry["key_hash"],
-        "key_prefix": entry["key_prefix"],
-        "account_name": entry["account_name"],
-    }]})
+    await ensure_key_on_machine(entry, machine)
     files = await supa.signed_lora_files(adapter["storage_path"])
     await call_agent(
         machine, "/load-lora",
@@ -530,6 +629,162 @@ async def wait_until_routed(account_id: str) -> dict | None:
         if not route or route["lora_status"] == "unloaded":
             return None  # o load falhou e o slot foi liberado
     return None
+
+
+def pick_stack(entry: dict) -> dict | None:
+    """Stack "casa" da conta pro modelo base: a mais recente do plano da
+    conta; sem stack do plano, a mais recente de qualquer plano; None quando
+    a conta não tem stacks (aí o fallback é o roteamento por plano puro)."""
+    stacks = entry.get("stacks") or []
+    if not stacks:
+        return None
+    same_plan = [s for s in stacks if s.get("plan") == entry["plan"]]
+    pool = same_plan or stacks
+    return max(pool, key=lambda s: s.get("created_at") or "")
+
+
+async def pick_running_machine_with_stack_slot(
+    plan: str, exclude_machine_id: str | None = None
+) -> dict | None:
+    """Primeira máquina running do plano com vaga de stack ("1 stack = 1
+    slot"). Capacidade desconhecida/sem teto (slots 0) é aceita — mesmo
+    critério do allocateMachineForTemplate do painel (lib/actions.ts)."""
+    for m in await supa.list_running_machines_for_plan(plan):
+        if exclude_machine_id and m["id"] == exclude_machine_id:
+            continue
+        slots = await supa.machine_stack_slots(m["id"])
+        if slots is None or slots == 0:
+            return m
+        if slots - await supa.count_stacks_on_machine(m["id"]) > 0:
+            return m
+    return None
+
+
+async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict | None:
+    """Realocação automática (cenário: máquina do stack pausada/terminada e
+    o usuário mandou request): muda a "casa" do usuário DE VEZ pra uma
+    running com vaga — stacks.machine_id reponta e as chaves ativas da conta
+    MOVEM junto (api_keys.machine_id); a plain key do cliente continua a
+    mesma, diferente do migrateStack do painel, que cria/revoga chaves.
+    None = sem vaga em lugar nenhum ou perdeu a corrida (o chamador decide:
+    religar a própria máquina ou cair no fallback por plano).
+
+    Limitação aceita: com múltiplos stacks da conta na mesma origem, só o
+    stack escolhido reponta (as chaves movem juntas); os irmãos ficam para o
+    admin migrar via migrateStack.
+    """
+    moved = False
+    async with realloc_locks[entry["plan"]]:
+        fresh = await supa.get_stack(stack["id"])
+        if not fresh:
+            return None
+        if fresh["machine_id"] != old_machine["id"]:
+            # request concorrente já realocou — segue a máquina nova dele
+            if not fresh["machine_id"]:
+                return None
+            m = await supa.get_machine(fresh["machine_id"])
+            if not (m and m.get("status") == "running" and m.get("public_url")):
+                return None
+            target = m
+        else:
+            target = await pick_running_machine_with_stack_slot(
+                entry["plan"], exclude_machine_id=old_machine["id"]
+            )
+            if not target:
+                return None
+            if not await supa.repoint_stack(stack["id"], old_machine["id"], target["id"]):
+                return None
+            await supa.move_account_keys(
+                entry["account_id"], old_machine["id"], target["id"]
+            )
+            moved = True
+
+    # stack é o mesmo objeto guardado no key_cache — mutar in place mantém o
+    # cache coerente pelo resto do TTL sem flush
+    stack["machine_id"] = target["id"]
+    agent_key_upserts.pop((entry["key_hash"], old_machine["id"]), None)
+    await ensure_key_on_machine(entry, target)
+    if moved:
+        try:
+            await store.record_reallocation(
+                entry["account_id"],
+                from_machine_id=old_machine["id"],
+                machine_id=target["id"],
+            )
+            reason = {"stopped": "pausada", "terminated": "terminada"}.get(
+                old_machine.get("status"), "indisponível"
+            )
+            await supa.log_machine_event(
+                target["id"], "stack_migrated",
+                f"Stack {stack.get('slug') or stack['id']} realocada automaticamente "
+                f"({old_machine.get('name') or 'origem'} {reason})",
+            )
+        except Exception:
+            pass  # histórico é best-effort, nunca derruba o request
+        logger.info(
+            "realloc: stack %s da conta %s movida de %s para %s",
+            stack.get("slug") or stack["id"], entry["account_id"],
+            old_machine["id"], target["id"],
+        )
+    return target
+
+
+async def resolve_base_machine(account_id: str, entry: dict) -> dict:
+    """Máquina pro modelo base (conta sem adapter), stack-aware.
+
+    1. Máquina do stack running → serve nela (chave garantida via upsert
+       lazy — o pod pode ter reiniciado e perdido as chaves).
+    2. Pausada/terminada/erro → realoca o stack pra outra running com vaga
+       (permanente). Sem vaga e pausada → religa a PRÓPRIA máquina do
+       usuário (as chaves já estão vinculadas a ela) e responde 503 +
+       Retry-After pro retry do cliente.
+    3. Sem stack, stack sem máquina, ou wake da própria falhou (ex.: host
+       sem GPU livre) → fallback por plano (comportamento original), agora
+       com upsert lazy da chave — sem ele o pod da outra máquina rejeitaria
+       a chave com 401.
+    """
+    stack = pick_stack(entry)
+    if stack and stack.get("machine_id"):
+        machine = await supa.get_machine(stack["machine_id"])
+        if machine:
+            status = machine.get("status")
+            if status == "running" and machine.get("public_url"):
+                await ensure_key_on_machine(entry, machine)
+                return machine
+            if status in ("stopped", "terminated", "error"):
+                target = await reallocate_stack(entry, stack, machine)
+                if target:
+                    return target
+                if status == "stopped":
+                    slug = stack.get("slug") or stack["id"]
+                    if await wake_machine(
+                        machine, f"stack {slug}: máquina pausada e sem vaga nas demais"
+                    ):
+                        raise waking_503()
+                    fresh = await supa.get_machine(machine["id"])
+                    if fresh and fresh.get("status") == "running":
+                        # request concorrente religou primeiro (o cooldown fez
+                        # o wake_machine devolver False) — o pod ainda está
+                        # subindo, não religa uma 2ª máquina à toa
+                        raise waking_503()
+                    # startPod falhou de verdade (ex.: host sem GPU) → segue
+                    # pro fallback por plano: serve temporário sem mover stack
+
+    machines = await supa.list_running_machines_for_plan(entry["plan"])
+    if not machines:
+        if await wake_some_machine_for_plan(entry["plan"]):
+            raise waking_503()
+        plan = entry["plan"]
+        if plan in provisioning_in_progress or await try_provision_for_request(
+            plan, "sem máquina para o modelo base"
+        ):
+            raise provisioning_503()
+        raise HTTPException(
+            status_code=503, detail=f"nenhuma máquina disponível para o plano {entry['plan']}"
+        )
+    machine = machines[0]
+    await ensure_key_on_machine(entry, machine)
+    return machine
 
 
 async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
@@ -571,22 +826,11 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
     # sem rota ativa: conta tem adapter?
     adapter = await supa.latest_ready_adapter(account_id)
     if not adapter:
-        # sem adapter registrado → serve o modelo base, mas só numa máquina
-        # do template compatível com o plano da conta (VibeCoder não pode
-        # cair numa máquina servindo o modelo do Pro/Max, e vice-versa)
-        machines = await supa.list_running_machines_for_plan(entry["plan"])
-        if not machines:
-            if await wake_some_machine_for_plan(entry["plan"]):
-                raise waking_503()
-            plan = entry["plan"]
-            if plan in provisioning_in_progress or await try_provision_for_request(
-                plan, "sem máquina para o modelo base"
-            ):
-                raise provisioning_503()
-            raise HTTPException(
-                status_code=503, detail=f"nenhuma máquina disponível para o plano {entry['plan']}"
-            )
-        return machines[0], False
+        # sem adapter registrado → serve o modelo base, stack-aware: máquina
+        # do stack da conta quando running; pausada → realocação automática
+        # ou wake da própria; fallback por plano (VibeCoder nunca cai numa
+        # máquina servindo o modelo do Pro/Max, e vice-versa)
+        return await resolve_base_machine(account_id, entry), False
 
     machine = await pick_machine_with_free_slot(entry["plan"])
     result = await store.claim_client_location(account_id, machine["id"])
@@ -691,38 +935,47 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     machine, rewrite_model = await resolve_route(account_id, entry)
     await maybe_touch(account_id, machine["id"])
 
-    body = await request.body()
-    if body:
-        try:
-            body_json = json.loads(body)
-            if rewrite_model and "model" in body_json:
-                body_json["model"] = lora_name(account_id)
-            # augment_body é no-op se a conta não tem system_prompt nem
-            # chunks indexados — sempre tentar é mais simples do que checar
-            # plano aqui (a mesma injeção serve VibeCoder/Pro/Max igual)
-            body_json = await augment_body(body_json, entry)
-            body = json.dumps(body_json).encode()
-        except Exception:
-            pass  # body não-JSON segue como está
-
+    # incrementa ANTES dos awaits lentos (leitura do body, embeddings do RAG):
+    # o grace recheck da auto-pausa conta este in_flight — quanto mais cedo,
+    # menor a janela pra pausa derrubar a máquina com request já resolvido
     flight_key = (account_id, machine["id"])
     in_flight[flight_key] += 1
 
-    upstream_req = proxy_client.build_request(
-        request.method,
-        f"{machine['public_url']}/v1/{path}",
-        content=body,
-        headers={
-            # repassa a Bearer original: o agent valida e conta uso por chave
-            "Authorization": authorization,
-            "Content-Type": request.headers.get("content-type", "application/json"),
-        },
-    )
     try:
+        body = await request.body()
+        if body:
+            try:
+                body_json = json.loads(body)
+                if rewrite_model and "model" in body_json:
+                    body_json["model"] = lora_name(account_id)
+                # augment_body é no-op se a conta não tem system_prompt nem
+                # chunks indexados — sempre tentar é mais simples do que checar
+                # plano aqui (a mesma injeção serve VibeCoder/Pro/Max igual)
+                body_json = await augment_body(body_json, entry)
+                body = json.dumps(body_json).encode()
+            except Exception:
+                pass  # body não-JSON segue como está
+
+        upstream_req = proxy_client.build_request(
+            request.method,
+            f"{machine['public_url']}/v1/{path}",
+            content=body,
+            headers={
+                # repassa a Bearer original: o agent valida e conta uso por chave
+                "Authorization": authorization,
+                "Content-Type": request.headers.get("content-type", "application/json"),
+            },
+        )
         upstream = await proxy_client.send(upstream_req, stream=True)
     except httpx.HTTPError as e:
         in_flight[flight_key] -= 1
         raise HTTPException(status_code=503, detail=f"máquina indisponível: {e}")
+    except BaseException:
+        # cliente desconectou no meio do body (CancelledError) ou qualquer
+        # outra falha — nunca vazar o contador, senão a máquina fica com
+        # in_flight > 0 pra sempre e a auto-pausa nunca mais dispara
+        in_flight[flight_key] -= 1
+        raise
 
     async def stream_and_release():
         try:
@@ -768,6 +1021,22 @@ async def flush_key_cache(x_admin_secret: str | None = Header(None)):
     n = len(key_cache)
     key_cache.clear()
     return {"ok": True, "flushed": n}
+
+
+@app.post("/admin/sync-machine-keys")
+async def admin_sync_machine_keys(request: Request, x_admin_secret: str | None = Header(None)):
+    """Agenda o reenvio das chaves da máquina quando o pod ficar saudável.
+    Chamado pelo painel após o startMachine (o pod religa com o agent zerado
+    e o poll de saúde precisa viver num processo longo — este aqui, não numa
+    função serverless)."""
+    require_admin(x_admin_secret)
+    body = await request.json()
+    machine_id = body.get("machine_id")
+    if not machine_id:
+        raise HTTPException(status_code=400, detail="machine_id é obrigatório")
+    _forget_machine_upserts(machine_id)
+    schedule_key_sync(machine_id)
+    return {"ok": True, "scheduled": True}
 
 
 @app.post("/admin/migrate")

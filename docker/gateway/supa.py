@@ -47,14 +47,17 @@ class SupaClient:
     # ---------- api_keys ----------
 
     async def find_active_key(self, key_hash: str) -> dict | None:
-        """Retorna {account_id, key_prefix, account_name, plan, system_prompt}
-        da chave ativa, ou None."""
+        """Retorna {account_id, key_prefix, account_name, plan, system_prompt,
+        stacks} da chave ativa, ou None. Os stacks vêm embutidos (FK reversa
+        accounts → stacks) pro roteamento base ser stack-aware sem query extra
+        por request — o dict inteiro pega carona no key_cache do gateway."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
-                "select": "account_id,key_prefix,key_hash,accounts(name,plan,system_prompt)",
+                "select": "account_id,key_prefix,key_hash,"
+                "accounts(name,plan,system_prompt,stacks(id,machine_id,plan,slug,created_at))",
                 "limit": "1",
             },
         )
@@ -71,6 +74,7 @@ class SupaClient:
             "account_name": account.get("name", "?"),
             "plan": account.get("plan", "VibeCoder"),
             "system_prompt": account.get("system_prompt"),
+            "stacks": account.get("stacks") or [],
         }
 
     async def list_active_keys_for_account(self, account_id: str) -> list[dict]:
@@ -92,6 +96,49 @@ class SupaClient:
             }
             for row in r.json()
         ]
+
+    async def list_active_keys_for_machine(self, machine_id: str) -> list[dict]:
+        """Chaves ativas vinculadas à máquina, no formato do /admin/upsert-keys.
+        Espelho do select do syncMachineKeys (lib/actions.ts) — usado no
+        re-sync pós-religada, já que o agent perde as chaves ao reiniciar."""
+        r = await self._rest.get(
+            "/api_keys",
+            params={
+                "machine_id": f"eq.{machine_id}",
+                "status": "eq.active",
+                "select": "key_hash,key_prefix,accounts(name)",
+            },
+        )
+        r.raise_for_status()
+        return [
+            {
+                "key_hash": row["key_hash"],
+                "key_prefix": row["key_prefix"],
+                "account_name": (row.get("accounts") or {}).get("name", "?"),
+            }
+            for row in r.json()
+        ]
+
+    async def move_account_keys(
+        self, account_id: str, from_machine_id: str, to_machine_id: str
+    ) -> int:
+        """Move as chaves ativas da conta de uma máquina pra outra (realocação
+        automática). MOVE a linha existente — nunca cria/revoga como o
+        migrateStack do painel, senão a plain key configurada no cliente do
+        usuário deixaria de funcionar. PATCH condicional: só linhas ainda na
+        origem mudam; retorna quantas moveram (0 = outro request já moveu)."""
+        r = await self._rest.patch(
+            "/api_keys",
+            params={
+                "account_id": f"eq.{account_id}",
+                "machine_id": f"eq.{from_machine_id}",
+                "status": "eq.active",
+            },
+            json={"machine_id": to_machine_id},
+            headers={"Prefer": "return=representation"},
+        )
+        r.raise_for_status()
+        return len(r.json())
 
     # ---------- machines ----------
 
@@ -215,6 +262,61 @@ class SupaClient:
         compartilhada com o painel). None = capacidade desconhecida."""
         r = await self._rest.post(
             "/rpc/machine_lora_slots", json={"p_machine_id": machine_id}
+        )
+        r.raise_for_status()
+        return r.json()
+
+    # ---------- stacks ----------
+
+    async def get_stack(self, stack_id: str) -> dict | None:
+        r = await self._rest.get(
+            "/stacks",
+            params={
+                "id": f"eq.{stack_id}",
+                "select": "id,account_id,machine_id,plan,slug",
+                "limit": "1",
+            },
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    async def repoint_stack(
+        self, stack_id: str, from_machine_id: str, to_machine_id: str
+    ) -> bool:
+        """Reponta a stack pra outra máquina, condicionado à origem esperada
+        (UPDATE ... WHERE machine_id = origem) — 0 linhas alteradas significa
+        que outro request realocou primeiro; o chamador re-lê e segue."""
+        r = await self._rest.patch(
+            "/stacks",
+            params={
+                "id": f"eq.{stack_id}",
+                "machine_id": f"eq.{from_machine_id}",
+            },
+            json={"machine_id": to_machine_id},
+            headers={"Prefer": "return=representation"},
+        )
+        r.raise_for_status()
+        return len(r.json()) > 0
+
+    async def count_stacks_on_machine(self, machine_id: str) -> int:
+        """Stacks hospedadas na máquina — ocupação padrão do modelo base
+        ("1 stack = 1 slot", mesmo critério do machineStackCapacity do painel)."""
+        r = await self._rest.get(
+            "/stacks",
+            params={"machine_id": f"eq.{machine_id}", "select": "id"},
+            headers={"Prefer": "count=exact"},
+        )
+        r.raise_for_status()
+        content_range = r.headers.get("content-range", "/0")
+        return int(content_range.split("/")[-1])
+
+    async def machine_stack_slots(self, machine_id: str) -> int | None:
+        """Slots de stacks da máquina (função SQL única, compartilhada com o
+        painel — migration 0018). 0 = capacidade desconhecida/sem teto, mesmo
+        contrato do computeCapacity com VRAM nula."""
+        r = await self._rest.post(
+            "/rpc/machine_stack_slots", json={"p_machine_id": machine_id}
         )
         r.raise_for_status()
         return r.json()

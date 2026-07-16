@@ -24,9 +24,16 @@ cliente → gateway (:8080) → agent do pod (:8000) → vLLM (:8001)
   `loaded`. Falha no load → slot liberado + 503. A Fase 6 troca o teto fixo
   pelo cálculo por VRAM.
 - **Conta sem adapter registrado**: roteia para o modelo base (sem reescrever
-  `model`) na primeira máquina running **do template compatível com o plano
-  da conta** (`accounts.plan` × `templates.plan`) — necessário desde que
-  existe mais de um modelo base em produção (VibeCoder × Pro/Max).
+  `model`), stack-aware: serve na máquina do stack da conta quando running;
+  pausada/terminada → **realocação automática** (reponta `stacks.machine_id`
+  e MOVE as `api_keys` juntas — a plain key do cliente não muda) para outra
+  máquina running com vaga de stack do MESMO plano (`machine_stack_slots`,
+  migration 0018); sem vaga em nenhuma → religa a PRÓPRIA máquina do stack
+  (503 + `Retry-After`). Conta sem stack cai no fallback por plano
+  (`accounts.plan` × `templates.plan`) — nunca cai no modelo base de outro
+  plano. Antes de todo proxy do fluxo base, a chave da conta é garantida no
+  agent via upsert lazy (cache `UPSERT_CACHE_TTL_S`) — o agent perde as
+  chaves em memória a cada restart do pod.
 - **Proxy**: reescreve `body.model = "acct-{account_id}"` quando o adapter
   está ativo e repassa a Bearer original — o agent continua validando e
   contando uso por chave. Máquina fora do ar → 503 imediato (connect 5s).
@@ -79,6 +86,7 @@ advisory lock.
 | `MACHINE_HEALTH_TIMEOUT_S` | não        | Prazo máx. esperando `vllm_ready` numa máquina recém-criada antes de desistir (default 900) |
 | `MACHINE_HEALTH_POLL_INTERVAL_S` | não  | Intervalo entre polls de `/health` na máquina recém-criada (default 10) |
 | `SETTINGS_CACHE_TTL_S`    | não         | TTL do cache em memória do interruptor liga/desliga (`system_settings.auto_provision_enabled`, default 30) |
+| `UPSERT_CACHE_TTL_S`      | não         | TTL do cache "chave já upsertada no agent X" do fluxo base (default 600; invalidado por máquina a cada religada) |
 
 ## Rodar local
 
@@ -105,6 +113,9 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
 - `GET /` / `GET /health` — health checks
 - `GET /admin/routes` — in-flight e tamanho do cache (header `X-Admin-Secret`)
 - `POST /admin/flush-key-cache` — invalida o cache de chaves (revogação imediata)
+- `POST /admin/sync-machine-keys` — `{machine_id}`: agenda o reenvio das
+  chaves da máquina ao agent quando o pod ficar saudável (chamado pelo painel
+  após o `startMachine` — o agent reinicia sem nenhuma chave em memória)
 - `POST /admin/migrate` — `{account_id, target_machine_id}`: migra o adapter
   sem perder request (migrating → load no destino → flip → drain → unload)
 - `POST /admin/reap-idle` — dispara um ciclo do idle reaper (útil em teste)
@@ -146,15 +157,19 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
   `machines.status='stopped'` no banco (novos claims param de enxergá-la) →
   grace de `STOP_RECHECK_GRACE_S` + re-checagem (claim que escapou → revert
   para `running`) → stopPod na API RunPod (falha → revert + retry no próximo
-  ciclo). Requests de contas cuja máquina pausou alocam em qualquer máquina
-  running com vaga; sem nenhuma vaga, entra o auto-wake abaixo.
+  ciclo). Requests de contas cuja máquina pausou disparam a realocação
+  automática do stack (outra running com vaga) ou o auto-wake abaixo.
   - Janela residual: um claim que passe depois da re-checagem cria uma rota
     `loading` para a máquina pausada; o load falha (503), o slot é liberado
     e o retry do cliente aloca em outra máquina — degradação auto-corretiva.
 - **Auto-wake**: request chega e NENHUMA máquina running do template do plano
-  tem slot livre → o gateway religa (startPod) a máquina `stopped` mais antiga
-  do plano que aceitar o start e responde `503` + `Retry-After: 60` ("máquina
-  religando"). O `last_activity_at` é tocado antes do flip para `running` —
+  tem slot livre → o gateway religa (startPod) uma máquina pausada — no fluxo
+  base, a PRÓPRIA máquina do stack da conta; no LoRA/fallback, a `stopped`
+  mais antiga do plano que aceitar o start — e responde `503` +
+  `Retry-After: 60` ("máquina religando"). Toda religada agenda o reenvio das
+  chaves ao agent assim que o vLLM fica de pé (`/admin/sync-machine-keys`
+  cobre o religar manual do painel; o reconcile cobre o console do RunPod).
+  O `last_activity_at` é tocado antes do flip para `running` —
   senão a auto-pausa pararia a máquina de novo durante o warm-up do vLLM
   (~3–8 min); nesse warm-up, retries recebem 503 "máquina indisponível" até o
   agent responder, e então a alocação + load do adapter seguem o fluxo normal.

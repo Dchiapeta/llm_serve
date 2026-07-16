@@ -78,6 +78,18 @@ class RoutingStore:
         )
         r.raise_for_status()
 
+    async def record_reallocation(
+        self, account_id: str, *, from_machine_id: str, machine_id: str
+    ) -> None:
+        """Registra a realocação automática de stack (máquina pausada → nova)
+        no histórico — mesmo evento 'migrated' das migrações de adapter."""
+        await self._record_routing_history(
+            account_id=account_id,
+            event="migrated",
+            machine_id=machine_id,
+            from_machine_id=from_machine_id,
+        )
+
     async def set_client_location(self, account_id: str, **patch) -> None:
         """Atualiza machine_id / lora_adapter_id / lora_status da rota."""
         allowed = {"machine_id", "lora_adapter_id", "lora_status"}

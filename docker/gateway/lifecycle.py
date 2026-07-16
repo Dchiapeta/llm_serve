@@ -37,6 +37,7 @@ class LifecycleManager:
         try_provision_for_pool=None,
         pool_watermark_slots: float = 5.0,
         auto_provision_enabled=None,
+        on_machine_running=None,
     ):
         self.store = store
         self.supa = supa
@@ -56,6 +57,10 @@ class LifecycleManager:
         self.try_provision_for_pool = try_provision_for_pool
         self.pool_watermark_slots = pool_watermark_slots
         self.auto_provision_enabled = auto_provision_enabled
+        # callback síncrono chamado quando a reconciliação observa uma máquina
+        # promovida a running (ex.: religada pelo console do RunPod) — main.py
+        # usa pra agendar o reenvio de chaves ao agent, que reinicia zerado
+        self.on_machine_running = on_machine_running
 
     def _in_flight_count(self, account_id: str, machine_id: str) -> int:
         return self.in_flight.get((account_id, machine_id), 0)
@@ -318,6 +323,11 @@ class LifecycleManager:
                     await self.supa.touch_machine_activity(m["id"])
                 except Exception:
                     pass
+                if self.on_machine_running:
+                    try:
+                        self.on_machine_running(m["id"])
+                    except Exception:
+                        pass
             await self.supa.set_machine_status(m["id"], new_status)
             changed.append((m["id"], new_status))
             logger.info("reconcile: máquina %s %s → %s", m["id"], m["status"], new_status)

@@ -609,6 +609,14 @@ export async function startMachine(
     .update({ status: "running", last_activity_at: new Date().toISOString() })
     .eq("id", machineId)
   await logEvent(machineId, "started", `Máquina "${m.name}" iniciada`)
+  // O pod religa com o agent zerado (chaves só em memória) e o status já foi
+  // pra "running" aqui em cima — o sync pós-boot do refreshMachineStatus
+  // nunca veria a transição. O gateway espera o vLLM subir e reenvia.
+  after(() =>
+    scheduleGatewayKeySync(machineId).catch((e) =>
+      console.error("Agendamento do sync pós-religada falhou (o upsert lazy do gateway cobre):", e)
+    )
+  )
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
 }
@@ -1273,6 +1281,22 @@ async function flushGatewayKeyCache() {
   await fetch(`${url.replace(/\/$/, "")}/admin/flush-key-cache`, {
     method: "POST",
     headers: { "X-Admin-Secret": secret },
+    signal: AbortSignal.timeout(5_000),
+  })
+}
+
+// Pede ao gateway pra reenviar as chaves da máquina ao agent quando o pod
+// ficar saudável (best-effort). O agent perde as chaves em memória a cada
+// restart do pod, e o poll de saúde leva minutos — precisa viver no processo
+// longo do gateway, não numa função serverless do painel.
+async function scheduleGatewayKeySync(machineId: string) {
+  const url = process.env.GATEWAY_URL
+  const secret = process.env.GATEWAY_ADMIN_SECRET
+  if (!url || !secret) return // gateway ainda não configurado
+  await fetch(`${url.replace(/\/$/, "")}/admin/sync-machine-keys`, {
+    method: "POST",
+    headers: { "X-Admin-Secret": secret, "Content-Type": "application/json" },
+    body: JSON.stringify({ machine_id: machineId }),
     signal: AbortSignal.timeout(5_000),
   })
 }
