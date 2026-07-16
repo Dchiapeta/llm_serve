@@ -178,11 +178,18 @@ async def lifespan(app: FastAPI):
     # do pool prendia o cliente por até 600s esperando um socket morto.
     # 60s é folgado pro maior gap real entre chunks de streaming — TTFT e
     # geração ficam bem abaixo disso mesmo sob 20 concorrentes.
+    # retries=2: mesmo com keepalive_expiry curto, uma conexão do pool pode
+    # ser resetada pelo Cloudflare ENQUANTO ociosa dentro da janela de expiry
+    # — a primeira escrita nela falha na hora (ConnectError). O transporte do
+    # httpx detecta e reabre uma conexão nova automaticamente antes de
+    # qualquer byte ir pro cliente (visto sob concorrência 5-20: sem isso,
+    # a requisição inteira falhava em ~3s com corpo vazio, sem erro visível).
     proxy_client = httpx.AsyncClient(
         timeout=httpx.Timeout(60.0, connect=5.0, write=10.0, pool=10.0),
         limits=httpx.Limits(
             max_connections=100, max_keepalive_connections=20, keepalive_expiry=5.0
         ),
+        transport=httpx.AsyncHTTPTransport(retries=2),
     )
     openai_client = httpx.AsyncClient(
         base_url="https://api.openai.com/v1",
@@ -978,64 +985,72 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple)
     in_reasoning = True
     pending = b""
     try:
-        async for raw in upstream.aiter_bytes():
-            pending += raw
-            while b"\n" in pending:
-                line, pending = pending.split(b"\n", 1)
-                stripped = line.strip()
-                if not in_reasoning or not stripped.startswith(b"data:") or stripped in (
-                    b"data: [DONE]",
-                    b"data:[DONE]",
-                ):
-                    yield line + b"\n"
-                    continue
+        try:
+            async for raw in upstream.aiter_bytes():
+                pending += raw
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    stripped = line.strip()
+                    if not in_reasoning or not stripped.startswith(b"data:") or stripped in (
+                        b"data: [DONE]",
+                        b"data:[DONE]",
+                    ):
+                        yield line + b"\n"
+                        continue
 
-                payload = stripped[len(b"data:") :].strip()
-                try:
-                    chunk = json.loads(payload)
-                except Exception:
-                    yield line + b"\n"
-                    continue
+                    payload = stripped[len(b"data:") :].strip()
+                    try:
+                        chunk = json.loads(payload)
+                    except Exception:
+                        yield line + b"\n"
+                        continue
 
-                choices = chunk.get("choices") or []
-                choice0 = choices[0] if choices and isinstance(choices[0], dict) else None
-                if choice0 is None:
-                    yield line + b"\n"
-                    continue
+                    choices = chunk.get("choices") or []
+                    choice0 = choices[0] if choices and isinstance(choices[0], dict) else None
+                    if choice0 is None:
+                        yield line + b"\n"
+                        continue
 
-                delta = choice0.get("delta") or {}
-                content = delta.get("content")
-                finish_reason = choice0.get("finish_reason")
-                if content:
-                    buffer_text += content
+                    delta = choice0.get("delta") or {}
+                    content = delta.get("content")
+                    finish_reason = choice0.get("finish_reason")
+                    if content:
+                        buffer_text += content
 
-                if THINK_CLOSE in buffer_text:
-                    _, visible = split_reasoning(buffer_text)
-                    in_reasoning = False
-                    buffer_text = ""
-                    if visible or finish_reason:
+                    if THINK_CLOSE in buffer_text:
+                        _, visible = split_reasoning(buffer_text)
+                        in_reasoning = False
+                        buffer_text = ""
+                        if visible or finish_reason:
+                            delta = dict(delta)
+                            delta["content"] = visible
+                            delta.setdefault("role", "assistant")
+                            choice0["delta"] = delta
+                            yield b"data: " + json.dumps(chunk).encode() + b"\n"
+                        continue
+
+                    if finish_reason:
+                        # bateu finish_reason sem nunca ver </think> — devolve o
+                        # que foi acumulado em vez de sumir com a resposta inteira
                         delta = dict(delta)
-                        delta["content"] = visible
+                        delta["content"] = buffer_text
                         delta.setdefault("role", "assistant")
                         choice0["delta"] = delta
+                        buffer_text = ""
+                        in_reasoning = False
                         yield b"data: " + json.dumps(chunk).encode() + b"\n"
-                    continue
+                        continue
 
-                if finish_reason:
-                    # bateu finish_reason sem nunca ver </think> — devolve o
-                    # que foi acumulado em vez de sumir com a resposta inteira
-                    delta = dict(delta)
-                    delta["content"] = buffer_text
-                    delta.setdefault("role", "assistant")
-                    choice0["delta"] = delta
-                    buffer_text = ""
-                    in_reasoning = False
-                    yield b"data: " + json.dumps(chunk).encode() + b"\n"
-                    continue
-
-                continue  # ainda dentro do raciocínio, sem finish_reason -> suprime
-        if pending:
-            yield pending
+                    continue  # ainda dentro do raciocínio, sem finish_reason -> suprime
+            if pending:
+                yield pending
+        except (httpx.HTTPError, ConnectionError, OSError):
+            # a conexão com o upstream (agent/vLLM) morreu no meio do stream —
+            # visto sob concorrência pesada (conexão do pool resetada pelo
+            # Cloudflare enquanto ociosa). Não deixa a exceção estourar em
+            # silêncio: cai no fallback abaixo, que devolve o que já foi
+            # acumulado em vez de fechar a resposta sem nada.
+            pass
         if in_reasoning and buffer_text:
             # a conexão upstream acabou sem nunca fechar </think> nem mandar um
             # finish_reason (visto sob concorrência pesada — provável preempção/
