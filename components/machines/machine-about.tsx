@@ -51,7 +51,7 @@ export function MachineAbout({
   -H "Authorization: Bearer <SUA_CHAVE_DE_ACESSO>" \\
   -d '{
     "model": "${model}",
-    "max_tokens": 200,
+    "max_tokens": 4096,
     "messages": [{"role": "user", "content": "oi"}]
   }'`
 
