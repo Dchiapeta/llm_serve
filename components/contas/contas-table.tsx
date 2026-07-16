@@ -5,7 +5,7 @@ import Link from "next/link"
 import { Copy, Search } from "lucide-react"
 import { toast } from "sonner"
 
-import type { Account, ApiKey, Machine, RoutingState, Stack } from "@/lib/types"
+import { TEMPLATE_PLANS, type Account, type ApiKey, type Machine, type RoutingState, type Stack } from "@/lib/types"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -13,6 +13,13 @@ import {
   InputGroupAddon,
   InputGroupInput,
 } from "@/components/ui/input-group"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import {
   Table,
   TableBody,
@@ -50,6 +57,18 @@ const MACHINE_STATUS_BADGE: Record<
 }
 
 const NO_MACHINE_BADGE = { label: "Desativada", variant: "outline" } as const
+
+// Opções do filtro de status — rótulos exibidos na tabela; "terminated"
+// fica de fora porque `machines` (page.tsx) já exclui máquinas encerradas.
+const STATUS_FILTER_OPTIONS = [
+  { value: "running", label: "Rodando" },
+  { value: "stopped", label: "Pausado" },
+  { value: "creating", label: "Criando" },
+  { value: "error", label: "Erro" },
+  { value: "none", label: "Desativada" },
+] as const
+
+const ALL = "__all__"
 
 export type StackInfo = Stack & {
   machineName?: string
@@ -105,6 +124,8 @@ export function ContasTable({
   templates: StackTemplate[]
 }) {
   const [query, setQuery] = React.useState("")
+  const [productFilter, setProductFilter] = React.useState(ALL)
+  const [statusFilter, setStatusFilter] = React.useState(ALL)
 
   function copySlug(slug: string) {
     navigator.clipboard.writeText(slug)
@@ -112,27 +133,60 @@ export function ContasTable({
   }
 
   const normalizedQuery = query.trim().toLowerCase()
-  const filteredRows = normalizedQuery
-    ? rows.filter(
-        (r) =>
-          r.stack.slug.toLowerCase().includes(normalizedQuery) ||
-          r.account.name.toLowerCase().includes(normalizedQuery) ||
-          r.account.email?.toLowerCase().includes(normalizedQuery)
-      )
-    : rows
+  const filteredRows = rows.filter((r) => {
+    const matchesQuery = normalizedQuery
+      ? r.stack.slug.toLowerCase().includes(normalizedQuery) ||
+        r.account.name.toLowerCase().includes(normalizedQuery) ||
+        r.account.email?.toLowerCase().includes(normalizedQuery)
+      : true
+    const matchesProduct = productFilter === ALL || r.stack.plan === productFilter
+    const statusValue = r.stack.machine?.status ?? "none"
+    const matchesStatus = statusFilter === ALL || statusValue === statusFilter
+    return matchesQuery && matchesProduct && matchesStatus
+  })
 
   return (
     <div className="flex flex-col gap-4">
-      <InputGroup className="max-w-xs">
-        <InputGroupAddon>
-          <Search className="size-4 text-muted-foreground" />
-        </InputGroupAddon>
-        <InputGroupInput
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Buscar por stack, cliente ou e-mail…"
-        />
-      </InputGroup>
+      <div className="flex flex-wrap items-center gap-2">
+        <InputGroup className="max-w-xs">
+          <InputGroupAddon>
+            <Search className="size-4 text-muted-foreground" />
+          </InputGroupAddon>
+          <InputGroupInput
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Buscar por stack, cliente ou e-mail…"
+          />
+        </InputGroup>
+
+        <Select value={productFilter} onValueChange={setProductFilter}>
+          <SelectTrigger className="w-40">
+            <SelectValue placeholder="Produto" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>Todos os produtos</SelectItem>
+            {TEMPLATE_PLANS.map((plan) => (
+              <SelectItem key={plan} value={plan}>
+                {plan}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        <Select value={statusFilter} onValueChange={setStatusFilter}>
+          <SelectTrigger className="w-40">
+            <SelectValue placeholder="Status" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>Todos os status</SelectItem>
+            {STATUS_FILTER_OPTIONS.map((s) => (
+              <SelectItem key={s.value} value={s.value}>
+                {s.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
 
       <Table>
         <TableHeader>
