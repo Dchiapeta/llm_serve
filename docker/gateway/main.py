@@ -173,8 +173,16 @@ async def lifespan(app: FastAPI):
     global supa, store, proxy_client, openai_client, panel_client, lifecycle_mgr, runpod_client
     supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
+    # read curto (60s): o Cloudflare na frente do RunPod às vezes derruba (RST)
+    # conexões TCP em keep-alive; sem isso, uma conexão zumbi reaproveitada
+    # do pool prendia o cliente por até 600s esperando um socket morto.
+    # 60s é folgado pro maior gap real entre chunks de streaming — TTFT e
+    # geração ficam bem abaixo disso mesmo sob 20 concorrentes.
     proxy_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(600.0, connect=5.0)
+        timeout=httpx.Timeout(60.0, connect=5.0, write=10.0, pool=10.0),
+        limits=httpx.Limits(
+            max_connections=100, max_keepalive_connections=20, keepalive_expiry=5.0
+        ),
     )
     openai_client = httpx.AsyncClient(
         base_url="https://api.openai.com/v1",
