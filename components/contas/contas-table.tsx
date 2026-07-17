@@ -132,6 +132,11 @@ export function ContasTable({
     toast.success("ID copiado")
   }
 
+  function copyStackId(stackId: string) {
+    navigator.clipboard.writeText(stackId)
+    toast.success("Stack ID copiado")
+  }
+
   const normalizedQuery = query.trim().toLowerCase()
   const filteredRows = rows.filter((r) => {
     const matchesQuery = normalizedQuery
@@ -192,6 +197,7 @@ export function ContasTable({
         <TableHeader>
           <TableRow>
             <TableHead>Stack</TableHead>
+            <TableHead>Stack ID</TableHead>
             <TableHead>Cliente</TableHead>
             <TableHead>E-mail</TableHead>
             <TableHead>Produto</TableHead>
@@ -203,7 +209,7 @@ export function ContasTable({
         <TableBody>
           {filteredRows.length === 0 && (
             <TableRow>
-              <TableCell colSpan={7} className="text-center text-muted-foreground">
+              <TableCell colSpan={8} className="text-center text-muted-foreground">
                 {rows.length === 0
                   ? "Nenhuma stack ainda."
                   : "Nenhuma stack encontrada."}
@@ -226,6 +232,25 @@ export function ContasTable({
                       className="size-6"
                       onClick={() => copySlug(stack.slug)}
                       aria-label="Copiar ID"
+                    >
+                      <Copy className="size-3" />
+                    </Button>
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <div className="flex items-center gap-1">
+                    <code
+                      className="max-w-32 truncate font-mono text-xs"
+                      title={stack.id}
+                    >
+                      {stack.id}
+                    </code>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-6 shrink-0"
+                      onClick={() => copyStackId(stack.id)}
+                      aria-label="Copiar Stack ID"
                     >
                       <Copy className="size-3" />
                     </Button>
