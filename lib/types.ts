@@ -83,6 +83,7 @@ export type ApiKey = {
   id: string
   account_id: string
   machine_id: string
+  stack_id: string | null
   key_hash: string
   key_prefix: string
   // Chave em texto puro, para cópia posterior pelo painel. Chaves criadas

@@ -649,13 +649,32 @@ async def wait_until_routed(account_id: str) -> dict | None:
 def pick_stack(entry: dict) -> dict | None:
     """Stack "casa" da conta pro modelo base: a mais recente do plano da
     conta; sem stack do plano, a mais recente de qualquer plano; None quando
-    a conta não tem stacks (aí o fallback é o roteamento por plano puro)."""
+    a conta não tem stacks (aí o fallback é o roteamento por plano puro).
+
+    Heurístico legado — só usado quando a chave não tem `stack_id` gravado
+    (ver resolve_key_stack). Quebra quando a conta tem stacks de planos
+    diferentes e `accounts.plan` não é o plano da stack que a chave deveria
+    usar (ver [[pro-loadtest-routing-workaround]])."""
     stacks = entry.get("stacks") or []
     if not stacks:
         return None
     same_plan = [s for s in stacks if s.get("plan") == entry["plan"]]
     pool = same_plan or stacks
     return max(pool, key=lambda s: s.get("created_at") or "")
+
+
+def resolve_key_stack(entry: dict) -> tuple[dict | None, str]:
+    """Stack efetiva da chave e o plano a usar no resto do fluxo.
+
+    Chave pós-migration 0019 (tem `stack_id`): resolve DIRETO pela stack
+    dela — sem adivinhar. Chave legada (`stack_id` nulo): cai no heurístico
+    antigo por `accounts.plan` (pick_stack), inalterado."""
+    stack_id = entry.get("stack_id")
+    if stack_id:
+        stack = next((s for s in entry.get("stacks") or [] if s["id"] == stack_id), None)
+        if stack:
+            return stack, stack["plan"]
+    return pick_stack(entry), entry["plan"]
 
 
 async def pick_running_machine_with_stack_slot(
@@ -689,7 +708,7 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
     admin migrar via migrateStack.
     """
     moved = False
-    async with realloc_locks[entry["plan"]]:
+    async with realloc_locks[stack["plan"]]:
         fresh = await supa.get_stack(stack["id"])
         if not fresh:
             return None
@@ -703,14 +722,15 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
             target = m
         else:
             target = await pick_running_machine_with_stack_slot(
-                entry["plan"], exclude_machine_id=old_machine["id"]
+                stack["plan"], exclude_machine_id=old_machine["id"]
             )
             if not target:
                 return None
             if not await supa.repoint_stack(stack["id"], old_machine["id"], target["id"]):
                 return None
             await supa.move_account_keys(
-                entry["account_id"], old_machine["id"], target["id"]
+                entry["account_id"], old_machine["id"], target["id"],
+                stack_id=stack["id"] if entry.get("stack_id") else None,
             )
             moved = True
 
@@ -744,8 +764,11 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
     return target
 
 
-async def resolve_base_machine(account_id: str, entry: dict) -> dict:
-    """Máquina pro modelo base (conta sem adapter), stack-aware.
+async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]:
+    """Máquina pro modelo base (conta sem adapter), stack-aware. Retorna
+    (machine, effective_plan) — effective_plan é o plano da STACK resolvida
+    (chave pós-migration 0019) ou, pra chave legada, o accounts.plan de
+    sempre (ver resolve_key_stack).
 
     1. Máquina do stack running → serve nela (chave garantida via upsert
        lazy — o pod pode ter reiniciado e perdido as chaves).
@@ -758,18 +781,18 @@ async def resolve_base_machine(account_id: str, entry: dict) -> dict:
        com upsert lazy da chave — sem ele o pod da outra máquina rejeitaria
        a chave com 401.
     """
-    stack = pick_stack(entry)
+    stack, effective_plan = resolve_key_stack(entry)
     if stack and stack.get("machine_id"):
         machine = await supa.get_machine(stack["machine_id"])
         if machine:
             status = machine.get("status")
             if status == "running" and machine.get("public_url"):
                 await ensure_key_on_machine(entry, machine)
-                return machine
+                return machine, effective_plan
             if status in ("stopped", "terminated", "error"):
                 target = await reallocate_stack(entry, stack, machine)
                 if target:
-                    return target
+                    return target, effective_plan
                 if status == "stopped":
                     slug = stack.get("slug") or stack["id"]
                     if await wake_machine(
@@ -785,29 +808,34 @@ async def resolve_base_machine(account_id: str, entry: dict) -> dict:
                     # startPod falhou de verdade (ex.: host sem GPU) → segue
                     # pro fallback por plano: serve temporário sem mover stack
 
-    machines = await supa.list_running_machines_for_plan(entry["plan"])
+    machines = await supa.list_running_machines_for_plan(effective_plan)
     if not machines:
-        if await wake_some_machine_for_plan(entry["plan"]):
+        if await wake_some_machine_for_plan(effective_plan):
             raise waking_503()
-        plan = entry["plan"]
-        if plan in provisioning_in_progress or await try_provision_for_request(
-            plan, "sem máquina para o modelo base"
+        if effective_plan in provisioning_in_progress or await try_provision_for_request(
+            effective_plan, "sem máquina para o modelo base"
         ):
             raise provisioning_503()
         raise HTTPException(
-            status_code=503, detail=f"nenhuma máquina disponível para o plano {entry['plan']}"
+            status_code=503, detail=f"nenhuma máquina disponível para o plano {effective_plan}"
         )
     machine = machines[0]
     await ensure_key_on_machine(entry, machine)
-    return machine
+    return machine, effective_plan
 
 
-async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
-    """Resolve (machine, rewrite_model) para a conta.
+async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
+    """Resolve (machine, rewrite_model, effective_plan) para a conta.
 
     Regra primária: rota com machine_id e status loaded/migrating → proxy
     direto (migrating = origem continua servindo). Sem adapter registrado →
     modelo base numa máquina running, sem reescrever "model".
+
+    `effective_plan`: nos branches de adapter LoRA (rewrite_model=True) é
+    sempre `entry["plan"]` — adapter é indexado por account_id, não por
+    stack, então o plano relevante pra escolher a máquina é o da conta
+    mesmo (ver plano de implementação, "fora de escopo"). Só o branch sem
+    adapter (modelo base) usa o plano resolvido por stack_id.
     """
     route = await store.get_client_location(account_id)
 
@@ -824,14 +852,14 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
             await store.mark_slot_idle(account_id)
             route = None
         else:
-            return machine, True
+            return machine, True, entry["plan"]
 
     if route and route["lora_status"] == "loading":
         waited = await wait_until_routed(account_id)
         if waited:
             machine = await supa.get_machine(waited["machine_id"])
             if machine:
-                return machine, True
+                return machine, True, entry["plan"]
         raise HTTPException(
             status_code=503,
             detail="adapter carregando, tente novamente",
@@ -842,10 +870,11 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
     adapter = await supa.latest_ready_adapter(account_id)
     if not adapter:
         # sem adapter registrado → serve o modelo base, stack-aware: máquina
-        # do stack da conta quando running; pausada → realocação automática
+        # da stack da chave quando running; pausada → realocação automática
         # ou wake da própria; fallback por plano (VibeCoder nunca cai numa
         # máquina servindo o modelo do Pro/Max, e vice-versa)
-        return await resolve_base_machine(account_id, entry), False
+        machine, effective_plan = await resolve_base_machine(account_id, entry)
+        return machine, False, effective_plan
 
     machine = await pick_machine_with_free_slot(entry["plan"])
     result = await store.claim_client_location(account_id, machine["id"])
@@ -855,7 +884,7 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
         if waited:
             m = await supa.get_machine(waited["machine_id"])
             if m:
-                return m, True
+                return m, True, entry["plan"]
         raise HTTPException(
             status_code=503,
             detail="adapter carregando, tente novamente",
@@ -870,7 +899,7 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool]:
     except Exception as e:
         await store.mark_slot_idle(account_id)
         raise HTTPException(status_code=503, detail=f"falha ao carregar adapter: {e}")
-    return machine, True
+    return machine, True, entry["plan"]
 
 
 # ---------- Proxy ----------
@@ -1081,7 +1110,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     entry = await authenticate(authorization)
     account_id = entry["account_id"]
 
-    machine, rewrite_model = await resolve_route(account_id, entry)
+    machine, rewrite_model, effective_plan = await resolve_route(account_id, entry)
     await maybe_touch(account_id, machine["id"])
 
     # incrementa ANTES dos awaits lentos (leitura do body, embeddings do RAG):
@@ -1127,7 +1156,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         in_flight[flight_key] -= 1
         raise
 
-    filter_reasoning = path == "chat/completions" and entry.get("plan") in REASONING_LEAK_PLANS
+    filter_reasoning = path == "chat/completions" and effective_plan in REASONING_LEAK_PLANS
     is_stream_request = isinstance(body_json, dict) and body_json.get("stream") is True
 
     if filter_reasoning and not is_stream_request:

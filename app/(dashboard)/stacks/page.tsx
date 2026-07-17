@@ -37,7 +37,9 @@ export default async function ContasPage() {
     db.from("machines").select("*").neq("status", "terminated"),
     db.from("routing_state").select("*"),
     db.from("lora_adapters").select("account_id, status"),
-    db.from("api_keys").select("id, account_id, machine_id, status, key_prefix, plain_key, created_at"),
+    db
+      .from("api_keys")
+      .select("id, account_id, machine_id, stack_id, status, key_prefix, plain_key, created_at"),
     db
       .from("usage_metrics")
       .select("api_key_id, tokens_in, tokens_out, requests, window_start")
@@ -56,7 +58,7 @@ export default async function ContasPage() {
   const loras = (lorasData ?? []) as Pick<LoraAdapter, "account_id" | "status">[]
   const keys = (keysData ?? []) as Pick<
     ApiKey,
-    "id" | "account_id" | "machine_id" | "status" | "key_prefix" | "plain_key" | "created_at"
+    "id" | "account_id" | "machine_id" | "stack_id" | "status" | "key_prefix" | "plain_key" | "created_at"
   >[]
   const usage = (usageData ?? []) as {
     api_key_id: string | null
@@ -165,8 +167,11 @@ export default async function ContasPage() {
     )
     return (stacksByAccount.get(account.id) ?? []).map((s) => {
       const machine = s.machine_id ? machineById.get(s.machine_id) : undefined
-      const stackKeys = keys.filter(
-        (k) => k.account_id === account.id && k.machine_id === s.machine_id
+      // Chaves pós-migration 0019 já sabem sua stack (stack_id); chaves
+      // legadas (stack_id null) caem no heurístico antigo por conta+máquina,
+      // que é ambíguo quando a conta tem múltiplas stacks na mesma máquina.
+      const stackKeys = keys.filter((k) =>
+        k.stack_id ? k.stack_id === s.id : k.account_id === account.id && k.machine_id === s.machine_id
       )
       const stackUsage = { tokensIn: 0, tokensOut: 0, requests: 0 }
       for (const k of stackKeys) {

@@ -1026,7 +1026,7 @@ export async function createStack(formData: FormData): Promise<{
     .eq("id", stackId)
   if (linkError) throw new Error(linkError.message)
 
-  const { plainKey } = await createKey({ accountId, machineId })
+  const { plainKey } = await createKey({ accountId, machineId, stackId })
 
   revalidatePath("/stacks")
   revalidatePath("/accounts")
@@ -1169,7 +1169,7 @@ export async function migrateStack(input: {
     if (fromMachineId && !otherStackRemainsAtOrigin) {
       const { data: movedKeys, error: moveError } = await db
         .from("api_keys")
-        .update({ machine_id: targetMachineId })
+        .update({ machine_id: targetMachineId, stack_id: stack.id })
         .eq("account_id", stack.account_id)
         .eq("machine_id", fromMachineId)
         .eq("status", "active")
@@ -1181,6 +1181,7 @@ export async function migrateStack(input: {
       const created = await createKey({
         accountId: stack.account_id,
         machineId: targetMachineId,
+        stackId: stack.id,
       })
       plainKey = created.plainKey
     }
@@ -1229,6 +1230,7 @@ export async function updateAccountConfig(formData: FormData) {
 export async function createKey(input: {
   accountId: string
   machineId: string
+  stackId?: string | null
 }): Promise<{ plainKey: string }> {
   const db = createSupabaseAdmin()
 
@@ -1271,6 +1273,7 @@ export async function createKey(input: {
   const { error } = await db.from("api_keys").insert({
     account_id: input.accountId,
     machine_id: input.machineId,
+    stack_id: input.stackId ?? null,
     key_hash: hashKey(plainKey),
     key_prefix: keyPrefix(plainKey),
     plain_key: plainKey,

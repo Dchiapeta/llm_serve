@@ -48,15 +48,18 @@ class SupaClient:
 
     async def find_active_key(self, key_hash: str) -> dict | None:
         """Retorna {account_id, key_prefix, account_name, plan, system_prompt,
-        stacks} da chave ativa, ou None. Os stacks vêm embutidos (FK reversa
-        accounts → stacks) pro roteamento base ser stack-aware sem query extra
-        por request — o dict inteiro pega carona no key_cache do gateway."""
+        stack_id, stacks} da chave ativa, ou None. Os stacks vêm embutidos (FK
+        reversa accounts → stacks) pro roteamento base ser stack-aware sem
+        query extra por request — o dict inteiro pega carona no key_cache do
+        gateway. `stack_id` (coluna direta de api_keys, migration 0019)
+        identifica QUAL dessas stacks é a da própria chave — sem ele (chave
+        legada), o roteamento cai no heurístico por accounts.plan."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
-                "select": "account_id,key_prefix,key_hash,"
+                "select": "account_id,key_prefix,key_hash,stack_id,"
                 "accounts(name,plan,system_prompt,stacks(id,machine_id,plan,slug,created_at))",
                 "limit": "1",
             },
@@ -71,6 +74,7 @@ class SupaClient:
             "account_id": row["account_id"],
             "key_prefix": row["key_prefix"],
             "key_hash": row["key_hash"],
+            "stack_id": row.get("stack_id"),
             "account_name": account.get("name", "?"),
             "plan": account.get("plan", "VibeCoder"),
             "system_prompt": account.get("system_prompt"),
@@ -120,20 +124,33 @@ class SupaClient:
         ]
 
     async def move_account_keys(
-        self, account_id: str, from_machine_id: str, to_machine_id: str
+        self,
+        account_id: str,
+        from_machine_id: str,
+        to_machine_id: str,
+        stack_id: str | None = None,
     ) -> int:
         """Move as chaves ativas da conta de uma máquina pra outra (realocação
         automática). MOVE a linha existente — nunca cria/revoga como o
         migrateStack do painel, senão a plain key configurada no cliente do
         usuário deixaria de funcionar. PATCH condicional: só linhas ainda na
-        origem mudam; retorna quantas moveram (0 = outro request já moveu)."""
+        origem mudam; retorna quantas moveram (0 = outro request já moveu).
+
+        `stack_id`: quando informado, escopa o move só à chave daquela stack
+        (chave pós-migration 0019) — sem isso, moveria TODAS as chaves ativas
+        da conta naquela máquina, inclusive de outras stacks/planos que não
+        deveriam se mexer. Chaves legadas (sem stack_id gravado) continuam
+        usando o comportamento antigo (sem esse filtro)."""
+        params = {
+            "account_id": f"eq.{account_id}",
+            "machine_id": f"eq.{from_machine_id}",
+            "status": "eq.active",
+        }
+        if stack_id:
+            params["stack_id"] = f"eq.{stack_id}"
         r = await self._rest.patch(
             "/api_keys",
-            params={
-                "account_id": f"eq.{account_id}",
-                "machine_id": f"eq.{from_machine_id}",
-                "status": "eq.active",
-            },
+            params=params,
             json={"machine_id": to_machine_id},
             headers={"Prefer": "return=representation"},
         )
