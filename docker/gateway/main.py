@@ -1011,7 +1011,10 @@ THINK_CLOSE = "</think>"
 # com Qwen3.5/3.6), então o raciocínio inteiro vaza pro campo "content" que o
 # cliente exibe. Filtrado aqui porque o produto é BYOE: nenhuma ferramenta
 # cliente (Cursor, Continue etc.) sabe separar isso sozinha.
-REASONING_LEAK_PLANS = {"VibeCoder"}
+# Pro (Qwen3.6-27B) validado em 17/07/2026: 14/15 respostas fecham com
+# </think> (a exceção foi truncada por length — coberta pelo fallback do
+# filtro, que devolve o buffer acumulado no fim do stream).
+REASONING_LEAK_PLANS = {"VibeCoder", "Pro"}
 
 
 def split_reasoning(text: str) -> tuple[str | None, str]:
