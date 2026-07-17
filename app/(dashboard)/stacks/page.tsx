@@ -44,7 +44,7 @@ export default async function ContasPage() {
       .from("usage_metrics")
       .select("api_key_id, tokens_in, tokens_out, requests, window_start")
       .gte("window_start", periodStart),
-    db.from("knowledge_chunks").select("account_id, storage_path"),
+    db.from("knowledge_chunks").select("stack_id, storage_path"),
     db.from("stacks").select("*").order("created_at"),
     db
       .from("templates")
@@ -68,7 +68,7 @@ export default async function ContasPage() {
     window_start: string
   }[]
   const knowledgeChunks = (knowledgeData ?? []) as {
-    account_id: string
+    stack_id: string | null
     storage_path: string
   }[]
 
@@ -132,11 +132,15 @@ export default async function ContasPage() {
     loras.filter((l) => l.status === "ready").map((l) => l.account_id)
   )
 
-  const knowledgeFilesByAccount = new Map<string, Map<string, number>>()
+  // Chunks sem stack_id são legados de contas que tinham 2+ stacks no
+  // momento da migration 0020 (não deu para saber a qual pertenciam) — não
+  // aparecem em nenhuma listagem específica até o admin re-indexar por stack.
+  const knowledgeFilesByStack = new Map<string, Map<string, number>>()
   for (const chunk of knowledgeChunks) {
-    const byPath = knowledgeFilesByAccount.get(chunk.account_id) ?? new Map()
+    if (!chunk.stack_id) continue
+    const byPath = knowledgeFilesByStack.get(chunk.stack_id) ?? new Map()
     byPath.set(chunk.storage_path, (byPath.get(chunk.storage_path) ?? 0) + 1)
-    knowledgeFilesByAccount.set(chunk.account_id, byPath)
+    knowledgeFilesByStack.set(chunk.stack_id, byPath)
   }
 
   const runningMachines = machines.filter((m) => m.status === "running")
@@ -161,12 +165,12 @@ export default async function ContasPage() {
     const route = routeByAccount.get(account.id)
     const currentMachine = route?.machine_id ? machineById.get(route.machine_id) : undefined
     const hasReadyAdapter = readyAdapterAccounts.has(account.id)
-    const knowledgeFiles = Array.from(
-      knowledgeFilesByAccount.get(account.id) ?? [],
-      ([storage_path, chunks]) => ({ storage_path, chunks })
-    )
     return (stacksByAccount.get(account.id) ?? []).map((s) => {
       const machine = s.machine_id ? machineById.get(s.machine_id) : undefined
+      const knowledgeFiles = Array.from(
+        knowledgeFilesByStack.get(s.id) ?? [],
+        ([storage_path, chunks]) => ({ storage_path, chunks })
+      )
       // Chaves pós-migration 0019 já sabem sua stack (stack_id); chaves
       // legadas (stack_id null) caem no heurístico antigo por conta+máquina,
       // que é ambíguo quando a conta tem múltiplas stacks na mesma máquina.

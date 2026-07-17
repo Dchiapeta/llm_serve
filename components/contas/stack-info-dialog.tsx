@@ -166,6 +166,15 @@ export function StackInfoDialog({
               </dl>
             </div>
 
+            {stack.system_prompt && (
+              <div className="text-sm">
+                <p className="text-muted-foreground mb-1">System prompt</p>
+                <p className="max-h-32 overflow-y-auto rounded-md border p-2 whitespace-pre-wrap">
+                  {stack.system_prompt}
+                </p>
+              </div>
+            )}
+
             {machine?.public_url && (
               <a
                 href={machine.public_url}

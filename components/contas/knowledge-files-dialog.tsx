@@ -19,13 +19,15 @@ type KnowledgeFile = { storage_path: string; chunks: number }
 
 export function KnowledgeFilesDialog({
   accountId,
-  accountName,
+  stackId,
+  stackSlug,
   initialFiles,
   open,
   onOpenChange,
 }: {
   accountId: string
-  accountName: string
+  stackId: string
+  stackSlug: string
   initialFiles: KnowledgeFile[]
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -38,7 +40,7 @@ export function KnowledgeFilesDialog({
   const inputRef = React.useRef<HTMLInputElement>(null)
 
   function reload() {
-    listKnowledgeFiles(accountId)
+    listKnowledgeFiles(stackId)
       .then(setFiles)
       .catch((e) => toast.error(e instanceof Error ? e.message : "Erro ao listar arquivos"))
   }
@@ -50,6 +52,7 @@ export function KnowledgeFilesDialog({
       try {
         const formData = new FormData()
         formData.set("account_id", accountId)
+        formData.set("stack_id", stackId)
         formData.set("file", file)
         await uploadKnowledgeFile(formData)
         toast.success("Arquivo indexado")
@@ -64,7 +67,7 @@ export function KnowledgeFilesDialog({
   function onDelete(storagePath: string) {
     startTransition(async () => {
       try {
-        await deleteKnowledgeFile(accountId, storagePath)
+        await deleteKnowledgeFile(stackId, storagePath)
         toast.success("Arquivo removido")
         reload()
       } catch (e) {
@@ -77,10 +80,10 @@ export function KnowledgeFilesDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Base de conhecimento — {accountName}</DialogTitle>
+          <DialogTitle>Base de conhecimento — {stackSlug}</DialogTitle>
           <DialogDescription>
             Arquivos .txt/.md indexados por embedding (OpenAI), usados como
-            contexto de RAG nas respostas desta conta.
+            contexto de RAG nas respostas desta stack.
           </DialogDescription>
         </DialogHeader>
 

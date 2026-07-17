@@ -55,15 +55,6 @@ export function ContaInfoDialog({
           <dt className="text-muted-foreground">Conta criada em</dt>
           <dd>{new Date(account.created_at).toLocaleString("pt-BR")}</dd>
         </dl>
-
-        {account.system_prompt && (
-          <div className="text-sm">
-            <p className="text-muted-foreground mb-1">System prompt</p>
-            <p className="max-h-32 overflow-y-auto rounded-md border p-2 whitespace-pre-wrap">
-              {account.system_prompt}
-            </p>
-          </div>
-        )}
       </DialogContent>
     </Dialog>
   )

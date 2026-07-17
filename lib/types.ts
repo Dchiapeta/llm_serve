@@ -65,14 +65,21 @@ export type Stack = {
   plan: TemplatePlan
   purchase_date: string // date "YYYY-MM-DD"
   slug: string
+  // Override de system prompt da stack; null = sem override. Independente
+  // de accounts.system_prompt (fallback legado só para chaves anteriores à
+  // migration 0019, sem stack_id resolvível).
+  system_prompt: string | null
   created_at: string
 }
 
-// Chunk de texto da base de conhecimento (RAG) de uma conta, com embedding
+// Chunk de texto da base de conhecimento (RAG) de uma stack, com embedding
 // já calculado (OpenAI text-embedding-3-small, 1536 dimensões).
 export type KnowledgeChunk = {
   id: string
   account_id: string
+  // null nos chunks legados de contas que tinham 2+ stacks no momento da
+  // migration 0020 (não dava para saber a qual stack pertenciam).
+  stack_id: string | null
   storage_path: string
   chunk_index: number
   content: string

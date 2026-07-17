@@ -53,14 +53,20 @@ class SupaClient:
         query extra por request — o dict inteiro pega carona no key_cache do
         gateway. `stack_id` (coluna direta de api_keys, migration 0019)
         identifica QUAL dessas stacks é a da própria chave — sem ele (chave
-        legada), o roteamento cai no heurístico por accounts.plan."""
+        legada), o roteamento cai no heurístico por accounts.plan.
+
+        `system_prompt` no nível de `accounts` (migration 0010) é só fallback
+        legado — desde a migration 0020 cada stack tem o seu próprio
+        `system_prompt`, embutido em cada item de `stacks`, resolvido por
+        `resolve_key_stack` (main.py) no lugar do valor da conta inteira."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
                 "select": "account_id,key_prefix,key_hash,stack_id,"
-                "accounts(name,plan,system_prompt,stacks(id,machine_id,plan,slug,created_at))",
+                "accounts(name,plan,system_prompt,"
+                "stacks(id,machine_id,plan,slug,created_at,system_prompt))",
                 "limit": "1",
             },
         )
@@ -403,14 +409,21 @@ class SupaClient:
     # ---------- knowledge_chunks (RAG) ----------
 
     async def match_knowledge_chunks(
-        self, account_id: str, query_embedding: list[float], top_k: int = 4
+        self,
+        account_id: str,
+        stack_id: str | None,
+        query_embedding: list[float],
+        top_k: int = 4,
     ) -> list[str]:
-        """Top-k chunks da base de conhecimento da conta por similaridade de
-        cosseno (RPC match_knowledge_chunks, mesma função usada pelo painel)."""
+        """Top-k chunks da base de conhecimento da stack por similaridade de
+        cosseno (RPC match_knowledge_chunks, mesma função usada pelo painel).
+        `stack_id=None` (chave legada sem stack resolvível) mantém o
+        comportamento antigo de buscar por toda a conta."""
         r = await self._rest.post(
             "/rpc/match_knowledge_chunks",
             json={
                 "p_account_id": account_id,
+                "p_stack_id": stack_id,
                 "p_query_embedding": query_embedding,
                 "p_top_k": top_k,
             },

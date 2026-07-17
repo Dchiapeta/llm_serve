@@ -3,8 +3,8 @@
 import * as React from "react"
 import { toast } from "sonner"
 
-import { updateAccountConfig } from "@/lib/actions"
-import type { Account } from "@/lib/types"
+import { updateStackSystemPrompt } from "@/lib/actions"
+import type { Stack } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -17,25 +17,24 @@ import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 
 export function EditAccountConfigDialog({
-  account,
+  stack,
   open,
   onOpenChange,
 }: {
-  account: Account
+  stack: Pick<Stack, "id" | "slug" | "system_prompt">
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
-  const [systemPrompt, setSystemPrompt] = React.useState(account.system_prompt ?? "")
+  const [systemPrompt, setSystemPrompt] = React.useState(stack.system_prompt ?? "")
   const [pending, startTransition] = React.useTransition()
 
   function onSave() {
     startTransition(async () => {
       try {
         const formData = new FormData()
-        formData.set("account_id", account.id)
-        formData.set("plan", account.plan)
+        formData.set("stack_id", stack.id)
         formData.set("system_prompt", systemPrompt)
-        await updateAccountConfig(formData)
+        await updateStackSystemPrompt(formData)
         toast.success("Configuração atualizada")
         onOpenChange(false)
       } catch (e) {
@@ -48,10 +47,10 @@ export function EditAccountConfigDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Plano e system prompt — {account.name}</DialogTitle>
+          <DialogTitle>System prompt — {stack.slug}</DialogTitle>
           <DialogDescription>
             O system prompt configurado aqui é injetado pelo gateway em toda
-            chamada de chat completions desta conta.
+            chamada de chat completions desta stack.
           </DialogDescription>
         </DialogHeader>
 

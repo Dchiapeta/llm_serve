@@ -948,9 +948,14 @@ MIN_MAX_TOKENS = 8000  # thinking mode (Qwen3.x) corta o raciocínio no meio qua
 
 
 async def augment_body(body_json: dict, entry: dict) -> dict:
-    """Injeta system prompt configurado da conta e contexto de RAG (top-k da
-    base de conhecimento) antes de repassar ao vLLM. Só se aplica a chamadas
-    de chat completions (body com "messages")."""
+    """Injeta system prompt configurado da STACK e contexto de RAG (top-k da
+    base de conhecimento da STACK) antes de repassar ao vLLM. Só se aplica a
+    chamadas de chat completions (body com "messages").
+
+    Reaproveita resolve_key_stack (mesmo helper do roteamento de máquina,
+    commit 7e64aa4) para saber qual stack da conta está servindo o request —
+    sem isso, contas com múltiplas stacks vazavam o mesmo prompt/RAG entre
+    todas elas (system_prompt/knowledge_chunks eram só por account_id)."""
     messages = body_json.get("messages")
     if not isinstance(messages, list):
         return body_json
@@ -959,14 +964,20 @@ async def augment_body(body_json: dict, entry: dict) -> dict:
     if not isinstance(current_max_tokens, int) or current_max_tokens < MIN_MAX_TOKENS:
         body_json["max_tokens"] = MIN_MAX_TOKENS
 
-    # system_prompt da conta e contexto do RAG viram UM único system message no
+    stack, _ = resolve_key_stack(entry)
+
+    # system_prompt da stack e contexto do RAG viram UM único system message no
     # índice 0 — o chat template do Qwen3.x rejeita ("System message must be at
     # the beginning") qualquer role "system" que não seja a primeira mensagem,
     # então duas inserções separadas (uma em 0, outra antes do último user)
     # quebravam toda chamada que tivesse as duas features ativas ao mesmo tempo.
     system_parts = []
-    if entry.get("system_prompt"):
-        system_parts.append(entry["system_prompt"])
+    # stack.system_prompt (por-stack, migration 0020) tem prioridade;
+    # entry["system_prompt"] (accounts.system_prompt) é só fallback legado
+    # para chave sem stack resolvível.
+    system_prompt = (stack or {}).get("system_prompt") or entry.get("system_prompt")
+    if system_prompt:
+        system_parts.append(system_prompt)
 
     last_user = next(
         (m for m in reversed(messages) if m.get("role") == "user"), None
@@ -975,7 +986,10 @@ async def augment_body(body_json: dict, entry: dict) -> dict:
         embedding = await embed_query(last_user["content"])
         if embedding:
             chunks = await supa.match_knowledge_chunks(
-                entry["account_id"], embedding, RAG_TOP_K
+                entry["account_id"],
+                stack["id"] if stack else None,
+                embedding,
+                RAG_TOP_K,
             )
             if chunks:
                 system_parts.append(

@@ -75,6 +75,14 @@ export function StackRowActions({
             <Info className="size-4" />
             Info
           </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setConfigOpen(true)}>
+            <Settings className="size-4" />
+            System prompt
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setKnowledgeOpen(true)}>
+            <BookOpen className="size-4" />
+            Base de conhecimento
+          </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setMigrateStackOpen(true)}>
             <ArrowRightLeft className="size-4" />
             Migrar
@@ -91,14 +99,6 @@ export function StackRowActions({
           <DropdownMenuItem onSelect={() => setContaInfoOpen(true)}>
             <UserRound className="size-4" />
             Info da conta
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setConfigOpen(true)}>
-            <Settings className="size-4" />
-            Plano / system prompt
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setKnowledgeOpen(true)}>
-            <BookOpen className="size-4" />
-            Base de conhecimento
           </DropdownMenuItem>
           <DropdownMenuItem
             disabled={!hasReadyAdapter}
@@ -144,11 +144,11 @@ export function StackRowActions({
       />
 
       {/* key força remount a cada abertura: reseta o form pros valores
-          atuais da conta em vez de arrastar o que sobrou de uma edição
+          atuais da stack em vez de arrastar o que sobrou de uma edição
           anterior cancelada, sem precisar sincronizar via effect */}
       <EditAccountConfigDialog
         key={configOpen ? "config-open" : "config-closed"}
-        account={account}
+        stack={stack}
         open={configOpen}
         onOpenChange={setConfigOpen}
       />
@@ -156,7 +156,8 @@ export function StackRowActions({
       <KnowledgeFilesDialog
         key={knowledgeOpen ? "knowledge-open" : "knowledge-closed"}
         accountId={account.id}
-        accountName={account.name}
+        stackId={stack.id}
+        stackSlug={stack.slug}
         initialFiles={knowledgeFiles}
         open={knowledgeOpen}
         onOpenChange={setKnowledgeOpen}

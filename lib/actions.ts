@@ -1207,19 +1207,18 @@ export async function migrateStack(input: {
   return { machineId: targetMachineId, machineCreated, plainKey }
 }
 
-// Atualiza plano e/ou system prompt de uma conta já existente.
-export async function updateAccountConfig(formData: FormData) {
+// Atualiza o system prompt de uma stack já existente.
+export async function updateStackSystemPrompt(formData: FormData) {
   const db = createSupabaseAdmin()
-  const accountId = String(formData.get("account_id"))
-  if (!accountId) throw new Error("Conta não informada")
+  const stackId = String(formData.get("stack_id"))
+  if (!stackId) throw new Error("Stack não informada")
 
-  const plan = parsePlan(formData)
   const systemPrompt = String(formData.get("system_prompt") || "").trim() || null
 
   const { error } = await db
-    .from("accounts")
-    .update({ plan, system_prompt: systemPrompt })
-    .eq("id", accountId)
+    .from("stacks")
+    .update({ system_prompt: systemPrompt })
+    .eq("id", stackId)
   if (error) throw new Error(error.message)
   revalidatePath("/stacks")
   revalidatePath("/accounts")
@@ -1620,8 +1619,10 @@ async function embedTexts(texts: string[]): Promise<number[][]> {
 export async function uploadKnowledgeFile(formData: FormData) {
   const db = createSupabaseAdmin()
   const accountId = String(formData.get("account_id"))
+  const stackId = String(formData.get("stack_id"))
   const file = formData.get("file")
   if (!accountId) throw new Error("Conta não informada")
+  if (!stackId) throw new Error("Stack não informada")
   if (!(file instanceof File) || file.size === 0) throw new Error("Arquivo não informado")
   if (!/\.(txt|md)$/i.test(file.name)) {
     throw new Error("Só arquivos .txt ou .md são aceitos por enquanto")
@@ -1631,7 +1632,9 @@ export async function uploadKnowledgeFile(formData: FormData) {
   const chunks = chunkText(text)
   if (chunks.length === 0) throw new Error("Arquivo vazio")
 
-  const storagePath = `${accountId}/${sanitizeStorageFileName(file.name)}`
+  // prefixo por stack (não por conta): evita que duas stacks da mesma conta
+  // com arquivo de mesmo nome se sobrescrevam mutuamente
+  const storagePath = `${stackId}/${sanitizeStorageFileName(file.name)}`
   const { error: uploadErr } = await db.storage
     .from(KNOWLEDGE_BUCKET)
     .upload(storagePath, file, { upsert: true, contentType: "text/plain" })
@@ -1639,11 +1642,16 @@ export async function uploadKnowledgeFile(formData: FormData) {
 
   const embeddings = await embedTexts(chunks)
 
-  // substitui qualquer indexação anterior deste mesmo arquivo
-  await db.from("knowledge_chunks").delete().eq("storage_path", storagePath)
+  // substitui qualquer indexação anterior deste mesmo arquivo nesta stack
+  await db
+    .from("knowledge_chunks")
+    .delete()
+    .eq("stack_id", stackId)
+    .eq("storage_path", storagePath)
   const { error: insertErr } = await db.from("knowledge_chunks").insert(
     chunks.map((content, i) => ({
       account_id: accountId,
+      stack_id: stackId,
       storage_path: storagePath,
       chunk_index: i,
       content,
@@ -1656,13 +1664,13 @@ export async function uploadKnowledgeFile(formData: FormData) {
 }
 
 export async function listKnowledgeFiles(
-  accountId: string
+  stackId: string
 ): Promise<{ storage_path: string; chunks: number }[]> {
   const db = createSupabaseAdmin()
   const { data, error } = await db
     .from("knowledge_chunks")
     .select("storage_path")
-    .eq("account_id", accountId)
+    .eq("stack_id", stackId)
   if (error) throw new Error(error.message)
 
   const counts = new Map<string, number>()
@@ -1672,13 +1680,13 @@ export async function listKnowledgeFiles(
   return Array.from(counts, ([storage_path, chunks]) => ({ storage_path, chunks }))
 }
 
-export async function deleteKnowledgeFile(accountId: string, storagePath: string) {
+export async function deleteKnowledgeFile(stackId: string, storagePath: string) {
   const db = createSupabaseAdmin()
   await db.storage.from(KNOWLEDGE_BUCKET).remove([storagePath])
   const { error } = await db
     .from("knowledge_chunks")
     .delete()
-    .eq("account_id", accountId)
+    .eq("stack_id", stackId)
     .eq("storage_path", storagePath)
   if (error) throw new Error(error.message)
   revalidatePath("/stacks")
