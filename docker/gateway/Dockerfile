@@ -6,7 +6,7 @@ WORKDIR /opt/gateway
 COPY docker/gateway/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY docker/gateway/main.py docker/gateway/routing.py docker/gateway/supa.py docker/gateway/lifecycle.py docker/gateway/runpod_api.py .
+COPY docker/gateway/main.py docker/gateway/routing.py docker/gateway/supa.py docker/gateway/lifecycle.py docker/gateway/runpod_api.py docker/gateway/anthropic_compat.py .
 
 EXPOSE 8080
 
