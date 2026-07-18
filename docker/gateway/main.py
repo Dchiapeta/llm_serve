@@ -1268,11 +1268,18 @@ def pin_model(body_json: dict, stack_id: str, rewrite_model: bool, machine: dict
     """Trava o campo "model": nunca confia no que o cliente mandou. Stack com
     adapter LoRA -> nome do adapter da PRÓPRIA stack (antes disso, além do
     cross-tenant, duas stacks da mesma conta colidiam no mesmo nome de adapter);
-    stack base -> nome do modelo servido pela máquina (machines.model_name).
+    stack base -> served_model_name da máquina (o alias de --served-model-name,
+    ex.: "pro-base"). É o ÚNICO nome que o vLLM aceita quando o template define
+    esse alias; fixar o machines.model_name (path do HF, ex.: "Qwen/...") daria
+    404 "model does not exist". Fallback pro model_name quando o template não usa
+    a flag (aí o vLLM serve pelo próprio --model).
     Roda sempre, mesmo se o cliente omitiu "model" ou mandou um --model
     diferente na CLI dele (Codex/Claude Code guardam isso em config local, que
     não temos como fiscalizar — a única trava confiável é no servidor)."""
-    body_json["model"] = lora_name(stack_id) if rewrite_model else machine.get("model_name")
+    if rewrite_model:
+        body_json["model"] = lora_name(stack_id)
+    else:
+        body_json["model"] = machine.get("served_model_name") or machine.get("model_name")
 
 
 async def validate_body(

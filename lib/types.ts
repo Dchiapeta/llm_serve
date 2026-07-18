@@ -44,7 +44,11 @@ export type Machine = {
   status: "creating" | "running" | "stopped" | "terminated" | "error"
   template_id: string | null
   admin_secret: string
+  // path do HF, usado como --model do vLLM no boot (ex.: "Qwen/Qwen3.6-27B-FP8")
   model_name: string | null
+  // alias com que o vLLM SERVE (--served-model-name, ex.: "pro-base"); é o que o
+  // gateway fixa no campo "model" das requisições. NULL = sem alias → usa model_name.
+  served_model_name: string | null
   vram_gb: number | null
   cost_per_hr: number | null
   public_url: string | null

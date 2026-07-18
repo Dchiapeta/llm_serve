@@ -8,6 +8,7 @@ import { randomBytes } from "crypto"
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
+import { parseServedModelName } from "./machines"
 import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
 import { generateStackSlug, STACK_SLUG_RE } from "./slug"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
@@ -495,6 +496,11 @@ async function provisionMachine(input: {
       template_id: tpl.id,
       admin_secret: adminSecret,
       model_name: tpl.model_name,
+      // alias servido pelo vLLM (--served-model-name), pra o gateway fixar o
+      // "model" correto em vez do path do HF; null se o template não usa a flag
+      served_model_name:
+        parseServedModelName(tpl.env?.VLLM_EXTRA_ARGS) ??
+        parseServedModelName(tpl.start_command),
       vram_gb: totalVramGb,
       cost_per_hr: pod.costPerHr ?? null,
       public_url: podProxyUrl(pod.id, 8000),
