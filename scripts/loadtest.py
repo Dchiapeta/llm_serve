@@ -55,6 +55,37 @@ TASKS = [
 ]
 
 
+def build_big_context(seed_idx: int, approx_tokens: int) -> str:
+    """Gera um bloco de "contexto de projeto" sintético de ~approx_tokens
+    tokens, ÚNICO por usuário/conta (seed_idx entra no conteúdo) mas ESTÁVEL
+    entre as requisições sequenciais do mesmo usuário — simula uma sessão de
+    coding real (mesmos arquivos ao longo da sessão): exercita o
+    prefix-caching intra-sessão, mas sem cache cross-user, então cada usuário
+    pressiona o KV com seu próprio prefixo (pior caso de ocupação). A
+    contagem por token é aproximada (~4 chars/token de código); o
+    prompt_tokens REAL de cada request vem no usage e é o que o relatório
+    reporta."""
+    if approx_tokens <= 0:
+        return ""
+    target_chars = approx_tokens * 4
+    parts = [f"# Projeto interno do usuário {seed_idx} — código-fonte para contexto\n\n"]
+    size = len(parts[0])
+    i = 0
+    while size < target_chars:
+        block = (
+            f"def modulo_{seed_idx}_func_{i}(entradas, pesos):\n"
+            f"    # rotina {seed_idx}.{i} do serviço de faturamento interno\n"
+            f"    acumulado = 0\n"
+            f"    for k in range(len(entradas)):\n"
+            f"        acumulado += entradas[k] * pesos[k % len(pesos)] + {i}\n"
+            f"    return acumulado  # marcador único {seed_idx}-{i}\n\n"
+        )
+        parts.append(block)
+        size += len(block)
+        i += 1
+    return "".join(parts)
+
+
 def build_user_queue(user_idx: int, level: int, requests_per_user: int) -> list[dict]:
     pool = TASKS.copy()
     rng = random.Random(1000 * level + user_idx)
@@ -67,14 +98,21 @@ def build_user_queue(user_idx: int, level: int, requests_per_user: int) -> list[
     return queue
 
 
-async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str) -> dict:
+async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str, context_prefix: str = "") -> dict:
     """Uma tentativa de request. `error_phase` distingue falha ANTES do
     primeiro byte de resposta (pre_byte: conexão zumbi/reset — infra de
     teste, seguro retentar) de stream cortado no meio (mid_stream: perda
-    real, um cliente de verdade veria a resposta truncada)."""
+    real, um cliente de verdade veria a resposta truncada). `context_prefix`
+    (opcional) enche o prompt com ~30K de contexto pra medir o teto novo."""
+    content = task["prompt"]
+    if context_prefix:
+        content = (
+            f"{context_prefix}\n\n---\n\n"
+            f"Com base no código acima, responda: {task['prompt']}"
+        )
     payload = {
         "model": args.model,
-        "messages": [{"role": "user", "content": task["prompt"]}],
+        "messages": [{"role": "user", "content": content}],
         "max_tokens": args.max_tokens,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -138,14 +176,14 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str)
     }
 
 
-async def run_one(client: httpx.AsyncClient, args, task: dict, api_key: str, tags: dict) -> dict:
+async def run_one(client: httpx.AsyncClient, args, task: dict, api_key: str, tags: dict, context_prefix: str = "") -> dict:
     """Roda a task com retry pra falha pre_byte (nenhum byte recebido —
     nada foi consumido, retentar é seguro). mid_stream NUNCA retenta: um
     stream cortado é perda real que o relatório precisa contar. `tags`
     identifica o registro no resultado (nível/usuário ou modo/conta)."""
     result = None
     for attempt in range(1 + args.retries):
-        result = await attempt_one(client, args, task, api_key)
+        result = await attempt_one(client, args, task, api_key, context_prefix)
         result.update({**tags, "retries_used": attempt})
         if not result["error"] or result["error_phase"] == "mid_stream":
             break
@@ -156,9 +194,11 @@ async def run_one(client: httpx.AsyncClient, args, task: dict, api_key: str, tag
 
 async def run_user(client: httpx.AsyncClient, args, user_idx: int, level: int) -> list[dict]:
     queue = build_user_queue(user_idx, level, args.requests_per_user)
+    # contexto grande estável por usuário (único entre usuários) — ver build_big_context
+    ctx = build_big_context(1000 * level + user_idx, args.context_tokens)
     out = []
     for seq, task in enumerate(queue, start=1):
-        r = await run_one(client, args, task, args.api_key, {"level": level, "user": user_idx, "seq": seq})
+        r = await run_one(client, args, task, args.api_key, {"level": level, "user": user_idx, "seq": seq}, ctx)
         out.append(r)
         err_info = f"err={r['error']} phase={r['error_phase']}" if r["error"] else "err=None"
         retry_info = f" retries={r['retries_used']}" if r.get("retries_used") else ""
@@ -175,11 +215,14 @@ async def run_account(
 ) -> list[dict]:
     """Sessão de uma conta no cenário de isolamento: requests sequenciais,
     mesma fila de tasks nos dois modos (comparação justa baseline vs full)."""
+    # contexto grande estável por conta (único entre contas) — ver build_big_context
+    ctx = build_big_context(5000 + account_idx, args.context_tokens)
     out = []
     for seq, task in enumerate(queue, start=1):
         r = await run_one(
             client, args, task, api_key,
             {"mode": mode, "account": account_idx, "seq": seq},
+            ctx,
         )
         out.append(r)
         err_info = f"err={r['error']} phase={r['error_phase']}" if r["error"] else "err=None"
@@ -257,6 +300,14 @@ async def main():
     parser.add_argument("--levels", default="5,10,15", help="Níveis de concorrência, separados por vírgula")
     parser.add_argument("--requests-per-user", type=int, default=5)
     parser.add_argument("--max-tokens", type=int, default=8000)
+    parser.add_argument(
+        "--context-tokens", type=int, default=0,
+        help="Se >0, prefixa cada prompt com ~N tokens de contexto sintético "
+        "(código de projeto) pra medir o teto de contexto do plano no PIOR "
+        "caso. Único por usuário (pressiona o KV) mas estável na sessão "
+        "(exercita prefix-caching). Ex: 30000 pra validar max-model-len 32768. "
+        "A contagem é aproximada; o prompt_tokens real vem no usage.",
+    )
     parser.add_argument(
         "--first-byte-timeout", type=float, default=120.0,
         help="Teto de silêncio entre chunks (s). Com o filtro de reasoning do "

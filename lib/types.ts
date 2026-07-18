@@ -50,6 +50,7 @@ export type Account = {
   id: string
   name: string
   email: string | null
+  user_id: string | null
   plan: TemplatePlan
   system_prompt: string | null
   created_at: string
