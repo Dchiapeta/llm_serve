@@ -170,3 +170,113 @@ Descobertas rodando o teste do plano Pro pela primeira vez — evitar repetir:
    pra pegar conexão zumbi rápido, não um teto de duração (com streaming,
    cada chunk reseta o timer). Sem `stream: true`, a resposta inteira
    chega de uma vez, e qualquer tarefa acima de 60s de geração falha ali.
+
+## Testes de hardening (verificar que os controles barram o esperado)
+
+Diferente da metodologia acima (que mede desempenho sob carga legítima),
+este bloco confirma que cada defesa introduzida no hardening de produção
+(isolamento entre tenants, allowlist, pinning de modelo, limites,
+rate-limit/quota, expiração de chave) efetivamente **barra** o
+comportamento que deveria barrar — e que tráfego legítimo continua
+passando normalmente. Rodar pelo menos uma vez após qualquer mudança no
+gateway/agent, e sempre antes de abrir um template novo pra usuários reais.
+
+**Use uma conta/stack de TESTE dedicada, nunca uma de cliente real** — os
+checks de rate-limit/concorrência disparam rajadas de propósito e podem
+consumir a quota diária de tokens da conta.
+
+### Automatizado: `scripts/security_check.py`
+
+```bash
+# checks rápidos (sem custo de rajada)
+python3 scripts/security_check.py \
+  --base-url https://llmserve-docker.up.railway.app \
+  --api-key <chave HEX da stack de teste>
+
+# inclui rate-limit/concorrência — custo real de GPU, ver aviso no --help
+python3 scripts/security_check.py \
+  --base-url https://llmserve-docker.up.railway.app \
+  --api-key <chave HEX da stack de teste> \
+  --include-burst
+```
+
+Cobre: `/health` não derruba com 500 (regressão do bug crítico do
+middleware de headers), headers de segurança presentes e `Server` não
+vazando, rotas `/admin/*` rejeitando sem/com secret errado, allowlist
+bloqueando `load_lora_adapter`/`unload_lora_adapter`/`tokenize`,
+`/v1/models` sem vazar `acct-*` de outros tenants, pinning de modelo
+(manda um `model` forjado e confirma que não quebra nem vaza pra outro
+adapter), limite de tamanho de corpo (413) e de número de mensagens (400),
+`/v1/messages` (Claude Code) e `/v1/responses` (Codex) respondendo no
+formato certo, e (com `--include-burst`) rate-limit e limite de
+concorrência disparando 429. Sai com código 1 se algum check falhar — dá
+pra plugar num CI/step manual de release.
+
+### Manual: precisam de setup no banco (não automatizados)
+
+**1. Isolamento de RAG entre stacks da mesma conta.** Indexe um documento
+característico numa stack A (upload pelo painel), depois mande uma
+pergunta pela chave da stack B (mesma conta) que só faria sentido
+responder citando o conteúdo de A. Confirme que a resposta não reflete
+esse conteúdo. Verificação direta no banco (todo chunk deve ter
+`stack_id` da própria stack, nunca `null`, numa conta com 2+ stacks):
+
+```sql
+select id, stack_id, left(content, 60) as preview
+from knowledge_chunks
+where account_id = '<account_id da conta de teste>'
+order by stack_id nulls first;
+```
+
+Qualquer linha com `stack_id` null aqui é um chunk legado ainda não
+reindexado — inacessível via RAG (não vaza, mas também não é servido).
+
+**2. Fail-closed de chave sem stack_id.** Depois da migration 0021, toda
+chave ativa de conta com stacks deveria ter `stack_id` resolvido — esta
+query deveria sempre voltar vazia:
+
+```sql
+select ak.id, ak.key_prefix, ak.account_id
+from api_keys ak
+where ak.status = 'active' and ak.stack_id is null
+  and exists (select 1 from stacks s where s.account_id = ak.account_id);
+```
+
+Se voltar alguma linha, teste a chave correspondente contra o gateway —
+espera-se `401 chave sem stack associada`.
+
+**3. Expiração de chave.** Force o vencimento de uma chave de teste:
+
+```sql
+update api_keys set expires_at = now() - interval '1 day'
+where key_hash = '<hash da chave de teste>';
+```
+
+Espera-se `401 chave expirada` no gateway. Pra confirmar a segunda camada
+(enforcement direto no agent, contra o bypass de bater na URL do pod), a
+chave precisa já ter sido re-sincronizada com o `expires_at` novo (o
+próximo `sync-keys`/`upsert-keys` propaga) — teste batendo direto no
+`public_url` da máquina. **Restaure depois**, senão a chave de teste fica
+inutilizável:
+
+```sql
+update api_keys set expires_at = null where key_hash = '<hash da chave de teste>';
+```
+
+**4. Isolamento entre contas (cross-account).** Essa fronteira é
+estrutural (todo roteamento e toda query de RAG são filtrados por
+`account_id` derivado da própria chave) — não dá pra "provar" batendo de
+fora sem já ter a chave da outra conta, o que anularia o teste. Validação
+prática: se você tem duas contas de teste reais, confirme que a resposta
+de uma nunca reflete o `system_prompt`/RAG/adapter da outra (mesma
+metodologia do item 1, mas com contas em vez de stacks).
+
+**5. Recuperação de máquina `terminated`/rota presa.** Não force isso
+artificialmente contra uma máquina real (custo/risco desnecessário).
+Observar durante operação real: se uma máquina for encerrada pelo console
+da RunPod com rotas ativas, as contas afetadas devem se recuperar
+sozinhas no próximo request (realocação ou auto-wake), sem ficar presas
+em 503 indefinidamente. Uma rota presa em `loading`/`migrating` por mais
+de 30 minutos deve aparecer nos logs do gateway como `reconciliação: conta
+... presa em '...' — liberada` (loop a cada 5 min, ver
+`STALE_ROUTE_CHECK_INTERVAL_S`/`STALE_ROUTE_THRESHOLD_S`).
