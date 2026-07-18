@@ -47,24 +47,37 @@ class SupaClient:
     # ---------- api_keys ----------
 
     async def find_active_key(self, key_hash: str) -> dict | None:
-        """Retorna {account_id, key_prefix, account_name, plan, system_prompt,
-        stack_id, stacks} da chave ativa, ou None. Os stacks vêm embutidos (FK
-        reversa accounts → stacks) pro roteamento base ser stack-aware sem
-        query extra por request — o dict inteiro pega carona no key_cache do
-        gateway. `stack_id` (coluna direta de api_keys, migration 0019)
-        identifica QUAL dessas stacks é a da própria chave — sem ele (chave
-        legada), o roteamento cai no heurístico por accounts.plan.
+        """Retorna {account_id, api_key_id, key_prefix, account_name, plan,
+        system_prompt, stack_id, stacks, expires_at} da chave ativa, ou None.
+        Os stacks vêm embutidos (FK reversa accounts → stacks) pro roteamento
+        base ser stack-aware sem query extra por request — o dict inteiro
+        pega carona no key_cache do gateway. `stack_id` (coluna direta de
+        api_keys, migration 0019) identifica QUAL dessas stacks é a da
+        própria chave — sem ele (chave legada), o roteamento cai no
+        heurístico por accounts.plan.
+
+        `api_key_id` (id da própria linha) é o identificador ESTÁVEL da
+        chave, sincronizado ao agent (sync-keys/upsert-keys) pra logs e
+        métricas por-chave — key_prefix sozinho (8 hex chars, 32 bits) tem
+        colisão possível entre chaves diferentes; usar só o prefixo como
+        chave de agregação misturava métricas/logs de duas contas diferentes
+        na (baixa, mas não nula) chance de colisão.
 
         `system_prompt` no nível de `accounts` (migration 0010) é só fallback
         legado — desde a migration 0020 cada stack tem o seu próprio
         `system_prompt`, embutido em cada item de `stacks`, resolvido por
-        `resolve_key_stack` (main.py) no lugar do valor da conta inteira."""
+        `resolve_key_stack` (main.py) no lugar do valor da conta inteira.
+
+        `expires_at` (migration 0024, nullable) é checado por request em
+        `authenticate` — não dá pra confiar só num filtro PostgREST aqui,
+        porque o key_cache do gateway (TTL de 60s) manteria uma chave
+        expirada válida por até mais um TTL depois do vencimento."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
-                "select": "account_id,key_prefix,key_hash,stack_id,"
+                "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,"
                 "accounts(name,plan,system_prompt,"
                 "stacks(id,machine_id,plan,slug,created_at,system_prompt))",
                 "limit": "1",
@@ -78,9 +91,11 @@ class SupaClient:
         account = row.get("accounts") or {}
         return {
             "account_id": row["account_id"],
+            "api_key_id": row["id"],
             "key_prefix": row["key_prefix"],
             "key_hash": row["key_hash"],
             "stack_id": row.get("stack_id"),
+            "expires_at": row.get("expires_at"),
             "account_name": account.get("name", "?"),
             "plan": account.get("plan", "VibeCoder"),
             "system_prompt": account.get("system_prompt"),
@@ -88,20 +103,29 @@ class SupaClient:
         }
 
     async def list_active_keys_for_account(self, account_id: str) -> list[dict]:
-        """Entradas de chave ativas da conta, no formato do /admin/upsert-keys."""
+        """Entradas de chave ativas da conta, no formato do /admin/upsert-keys.
+
+        Precisa trazer api_key_id e expires_at: o agent SUBSTITUI a entrada
+        inteira em keys_by_hash (não faz merge) — um upsert sem esses campos
+        apagava o api_key_id/expires_at que um upsert anterior (via
+        ensure_key_on_machine) já tinha gravado, derrotando silenciosamente
+        a quota de tokens (track_usage descarta uso sem api_key_id) e a
+        expiração no agent pra essa chave."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "account_id": f"eq.{account_id}",
                 "status": "eq.active",
-                "select": "key_hash,key_prefix,accounts(name)",
+                "select": "id,key_hash,key_prefix,expires_at,accounts(name)",
             },
         )
         r.raise_for_status()
         return [
             {
                 "key_hash": row["key_hash"],
+                "api_key_id": row["id"],
                 "key_prefix": row["key_prefix"],
+                "expires_at": row.get("expires_at"),
                 "account_name": (row.get("accounts") or {}).get("name", "?"),
             }
             for row in r.json()
@@ -110,20 +134,25 @@ class SupaClient:
     async def list_active_keys_for_machine(self, machine_id: str) -> list[dict]:
         """Chaves ativas vinculadas à máquina, no formato do /admin/upsert-keys.
         Espelho do select do syncMachineKeys (lib/actions.ts) — usado no
-        re-sync pós-religada, já que o agent perde as chaves ao reiniciar."""
+        re-sync pós-religada, já que o agent perde as chaves ao reiniciar.
+
+        Mesmo motivo de api_key_id/expires_at do docstring de
+        list_active_keys_for_account acima."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "machine_id": f"eq.{machine_id}",
                 "status": "eq.active",
-                "select": "key_hash,key_prefix,accounts(name)",
+                "select": "id,key_hash,key_prefix,expires_at,accounts(name)",
             },
         )
         r.raise_for_status()
         return [
             {
                 "key_hash": row["key_hash"],
+                "api_key_id": row["id"],
                 "key_prefix": row["key_prefix"],
+                "expires_at": row.get("expires_at"),
                 "account_name": (row.get("accounts") or {}).get("name", "?"),
             }
             for row in r.json()
@@ -288,6 +317,23 @@ class SupaClient:
         )
         r.raise_for_status()
         return r.json()
+
+    # ---------- uso / quota de tokens ----------
+
+    async def insert_usage_metrics(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        r = await self._rest.post("/usage_metrics", json=rows)
+        r.raise_for_status()
+
+    async def account_token_usage_today(self, account_id: str) -> int:
+        """Soma tokens_in+tokens_out de usage_metrics do dia corrente, via
+        todas as chaves/máquinas da conta — base da quota diária no gateway."""
+        r = await self._rest.post(
+            "/rpc/account_token_usage_today", json={"p_account_id": account_id}
+        )
+        r.raise_for_status()
+        return r.json() or 0
 
     # ---------- stacks ----------
 

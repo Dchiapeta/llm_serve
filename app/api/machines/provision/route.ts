@@ -1,7 +1,14 @@
+import { timingSafeEqual } from "crypto"
 import { NextRequest, NextResponse } from "next/server"
 
 import { provisionMachineForPlan } from "@/lib/actions"
 import { TEMPLATE_PLANS, type TemplatePlan } from "@/lib/types"
+
+function secretsMatch(a: string, b: string): boolean {
+  const bufA = Buffer.from(a)
+  const bufB = Buffer.from(b)
+  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB)
+}
 
 // Chamada pelo gateway (docker/gateway/main.py) quando decide, via watermark
 // de slots livres do plano, que vale a pena criar uma máquina nova. Guardada
@@ -12,7 +19,7 @@ import { TEMPLATE_PLANS, type TemplatePlan } from "@/lib/types"
 // executa o provisionamento pedido.
 export async function POST(req: NextRequest) {
   const secret = req.headers.get("x-admin-secret")
-  if (!process.env.PANEL_ADMIN_SECRET || secret !== process.env.PANEL_ADMIN_SECRET) {
+  if (!process.env.PANEL_ADMIN_SECRET || !secret || !secretsMatch(secret, process.env.PANEL_ADMIN_SECRET)) {
     return NextResponse.json({ error: "admin secret inválido" }, { status: 401 })
   }
 

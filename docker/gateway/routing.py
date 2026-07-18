@@ -146,3 +146,26 @@ class RoutingStore:
         )
         r.raise_for_status()
         return r.json()
+
+    async def list_stale_transitional_routes(self, cutoff_iso: str) -> list[dict]:
+        """Rotas presas em 'loading'/'migrating' há mais tempo do que
+        qualquer operação legítima levaria (LORA_LOAD_TIMEOUT_S,
+        MIGRATION_DRAIN_TIMEOUT_S) — candidatas a recuperação automática.
+
+        claim_route e set_client_location sempre tocam updated_at na
+        transição pra esses estados; nada além do próprio fluxo de
+        load/migração tira uma rota deles, então uma exceção no meio do
+        caminho (rede pro Supabase falhar bem no update de reversão, por
+        exemplo) deixa a linha presa pra sempre sem isso aqui — todo request
+        futuro da conta bateria em wait_until_routed e nunca mais sairia de
+        503 "adapter carregando"."""
+        r = await self._client.get(
+            "/routing_state",
+            params={
+                "lora_status": "in.(loading,migrating)",
+                "updated_at": f"lt.{cutoff_iso}",
+                "select": "*",
+            },
+        )
+        r.raise_for_status()
+        return r.json()

@@ -10,12 +10,14 @@ Agent que roda dentro do pod, na frente do vLLM.
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import shutil
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -35,10 +37,11 @@ LORA_DIR = os.environ.get("LORA_DIR", "/workspace/loras")
 
 STARTED_AT = time.time()
 
-# chaves sincronizadas: hash -> {key_prefix, account_name}
+# chaves sincronizadas: hash -> {api_key_id, key_prefix, account_name}
 keys_by_hash: dict[str, dict] = {}
 
-# métricas por key_prefix
+# métricas por api_key_id (não por key_prefix: 8 hex chars = 32 bits, uma
+# colisão entre duas chaves diferentes misturaria o uso de duas contas)
 metrics_per_key: dict[str, dict] = {}
 total_requests = 0
 concurrent_now = 0
@@ -60,7 +63,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 def require_admin(secret: str | None):
-    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+    if not ADMIN_SECRET or not secret or not hmac.compare_digest(secret, ADMIN_SECRET):
         raise HTTPException(status_code=401, detail="admin secret inválido")
 
 
@@ -72,14 +75,30 @@ def authenticate(authorization: str | None) -> dict:
     entry = keys_by_hash.get(key_hash)
     if not entry:
         raise HTTPException(status_code=401, detail="chave de acesso inválida")
+
+    # segunda camada de enforcement (a primeira é o gateway): fecha o bypass
+    # de quem descobre a URL pública do pod e chama o agent direto, sem
+    # passar pelo gateway — ali a chave expirada já seria barrada antes de
+    # chegar aqui, mas o agent é alcançável sozinho (ver ALLOWED_V1 acima)
+    expires_at = entry.get("expires_at")
+    if expires_at:
+        try:
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            expiry = None
+        if expiry and expiry <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=401, detail="chave expirada")
+
     return entry
 
 
-def log_line(prefix: str, account: str, msg: str):
+def log_line(api_key_id: str | None, prefix: str, account: str, msg: str):
     request_logs.append(
         {
             "ts": time.time(),
-            "key_prefix": prefix,
+            # api_key_id é o identificador ESTÁVEL pra filtrar (ver
+            # /admin/logs); key_prefix fica só na linha de texto, pra leitura
+            "api_key_id": api_key_id,
             "line": f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [{account}/{prefix}…] {msg}",
         }
     )
@@ -97,9 +116,18 @@ async def sync_keys(body: SyncKeysBody, x_admin_secret: str | None = Header(None
     require_admin(x_admin_secret)
     keys_by_hash.clear()
     for k in body.keys:
-        keys_by_hash[k["key_hash"]] = {
-            "key_prefix": k["key_prefix"],
+        # .get() em vez de indexação direta: um registro sem key_hash não
+        # deve estourar KeyError no meio do loop (já rodou o clear() acima —
+        # um erro aqui deixaria keys_by_hash só com os registros anteriores
+        # a esse, derrubando 401 pra todo mundo que vinha depois na lista)
+        key_hash = k.get("key_hash")
+        if not key_hash:
+            continue
+        keys_by_hash[key_hash] = {
+            "api_key_id": k.get("api_key_id"),
+            "key_prefix": k.get("key_prefix", "?"),
             "account_name": k.get("account_name", "?"),
+            "expires_at": k.get("expires_at"),
         }
     return {"ok": True, "count": len(keys_by_hash)}
 
@@ -107,12 +135,12 @@ async def sync_keys(body: SyncKeysBody, x_admin_secret: str | None = Header(None
 @app.get("/admin/logs")
 async def get_logs(
     x_admin_secret: str | None = Header(None),
-    key_prefix: str | None = Query(None),
+    api_key_id: str | None = Query(None),
     tail: int = Query(200, le=2000),
 ):
     require_admin(x_admin_secret)
-    if key_prefix:
-        lines = [l["line"] for l in request_logs if l["key_prefix"] == key_prefix]
+    if api_key_id:
+        lines = [l["line"] for l in request_logs if l["api_key_id"] == api_key_id]
         return {"lines": lines[-tail:]}
     # logs da máquina inteira: stdout do vLLM + requisições
     machine_lines: list[str] = []
@@ -161,9 +189,14 @@ async def admin_health(x_admin_secret: str | None = Header(None)):
 async def upsert_keys(body: SyncKeysBody, x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
     for k in body.keys:
-        keys_by_hash[k["key_hash"]] = {
-            "key_prefix": k["key_prefix"],
+        key_hash = k.get("key_hash")
+        if not key_hash:
+            continue
+        keys_by_hash[key_hash] = {
+            "api_key_id": k.get("api_key_id"),
+            "key_prefix": k.get("key_prefix", "?"),
             "account_name": k.get("account_name", "?"),
+            "expires_at": k.get("expires_at"),
         }
     return {"ok": True, "count": len(keys_by_hash)}
 
@@ -345,9 +378,11 @@ async def health():
 # ---------- Proxy OpenAI-compatible ----------
 
 
-def track_usage(prefix: str, usage: dict | None):
+def track_usage(api_key_id: str | None, usage: dict | None):
+    if not api_key_id:
+        return  # chave sem id sincronizado (sync antigo) — nada seguro pra agregar
     m = metrics_per_key.setdefault(
-        prefix, {"requests": 0, "tokens_in": 0, "tokens_out": 0, "last_used": None}
+        api_key_id, {"requests": 0, "tokens_in": 0, "tokens_out": 0, "last_used": None}
     )
     m["requests"] += 1
     m["last_used"] = time.time()
@@ -356,11 +391,31 @@ def track_usage(prefix: str, usage: dict | None):
         m["tokens_out"] += usage.get("completion_tokens", 0) or 0
 
 
+# paths do vLLM que o agent repassa — mesmo conjunto que o gateway permite
+# (docker/gateway/main.py ALLOWED_V1). Sem esta allowlist aqui TAMBÉM, quem
+# descobrisse a URL pública do pod (proxy da RunPod) podia chamar endpoints
+# administrativos do vLLM (load/unload_lora_adapter etc.) direto, contornando
+# qualquer allowlist que existisse só no gateway — o agent é alcançável
+# diretamente, sem passar pelo proxy central.
+ALLOWED_V1: dict[str, set[str]] = {
+    "chat/completions": {"POST"},
+    "completions": {"POST"},
+    "embeddings": {"POST"},
+    "models": {"GET"},
+    "responses": {"POST"},  # Codex CLI (0.59+) só fala essa API
+}
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy_vllm(path: str, request: Request, authorization: str | None = Header(None)):
     global total_requests, concurrent_now, concurrent_peak
 
+    allowed_methods = ALLOWED_V1.get(path)
+    if not allowed_methods or request.method not in allowed_methods:
+        raise HTTPException(status_code=404, detail="not found")
+
     entry = authenticate(authorization)
+    api_key_id = entry.get("api_key_id")
     prefix = entry["key_prefix"]
     account = entry["account_name"]
 
@@ -368,7 +423,7 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
     total_requests += 1
     concurrent_now += 1
     concurrent_peak = max(concurrent_peak, concurrent_now)
-    log_line(prefix, account, f"{request.method} /v1/{path}")
+    log_line(api_key_id, prefix, account, f"{request.method} /v1/{path}")
 
     try:
         # detecta streaming para repassar SSE; injeta include_usage para o
@@ -412,9 +467,9 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
                                 pass
                     global concurrent_now
                     concurrent_now -= 1
-                    track_usage(prefix, usage)
+                    track_usage(api_key_id, usage)
                     log_line(
-                        prefix, account,
+                        api_key_id, prefix, account,
                         f"stream concluído ({upstream.status_code}) · "
                         f"{usage.get('total_tokens', '?') if usage else '?'} tokens",
                     )
@@ -431,18 +486,27 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
         )
         concurrent_now -= 1
 
-        usage = None
-        try:
-            usage = resp.json().get("usage")
-        except Exception:
-            pass
-        track_usage(prefix, usage)
+        # resp.json() reparseia o body do zero a cada chamada (httpx não
+        # cacheia) — parsear uma vez só e reusar. Antes disso, uma segunda
+        # chamada que falhasse (ex.: 200 com corpo vazio) escapava pro
+        # except Exception externo, que decrementava concurrent_now DE NOVO
+        # (contador ia pro negativo com o tempo) e devolvia 502 "vLLM
+        # indisponível" pro cliente mesmo o vLLM tendo respondido normalmente.
+        parsed = None
+        if resp.headers.get("content-type", "").startswith("application/json"):
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = None
+
+        usage = parsed.get("usage") if isinstance(parsed, dict) else None
+        track_usage(api_key_id, usage)
         log_line(
-            prefix, account,
+            api_key_id, prefix, account,
             f"{resp.status_code} · {usage.get('total_tokens', '?') if usage else '?'} tokens",
         )
         return JSONResponse(
-            content=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text},
+            content=parsed if parsed is not None else {"raw": resp.text},
             status_code=resp.status_code,
         )
     except HTTPException:
@@ -450,5 +514,5 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
         raise
     except Exception as e:
         concurrent_now -= 1
-        log_line(prefix, account, f"erro: {e}")
+        log_line(api_key_id, prefix, account, f"erro: {e}")
         raise HTTPException(status_code=502, detail=f"vLLM indisponível: {e}")

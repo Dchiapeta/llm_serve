@@ -39,6 +39,8 @@ export async function signup(formData: FormData) {
   const { data, error } = await supabase.auth.signUp({ email, password })
   if (error) redirect(`/signup?error=${encodeURIComponent(error.message)}`)
 
+  if (data.user) await ensureAccountForUser(data.user.id, email)
+
   // Quando a confirmação de e-mail está ativa, não há sessão ainda.
   if (!data.session) {
     redirect(
@@ -48,6 +50,41 @@ export async function signup(formData: FormData) {
     )
   }
   redirect("/")
+}
+
+// Garante que todo login do painel tenha uma linha correspondente em
+// accounts (antes só existia se um admin cadastrasse o cliente manualmente
+// via createStack, então usuários que só passavam pelo /signup sumiam da
+// listagem de contas). Casa por user_id primeiro (idempotente em re-signup)
+// e por e-mail em seguida, pra linkar com uma conta já cadastrada
+// manualmente antes do usuário se autenticar.
+async function ensureAccountForUser(userId: string, email: string) {
+  const db = createSupabaseAdmin()
+
+  const { data: byUserId } = await db
+    .from("accounts")
+    .select("id")
+    .eq("user_id", userId)
+    .maybeSingle<{ id: string }>()
+  if (byUserId) return
+
+  const { data: byEmail } = await db
+    .from("accounts")
+    .select("id")
+    .ilike("email", email)
+    .is("user_id", null)
+    .limit(1)
+    .maybeSingle<{ id: string }>()
+  if (byEmail) {
+    await db.from("accounts").update({ user_id: userId }).eq("id", byEmail.id)
+    return
+  }
+
+  const name = email.split("@")[0]
+  const { error } = await db.from("accounts").insert({ name, email, user_id: userId })
+  // 23505 = corrida com outro insert concorrente pro mesmo user_id; a conta
+  // já existe, não é uma falha real.
+  if (error && error.code !== "23505") throw new Error(error.message)
 }
 
 export async function logout() {
@@ -1230,6 +1267,10 @@ export async function createKey(input: {
   accountId: string
   machineId: string
   stackId?: string | null
+  // ISO 8601; null/omitido = nunca expira. Chave de onboarding/teste deve
+  // sempre passar uma data — chave "de produção" emitida manualmente pelo
+  // painel para um cliente já validado pode ficar sem teto.
+  expiresAt?: string | null
 }): Promise<{ plainKey: string }> {
   const db = createSupabaseAdmin()
 
@@ -1267,16 +1308,37 @@ export async function createKey(input: {
     throw new Error(`Limite de ${cap.slotsMax} usuário(s) atingido nesta máquina`)
   }
 
+  // Sem stackId explícito (ex.: CreateKeyDialog, que só pergunta conta +
+  // máquina): resolve pela stack da PRÓPRIA conta que já vive nessa
+  // máquina — é a intenção óbvia de "gerar mais uma chave" quando o admin
+  // já escolheu a máquina certa. Sem isso, contas com stack ficavam com
+  // stack_id null e authenticate() rejeitava a chave com 401 no primeiro
+  // uso (fail-closed da migration 0021 — conta com stacks precisa de
+  // stack_id resolvido).
+  let stackId = input.stackId ?? null
+  if (!stackId) {
+    const { data: matchingStack } = await db
+      .from("stacks")
+      .select("id")
+      .eq("account_id", input.accountId)
+      .eq("machine_id", input.machineId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ id: string }>()
+    stackId = matchingStack?.id ?? null
+  }
+
   const plainKey = generateHexKey()
 
   const { error } = await db.from("api_keys").insert({
     account_id: input.accountId,
     machine_id: input.machineId,
-    stack_id: input.stackId ?? null,
+    stack_id: stackId,
     key_hash: hashKey(plainKey),
     key_prefix: keyPrefix(plainKey),
     plain_key: plainKey,
     status: "active",
+    expires_at: input.expiresAt ?? null,
   })
   if (error) throw new Error(error.message)
 
@@ -1537,15 +1599,17 @@ export async function syncMachineKeys(machineId: string) {
 
   const { data: keys } = await db
     .from("api_keys")
-    .select("key_hash, key_prefix, status, accounts(name)")
+    .select("id, key_hash, key_prefix, status, expires_at, accounts(name)")
     .eq("machine_id", machineId)
     .eq("status", "active")
 
   const entries: AgentKeyEntry[] = (keys ?? []).map((k) => ({
     key_hash: k.key_hash,
+    api_key_id: k.id,
     key_prefix: k.key_prefix,
     account_name:
       (k.accounts as unknown as { name: string } | null)?.name ?? "desconhecida",
+    expires_at: k.expires_at,
   }))
 
   await agent.syncKeys(m, entries)

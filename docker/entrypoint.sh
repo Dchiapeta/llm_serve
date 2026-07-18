@@ -29,6 +29,43 @@ if [ "${ENABLE_LORA}" = "true" ]; then
   echo "[entrypoint] multi-LoRA habilitado (${LORA_ARGS})"
 fi
 
+# Tool-calling nativo (opt-in): o Codex CLI fala só a Responses API
+# (/v1/responses) e depende do vLLM parsear tool calls e reasoning
+# nativamente — sem isso o raciocínio vaza pro campo "content" (por isso o
+# filtro <think> do gateway existe hoje) e chamadas de ferramenta não
+# funcionam. Desligado por padrão pra não mudar templates já em produção;
+# ligar por template via ENABLE_TOOL_CALLING=true + os parsers certos pro
+# modelo (ex.: Qwen3.x -> TOOL_CALL_PARSER=qwen3_coder REASONING_PARSER=qwen3
+# — ver docs.vllm.ai/serving/integrations/codex). Ligar isso torna o filtro
+# <think> do gateway redundante pra esse template (reasoning já vem separado
+# em "reasoning_content", não mais em "content") — reconciliar depois.
+ENABLE_TOOL_CALLING="${ENABLE_TOOL_CALLING:-false}"
+TOOL_CALLING_ARGS=""
+if [ "${ENABLE_TOOL_CALLING}" = "true" ]; then
+  : "${TOOL_CALL_PARSER:?TOOL_CALL_PARSER é obrigatória quando ENABLE_TOOL_CALLING=true}"
+  : "${REASONING_PARSER:?REASONING_PARSER é obrigatória quando ENABLE_TOOL_CALLING=true}"
+  TOOL_CALLING_ARGS="--enable-auto-tool-choice --tool-call-parser ${TOOL_CALL_PARSER} --reasoning-parser ${REASONING_PARSER}"
+  echo "[entrypoint] tool-calling habilitado (${TOOL_CALLING_ARGS})"
+fi
+
+# Prefix caching automático (opt-in pra DESLIGAR — vLLM liga por padrão em
+# versões recentes): em pod COMPARTILHADO entre tenants (várias stacks/
+# contas no mesmo processo vLLM), um cache hit de prefixo (prompt com o
+# mesmo início de outro tenant) reduz o TTFT de forma observável — um canal
+# lateral de tempo que pode vazar informação sobre o prompt de outro
+# tenant por inferência. Planos de pod DEDICADO não têm esse problema (sem
+# co-tenant pra inferir nada) e não precisam desta flag. Desligar por
+# template de pod compartilhado via DISABLE_PREFIX_CACHING=true. Flag
+# exata depende da versão do vLLM em produção (BooleanOptionalAction:
+# --no-enable-prefix-caching nas versões recentes) — validar antes de
+# ligar em produção.
+DISABLE_PREFIX_CACHING="${DISABLE_PREFIX_CACHING:-false}"
+PREFIX_CACHING_ARGS=""
+if [ "${DISABLE_PREFIX_CACHING}" = "true" ]; then
+  PREFIX_CACHING_ARGS="--no-enable-prefix-caching"
+  echo "[entrypoint] prefix caching desligado (pod compartilhado entre tenants)"
+fi
+
 echo "[entrypoint] subindo vLLM com modelo ${MODEL_NAME} na porta ${VLLM_PORT}"
 # output do vLLM vai pro stdout do container (visível no RunPod) E pro arquivo
 # que o agent lê em /admin/logs.
@@ -38,6 +75,8 @@ python3 -m vllm.entrypoints.openai.api_server \
   --port "${VLLM_PORT}" \
   ${TP_ARGS} \
   ${LORA_ARGS} \
+  ${TOOL_CALLING_ARGS} \
+  ${PREFIX_CACHING_ARGS} \
   ${VLLM_EXTRA_ARGS:-} \
   2>&1 | sed -u 's/^/[vllm] /' | tee "${VLLM_LOG_FILE}" &
 

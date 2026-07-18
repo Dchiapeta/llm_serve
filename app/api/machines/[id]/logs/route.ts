@@ -20,11 +20,11 @@ export async function GET(
     return NextResponse.json({ error: "Máquina não encontrada" }, { status: 404 })
   }
 
-  const keyPrefix = req.nextUrl.searchParams.get("key_prefix") ?? undefined
+  const apiKeyId = req.nextUrl.searchParams.get("api_key_id") ?? undefined
   const tail = Number(req.nextUrl.searchParams.get("tail") ?? 200)
 
   try {
-    const logs = await agent.logs(m, { keyPrefix, tail })
+    const logs = await agent.logs(m, { apiKeyId, tail })
     return NextResponse.json(logs)
   } catch (e) {
     return NextResponse.json(

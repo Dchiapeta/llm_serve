@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { TriangleAlert } from "lucide-react"
 import { toast } from "sonner"
 
 import { updateStackSystemPrompt } from "@/lib/actions"
@@ -65,6 +66,13 @@ export function EditAccountConfigDialog({
               value={systemPrompt}
               onChange={(e) => setSystemPrompt(e.target.value)}
             />
+            <p className="text-muted-foreground flex items-start gap-1.5 text-xs">
+              <TriangleAlert aria-hidden="true" className="mt-0.5 size-3 shrink-0" />
+              Nunca coloque segredos aqui (chaves, URLs internas, dados
+              pessoais). O texto é injetado literalmente em cada chamada e um
+              usuário pode conseguir extraí-lo via prompt injection — não há
+              garantia de que fique oculto.
+            </p>
           </div>
           <Button onClick={onSave} disabled={pending}>
             {pending ? "Salvando…" : "Salvar"}

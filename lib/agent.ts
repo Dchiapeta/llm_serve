@@ -5,8 +5,12 @@ import type { Machine } from "./types"
 
 export type AgentKeyEntry = {
   key_hash: string
+  // identificador estável pra logs/métricas por-chave no agent — key_prefix
+  // sozinho (32 bits) tem colisão possível entre chaves diferentes
+  api_key_id: string
   key_prefix: string
   account_name: string
+  expires_at: string | null
 }
 
 export type AgentKeyMetrics = {
@@ -62,10 +66,10 @@ export const agent = {
     }),
   logs: (
     m: Pick<Machine, "public_url" | "admin_secret">,
-    opts?: { keyPrefix?: string; tail?: number }
+    opts?: { apiKeyId?: string; tail?: number }
   ) => {
     const params = new URLSearchParams()
-    if (opts?.keyPrefix) params.set("key_prefix", opts.keyPrefix)
+    if (opts?.apiKeyId) params.set("api_key_id", opts.apiKeyId)
     if (opts?.tail) params.set("tail", String(opts.tail))
     const qs = params.toString()
     return agentFetch<{ lines: string[] }>(m, `/logs${qs ? `?${qs}` : ""}`)

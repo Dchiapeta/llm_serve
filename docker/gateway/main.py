@@ -33,17 +33,25 @@ streams durante migração. Ver README.md.
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from anthropic_compat import (
+    anthropic_sse_from_openai_stream,
+    anthropic_to_openai_request,
+    openai_to_anthropic_response,
+)
 from lifecycle import LifecycleManager, MigrationError
 from routing import RoutingStore
 from runpod_api import RunPodClient
@@ -64,6 +72,38 @@ RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "4"))
 # teto de adapters por máquina usado na alocação placeholder; a Fase 6 troca
 # isso pelo cálculo de capacidade por VRAM (machine_lora_slots)
 MAX_LORAS_PER_MACHINE = int(os.environ.get("MAX_LORAS_PER_MACHINE", "8"))
+
+# ---------- limites de abuso/custo por chave (produção multi-tenant) ----------
+# rate limit (token bucket, req/min) e concorrência simultânea por chave —
+# sem isso uma chave vazada ou um cliente descontrolado consumia GPU sem
+# nenhum teto. Réplica única do gateway (ver docstring do módulo), então
+# estado em memória é seguro — mesmo padrão do key_cache/in_flight.
+RATE_LIMIT_RPM = float(os.environ.get("RATE_LIMIT_RPM", "60"))
+MAX_CONCURRENT_PER_KEY = int(os.environ.get("MAX_CONCURRENT_PER_KEY", "8"))
+# corpo/params da request — nenhum destes existia antes: sem teto, um
+# cliente BYOE podia mandar prompt gigante sem limite de tamanho/mensagens
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(1_000_000)))
+MAX_MESSAGES = int(os.environ.get("MAX_MESSAGES", "200"))
+
+# quota diária de tokens por conta (controle de custo real — rate limit e
+# concorrência limitam volume de requests, não o custo de cada uma). 0 =
+# sem teto (default, por plano — só liga onde configurado). Lida de
+# usage_metrics, populada pelo metrics_collection_loop abaixo; cache curto
+# evita 1 round-trip ao Supabase por request na hot path.
+DAILY_TOKEN_BUDGET = {
+    "VibeCoder": int(os.environ.get("DAILY_TOKEN_BUDGET_VIBECODER", "0")),
+    "Pro": int(os.environ.get("DAILY_TOKEN_BUDGET_PRO", "0")),
+    "Max": int(os.environ.get("DAILY_TOKEN_BUDGET_MAX", "0")),
+    "Enterprise": int(os.environ.get("DAILY_TOKEN_BUDGET_ENTERPRISE", "0")),
+}
+TOKEN_QUOTA_CACHE_TTL_S = float(os.environ.get("TOKEN_QUOTA_CACHE_TTL_S", "60"))
+# usage_metrics antes só era populado quando um admin abria o painel
+# (collectUsageMetrics em lib/metrics.ts, chamado só no carregamento da
+# página) — inviável como base de uma quota real, já que uma conta gerava
+# uso ilimitado entre duas visitas ao painel sem nenhum registro. Este loop
+# espelha aquela coleta, mas roda sozinho no processo do gateway.
+METRICS_COLLECTION_INTERVAL_S = float(os.environ.get("METRICS_COLLECTION_INTERVAL_S", "120"))
+
 # quanto tempo um request espera por um load em andamento de outro request
 LOAD_WAIT_TIMEOUT_S = float(os.environ.get("LOAD_WAIT_TIMEOUT_S", "20"))
 TOUCH_THROTTLE_S = 15.0
@@ -74,6 +114,12 @@ IDLE_RELEASE_MINUTES = float(
     os.environ.get("IDLE_RELEASE_MINUTES", os.environ.get("IDLE_UNLOAD_MINUTES", "30"))
 )
 MIGRATION_DRAIN_TIMEOUT_S = float(os.environ.get("MIGRATION_DRAIN_TIMEOUT_S", "600"))
+# staleness de routing_state presa em loading/migrating (ver
+# reconcile_stale_routes_once) — bem acima de LORA_LOAD_TIMEOUT_S/
+# MIGRATION_DRAIN_TIMEOUT_S de propósito, pra nunca competir com uma
+# operação genuinamente em andamento e só pegar o que ficou preso de fato
+STALE_ROUTE_THRESHOLD_S = float(os.environ.get("STALE_ROUTE_THRESHOLD_S", "1800"))
+STALE_ROUTE_CHECK_INTERVAL_S = float(os.environ.get("STALE_ROUTE_CHECK_INTERVAL_S", "300"))
 # lifecycle de máquinas: consolidação (esvaziar máquina quase vazia migrando
 # as contas pra outra do mesmo template), auto-pausa (stopPod) de máquina sem
 # nenhuma atividade e auto-wake (startPod) quando chega request sem nenhuma
@@ -135,6 +181,14 @@ auto_provision_cache: tuple[bool, float] | None = None
 # requests em voo por (account_id, machine_id) — base do drain da Fase 5.
 # Em memória: válido apenas com réplica única do gateway.
 in_flight: dict[tuple[str, str], int] = defaultdict(int)
+
+# rate limit (token bucket) e concorrência em voo por chave — key_hash, não
+# account_id: uma conta pode ter várias chaves, cada uma com seu próprio teto
+rate_buckets: dict[str, tuple[float, float]] = {}  # key_hash -> (tokens, last_refill_ts)
+concurrency_per_key: dict[str, int] = defaultdict(int)  # key_hash -> em voo
+
+# cache curto da quota diária de tokens: account_id -> (tokens_usados, expira_em)
+token_usage_cache: dict[str, tuple[int, float]] = {}
 
 # último touch por conta e por máquina (throttle)
 last_touch: dict[str, float] = {}
@@ -232,9 +286,13 @@ async def lifespan(app: FastAPI):
     machine_task = asyncio.create_task(
         lifecycle_mgr.machine_lifecycle_loop(CONSOLIDATION_INTERVAL_S)
     )
+    metrics_task = asyncio.create_task(metrics_collection_loop())
+    stale_routes_task = asyncio.create_task(stale_route_reconciliation_loop())
     yield
     reaper_task.cancel()
     machine_task.cancel()
+    metrics_task.cancel()
+    stale_routes_task.cancel()
     await proxy_client.aclose()
     await openai_client.aclose()
     await panel_client.aclose()
@@ -246,9 +304,37 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# O gateway é uma API pra clientes programáticos (SDK OpenAI/Anthropic,
+# Codex/Claude Code, BYOE) — nunca chamada de um browser. CORS explícito e
+# fechado em vez de ausente (o padrão do Starlette sem CORSMiddleware
+# nenhum já bloqueia por padrão, mas fica implícito; aqui fica documentado
+# e fácil de abrir uma origem específica no futuro, se algum dia existir
+# um playground no browser).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "x-api-key", "Content-Type", "anthropic-version"],
+)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    # não mexe em headers de cache/transformação: quebraria as respostas
+    # SSE (text/event-stream) do proxy de streaming
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    # MutableHeaders do Starlette não tem .pop() (só __delitem__) — usar
+    # .pop() aqui derrubava TODA requisição do gateway com 500
+    if "Server" in response.headers:
+        del response.headers["Server"]
+    return response
+
 
 def require_admin(secret: str | None):
-    if not GATEWAY_ADMIN_SECRET or secret != GATEWAY_ADMIN_SECRET:
+    if not GATEWAY_ADMIN_SECRET or not secret or not hmac.compare_digest(secret, GATEWAY_ADMIN_SECRET):
         raise HTTPException(status_code=401, detail="admin secret inválido")
 
 
@@ -259,7 +345,7 @@ def lora_name(account_id: str) -> str:
 # ---------- Autenticação ----------
 
 
-async def authenticate(authorization: str | None) -> dict:
+async def authenticate(authorization: str | None) -> tuple[dict, str]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="chave de acesso ausente")
     key = authorization.removeprefix("Bearer ").strip()
@@ -275,7 +361,92 @@ async def authenticate(authorization: str | None) -> dict:
 
     if not entry:
         raise HTTPException(status_code=401, detail="chave de acesso inválida")
-    return entry
+
+    # checado por request, não só num filtro na query: o key_cache (TTL de
+    # KEY_CACHE_TTL_S) manteria uma chave expirada válida por até mais um
+    # TTL depois do vencimento se a expiração dependesse só do PostgREST
+    expires_at = entry.get("expires_at")
+    if expires_at:
+        try:
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            expiry = None
+        if expiry and expiry <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=401, detail="chave expirada")
+
+    # fail-closed: conta com stacks precisa de uma chave com stack_id
+    # resolvido. Sem isso, resolve_key_stack cai no heurístico pick_stack,
+    # que pode escolher a stack ERRADA entre as da mesma conta (ambiguidade
+    # cross-stack). A migration 0021 já fez o backfill de stack_id em toda
+    # chave ativa de conta com stack — esta checagem é o defense-in-depth
+    # pra qualquer chave que escape disso no futuro. Conta SEM nenhuma stack
+    # (roteamento por plano puro) não tem ambiguidade — nada pra rejeitar.
+    if entry.get("stacks") and not entry.get("stack_id"):
+        raise HTTPException(status_code=401, detail="chave sem stack associada — contate o suporte")
+
+    return entry, key_hash
+
+
+def check_rate_limit(key_hash: str) -> None:
+    """Token bucket em memória por chave: RATE_LIMIT_RPM tokens/min, com
+    burst até o teto do bucket. Estourou -> 429 + Retry-After; nunca
+    enfileira, só rejeita — o cliente decide se tenta de novo."""
+    now = time.time()
+    tokens, last = rate_buckets.get(key_hash, (RATE_LIMIT_RPM, now))
+    tokens = min(RATE_LIMIT_RPM, tokens + (now - last) * RATE_LIMIT_RPM / 60.0)
+    if tokens < 1.0:
+        rate_buckets[key_hash] = (tokens, now)
+        retry_after = max(1, int((1.0 - tokens) * 60.0 / RATE_LIMIT_RPM) + 1)
+        raise HTTPException(
+            status_code=429,
+            detail="limite de requisições excedido, tente novamente em instantes",
+            headers={"Retry-After": str(retry_after)},
+        )
+    rate_buckets[key_hash] = (tokens - 1.0, now)
+
+
+async def check_token_quota(account_id: str, plan: str) -> None:
+    """Quota diária de tokens por conta — protege contra custo real (poucas
+    requests, cada uma gerando muito token), o que rate limit/concorrência
+    por si não cobrem. Lida de usage_metrics via account_token_usage_today,
+    com cache curto (TOKEN_QUOTA_CACHE_TTL_S) pra não bater no Supabase a
+    cada request. 0/plano sem entrada = sem teto (opt-in por plano)."""
+    budget = DAILY_TOKEN_BUDGET.get(plan, 0)
+    if budget <= 0:
+        return
+    now = time.time()
+    cached = token_usage_cache.get(account_id)
+    if cached and cached[1] > now:
+        used = cached[0]
+    else:
+        used = await supa.account_token_usage_today(account_id)
+        token_usage_cache[account_id] = (used, now + TOKEN_QUOTA_CACHE_TTL_S)
+    if used >= budget:
+        raise HTTPException(
+            status_code=429,
+            detail=f"quota diária de tokens excedida ({used}/{budget})",
+            headers={"Retry-After": "3600"},
+        )
+
+
+async def authenticate_anthropic(
+    authorization: str | None, x_api_key: str | None
+) -> tuple[dict, str, str]:
+    """Igual a authenticate, mas aceita a chave em Authorization: Bearer OU
+    x-api-key — o Claude Code manda num dos dois (às vezes os dois, se o
+    usuário configurou apiKeyHelper) dependendo de ANTHROPIC_AUTH_TOKEN vs
+    ANTHROPIC_API_KEY. Devolve também o header já normalizado pra "Bearer
+    <key>", pra repassar ao agent no upstream (que só entende Bearer, nunca
+    x-api-key)."""
+    bearer = None
+    if authorization and authorization.startswith("Bearer "):
+        bearer = authorization.removeprefix("Bearer ").strip()
+    key = bearer or (x_api_key.strip() if x_api_key else None)
+    if not key:
+        raise HTTPException(status_code=401, detail="chave de acesso ausente")
+    bearer_header = f"Bearer {key}"
+    entry, key_hash = await authenticate(bearer_header)
+    return entry, key_hash, bearer_header
 
 
 # ---------- Roteamento / alocação ----------
@@ -295,6 +466,122 @@ async def call_agent(machine: dict, path: str, body: dict, timeout_s: float = 30
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"agent {path} → {r.status_code}: {r.text}")
     return r.json()
+
+
+async def get_agent_metrics(machine: dict, reset: bool = True) -> dict | None:
+    """GET /admin/metrics no agent (call_agent só faz POST) — usado só pela
+    coleta periódica de uso abaixo, nunca no caminho de request de cliente.
+    None em qualquer falha: agent fora do ar não deve derrubar o loop, os
+    contadores seguem acumulando no pod até a próxima coleta."""
+    try:
+        r = await proxy_client.get(
+            f"{machine['public_url']}/admin/metrics",
+            params={"reset": "true"} if reset else {},
+            headers={"X-Admin-Secret": machine["admin_secret"]},
+            timeout=httpx.Timeout(10.0, connect=5.0),
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+async def collect_usage_metrics_once() -> None:
+    """Espelha collectUsageMetrics (lib/metrics.ts): puxa os contadores
+    acumulados do agent de cada máquina running (zerando-os na leitura) e
+    grava o delta em usage_metrics. Roda sozinha no processo do gateway —
+    antes disso, usage_metrics só era populado quando um admin abria o
+    painel, o que deixava a quota diária de tokens (check_token_quota)
+    cega a qualquer uso entre duas visitas.
+
+    `per_key` do agent é indexado por api_key_id (não mais por key_prefix):
+    o prefixo tem só 32 bits, colisão entre duas contas diferentes não é
+    impossível, e usar o prefixo como chave de agregação atribuiria o uso
+    de uma conta à outra na eventualidade de colisão — sensível o bastante
+    (alimenta a quota diária de custo) pra merecer o identificador estável."""
+    machines = await supa.list_running_machines()
+    for machine in machines:
+        if not machine.get("public_url"):
+            continue
+        snap = await get_agent_metrics(machine)
+        if not snap:
+            continue
+        active = {
+            api_key_id: v for api_key_id, v in (snap.get("per_key") or {}).items()
+            if v.get("requests", 0) > 0
+        }
+        if not active:
+            continue
+        window_start = datetime.now(timezone.utc).isoformat()
+        rows = [
+            {
+                "api_key_id": api_key_id,
+                "machine_id": machine["id"],
+                "window_start": window_start,
+                "requests": v.get("requests", 0),
+                "tokens_in": v.get("tokens_in", 0),
+                "tokens_out": v.get("tokens_out", 0),
+                "concurrent_peak": snap.get("concurrent_peak", 0),
+            }
+            for api_key_id, v in active.items()
+        ]
+        try:
+            await supa.insert_usage_metrics(rows)
+        except Exception as e:
+            logger.warning("coleta de métricas: falha ao gravar máquina %s (%s)", machine["id"], e)
+
+
+async def metrics_collection_loop(interval_s: float = METRICS_COLLECTION_INTERVAL_S):
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await collect_usage_metrics_once()
+        except Exception as e:
+            logger.warning("coleta periódica de métricas falhou: %s", e)
+
+
+async def reconcile_stale_routes_once() -> None:
+    """Recupera contas presas em routing_state.lora_status in
+    ('loading','migrating') há mais tempo do que qualquer load/migração
+    legítima levaria. claim_route/set_client_location só saem desses
+    estados via código explícito de reversão (do_load falhar → mark_slot_idle;
+    migrate falhar → volta pra 'loaded') — se ESSA própria chamada de
+    reversão falhar (ex.: hiccup de rede pro Supabase bem nesse instante),
+    a linha fica presa pra sempre: nada mais no sistema a revisita
+    (list_idle_routes só olha 'loaded'), e todo request futuro da conta
+    bate em wait_until_routed e recebe 503 "adapter carregando" sem nunca
+    se recuperar sozinho. Reset pra 'unloaded' é seguro mesmo se a operação
+    original eventualmente completasse tarde: o pior caso é um load/migração
+    redundante no próximo request, não um estado inconsistente."""
+    cutoff_iso = datetime.fromtimestamp(
+        time.time() - STALE_ROUTE_THRESHOLD_S, tz=timezone.utc
+    ).isoformat()
+    try:
+        stale = await store.list_stale_transitional_routes(cutoff_iso)
+    except Exception as e:
+        logger.warning("reconciliação de rotas presas: falha ao listar (%s)", e)
+        return
+    for route in stale:
+        account_id = route.get("account_id")
+        if not account_id:
+            continue
+        try:
+            await store.mark_slot_idle(account_id)
+            logger.warning(
+                "reconciliação: conta %s presa em '%s' desde %s — liberada",
+                account_id, route.get("lora_status"), route.get("updated_at"),
+            )
+        except Exception as e:
+            logger.warning("reconciliação de rotas presas: falha ao liberar %s (%s)", account_id, e)
+
+
+async def stale_route_reconciliation_loop(interval_s: float = STALE_ROUTE_CHECK_INTERVAL_S):
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await reconcile_stale_routes_once()
+        except Exception as e:
+            logger.warning("reconciliação periódica de rotas presas falhou: %s", e)
 
 
 async def machine_free_slots(machine: dict) -> int:
@@ -339,8 +626,10 @@ async def ensure_key_on_machine(entry: dict, machine: dict) -> None:
         return
     await call_agent(machine, "/upsert-keys", {"keys": [{
         "key_hash": entry["key_hash"],
+        "api_key_id": entry.get("api_key_id"),
         "key_prefix": entry["key_prefix"],
         "account_name": entry["account_name"],
+        "expires_at": entry.get("expires_at"),
     }]})
     agent_key_upserts[cache_key] = time.time() + UPSERT_CACHE_TTL_S
 
@@ -843,12 +1132,20 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
         machine = await supa.get_machine(route["machine_id"])
         if not machine:
             raise HTTPException(status_code=503, detail="máquina da rota não existe mais")
-        if machine.get("status") == "stopped":
-            # stop manual pelo painel com a rota ainda apontando pra máquina
-            # (a auto-pausa exige 0 rotas, então nunca cria este estado). O
-            # restart zera a VRAM — o adapter não está mais carregado mesmo —
-            # então libera o slot e cai no fluxo sem-rota: realoca em máquina
-            # running com vaga ou dispara o auto-wake.
+        # "stopped": stop manual pelo painel com a rota ainda apontando pra
+        # máquina (a auto-pausa exige 0 rotas, então nunca cria este estado
+        # sozinha). "terminated"/"error": pod sumiu de vez (deletado via
+        # console do RunPod, host reclamou a instância) —
+        # reconcile_statuses_once promove pra esses status SEM checar rotas
+        # ativas (ao contrário de stop_idle_machines_once). Sem public_url:
+        # estado transitório/inconsistente, não dá pra servir mesmo com
+        # status "running". Em qualquer um desses casos o adapter não está
+        # mais carregado (nem nunca mais vai estar, nos dois primeiros) —
+        # sem tratar isso aqui, a conta ficava presa apontando pra uma
+        # máquina morta em todo request seguinte, sem nenhuma auto-cura.
+        if machine.get("status") in ("stopped", "terminated", "error") or not machine.get(
+            "public_url"
+        ):
             await store.mark_slot_idle(account_id)
             route = None
         else:
@@ -945,32 +1242,105 @@ MIN_MAX_TOKENS = 8000  # thinking mode (Qwen3.x) corta o raciocínio no meio qua
 # aponta a ferramenta dele direto pro endpoint, sem UI de chat própria controlando
 # esse parâmetro), o gateway impõe o piso aqui pra garantir qualidade consistente
 # independente do cliente.
+MAX_MAX_TOKENS = int(os.environ.get("MAX_MAX_TOKENS", "16000"))  # teto: sem isso um
+# cliente podia pedir max_tokens arbitrário e a GPU rodava até esgotar o contexto,
+# sem nenhum controle de custo (ver também MAX_CONCURRENT_PER_KEY/RATE_LIMIT_RPM)
+
+ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
 
-async def augment_body(body_json: dict, entry: dict) -> dict:
-    """Injeta system prompt configurado da STACK e contexto de RAG (top-k da
-    base de conhecimento da STACK) antes de repassar ao vLLM. Só se aplica a
-    chamadas de chat completions (body com "messages").
+def pin_model(body_json: dict, account_id: str, rewrite_model: bool, machine: dict) -> None:
+    """Trava o campo "model": nunca confia no que o cliente mandou. Conta com
+    adapter LoRA -> nome do adapter da PRÓPRIA conta (antes disso, uma conta
+    base podia mandar {"model": "acct-<outro-uuid>"} e o vLLM servia o
+    fine-tune de outro tenant); conta base -> nome do modelo servido pela
+    máquina (machines.model_name). Roda sempre, mesmo se o cliente omitiu
+    "model" ou mandou um --model diferente na CLI dele (Codex/Claude Code
+    guardam isso em config local, que não temos como fiscalizar — a única
+    trava confiável é no servidor)."""
+    body_json["model"] = lora_name(account_id) if rewrite_model else machine.get("model_name")
+
+
+async def validate_body(
+    body_json: dict, entry: dict, rewrite_model: bool, machine: dict
+) -> dict:
+    """Ponto único de validação/transformação do corpo antes do proxy:
+    trava o modelo, aplica piso/teto de max_tokens e clamp de parâmetros
+    (qualquer endpoint /v1/*) e, só para chat completions (body com
+    "messages"), filtra roles e injeta system prompt da stack + RAG."""
+    pin_model(body_json, entry["account_id"], rewrite_model, machine)
+
+    current_max_tokens = body_json.get("max_tokens")
+    if not isinstance(current_max_tokens, int) or current_max_tokens < MIN_MAX_TOKENS:
+        body_json["max_tokens"] = MIN_MAX_TOKENS
+    elif current_max_tokens > MAX_MAX_TOKENS:
+        body_json["max_tokens"] = MAX_MAX_TOKENS
+
+    # n>1 multiplica o custo de GPU por resposta — sem valor pro caso de uso
+    # BYOE (ferramentas de código pedem 1 completion) e sem teto era um vetor
+    # de abuso trivial (n=100 = 100x o custo de uma request só)
+    if isinstance(body_json.get("n"), int):
+        body_json["n"] = 1
+    for param, lo, hi in (
+        ("temperature", 0.0, 2.0),
+        ("top_p", 0.0, 1.0),
+        ("frequency_penalty", -2.0, 2.0),
+        ("presence_penalty", -2.0, 2.0),
+    ):
+        value = body_json.get(param)
+        if isinstance(value, (int, float)):
+            body_json[param] = min(max(value, lo), hi)
+    body_json.pop("logit_bias", None)
+
+    messages = body_json.get("messages")
+    if not isinstance(messages, list):
+        return body_json
+
+    if len(messages) > MAX_MESSAGES:
+        raise HTTPException(status_code=400, detail="número de mensagens excede o limite")
+
+    # roles fora da whitelist são descartadas silenciosamente — nenhuma
+    # ferramenta BYOE legítima deveria mandar algo além disso, e um role
+    # desconhecido não tem tratamento definido no chat template do vLLM
+    messages = [m for m in messages if m.get("role") in ALLOWED_ROLES]
+
+    # normaliza "system": no máximo UM, sempre no índice 0 — o chat template
+    # do Qwen3.x rejeita ("System message must be at the beginning") qualquer
+    # role "system" que não seja a primeira mensagem. Se o cliente já mandou
+    # um (comum em ferramentas BYOE — Cursor/Codex/Claude Code embutem o
+    # próprio system prompt pra tool-calling/formatação), respeita o dele e
+    # NÃO injeta o da stack — evita duas inserções (uma em 0, outra antes do
+    # último user) que quebravam a chamada inteira, e preserva o
+    # funcionamento normal da ferramenta cliente. Sem system do cliente,
+    # injeta o system_prompt da stack + contexto do RAG.
+    client_systems = [m for m in messages if m.get("role") == "system"]
+    messages = [m for m in messages if m.get("role") != "system"]
+
+    if client_systems:
+        content = "\n\n---\n\n".join(
+            c["content"] for c in client_systems if isinstance(c.get("content"), str)
+        )
+        if content:
+            messages.insert(0, {"role": "system", "content": content})
+    else:
+        system_message = await build_stack_system_message(messages, entry)
+        if system_message:
+            messages.insert(0, system_message)
+
+    body_json["messages"] = messages
+    return body_json
+
+
+async def build_stack_system_message(messages: list, entry: dict) -> dict | None:
+    """system_prompt configurado da STACK + contexto de RAG (top-k da base de
+    conhecimento da STACK), pra quando o cliente não mandou system próprio.
 
     Reaproveita resolve_key_stack (mesmo helper do roteamento de máquina,
     commit 7e64aa4) para saber qual stack da conta está servindo o request —
     sem isso, contas com múltiplas stacks vazavam o mesmo prompt/RAG entre
     todas elas (system_prompt/knowledge_chunks eram só por account_id)."""
-    messages = body_json.get("messages")
-    if not isinstance(messages, list):
-        return body_json
-
-    current_max_tokens = body_json.get("max_tokens")
-    if not isinstance(current_max_tokens, int) or current_max_tokens < MIN_MAX_TOKENS:
-        body_json["max_tokens"] = MIN_MAX_TOKENS
-
     stack, _ = resolve_key_stack(entry)
 
-    # system_prompt da stack e contexto do RAG viram UM único system message no
-    # índice 0 — o chat template do Qwen3.x rejeita ("System message must be at
-    # the beginning") qualquer role "system" que não seja a primeira mensagem,
-    # então duas inserções separadas (uma em 0, outra antes do último user)
-    # quebravam toda chamada que tivesse as duas features ativas ao mesmo tempo.
     system_parts = []
     # stack.system_prompt (por-stack, migration 0020) tem prioridade;
     # entry["system_prompt"] (accounts.system_prompt) é só fallback legado
@@ -997,10 +1367,112 @@ async def augment_body(body_json: dict, entry: dict) -> dict:
                     + "\n---\n".join(chunks)
                 )
 
-    if system_parts:
-        messages.insert(0, {"role": "system", "content": "\n\n---\n\n".join(system_parts)})
+    if not system_parts:
+        return None
+    return {"role": "system", "content": "\n\n---\n\n".join(system_parts)}
 
-    body_json["messages"] = messages
+
+async def build_stack_instructions(entry: dict, last_user_text: str | None) -> str | None:
+    """Equivalente a build_stack_system_message, mas devolve só o texto: a
+    Responses API (Codex) usa o campo "instructions", não uma mensagem
+    role=system dentro de "input"."""
+    stack, _ = resolve_key_stack(entry)
+
+    system_parts = []
+    system_prompt = (stack or {}).get("system_prompt") or entry.get("system_prompt")
+    if system_prompt:
+        system_parts.append(system_prompt)
+
+    if last_user_text:
+        embedding = await embed_query(last_user_text)
+        if embedding:
+            chunks = await supa.match_knowledge_chunks(
+                entry["account_id"],
+                stack["id"] if stack else None,
+                embedding,
+                RAG_TOP_K,
+            )
+            if chunks:
+                system_parts.append(
+                    "Contexto relevante da base de conhecimento:\n"
+                    + "\n---\n".join(chunks)
+                )
+
+    if not system_parts:
+        return None
+    return "\n\n---\n\n".join(system_parts)
+
+
+def _last_user_text_from_responses_input(input_items) -> str | None:
+    if not isinstance(input_items, list):
+        return None
+    for item in reversed(input_items):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [
+                part.get("text") for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            ]
+            if texts:
+                return "\n".join(texts)
+    return None
+
+
+async def validate_responses_body(
+    body_json: dict, entry: dict, rewrite_model: bool, machine: dict
+) -> dict:
+    """Equivalente a validate_body pro formato da Responses API (Codex CLI):
+    "input" no lugar de "messages", "instructions" no lugar de um system
+    message, "max_output_tokens" no lugar de "max_tokens"."""
+    pin_model(body_json, entry["account_id"], rewrite_model, machine)
+
+    # nunca persistir a resposta recuperável por outro tenant via
+    # GET /v1/responses/{id} — esse subpath nem está na allowlist, mas
+    # store=false garante que não sobra nada pra recuperar de qualquer jeito
+    body_json["store"] = False
+
+    max_output_tokens = body_json.get("max_output_tokens")
+    if not isinstance(max_output_tokens, int) or max_output_tokens < MIN_MAX_TOKENS:
+        body_json["max_output_tokens"] = MIN_MAX_TOKENS
+    elif max_output_tokens > MAX_MAX_TOKENS:
+        body_json["max_output_tokens"] = MAX_MAX_TOKENS
+
+    for param, lo, hi in (("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)):
+        value = body_json.get(param)
+        if isinstance(value, (int, float)):
+            body_json[param] = min(max(value, lo), hi)
+
+    input_items = body_json.get("input")
+    if isinstance(input_items, list):
+        if len(input_items) > MAX_MESSAGES:
+            raise HTTPException(status_code=400, detail="número de itens excede o limite")
+        # bug conhecido do Codex (openai/codex#12669): ao reenviar itens de
+        # turnos anteriores (mensagens do assistente, chamadas de
+        # ferramenta), às vezes vêm sem "id"/"status" — a validação estrita
+        # do vLLM rejeita com 502. Sintetiza os dois só nesses itens (nunca
+        # em input NOVO do usuário, que legitimamente não tem esses campos)
+        for i, item in enumerate(input_items):
+            if not isinstance(item, dict):
+                continue
+            is_replayed_output = item.get("role") == "assistant" or item.get("type") in (
+                "function_call",
+                "function_call_output",
+            )
+            if is_replayed_output:
+                item.setdefault("id", f"synth_{i}")
+                item.setdefault("status", "completed")
+
+    if not body_json.get("instructions"):
+        instructions = await build_stack_instructions(
+            entry, _last_user_text_from_responses_input(input_items)
+        )
+        if instructions:
+            body_json["instructions"] = instructions
+
     return body_json
 
 
@@ -1028,7 +1500,7 @@ def split_reasoning(text: str) -> tuple[str | None, str]:
     return text[:idx], text[idx + len(THINK_CLOSE) :].lstrip("\n")
 
 
-async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple):
+async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple, key_hash: str):
     """Envolve o stream SSE bruto do vLLM suprimindo os chunks de raciocínio
     (antes de </think>) e só repassando ao cliente o que vem depois. Se o
     teto de tokens for atingido sem nunca fechar </think> (raro, ~0-5% mesmo
@@ -1065,6 +1537,29 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple)
                         continue
 
                     delta = choice0.get("delta") or {}
+
+                    # vLLM com --reasoning-parser (ENABLE_TOOL_CALLING, ver
+                    # entrypoint.sh) já separa o raciocínio em
+                    # "reasoning_content" — nesse caso "content" nunca vem
+                    # com <think>, e o buffer abaixo nunca veria um </think>
+                    # pra fechar, represando a resposta INTEIRA até o fim do
+                    # stream (todo o texto sairia de uma vez só no fallback,
+                    # quebrando streaming incremental). Detectar isso aqui e
+                    # desligar o filtro nesta resposta evita esse represamento.
+                    if "reasoning_content" in delta:
+                        in_reasoning = False
+                        if buffer_text:
+                            flushed_delta = dict(delta)
+                            flushed_delta["content"] = buffer_text
+                            flushed_choice = dict(choice0)
+                            flushed_choice["delta"] = flushed_delta
+                            flushed_chunk = dict(chunk)
+                            flushed_chunk["choices"] = [flushed_choice]
+                            yield b"data: " + json.dumps(flushed_chunk).encode() + b"\n"
+                            buffer_text = ""
+                        yield line + b"\n"
+                        continue
+
                     content = delta.get("content")
                     finish_reason = choice0.get("finish_reason")
                     if content:
@@ -1119,13 +1614,181 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple)
             yield b"data: [DONE]\n\n"
     finally:
         await upstream.aclose()
-        in_flight[flight_key] -= 1
+        release_flight(flight_key, key_hash)
+
+
+# ---------- Claude Code (Anthropic Messages API) ----------
+#
+# Registrados ANTES do catch-all /v1/{path:path} abaixo: o Starlette casa
+# rotas na ordem de declaração, e o catch-all engoliria /v1/messages* se
+# viesse primeiro. O Claude Code só fala esse formato (não tem suporte a
+# backend OpenAI-compatível) — ver anthropic_compat.py pro porquê e os
+# limites da tradução.
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(
+    request: Request,
+    authorization: str | None = Header(None),
+    x_api_key: str | None = Header(None),
+):
+    raw_body = await request.body()
+    if len(raw_body) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
+
+    entry, key_hash, bearer_header = await authenticate_anthropic(authorization, x_api_key)
+    check_rate_limit(key_hash)
+    account_id = entry["account_id"]
+    await check_token_quota(account_id, entry["plan"])
+
+    machine, rewrite_model, effective_plan = await resolve_route(account_id, entry)
+    await maybe_touch(account_id, machine["id"])
+
+    flight_key = (account_id, machine["id"])
+    in_flight[flight_key] += 1
+    concurrency_per_key[key_hash] += 1
+    if concurrency_per_key[key_hash] > MAX_CONCURRENT_PER_KEY:
+        release_flight(flight_key, key_hash)
+        raise HTTPException(
+            status_code=429,
+            detail="limite de requisições simultâneas excedido",
+            headers={"Retry-After": "2"},
+        )
+
+    try:
+        anthropic_body = json.loads(raw_body)
+    except Exception:
+        release_flight(flight_key, key_hash)
+        raise HTTPException(status_code=400, detail="corpo inválido")
+
+    openai_body, requested_model = anthropic_to_openai_request(anthropic_body)
+    is_stream = bool(anthropic_body.get("stream"))
+    # mesmo filtro de <think> do chat/completions (main.py:REASONING_LEAK_PLANS)
+    # — sem isso, Claude Code apontado pra um plano sem reasoning-parser
+    # (ver ENABLE_TOOL_CALLING) recebia o raciocínio cru misturado no texto
+    filter_reasoning = effective_plan in REASONING_LEAK_PLANS
+
+    try:
+        # mesmo validate_body do chat/completions: trava o model, aplica
+        # piso/teto de max_tokens e clamp de parâmetros. O "system"
+        # convertido acima já entra como client_systems (é o system prompt
+        # do próprio Claude Code) — respeitado, sem injetar o da stack por
+        # cima (mesma política de todos os outros canais)
+        openai_body = await validate_body(openai_body, entry, rewrite_model, machine)
+    except HTTPException:
+        release_flight(flight_key, key_hash)
+        raise
+
+    upstream_body = json.dumps(openai_body).encode()
+
+    try:
+        upstream_req = proxy_client.build_request(
+            "POST",
+            f"{machine['public_url']}/v1/chat/completions",
+            content=upstream_body,
+            headers={"Authorization": bearer_header, "Content-Type": "application/json"},
+        )
+        upstream = await proxy_client.send(upstream_req, stream=True)
+    except httpx.HTTPError as e:
+        release_flight(flight_key, key_hash)
+        logger.warning("anthropic proxy: upstream indisponível para %s (%s)", flight_key, e)
+        raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
+    except BaseException:
+        release_flight(flight_key, key_hash)
+        raise
+
+    if is_stream:
+        return StreamingResponse(
+            anthropic_sse_from_openai_stream(
+                upstream, requested_model,
+                on_done=lambda: release_flight(flight_key, key_hash),
+                filter_reasoning=filter_reasoning,
+            ),
+            status_code=upstream.status_code,
+            media_type="text/event-stream",
+        )
+
+    try:
+        raw = await upstream.aread()
+        try:
+            openai_resp = json.loads(raw)
+            if filter_reasoning:
+                for choice in openai_resp.get("choices", []):
+                    message = choice.get("message")
+                    if isinstance(message, dict) and isinstance(message.get("content"), str):
+                        reasoning, visible = split_reasoning(message["content"])
+                        if reasoning is not None:
+                            message["content"] = visible
+            anthropic_resp = openai_to_anthropic_response(openai_resp, requested_model)
+            raw = json.dumps(anthropic_resp).encode()
+        except Exception:
+            pass  # resposta não é o JSON esperado -> repassa como veio
+    finally:
+        await upstream.aclose()
+        release_flight(flight_key, key_hash)
+    return Response(content=raw, status_code=upstream.status_code, media_type="application/json")
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(
+    request: Request,
+    authorization: str | None = Header(None),
+    x_api_key: str | None = Header(None),
+):
+    """Estimativa heurística (~4 chars/token), não a contagem exata do
+    tokenizer do modelo servido — o Claude Code usa isso pra gerenciar a
+    janela de contexto, não pra billing, então a aproximação é aceitável.
+    Não passa por rate limit/quota/concorrência: não há inferência aqui,
+    só autenticação (mesma chave) e um cálculo local barato."""
+    await authenticate_anthropic(authorization, x_api_key)
+    raw_body = await request.body()
+    if len(raw_body) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
+    try:
+        anthropic_body = json.loads(raw_body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="corpo inválido")
+    openai_body, _ = anthropic_to_openai_request(anthropic_body)
+    estimated = max(1, len(json.dumps(openai_body.get("messages", []))) // 4)
+    return {"input_tokens": estimated}
+
+
+# paths do vLLM que o gateway repassa — qualquer coisa fora daqui (ex.:
+# load_lora_adapter, unload_lora_adapter, tokenize) nunca chega nem a
+# autenticar. Antes desta allowlist, um usuário comum autenticado tinha
+# acesso irrestrito a QUALQUER endpoint /v1/* do vLLM, incluindo os
+# administrativos (ver furo B do plano — cross-tenant via load/unload de
+# adapter alheio). "models" é permitido mas tratado à parte (filtra acct-*).
+ALLOWED_V1: dict[str, set[str]] = {
+    "chat/completions": {"POST"},
+    "completions": {"POST"},
+    "embeddings": {"POST"},
+    "models": {"GET"},
+    "responses": {"POST"},  # Codex CLI (0.59+) só fala essa API, não chat/completions
+}
+
+
+def release_flight(flight_key: tuple[str, str], key_hash: str) -> None:
+    in_flight[flight_key] -= 1
+    concurrency_per_key[key_hash] -= 1
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request, authorization: str | None = Header(None)):
-    entry = await authenticate(authorization)
+    allowed_methods = ALLOWED_V1.get(path)
+    if not allowed_methods or request.method not in allowed_methods:
+        raise HTTPException(status_code=404, detail="not found")
+
+    # lido cedo (antes de autenticar/resolver rota) pra rejeitar corpo grande
+    # sem pagar o custo de wake/provisionamento numa request que será recusada
+    body = await request.body()
+    if len(body) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
+
+    entry, key_hash = await authenticate(authorization)
+    check_rate_limit(key_hash)
     account_id = entry["account_id"]
+    await check_token_quota(account_id, entry["plan"])
 
     machine, rewrite_model, effective_plan = await resolve_route(account_id, entry)
     await maybe_touch(account_id, machine["id"])
@@ -1135,20 +1798,33 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     # menor a janela pra pausa derrubar a máquina com request já resolvido
     flight_key = (account_id, machine["id"])
     in_flight[flight_key] += 1
+    concurrency_per_key[key_hash] += 1
+    if concurrency_per_key[key_hash] > MAX_CONCURRENT_PER_KEY:
+        release_flight(flight_key, key_hash)
+        raise HTTPException(
+            status_code=429,
+            detail="limite de requisições simultâneas excedido",
+            headers={"Retry-After": "2"},
+        )
 
     body_json = None
     try:
-        body = await request.body()
         if body:
             try:
                 body_json = json.loads(body)
-                if rewrite_model and "model" in body_json:
-                    body_json["model"] = lora_name(account_id)
-                # augment_body é no-op se a conta não tem system_prompt nem
-                # chunks indexados — sempre tentar é mais simples do que checar
-                # plano aqui (a mesma injeção serve VibeCoder/Pro/Max igual)
-                body_json = await augment_body(body_json, entry)
+                # validate_body (chat/completions/embeddings) ou
+                # validate_responses_body (Codex, formato Responses) travam
+                # o model, aplicam piso/teto de tokens e clamp de parâmetros,
+                # e injetam system prompt da stack + RAG no formato certo
+                if path == "responses":
+                    body_json = await validate_responses_body(
+                        body_json, entry, rewrite_model, machine
+                    )
+                else:
+                    body_json = await validate_body(body_json, entry, rewrite_model, machine)
                 body = json.dumps(body_json).encode()
+            except HTTPException:
+                raise  # rejeição explícita (ex.: limite de mensagens) não pode virar "segue como está"
             except Exception:
                 pass  # body não-JSON segue como está
 
@@ -1164,14 +1840,41 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         )
         upstream = await proxy_client.send(upstream_req, stream=True)
     except httpx.HTTPError as e:
-        in_flight[flight_key] -= 1
-        raise HTTPException(status_code=503, detail=f"máquina indisponível: {e}")
+        release_flight(flight_key, key_hash)
+        # detalhe da exceção (pode conter a public_url interna do pod) só no
+        # log do servidor — o cliente recebe uma mensagem genérica
+        logger.warning("proxy: upstream indisponível para %s (%s)", flight_key, e)
+        raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
     except BaseException:
         # cliente desconectou no meio do body (CancelledError) ou qualquer
         # outra falha — nunca vazar o contador, senão a máquina fica com
         # in_flight > 0 pra sempre e a auto-pausa nunca mais dispara
-        in_flight[flight_key] -= 1
+        release_flight(flight_key, key_hash)
         raise
+
+    if path == "models":
+        # lista também os adapters LoRA carregados na máquina ("acct-<uuid>")
+        # — sem filtrar, qualquer tenant autenticado enumerava os account_id
+        # de TODOS os outros tenants que dividem o mesmo pod
+        try:
+            raw = await upstream.aread()
+            try:
+                payload = json.loads(raw)
+                payload["data"] = [
+                    m for m in payload.get("data", [])
+                    if not str(m.get("id", "")).startswith("acct-")
+                ]
+                raw = json.dumps(payload).encode()
+            except Exception:
+                pass
+        finally:
+            await upstream.aclose()
+            release_flight(flight_key, key_hash)
+        return Response(
+            content=raw,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "application/json"),
+        )
 
     filter_reasoning = path == "chat/completions" and effective_plan in REASONING_LEAK_PLANS
     is_stream_request = isinstance(body_json, dict) and body_json.get("stream") is True
@@ -1192,7 +1895,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                 pass  # resposta não é o JSON de chat completion esperado -> repassa como veio
         finally:
             await upstream.aclose()
-            in_flight[flight_key] -= 1
+            release_flight(flight_key, key_hash)
         return Response(
             content=raw,
             status_code=upstream.status_code,
@@ -1201,7 +1904,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
 
     if filter_reasoning:
         return StreamingResponse(
-            filtered_reasoning_stream(upstream, flight_key),
+            filtered_reasoning_stream(upstream, flight_key, key_hash),
             status_code=upstream.status_code,
             media_type=upstream.headers.get("content-type", "text/event-stream"),
         )
@@ -1212,7 +1915,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                 yield chunk
         finally:
             await upstream.aclose()
-            in_flight[flight_key] -= 1
+            release_flight(flight_key, key_hash)
 
     return StreamingResponse(
         stream_and_release(),

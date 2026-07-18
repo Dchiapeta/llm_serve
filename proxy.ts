@@ -4,8 +4,12 @@ import { NextResponse, type NextRequest } from "next/server"
 export async function proxy(request: NextRequest) {
   let response = NextResponse.next({ request })
 
-  // apenas para desenvolvimento local sem Supabase configurado
-  if (process.env.DEV_BYPASS_AUTH === "1") return response
+  // apenas para desenvolvimento local sem Supabase configurado — o check
+  // de NODE_ENV é defesa em profundidade contra a env var vazar pra um
+  // deploy de produção por engano (ex.: copiada de um .env de dev)
+  if (process.env.DEV_BYPASS_AUTH === "1" && process.env.NODE_ENV !== "production") {
+    return response
+  }
 
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
