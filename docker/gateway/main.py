@@ -1718,6 +1718,40 @@ async def anthropic_messages(
         raise
 
     if is_stream:
+        if upstream.status_code >= 400:
+            # o upstream (vLLM) recusou a request antes de gerar qualquer chunk
+            # SSE — o corpo é um erro OpenAI/FastAPI comum (JSON, não SSE). Se
+            # deixarmos isso cair no anthropic_sse_from_openai_stream, o loop
+            # de parsing (que só entende linhas "data: ...") descarta o corpo
+            # inteiro e emite um stream vazio "bem-sucedido" (content: [],
+            # stop_reason: end_turn) com status_code=400 por cima — o Claude
+            # Code mostra "API Error: 400" seguido do stream vazio, sem
+            # nenhuma pista da causa real. Aqui devolvemos o erro de verdade,
+            # no formato que a Anthropic Messages API usa.
+            error_raw = await upstream.aread()
+            await upstream.aclose()
+            release_flight(flight_key)
+            logger.warning(
+                "anthropic proxy: upstream %s retornou %s para %s: %s",
+                machine["id"], upstream.status_code, flight_key, error_raw[:500],
+            )
+            try:
+                error_detail = json.loads(error_raw)
+                message = (
+                    error_detail.get("message")
+                    or (error_detail.get("error") or {}).get("message")
+                    or error_detail.get("detail")
+                    or error_raw.decode(errors="replace")
+                )
+            except Exception:
+                message = error_raw.decode(errors="replace") or "erro desconhecido do modelo"
+            return JSONResponse(
+                status_code=upstream.status_code,
+                content={
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": message},
+                },
+            )
         return StreamingResponse(
             anthropic_sse_from_openai_stream(
                 upstream, requested_model,
