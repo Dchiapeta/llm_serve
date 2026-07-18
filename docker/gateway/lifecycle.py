@@ -15,8 +15,10 @@ from datetime import datetime, timedelta, timezone
 logger = logging.getLogger("gateway.lifecycle")
 
 
-def lora_name(account_id: str) -> str:
-    return f"acct-{account_id}"
+def lora_name(stack_id: str) -> str:
+    # adapter escopado por STACK (migration 0029); prefixo "acct-" mantido por
+    # compat com os filtros de /v1/models. Espelha main.py:lora_name.
+    return f"acct-{stack_id}"
 
 
 class LifecycleManager:
@@ -61,12 +63,72 @@ class LifecycleManager:
         # promovida a running (ex.: religada pelo console do RunPod) — main.py
         # usa pra agendar o reenvio de chaves ao agent, que reinicia zerado
         self.on_machine_running = on_machine_running
+        # unloads adiados: quando o drain de uma migração estoura o timeout, a
+        # origem fica com o adapter carregado (órfão) ocupando slot. Em vez de
+        # esperar o pod reiniciar, guardamos (origin_id, account_id) aqui e o
+        # lifecycle loop reprocessa a cada ciclo (process_pending_unloads_once),
+        # descarregando assim que o in-flight na origem zerar. In-memory (mesma
+        # limitação de réplica única do resto do estado — ver finding #13).
+        self.pending_unloads: list[dict] = []
 
-    def _in_flight_count(self, account_id: str, machine_id: str) -> int:
-        return self.in_flight.get((account_id, machine_id), 0)
+    def _in_flight_count(self, stack_id: str, machine_id: str) -> int:
+        # in_flight é chaveado por (stack_id, machine_id) desde a migration 0029
+        return self.in_flight.get((stack_id, machine_id), 0)
 
     def _machine_in_flight(self, machine_id: str) -> int:
         return sum(n for (_, m), n in self.in_flight.items() if m == machine_id and n > 0)
+
+    def _enqueue_pending_unload(self, machine_id: str, stack_id: str) -> None:
+        if any(
+            p["machine_id"] == machine_id and p["stack_id"] == stack_id
+            for p in self.pending_unloads
+        ):
+            return
+        self.pending_unloads.append({"machine_id": machine_id, "stack_id": stack_id})
+
+    async def process_pending_unloads_once(self) -> list[str]:
+        """Reprocessa os unloads adiados por drain timeout (ver migrate step 4).
+        Descarrega a origem assim que o in-flight zera; se a stack voltou a ser
+        roteada pra essa mesma máquina, cancela o unload (o adapter está em uso).
+        Retorna as stacks efetivamente descarregadas."""
+        if not self.pending_unloads:
+            return []
+        done: list[str] = []
+        still_pending: list[dict] = []
+        for p in self.pending_unloads:
+            machine_id, stack_id = p["machine_id"], p["stack_id"]
+            # a stack voltou pra origem no meio-tempo → adapter em uso, cancela
+            route = await self.store.get_client_location(stack_id)
+            if route and route.get("machine_id") == machine_id:
+                logger.info(
+                    "unload adiado da stack %s cancelado: voltou a rotear pra %s",
+                    stack_id, machine_id,
+                )
+                continue
+            # ainda com request em voo na origem → tenta no próximo ciclo
+            if self._in_flight_count(stack_id, machine_id) > 0:
+                still_pending.append(p)
+                continue
+            machine = await self.supa.get_machine(machine_id)
+            if not machine:
+                # máquina não existe mais (terminada) → nada a descarregar
+                continue
+            try:
+                await self.call_agent(
+                    machine, "/unload-lora", {"lora_name": lora_name(stack_id)}
+                )
+                done.append(stack_id)
+                logger.info(
+                    "unload adiado da stack %s concluído em %s", stack_id, machine_id
+                )
+            except Exception as e:
+                logger.warning(
+                    "unload adiado da stack %s falhou (%s) — tenta no próximo ciclo",
+                    stack_id, e,
+                )
+                still_pending.append(p)
+        self.pending_unloads = still_pending
+        return done
 
     # ---------- Idle reaper ----------
 
@@ -78,27 +140,27 @@ class LifecycleManager:
         routes = await self.store.list_idle_routes(cutoff.isoformat())
         reaped: list[str] = []
         for route in routes:
-            account_id, machine_id = route["account_id"], route["machine_id"]
+            stack_id, machine_id = route["stack_id"], route["machine_id"]
             if not machine_id:
                 continue
             # nunca descarrega com request em voo — fica pro próximo ciclo
-            if self._in_flight_count(account_id, machine_id) > 0:
+            if self._in_flight_count(stack_id, machine_id) > 0:
                 continue
             machine = await self.supa.get_machine(machine_id)
             if not machine:
-                await self.store.mark_slot_idle(account_id)
+                await self.store.mark_slot_idle(stack_id)
                 continue
             try:
                 # unload primeiro, slot liberado depois: se o unload falhar a
                 # rota continua 'loaded' e o próximo ciclo tenta de novo
                 await self.call_agent(
-                    machine, "/unload-lora", {"lora_name": lora_name(account_id)}
+                    machine, "/unload-lora", {"lora_name": lora_name(stack_id)}
                 )
-                await self.store.mark_slot_idle(account_id)
-                reaped.append(account_id)
-                logger.info("idle reaper: adapter de %s descarregado de %s", account_id, machine_id)
+                await self.store.mark_slot_idle(stack_id)
+                reaped.append(stack_id)
+                logger.info("idle reaper: adapter da stack %s descarregado de %s", stack_id, machine_id)
             except Exception as e:
-                logger.warning("idle reaper: unload de %s falhou (%s) — mantém loaded", account_id, e)
+                logger.warning("idle reaper: unload da stack %s falhou (%s) — mantém loaded", stack_id, e)
         return reaped
 
     async def idle_reaper_loop(self, interval_s: float = 60.0):
@@ -111,16 +173,17 @@ class LifecycleManager:
 
     # ---------- Migração ativa ----------
 
-    async def migrate(self, account_id: str, target_machine_id: str) -> dict:
-        """Migra o adapter de uma conta para outra máquina, sem perder request.
+    async def migrate(self, stack_id: str, target_machine_id: str) -> dict:
+        """Migra o adapter de uma STACK para outra máquina, sem perder request.
 
         Sequência: marca 'migrating' (origem continua servindo pelo machine_id),
         carrega no destino, flip atômico do machine_id, drena os requests em
         voo na origem e só então descarrega a origem.
         """
-        route = await self.store.get_client_location(account_id)
+        route = await self.store.get_client_location(stack_id)
         if not route or route["lora_status"] != "loaded" or not route["machine_id"]:
-            raise MigrationError(409, f"conta sem rota 'loaded' para migrar (estado: {route and route['lora_status']})")
+            raise MigrationError(409, f"stack sem rota 'loaded' para migrar (estado: {route and route['lora_status']})")
+        account_id = route["account_id"]  # denormalizado na rota, p/ chaves/histórico
         origin_id = route["machine_id"]
         if origin_id == target_machine_id:
             raise MigrationError(400, "máquina de destino é a própria origem")
@@ -130,15 +193,17 @@ class LifecycleManager:
             raise MigrationError(400, "máquina de destino não está running")
         origin = await self.supa.get_machine(origin_id)
 
-        adapter = await self.supa.latest_ready_adapter(account_id)
+        adapter = await self.supa.latest_ready_adapter_for_stack(stack_id)
         if not adapter:
-            raise MigrationError(409, "conta não tem adapter ready registrado")
+            raise MigrationError(409, "stack não tem adapter ready registrado")
 
         # 1. migrating: bloqueia reaper e novos claims; requests novos seguem
         #    indo à origem (o roteamento usa machine_id, que ainda é a origem)
-        await self.store.set_client_location(account_id, lora_status="migrating")
+        await self.store.set_client_location(stack_id, lora_status="migrating")
 
-        # 2. chaves + load no destino; falha → volta 'loaded' na origem
+        # 2. chaves + load no destino; falha → volta 'loaded' na origem. As
+        #    chaves são por conta (api_keys.account_id); upsertar todas na origem
+        #    é superset seguro — inclui a da stack que está migrando.
         try:
             keys = await self.supa.list_active_keys_for_account(account_id)
             if keys:
@@ -146,19 +211,19 @@ class LifecycleManager:
             files = await self.supa.signed_lora_files(adapter["storage_path"])
             await self.call_agent(
                 target, "/load-lora",
-                {"lora_name": lora_name(account_id), "files": files},
+                {"lora_name": lora_name(stack_id), "files": files},
                 timeout_s=self.lora_load_timeout_s,
             )
         except MigrationError:
-            await self.store.set_client_location(account_id, lora_status="loaded")
+            await self.store.set_client_location(stack_id, lora_status="loaded")
             raise
         except Exception as e:
-            await self.store.set_client_location(account_id, lora_status="loaded")
+            await self.store.set_client_location(stack_id, lora_status="loaded")
             raise MigrationError(502, f"load no destino falhou: {e}")
 
         # 3. flip: só após o load confirmado — requests novos vão pro destino
         await self.store.set_client_location(
-            account_id,
+            stack_id,
             machine_id=target_machine_id,
             lora_adapter_id=adapter["id"],
             lora_status="loaded",
@@ -168,14 +233,17 @@ class LifecycleManager:
         #    nunca corta um stream no meio
         drain_deadline = time.time() + self.drain_timeout_s
         drained = True
-        while self._in_flight_count(account_id, origin_id) > 0:
+        while self._in_flight_count(stack_id, origin_id) > 0:
             if time.time() > drain_deadline:
                 drained = False
                 logger.warning(
-                    "migração de %s: drain excedeu %ss com %d request(s) em voo — unload da origem adiado",
-                    account_id, self.drain_timeout_s,
-                    self._in_flight_count(account_id, origin_id),
+                    "migração da stack %s: drain excedeu %ss com %d request(s) em voo — unload da origem adiado",
+                    stack_id, self.drain_timeout_s,
+                    self._in_flight_count(stack_id, origin_id),
                 )
+                # enfileira o unload adiado: o lifecycle loop reprocessa quando
+                # o in-flight zerar, em vez de deixar o adapter órfão até restart
+                self._enqueue_pending_unload(origin_id, stack_id)
                 break
             await asyncio.sleep(0.5)
 
@@ -186,14 +254,15 @@ class LifecycleManager:
         if drained and origin:
             try:
                 await self.call_agent(
-                    origin, "/unload-lora", {"lora_name": lora_name(account_id)}
+                    origin, "/unload-lora", {"lora_name": lora_name(stack_id)}
                 )
                 unloaded = True
             except Exception as e:
-                logger.warning("migração de %s: unload da origem falhou (%s)", account_id, e)
+                logger.warning("migração da stack %s: unload da origem falhou (%s)", stack_id, e)
 
         return {
             "ok": True,
+            "stack_id": stack_id,
             "account_id": account_id,
             "from": origin_id,
             "to": target_machine_id,
@@ -236,7 +305,7 @@ class LifecycleManager:
                 # decide no próximo ciclo, nunca força
                 if any(r["lora_status"] != "loaded" for r in routes):
                     continue
-                if any(self._in_flight_count(r["account_id"], origin["id"]) > 0 for r in routes):
+                if any(self._in_flight_count(r["stack_id"], origin["id"]) > 0 for r in routes):
                     continue
 
                 # destino: a MAIS cheia que ainda caiba TODAS as rotas da origem
@@ -253,12 +322,12 @@ class LifecycleManager:
                 moved: list[dict] = []
                 for route in routes:
                     try:
-                        result = await self.migrate(route["account_id"], target["id"])
+                        result = await self.migrate(route["stack_id"], target["id"])
                         moved.append(result)
                     except Exception as e:
                         logger.warning(
-                            "consolidação: migração de %s (%s → %s) falhou (%s) — interrompe a origem",
-                            route["account_id"], origin["id"], target["id"], e,
+                            "consolidação: migração da stack %s (%s → %s) falhou (%s) — interrompe a origem",
+                            route["stack_id"], origin["id"], target["id"], e,
                         )
                         break
                 if moved:
@@ -328,7 +397,21 @@ class LifecycleManager:
                         self.on_machine_running(m["id"])
                     except Exception:
                         pass
-            await self.supa.set_machine_status(m["id"], new_status)
+            # compare-and-set: o new_status foi decidido a partir de m["status"]
+            # (lido no topo do loop) + o snapshot do RunPod. Se o painel ou outro
+            # ciclo mudou o status nesse meio-tempo, não sobrescreve — reconcilia
+            # no próximo ciclo com o valor fresco. Fecha a corrida do finding #7
+            # (ex.: painel marca 'stopped' e o reconcile, com snapshot velho,
+            # devolvia pra 'running').
+            applied = await self.supa.set_machine_status(
+                m["id"], new_status, expected=m["status"]
+            )
+            if not applied:
+                logger.info(
+                    "reconcile: status de %s mudou concorrentemente (esperava %s) — pula",
+                    m["id"], m["status"],
+                )
+                continue
             changed.append((m["id"], new_status))
             logger.info("reconcile: máquina %s %s → %s", m["id"], m["status"], new_status)
         return changed
@@ -430,6 +513,12 @@ class LifecycleManager:
                 await self.reconcile_statuses_once()
             except Exception as e:
                 logger.warning("reconcile: ciclo falhou (%s)", e)
+            # limpa adapters órfãos de migrações cujo drain estourou o timeout,
+            # antes da consolidação/auto-pausa (libera slot que elas consideram)
+            try:
+                await self.process_pending_unloads_once()
+            except Exception as e:
+                logger.warning("unloads adiados: ciclo falhou (%s)", e)
             try:
                 await self.consolidate_once()
             except Exception as e:

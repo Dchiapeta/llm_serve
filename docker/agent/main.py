@@ -505,6 +505,16 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
             api_key_id, prefix, account,
             f"{resp.status_code} · {usage.get('total_tokens', '?') if usage else '?'} tokens",
         )
+        if path == "models" and isinstance(parsed, dict):
+            # espelha o filtro do gateway (main.py, path == "models"): remove os
+            # adapters LoRA "acct-<uuid>" da listagem. O pod é alcançável direto
+            # pela URL pública do RunPod; sem este filtro TAMBÉM aqui, um tenant
+            # com chave válida enumeraria os account_id de todos os co-tenants
+            # que dividem o mesmo pod compartilhado, contornando o gateway.
+            parsed["data"] = [
+                m for m in parsed.get("data", [])
+                if not str(m.get("id", "")).startswith("acct-")
+            ]
         return JSONResponse(
             content=parsed if parsed is not None else {"raw": resp.text},
             status_code=resp.status_code,

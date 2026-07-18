@@ -348,8 +348,13 @@ def require_admin(secret: str | None):
         raise HTTPException(status_code=401, detail="admin secret inválido")
 
 
-def lora_name(account_id: str) -> str:
-    return f"acct-{account_id}"
+def lora_name(stack_id: str) -> str:
+    # Nome do adapter LoRA no vLLM, escopado por STACK (migration 0029). O
+    # prefixo "acct-" é mantido por compatibilidade: os filtros de /v1/models
+    # (gateway e agent) removem qualquer id que comece com "acct-", então trocar
+    # o prefixo exigiria atualizar os dois. Duas stacks da mesma conta agora
+    # recebem nomes distintos (acct-<stackA> ≠ acct-<stackB>) — fim da colisão.
+    return f"acct-{stack_id}"
 
 
 # ---------- Autenticação ----------
@@ -575,17 +580,17 @@ async def reconcile_stale_routes_once() -> None:
         logger.warning("reconciliação de rotas presas: falha ao listar (%s)", e)
         return
     for route in stale:
-        account_id = route.get("account_id")
-        if not account_id:
+        stack_id = route.get("stack_id")
+        if not stack_id:
             continue
         try:
-            await store.mark_slot_idle(account_id)
+            await store.mark_slot_idle(stack_id)
             logger.warning(
-                "reconciliação: conta %s presa em '%s' desde %s — liberada",
-                account_id, route.get("lora_status"), route.get("updated_at"),
+                "reconciliação: stack %s presa em '%s' desde %s — liberada",
+                stack_id, route.get("lora_status"), route.get("updated_at"),
             )
         except Exception as e:
-            logger.warning("reconciliação de rotas presas: falha ao liberar %s (%s)", account_id, e)
+            logger.warning("reconciliação de rotas presas: falha ao liberar %s (%s)", stack_id, e)
 
 
 async def stale_route_reconciliation_loop(interval_s: float = STALE_ROUTE_CHECK_INTERVAL_S):
@@ -918,29 +923,31 @@ async def pick_machine_with_free_slot(plan: str) -> dict:
     raise HTTPException(status_code=503, detail="sem capacidade: todas as máquinas estão cheias")
 
 
-async def do_load(account_id: str, entry: dict, machine: dict, adapter: dict) -> None:
-    """Garante a chave no agent, baixa+carrega o adapter e confirma a rota."""
+async def do_load(stack_id: str, entry: dict, machine: dict, adapter: dict) -> None:
+    """Garante a chave no agent, baixa+carrega o adapter e confirma a rota.
+    Escopo por stack: o adapter é nomeado e roteado por stack_id (a chave, que é
+    por conta, é garantida separadamente por ensure_key_on_machine)."""
     await ensure_key_on_machine(entry, machine)
     files = await supa.signed_lora_files(adapter["storage_path"])
     await call_agent(
         machine, "/load-lora",
-        {"lora_name": lora_name(account_id), "files": files},
+        {"lora_name": lora_name(stack_id), "files": files},
         timeout_s=LORA_LOAD_TIMEOUT_S,
     )
     await store.set_client_location(
-        account_id,
+        stack_id,
         machine_id=machine["id"],
         lora_adapter_id=adapter["id"],
         lora_status="loaded",
     )
 
 
-async def wait_until_routed(account_id: str) -> dict | None:
+async def wait_until_routed(stack_id: str) -> dict | None:
     """Espera (poll curto) um load em andamento de outro request terminar."""
     deadline = time.time() + LOAD_WAIT_TIMEOUT_S
     while time.time() < deadline:
         await asyncio.sleep(1.0)
-        route = await store.get_client_location(account_id)
+        route = await store.get_client_location(stack_id)
         if route and route["lora_status"] in ("loaded", "migrating") and route["machine_id"]:
             return route
         if not route or route["lora_status"] == "unloaded":
@@ -1112,8 +1119,12 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
     return machine, effective_plan
 
 
-async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
-    """Resolve (machine, rewrite_model, effective_plan) para a conta.
+async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str, str]:
+    """Resolve (machine, rewrite_model, effective_plan, stack_id) para a conta.
+
+    O roteamento é escopado por STACK (migration 0029): a rota, o nome do
+    adapter e o in_flight/drain são por stack_id (resolvido da própria chave via
+    resolve_key_stack). account_id ainda circula para chaves e histórico.
 
     Regra primária: rota com machine_id e status loaded/migrating → proxy
     direto (migrating = origem continua servindo). Sem adapter registrado →
@@ -1128,8 +1139,9 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
     stack, effective_plan = resolve_key_stack(entry)
     if effective_plan is None:
         raise HTTPException(status_code=503, detail="conta sem stack configurada")
+    stack_id = stack["id"]
 
-    route = await store.get_client_location(account_id)
+    route = await store.get_client_location(stack_id)
 
     if route and route["machine_id"] and route["lora_status"] in ("loaded", "migrating"):
         machine = await supa.get_machine(route["machine_id"])
@@ -1149,17 +1161,17 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
         if machine.get("status") in ("stopped", "terminated", "error") or not machine.get(
             "public_url"
         ):
-            await store.mark_slot_idle(account_id)
+            await store.mark_slot_idle(stack_id)
             route = None
         else:
-            return machine, True, effective_plan
+            return machine, True, effective_plan, stack_id
 
     if route and route["lora_status"] == "loading":
-        waited = await wait_until_routed(account_id)
+        waited = await wait_until_routed(stack_id)
         if waited:
             machine = await supa.get_machine(waited["machine_id"])
             if machine:
-                return machine, True, effective_plan
+                return machine, True, effective_plan, stack_id
         raise HTTPException(
             status_code=503,
             detail="adapter carregando, tente novamente",
@@ -1167,24 +1179,24 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
         )
 
     # sem rota ativa: a STACK da chave tem adapter?
-    adapter = await supa.latest_ready_adapter_for_stack(stack["id"]) if stack else None
+    adapter = await supa.latest_ready_adapter_for_stack(stack_id)
     if not adapter:
         # sem adapter registrado → serve o modelo base, stack-aware: máquina
         # da stack da chave quando running; pausada → realocação automática
         # ou wake da própria; fallback por plano (VibeCoder nunca cai numa
         # máquina servindo o modelo do Pro/Max, e vice-versa)
         machine, effective_plan = await resolve_base_machine(account_id, entry)
-        return machine, False, effective_plan
+        return machine, False, effective_plan, stack_id
 
     machine = await pick_machine_with_free_slot(effective_plan)
-    result = await store.claim_client_location(account_id, machine["id"])
+    result = await store.claim_client_location(stack_id, account_id, machine["id"])
     if not result["claimed"]:
-        # outro request venceu a corrida — espera o load dele
-        waited = await wait_until_routed(account_id)
+        # outro request da mesma stack venceu a corrida — espera o load dele
+        waited = await wait_until_routed(stack_id)
         if waited:
             m = await supa.get_machine(waited["machine_id"])
             if m:
-                return m, True, effective_plan
+                return m, True, effective_plan, stack_id
         raise HTTPException(
             status_code=503,
             detail="adapter carregando, tente novamente",
@@ -1192,25 +1204,25 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
         )
 
     try:
-        await do_load(account_id, entry, machine, adapter)
+        await do_load(stack_id, entry, machine, adapter)
     except HTTPException:
-        await store.mark_slot_idle(account_id)
+        await store.mark_slot_idle(stack_id)
         raise
     except Exception as e:
-        await store.mark_slot_idle(account_id)
+        await store.mark_slot_idle(stack_id)
         raise HTTPException(status_code=503, detail=f"falha ao carregar adapter: {e}")
-    return machine, True, effective_plan
+    return machine, True, effective_plan, stack_id
 
 
 # ---------- Proxy ----------
 
 
-async def maybe_touch(account_id: str, machine_id: str | None = None):
+async def maybe_touch(stack_id: str, machine_id: str | None = None):
     now = time.time()
-    if now - last_touch.get(account_id, 0) >= TOUCH_THROTTLE_S:
-        last_touch[account_id] = now
+    if now - last_touch.get(stack_id, 0) >= TOUCH_THROTTLE_S:
+        last_touch[stack_id] = now
         try:
-            await store.touch(account_id)
+            await store.touch(stack_id)
         except Exception:
             pass  # touch é best-effort, nunca derruba o request
     # atividade por máquina (base da auto-pausa) — cobre também requests de
@@ -1252,26 +1264,25 @@ MAX_MAX_TOKENS = int(os.environ.get("MAX_MAX_TOKENS", "16000"))  # teto: sem iss
 ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
 
-def pin_model(body_json: dict, account_id: str, rewrite_model: bool, machine: dict) -> None:
-    """Trava o campo "model": nunca confia no que o cliente mandou. Conta com
-    adapter LoRA -> nome do adapter da PRÓPRIA conta (antes disso, uma conta
-    base podia mandar {"model": "acct-<outro-uuid>"} e o vLLM servia o
-    fine-tune de outro tenant); conta base -> nome do modelo servido pela
-    máquina (machines.model_name). Roda sempre, mesmo se o cliente omitiu
-    "model" ou mandou um --model diferente na CLI dele (Codex/Claude Code
-    guardam isso em config local, que não temos como fiscalizar — a única
-    trava confiável é no servidor)."""
-    body_json["model"] = lora_name(account_id) if rewrite_model else machine.get("model_name")
+def pin_model(body_json: dict, stack_id: str, rewrite_model: bool, machine: dict) -> None:
+    """Trava o campo "model": nunca confia no que o cliente mandou. Stack com
+    adapter LoRA -> nome do adapter da PRÓPRIA stack (antes disso, além do
+    cross-tenant, duas stacks da mesma conta colidiam no mesmo nome de adapter);
+    stack base -> nome do modelo servido pela máquina (machines.model_name).
+    Roda sempre, mesmo se o cliente omitiu "model" ou mandou um --model
+    diferente na CLI dele (Codex/Claude Code guardam isso em config local, que
+    não temos como fiscalizar — a única trava confiável é no servidor)."""
+    body_json["model"] = lora_name(stack_id) if rewrite_model else machine.get("model_name")
 
 
 async def validate_body(
-    body_json: dict, entry: dict, rewrite_model: bool, machine: dict
+    body_json: dict, entry: dict, rewrite_model: bool, machine: dict, stack_id: str
 ) -> dict:
     """Ponto único de validação/transformação do corpo antes do proxy:
     trava o modelo, aplica piso/teto de max_tokens e clamp de parâmetros
     (qualquer endpoint /v1/*) e, só para chat completions (body com
     "messages"), filtra roles e injeta system prompt da stack + RAG."""
-    pin_model(body_json, entry["account_id"], rewrite_model, machine)
+    pin_model(body_json, stack_id, rewrite_model, machine)
 
     current_max_tokens = body_json.get("max_tokens")
     if not isinstance(current_max_tokens, int) or current_max_tokens < MIN_MAX_TOKENS:
@@ -1425,12 +1436,12 @@ def _last_user_text_from_responses_input(input_items) -> str | None:
 
 
 async def validate_responses_body(
-    body_json: dict, entry: dict, rewrite_model: bool, machine: dict
+    body_json: dict, entry: dict, rewrite_model: bool, machine: dict, stack_id: str
 ) -> dict:
     """Equivalente a validate_body pro formato da Responses API (Codex CLI):
     "input" no lugar de "messages", "instructions" no lugar de um system
     message, "max_output_tokens" no lugar de "max_tokens"."""
-    pin_model(body_json, entry["account_id"], rewrite_model, machine)
+    pin_model(body_json, stack_id, rewrite_model, machine)
 
     # nunca persistir a resposta recuperável por outro tenant via
     # GET /v1/responses/{id} — esse subpath nem está na allowlist, mas
@@ -1650,10 +1661,10 @@ async def anthropic_messages(
     _, key_plan = resolve_key_stack(entry)
     await check_token_quota(account_id, key_plan)
 
-    machine, rewrite_model, effective_plan = await resolve_route(account_id, entry)
-    await maybe_touch(account_id, machine["id"])
+    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    await maybe_touch(stack_id, machine["id"])
 
-    flight_key = (account_id, machine["id"])
+    flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
     check_concurrency(flight_key, machine, effective_plan)
 
@@ -1676,7 +1687,7 @@ async def anthropic_messages(
         # convertido acima já entra como client_systems (é o system prompt
         # do próprio Claude Code) — respeitado, sem injetar o da stack por
         # cima (mesma política de todos os outros canais)
-        openai_body = await validate_body(openai_body, entry, rewrite_model, machine)
+        openai_body = await validate_body(openai_body, entry, rewrite_model, machine, stack_id)
     except HTTPException:
         release_flight(flight_key)
         raise
@@ -1824,13 +1835,13 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     _, key_plan = resolve_key_stack(entry)
     await check_token_quota(account_id, key_plan)
 
-    machine, rewrite_model, effective_plan = await resolve_route(account_id, entry)
-    await maybe_touch(account_id, machine["id"])
+    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    await maybe_touch(stack_id, machine["id"])
 
     # incrementa ANTES dos awaits lentos (leitura do body, embeddings do RAG):
     # o grace recheck da auto-pausa conta este in_flight — quanto mais cedo,
     # menor a janela pra pausa derrubar a máquina com request já resolvido
-    flight_key = (account_id, machine["id"])
+    flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
     check_concurrency(flight_key, machine, effective_plan)
 
@@ -1845,10 +1856,12 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                 # e injetam system prompt da stack + RAG no formato certo
                 if path == "responses":
                     body_json = await validate_responses_body(
-                        body_json, entry, rewrite_model, machine
+                        body_json, entry, rewrite_model, machine, stack_id
                     )
                 else:
-                    body_json = await validate_body(body_json, entry, rewrite_model, machine)
+                    body_json = await validate_body(
+                        body_json, entry, rewrite_model, machine, stack_id
+                    )
                 body = json.dumps(body_json).encode()
             except HTTPException:
                 raise  # rejeição explícita (ex.: limite de mensagens) não pode virar "segue como está"
@@ -2008,12 +2021,12 @@ async def admin_sync_machine_keys(request: Request, x_admin_secret: str | None =
 async def admin_migrate(request: Request, x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
     body = await request.json()
-    account_id = body.get("account_id")
+    stack_id = body.get("stack_id")
     target = body.get("target_machine_id")
-    if not account_id or not target:
-        raise HTTPException(status_code=400, detail="account_id e target_machine_id são obrigatórios")
+    if not stack_id or not target:
+        raise HTTPException(status_code=400, detail="stack_id e target_machine_id são obrigatórios")
     try:
-        return await lifecycle_mgr.migrate(account_id, target)
+        return await lifecycle_mgr.migrate(stack_id, target)
     except MigrationError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
 

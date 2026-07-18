@@ -264,13 +264,28 @@ class SupaClient:
         r.raise_for_status()
         return r.json()
 
-    async def set_machine_status(self, machine_id: str, status: str) -> None:
+    async def set_machine_status(
+        self, machine_id: str, status: str, expected: str | None = None
+    ) -> bool:
+        """Atualiza machines.status. Se `expected` for passado, só escreve quando
+        o status atual ainda é `expected` (compare-and-set) — evita que um
+        reconciler, decidindo sobre um snapshot velho do RunPod, sobrescreva uma
+        transição que outro escritor (painel/gateway) fez no meio. Retorna True
+        se alguma linha foi atualizada."""
+        params = {"id": f"eq.{machine_id}"}
+        if expected is not None:
+            params["status"] = f"eq.{expected}"
         r = await self._rest.patch(
             "/machines",
-            params={"id": f"eq.{machine_id}"},
+            params=params,
             json={"status": status},
+            headers={"Prefer": "return=representation"},
         )
         r.raise_for_status()
+        try:
+            return len(r.json()) > 0
+        except Exception:
+            return True
 
     async def touch_machine_activity(self, machine_id: str) -> None:
         r = await self._rest.patch(

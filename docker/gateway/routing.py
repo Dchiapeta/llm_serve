@@ -26,20 +26,29 @@ class RoutingStore:
     async def aclose(self):
         await self._client.aclose()
 
-    async def get_client_location(self, account_id: str) -> dict | None:
+    async def get_client_location(self, stack_id: str) -> dict | None:
+        # routing_state é escopado por STACK (migration 0029): a PK é stack_id.
         r = await self._client.get(
             "/routing_state",
-            params={"account_id": f"eq.{account_id}", "select": "*"},
+            params={"stack_id": f"eq.{stack_id}", "select": "*"},
         )
         r.raise_for_status()
         rows = r.json()
         return rows[0] if rows else None
 
-    async def claim_client_location(self, account_id: str, machine_id: str) -> dict:
-        """Claim atômico via RPC. Retorna o estado com a flag 'claimed'."""
+    async def claim_client_location(
+        self, stack_id: str, account_id: str, machine_id: str
+    ) -> dict:
+        """Claim atômico via RPC, por stack. account_id vai junto só para
+        popular a coluna denormalizada no insert e o histórico. Retorna o
+        estado com a flag 'claimed'."""
         r = await self._client.post(
             "/rpc/claim_route",
-            json={"p_account_id": account_id, "p_machine_id": machine_id},
+            json={
+                "p_stack_id": stack_id,
+                "p_account_id": account_id,
+                "p_machine_id": machine_id,
+            },
         )
         r.raise_for_status()
         rows = r.json()
@@ -90,8 +99,8 @@ class RoutingStore:
             from_machine_id=from_machine_id,
         )
 
-    async def set_client_location(self, account_id: str, **patch) -> None:
-        """Atualiza machine_id / lora_adapter_id / lora_status da rota."""
+    async def set_client_location(self, stack_id: str, **patch) -> None:
+        """Atualiza machine_id / lora_adapter_id / lora_status da rota da stack."""
         allowed = {"machine_id", "lora_adapter_id", "lora_status"}
         unknown = set(patch) - allowed
         if unknown:
@@ -99,29 +108,30 @@ class RoutingStore:
         patch["updated_at"] = datetime.now(timezone.utc).isoformat()
         r = await self._client.patch(
             "/routing_state",
-            params={"account_id": f"eq.{account_id}"},
+            params={"stack_id": f"eq.{stack_id}"},
             json=patch,
         )
         r.raise_for_status()
 
-    async def mark_slot_idle(self, account_id: str) -> None:
-        """Libera o slot: sem adapter em VRAM e sem máquina — apto a novo claim."""
-        previous = await self.get_client_location(account_id)
+    async def mark_slot_idle(self, stack_id: str) -> None:
+        """Libera o slot: sem adapter em VRAM e sem máquina — apto a novo claim.
+        O account_id do histórico sai da própria linha (coluna denormalizada)."""
+        previous = await self.get_client_location(stack_id)
         await self.set_client_location(
-            account_id, machine_id=None, lora_status="unloaded"
+            stack_id, machine_id=None, lora_status="unloaded"
         )
         if previous and previous.get("machine_id"):
             await self._record_routing_history(
-                account_id=account_id,
+                account_id=previous.get("account_id"),
                 event="released",
                 from_machine_id=previous.get("machine_id"),
                 lora_adapter_id=previous.get("lora_adapter_id"),
             )
 
-    async def touch(self, account_id: str) -> None:
+    async def touch(self, stack_id: str) -> None:
         """Marca uso recente (o chamador é responsável pelo throttling)."""
         r = await self._client.post(
-            "/rpc/touch_route", json={"p_account_id": account_id}
+            "/rpc/touch_route", json={"p_stack_id": stack_id}
         )
         r.raise_for_status()
 

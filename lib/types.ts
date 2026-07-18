@@ -7,6 +7,12 @@ export const TEMPLATE_PLANS: TemplatePlan[] = [
   "Enterprise",
 ]
 
+// Planos cujo pod é COMPARTILHADO entre tenants (várias stacks/contas no mesmo
+// processo vLLM). Espelha SHARED_POD_PLANS do gateway (docker/gateway/main.py).
+// Nesses planos o prefix caching vira canal lateral de tempo entre co-tenants
+// (ver docker/entrypoint.sh), então o provisionamento força DISABLE_PREFIX_CACHING.
+export const SHARED_POD_PLANS: TemplatePlan[] = ["VibeCoder", "Pro"]
+
 export type Template = {
   id: string
   runpod_template_id: string | null
@@ -119,6 +125,9 @@ export type LoraAdapter = {
 // Durante migração (lora_status = "migrating"), machine_id continua apontando
 // para a origem, que segue servindo até o flip pós-load no destino.
 export type RoutingState = {
+  // Escopo por STACK desde a migration 0029 (era por conta). stack_id é a PK;
+  // account_id continua denormalizado para histórico/joins.
+  stack_id: string
   account_id: string
   machine_id: string | null
   lora_adapter_id: string | null

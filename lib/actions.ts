@@ -8,11 +8,15 @@ import { randomBytes } from "crypto"
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
-import { getClientLocation, setClientLocation } from "./routing"
+import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
 import { generateStackSlug, STACK_SLUG_RE } from "./slug"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import { TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Stack, type Template, type TemplatePlan } from "./types"
+import { SHARED_POD_PLANS, TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Stack, type Template, type TemplatePlan } from "./types"
+
+// Janela de deduplicação do provisionamento: um retry do gateway dentro desse
+// intervalo reusa a máquina 'creating' recém-criada em vez de criar outra.
+const PROVISION_DEDUP_WINDOW_MS = 120_000
 
 // ---------- Auth ----------
 
@@ -410,6 +414,13 @@ function podInputFromTemplate(input: {
       AGENT_ADMIN_SECRET: input.adminSecret,
       GPU_COUNT: String(gpuCount),
       ...(input.maxUsers !== null ? { MAX_USERS: String(input.maxUsers) } : {}),
+      // Pod compartilhado entre tenants: desliga o prefix caching (canal
+      // lateral de tempo entre co-tenants — ver docker/entrypoint.sh). Vem
+      // depois de ...tpl.env de propósito, pra sobrepor um valor do template.
+      // Só afeta pods novos/recriados; pods já rodando precisam de recreate.
+      ...(SHARED_POD_PLANS.includes(tpl.plan)
+        ? { DISABLE_PREFIX_CACHING: "true" }
+        : {}),
     },
   }
 }
@@ -492,8 +503,19 @@ async function provisionMachine(input: {
     .select()
     .single<Machine>()
   if (error) {
+    // O pod já existe no RunPod mas não há registro em `machines` pra
+    // reconciliar/pausar/terminar — ficaria órfão cobrando GPU pra sempre.
+    // Desliga best-effort; se o delete falhar, aí sim reporta o pod pra
+    // limpeza manual (o id vai na mensagem).
+    let orphanNote = ""
+    try {
+      await runpod.deletePod(pod.id)
+    } catch (delErr) {
+      const delMsg = delErr instanceof Error ? delErr.message : String(delErr)
+      orphanNote = ` (ATENÇÃO: falha ao remover o pod órfão ${pod.id}: ${delMsg} — remova manualmente no RunPod)`
+    }
     return {
-      error: `Pod ${pod.id} criado no RunPod, mas falhou ao salvar no banco: ${error.message}`,
+      error: `Falha ao salvar a máquina no banco: ${error.message}${orphanNote}`,
     }
   }
 
@@ -541,6 +563,30 @@ export async function provisionMachineForPlan(input: {
   if (!tpl) return { error: `Nenhum produto ${input.plan} cadastrado` }
   if (input.templateId && tpl.plan !== input.plan) {
     return { error: "O template informado não pertence ao plano informado" }
+  }
+
+  // Idempotência por janela: o gateway pode reintentar esta chamada se a
+  // resposta HTTP se perder por timeout DEPOIS do pod já ter sido criado (a
+  // trava provisioning_in_progress do gateway é in-memory e não sobrevive a
+  // isso). Sem esta checagem, o retry criaria um pod duplicado cobrando GPU.
+  // Se já há uma máquina do mesmo template em 'creating' criada há poucos
+  // segundos, devolve ela em vez de criar outra. Seguro porque o provisionamento
+  // é serializado por plano no gateway (nunca dispara 2 de propósito na janela).
+  const dedupSince = new Date(Date.now() - PROVISION_DEDUP_WINDOW_MS).toISOString()
+  const { data: recent } = await db
+    .from("machines")
+    .select("id, name, public_url, created_at")
+    .eq("template_id", tpl.id)
+    .eq("status", "creating")
+    .gte("created_at", dedupSince)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle<Pick<Machine, "id" | "name" | "public_url">>()
+  if (recent) {
+    console.warn(
+      `provisionMachineForPlan: máquina ${recent.id} do template ${tpl.id} criada há pouco ainda em 'creating' — retorna ela (dedup de retry) em vez de criar outra`
+    )
+    return { machineId: recent.id, name: recent.name, publicUrl: recent.public_url ?? null }
   }
 
   let viableGpuIds: string[]
@@ -608,10 +654,30 @@ export async function refreshMachineStatus(machineId: string) {
   revalidatePath("/machines")
 }
 
-export async function stopMachine(machineId: string) {
+export async function stopMachine(
+  machineId: string,
+  opts?: { force?: boolean }
+): Promise<{ error: string; code?: "in_use" } | void> {
   const db = createSupabaseAdmin()
   const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
   if (!m?.runpod_pod_id) throw new Error("Máquina sem pod associado")
+  // Ao contrário da auto-pausa (que só para máquina ociosa, com flip+grace+
+  // recheck no gateway), o stop manual cortaria streams em voo. Bloqueia se há
+  // rota ativa (conta com adapter carregado/migrando) na máquina, a menos que
+  // o admin confirme com force. O in-flight real (stream em voo) só vive na
+  // memória do gateway; aqui checamos as rotas persistidas em routing_state.
+  if (!opts?.force) {
+    const routes = await listRoutesByMachine(machineId)
+    const active = routes.filter((r) =>
+      ["loading", "loaded", "migrating"].includes(r.lora_status)
+    )
+    if (active.length > 0) {
+      return {
+        error: `A máquina "${m.name}" tem ${active.length} conta(s) ativa(s) — desativar agora corta as requisições em andamento.`,
+        code: "in_use",
+      }
+    }
+  }
   await runpod.stopPod(m.runpod_pod_id)
   await db.from("machines").update({ status: "stopped" }).eq("id", machineId)
   await logEvent(machineId, "stopped", `Máquina "${m.name}" desativada`)
@@ -1536,10 +1602,12 @@ export async function listLoraAdapters(accountId?: string): Promise<LoraAdapter[
   return (data ?? []) as LoraAdapter[]
 }
 
-// Nome canônico do adapter dentro do vLLM: determinístico por conta, usado
-// pelo gateway para reescrever o campo "model" da request.
-function loraName(accountId: string): string {
-  return `acct-${accountId}`
+// Nome canônico do adapter dentro do vLLM: determinístico por STACK (migration
+// 0029), usado pelo gateway para reescrever o campo "model" da request. O
+// prefixo "acct-" é mantido por compat com os filtros de /v1/models (gateway e
+// agent removem ids "acct-*"). Espelha docker/gateway/main.py:lora_name.
+function loraName(stackId: string): string {
+  return `acct-${stackId}`
 }
 
 // Gera signed URLs (TTL curto) para os arquivos do adapter no bucket —
@@ -1582,24 +1650,29 @@ export async function loadLoraOnMachine(machineId: string, adapterId: string) {
     .single<LoraAdapter>()
   if (!adapter) throw new Error("Adapter não encontrado")
   if (adapter.status !== "ready") throw new Error("Adapter marcado como inválido")
+  // o nome do adapter é por stack (migration 0029); adapter legado sem stack_id
+  // (conta com 2+ stacks no momento da 0026) é ambíguo — exige reassociação
+  if (!adapter.stack_id) {
+    throw new Error("Adapter sem stack associada — reassocie a stack antes de carregar")
+  }
 
   const files = await buildLoraSignedFiles(adapter)
-  const result = await agent.loadLora(m, { lora_name: loraName(adapter.account_id), files })
+  const result = await agent.loadLora(m, { lora_name: loraName(adapter.stack_id), files })
   await logEvent(
     machineId,
     "sync",
-    `Adapter ${loraName(adapter.account_id)} carregado (download ${result.download_s}s, load ${result.load_s}s)`
+    `Adapter ${loraName(adapter.stack_id)} carregado (download ${result.download_s}s, load ${result.load_s}s)`
   )
   revalidatePath(`/machines/${machineId}`)
   return result
 }
 
-export async function unloadLoraOnMachine(machineId: string, accountId: string) {
+export async function unloadLoraOnMachine(machineId: string, stackId: string) {
   const db = createSupabaseAdmin()
   const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
   if (!m) throw new Error("Máquina não encontrada")
-  const result = await agent.unloadLora(m, loraName(accountId))
-  await logEvent(machineId, "sync", `Adapter ${loraName(accountId)} descarregado`)
+  const result = await agent.unloadLora(m, loraName(stackId))
+  await logEvent(machineId, "sync", `Adapter ${loraName(stackId)} descarregado`)
   revalidatePath(`/machines/${machineId}`)
   return result
 }
@@ -1769,48 +1842,77 @@ export async function deleteKnowledgeFile(stackId: string, storagePath: string) 
   revalidatePath("/stacks")
 }
 
-// ---------- Migração de conta ----------
+// ---------- Migração de stack ----------
 
-// Move o adapter LoRA de uma conta da máquina atual para outra: descarrega
-// na origem, carrega no destino, atualiza routing_state e grava o evento em
-// routing_history. Ação manual via painel — o fluxo automático (rebalance)
-// não existe ainda.
-export async function migrateAccountToMachine(accountId: string, targetMachineId: string) {
+// Move o adapter LoRA de uma STACK da máquina atual para outra: escopo por
+// stack desde a migration 0029 (uma conta pode ter várias stacks, cada uma com
+// seu próprio adapter/rota). Carrega no destino, faz o flip do routing_state e
+// descarrega a origem, gravando o evento em routing_history. Ação manual via
+// painel — o fluxo automático (rebalance) vive no gateway (lifecycle.migrate).
+export async function migrateStackToMachine(stackId: string, targetMachineId: string) {
   const db = createSupabaseAdmin()
 
-  const current = await getClientLocation(accountId)
+  const current = await getClientLocation(stackId)
   const { data: adapter } = await db
     .from("lora_adapters")
     .select("*")
-    .eq("account_id", accountId)
+    .eq("stack_id", stackId)
     .eq("status", "ready")
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle<LoraAdapter>()
-  if (!adapter) throw new Error("Conta não tem adapter LoRA pronto para migrar")
+  if (!adapter) throw new Error("Stack não tem adapter LoRA pronto para migrar")
 
   const fromMachineId = current?.machine_id ?? null
   if (fromMachineId === targetMachineId) {
-    throw new Error("A conta já está nessa máquina")
+    throw new Error("A stack já está nessa máquina")
   }
 
+  // Ordem espelhando LifecycleManager.migrate do gateway (lifecycle.py):
+  // carrega no destino ANTES de descarregar a origem, pra nunca deixar a stack
+  // sem adapter (o código antigo fazia unload→load e abria uma janela de 503).
+  // 1. 'migrating': a origem continua servindo (o roteamento usa machine_id,
+  //    que ainda aponta a origem); bloqueia o idle reaper de mexer na origem.
   if (fromMachineId) {
-    await unloadLoraOnMachine(fromMachineId, accountId)
+    await setClientLocation(stackId, { lora_status: "migrating" })
   }
-  await loadLoraOnMachine(targetMachineId, adapter.id)
 
-  await setClientLocation(accountId, {
+  // 2. load no destino; se falhar, reverte a rota pro estado anterior na origem
+  //    (a stack continua funcionando onde estava) e propaga o erro.
+  try {
+    await loadLoraOnMachine(targetMachineId, adapter.id)
+  } catch (e) {
+    if (fromMachineId) {
+      await setClientLocation(stackId, { lora_status: "loaded" }).catch(() => {})
+    }
+    throw e
+  }
+
+  // 3. flip atômico: só depois do load confirmado — requests novos vão ao destino
+  await setClientLocation(stackId, {
     machine_id: targetMachineId,
     lora_adapter_id: adapter.id,
     lora_status: "loaded",
   })
   await db.from("routing_history").insert({
-    account_id: accountId,
+    account_id: adapter.account_id,
     event: "migrated",
     machine_id: targetMachineId,
     from_machine_id: fromMachineId,
     lora_adapter_id: adapter.id,
   })
+
+  // 4. unload da origem best-effort: o painel não enxerga in-flight (esse
+  //    contador só vive na memória do gateway), então não há drain aqui — mas
+  //    a rota já aponta o destino, então no máximo um stream já em voo na
+  //    origem é afetado. Se o unload falhar, o idle reaper limpa depois.
+  if (fromMachineId) {
+    try {
+      await unloadLoraOnMachine(fromMachineId, stackId)
+    } catch (e) {
+      console.error(`Unload da origem ${fromMachineId} falhou após migração (idle reaper cobre):`, e)
+    }
+  }
 
   revalidatePath("/stacks")
   if (fromMachineId) revalidatePath(`/machines/${fromMachineId}`)

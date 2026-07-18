@@ -46,6 +46,7 @@ export function MachineRowActions({
   const [infoOpen, setInfoOpen] = React.useState(false)
   const [deleteOpen, setDeleteOpen] = React.useState(false)
   const [recreateOpen, setRecreateOpen] = React.useState(false)
+  const [stopForceOpen, setStopForceOpen] = React.useState(false)
   const [pending, startTransition] = React.useTransition()
 
   function run(
@@ -59,6 +60,8 @@ export function MachineRowActions({
           toast.error(result.error)
           // Host sem GPU livre: oferece recriar o pod em outro host
           if (result.code === "no_gpu_on_host") setRecreateOpen(true)
+          // Máquina em uso: oferece pausar mesmo assim (force)
+          if (result.code === "in_use") setStopForceOpen(true)
           return
         }
         toast.success(success)
@@ -128,6 +131,32 @@ export function MachineRowActions({
         open={infoOpen}
         onOpenChange={setInfoOpen}
       />
+
+      <AlertDialog open={stopForceOpen} onOpenChange={setStopForceOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Pausar mesmo com uso ativo?</AlertDialogTitle>
+            <AlertDialogDescription>
+              “{machine.name}” tem requisições em andamento. Pausar agora corta
+              os streams em voo dessas contas. Prefira esperar ficar ociosa (a
+              auto-pausa faz isso sem cortar ninguém).
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancelar</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={pending}
+              onClick={(e) => {
+                e.preventDefault()
+                run(() => stopMachine(machine.id, { force: true }), "Máquina desativada")
+                setStopForceOpen(false)
+              }}
+            >
+              Pausar mesmo assim
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={recreateOpen} onOpenChange={setRecreateOpen}>
         <AlertDialogContent>

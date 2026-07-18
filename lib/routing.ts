@@ -16,13 +16,14 @@ async function recordRoutingHistory(
 }
 
 export async function getClientLocation(
-  accountId: string
+  stackId: string
 ): Promise<RoutingState | null> {
+  // routing_state é escopado por STACK (PK stack_id) desde a migration 0029.
   const db = createSupabaseAdmin()
   const { data, error } = await db
     .from("routing_state")
     .select("*")
-    .eq("account_id", accountId)
+    .eq("stack_id", stackId)
     .maybeSingle<RoutingState>()
   if (error) throw new Error(error.message)
   return data
@@ -30,12 +31,15 @@ export async function getClientLocation(
 
 // Claim atômico via RPC: só um chamador vence a corrida e inicia o load
 // (claimed = true); os demais recebem o estado atual com claimed = false.
+// account_id vai junto só para popular a coluna denormalizada / histórico.
 export async function claimClientLocation(
+  stackId: string,
   accountId: string,
   machineId: string
 ): Promise<{ claimed: boolean; state: RoutingState }> {
   const db = createSupabaseAdmin()
   const { data, error } = await db.rpc("claim_route", {
+    p_stack_id: stackId,
     p_account_id: accountId,
     p_machine_id: machineId,
   })
@@ -55,7 +59,7 @@ export async function claimClientLocation(
 }
 
 export async function setClientLocation(
-  accountId: string,
+  stackId: string,
   patch: Partial<
     Pick<RoutingState, "machine_id" | "lora_adapter_id" | "lora_status">
   >
@@ -64,20 +68,20 @@ export async function setClientLocation(
   const { error } = await db
     .from("routing_state")
     .update({ ...patch, updated_at: new Date().toISOString() })
-    .eq("account_id", accountId)
+    .eq("stack_id", stackId)
   if (error) throw new Error(error.message)
 }
 
 // Libera o slot: sem adapter em VRAM e sem máquina — apto a novo claim.
-export async function markSlotIdle(accountId: string): Promise<void> {
-  const previous = await getClientLocation(accountId)
-  await setClientLocation(accountId, {
+export async function markSlotIdle(stackId: string): Promise<void> {
+  const previous = await getClientLocation(stackId)
+  await setClientLocation(stackId, {
     machine_id: null,
     lora_status: "unloaded",
   })
   if (previous?.machine_id) {
     await recordRoutingHistory({
-      account_id: accountId,
+      account_id: previous.account_id,
       event: "released",
       from_machine_id: previous.machine_id,
       lora_adapter_id: previous.lora_adapter_id,
@@ -85,9 +89,9 @@ export async function markSlotIdle(accountId: string): Promise<void> {
   }
 }
 
-export async function touchClientLocation(accountId: string): Promise<void> {
+export async function touchClientLocation(stackId: string): Promise<void> {
   const db = createSupabaseAdmin()
-  const { error } = await db.rpc("touch_route", { p_account_id: accountId })
+  const { error } = await db.rpc("touch_route", { p_stack_id: stackId })
   if (error) throw new Error(error.message)
 }
 

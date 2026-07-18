@@ -107,7 +107,8 @@ export default async function ContasPage() {
       max_users: m.max_users,
       occupied: stacksCountByMachine.get(m.id) ?? 0,
     }))
-  const routeByAccount = new Map(routes.map((r) => [r.account_id, r]))
+  // routing_state é escopado por stack (migration 0029): a rota é por stack_id.
+  const routeByStack = new Map(routes.map((r) => [r.stack_id, r]))
 
   const usageByKeyId = new Map<
     string,
@@ -147,9 +148,11 @@ export default async function ContasPage() {
   const activeMachines = machines.filter((m) =>
     ["running", "stopped"].includes(m.status)
   )
-  const allocatedAccounts = accounts.filter(
-    (a) => routeByAccount.get(a.id)?.machine_id
+  // conta "alocada" = tem ao menos uma stack com rota apontando pra máquina
+  const allocatedAccountIds = new Set(
+    routes.filter((r) => r.machine_id).map((r) => r.account_id)
   )
+  const allocatedAccounts = accounts.filter((a) => allocatedAccountIds.has(a.id))
 
   const kpis = [
     { label: "Total de contas", value: accounts.length, icon: Users },
@@ -162,9 +165,10 @@ export default async function ContasPage() {
   // continuam contando todas, e criar stack pra elas segue possível pelo
   // botão do header).
   const rows: StackRow[] = accounts.flatMap((account) => {
-    const route = routeByAccount.get(account.id)
-    const currentMachine = route?.machine_id ? machineById.get(route.machine_id) : undefined
     return (stacksByAccount.get(account.id) ?? []).map((s) => {
+      // rota por STACK (migration 0029), não mais por conta
+      const route = routeByStack.get(s.id)
+      const currentMachine = route?.machine_id ? machineById.get(route.machine_id) : undefined
       const hasReadyAdapter = readyAdapterStacks.has(s.id)
       const machine = s.machine_id ? machineById.get(s.machine_id) : undefined
       const knowledgeFiles = Array.from(

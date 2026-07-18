@@ -70,7 +70,12 @@ export async function reconcileMachineStatuses(
 
   const client = db ?? createSupabaseAdmin()
   const podById = new Map<string, RunPodPod>(pods.map((p) => [p.id, p]))
-  const updates: Array<{ id: string; status: Machine["status"]; cost: number | null }> = []
+  const updates: Array<{
+    id: string
+    status: Machine["status"]
+    cost: number | null
+    fromStatus: Machine["status"]
+  }> = []
 
   const reconciled = machines.map((m) => {
     if (!m.runpod_pod_id) return m
@@ -92,17 +97,28 @@ export async function reconcileMachineStatuses(
     const before = machines[i]
     const after = reconciled[i]
     if (before.status !== after.status || before.cost_per_hr !== after.cost_per_hr) {
-      updates.push({ id: after.id, status: after.status, cost: after.cost_per_hr })
+      updates.push({
+        id: after.id,
+        status: after.status,
+        cost: after.cost_per_hr,
+        fromStatus: before.status,
+      })
     }
   }
 
   if (updates.length > 0) {
+    // compare-and-set no status: o after.status foi decidido a partir de
+    // before.status + snapshot do RunPod. Se outro escritor (server action ou o
+    // reconciler do gateway) mudou o status nesse meio-tempo, não sobrescreve
+    // (o .eq no status casa 0 linhas). Fecha a corrida do finding #7. O custo
+    // segue sem guarda — é métrica, não estado de transição.
     await Promise.all(
       updates.map((u) =>
         client
           .from("machines")
           .update({ status: u.status, cost_per_hr: u.cost })
           .eq("id", u.id)
+          .eq("status", u.fromStatus)
       )
     )
   }

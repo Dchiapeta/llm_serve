@@ -164,7 +164,7 @@ export function StackRowActions({
       />
 
       <MigrateAccountDialog
-        accountId={account.id}
+        stackId={stack.id}
         accountName={account.name}
         currentMachineName={currentMachine?.name}
         eligibleMachines={runningMachines.filter(

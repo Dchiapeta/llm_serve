@@ -3,7 +3,7 @@
 import * as React from "react"
 import { toast } from "sonner"
 
-import { migrateAccountToMachine } from "@/lib/actions"
+import { migrateStackToMachine } from "@/lib/actions"
 import type { Machine } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import {
@@ -24,14 +24,14 @@ import {
 } from "@/components/ui/select"
 
 export function MigrateAccountDialog({
-  accountId,
+  stackId,
   accountName,
   currentMachineName,
   eligibleMachines,
   open,
   onOpenChange,
 }: {
-  accountId: string
+  stackId: string
   accountName: string
   currentMachineName: string | undefined
   eligibleMachines: Machine[]
@@ -44,8 +44,8 @@ export function MigrateAccountDialog({
   function onMigrate() {
     startTransition(async () => {
       try {
-        await migrateAccountToMachine(accountId, machineId)
-        toast.success("Conta migrada")
+        await migrateStackToMachine(stackId, machineId)
+        toast.success("Stack migrada")
         onOpenChange(false)
         setMachineId("")
       } catch (e) {
