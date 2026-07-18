@@ -208,9 +208,14 @@ bloqueando `load_lora_adapter`/`unload_lora_adapter`/`tokenize`,
 (manda um `model` forjado e confirma que não quebra nem vaza pra outro
 adapter), limite de tamanho de corpo (413) e de número de mensagens (400),
 `/v1/messages` (Claude Code) e `/v1/responses` (Codex) respondendo no
-formato certo, e (com `--include-burst`) rate-limit e limite de
-concorrência disparando 429. Sai com código 1 se algum check falhar — dá
-pra plugar num CI/step manual de release.
+formato certo, e (com `--include-burst`) rate-limit disparando 429. O
+check de concorrência também roda com `--include-burst`, mas **não espera
+mais 429 de uma rajada de uma chave só** — concorrência é elástica por
+máquina (ver item 6 abaixo), então uma chave sozinha pode legitimamente
+absorver a rajada inteira sem ser barrada; o check só falha se aparecer a
+mensagem do antigo teto fixo por chave (sinal de deploy desatualizado). Sai
+com código 1 se algum check falhar — dá pra plugar num CI/step manual de
+release.
 
 ### Manual: precisam de setup no banco (não automatizados)
 
@@ -280,3 +285,34 @@ em 503 indefinidamente. Uma rota presa em `loading`/`migrating` por mais
 de 30 minutos deve aparecer nos logs do gateway como `reconciliação: conta
 ... presa em '...' — liberada` (loop a cada 5 min, ver
 `STALE_ROUTE_CHECK_INTERVAL_S`/`STALE_ROUTE_THRESHOLD_S`).
+
+**6. Concorrência elástica por máquina + piso reservado (pod compartilhado).**
+Concorrência não trava mais por chave — trava pelo agregado de
+`in_flight` na MÁQUINA vs. `machines.max_concurrent_seqs` (migration 0028;
+`NULL` cai no fallback `DEFAULT_MAX_CONCURRENT_SEQS`), com um piso
+(`MIN_RESERVED_SLOTS_SHARED_POD`, default 2) sempre reservado em planos de
+pod compartilhado (`SHARED_POD_PLANS` — VibeCoder/Pro) pra quem chegar
+depois nunca ficar 100% bloqueado esperando um tenant pesado. O roteamento
+(`routing_state`) é por `account_id`, não por `stack_id` — requer então
+duas CONTAS de teste (não duas stacks da mesma conta) cujas chaves roteiem
+pra mesma máquina compartilhada:
+
+```sql
+-- confirma que as duas contas de teste caem na mesma máquina
+select r.account_id, r.machine_id
+from routing_state r
+where r.account_id in ('<conta_a>', '<conta_b>');
+```
+
+- Dispare uma rajada sustentada só com a chave A (ex.: `security_check.py
+  --include-burst` ou N requests concorrentes manuais) até ela sozinha
+  ocupar perto da capacidade cheia da máquina.
+- Enquanto isso, mande UMA requisição com a chave B. Espera-se que ela
+  **não** receba 429 — o piso reservado garante isso mesmo com A saturando
+  o resto. Confirme via `GET /admin/routes` (header `X-Admin-Secret`) que
+  `in_flight_by_machine` do `machine_id` compartilhado nunca ultrapassa
+  `max_concurrent_seqs` da máquina (coluna em `machines`, não exposta pelo
+  endpoint — conferir direto no banco).
+- Em pod dedicado (Max/Enterprise), o mesmo teste com a máquina do próprio
+  plano deve deixar a chave sozinha ocupar a capacidade cheia, sem sobra
+  reservada (não há vizinho pra proteger).

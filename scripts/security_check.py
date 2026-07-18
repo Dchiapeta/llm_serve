@@ -216,7 +216,16 @@ async def check_rate_limit(client: httpx.AsyncClient, api_key: str, burst: int) 
 
 
 async def check_concurrency_limit(client: httpx.AsyncClient, api_key: str, burst: int) -> None:
+    """Concorrência não usa mais teto fixo por chave — é elástica por máquina
+    (check_concurrency em main.py): uma chave sozinha no pod pode legitimamente
+    ocupar quase toda a capacidade, então uma rajada de UMA chave não tem mais
+    um número de 429 esperado (depende de machines.max_concurrent_seqs, que
+    este script não enxerga sem credencial de admin). O que dá pra verificar
+    sem essa informação: SE algum 429 aparecer, o motivo tem que ser o teto
+    elástico de capacidade (mensagem nova) — nunca a mensagem do antigo teto
+    fixo por chave, o que indicaria deploy desatualizado (imagem antiga)."""
     statuses: list = []
+    details: list[str] = []
 
     async def one():
         try:
@@ -228,13 +237,25 @@ async def check_concurrency_limit(client: httpx.AsyncClient, api_key: str, burst
                 timeout=httpx.Timeout(5.0, connect=5.0),
             )
             statuses.append(r.status_code)
+            if r.status_code == 429:
+                try:
+                    details.append(r.json().get("detail", ""))
+                except Exception:
+                    details.append("")
         except httpx.TimeoutException:
             statuses.append("seguiu_para_inferencia")
 
     await asyncio.gather(*[one() for _ in range(burst)])
     counts = {str(s): statuses.count(s) for s in set(statuses)}
-    record(f"limite de concorrência dispara 429 sob {burst} requests simultâneas",
-           429 in statuses, f"status_counts={counts}")
+    stale_static_cap = any("requisições simultâneas excedido" in d for d in details)
+    record(
+        f"concorrência sob rajada de {burst} requests (elástica por máquina, sem teto fixo por chave)",
+        not stale_static_cap,
+        f"status_counts={counts}" + (
+            " — ATENÇÃO: mensagem do antigo teto fixo por chave apareceu, deploy pode estar desatualizado"
+            if stale_static_cap else ""
+        ),
+    )
 
 
 async def main() -> None:
@@ -250,7 +271,8 @@ async def main() -> None:
     parser.add_argument("--burst-size", type=int, default=70,
                          help="requests simultâneas nos checks de rajada (default 70, > RATE_LIMIT_RPM default de 60)")
     parser.add_argument("--concurrency-burst-size", type=int, default=15,
-                         help="requests simultâneas no check de concorrência (default 15, > MAX_CONCURRENT_PER_KEY default de 8)")
+                         help="requests simultâneas no check de concorrência (default 15 — "
+                              "não há mais teto fixo esperado, ver docstring de check_concurrency_limit)")
     args = parser.parse_args()
 
     async with httpx.AsyncClient(base_url=args.base_url.rstrip("/")) as client:

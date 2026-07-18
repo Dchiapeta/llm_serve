@@ -74,12 +74,23 @@ RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "4"))
 MAX_LORAS_PER_MACHINE = int(os.environ.get("MAX_LORAS_PER_MACHINE", "8"))
 
 # ---------- limites de abuso/custo por chave (produção multi-tenant) ----------
-# rate limit (token bucket, req/min) e concorrência simultânea por chave —
-# sem isso uma chave vazada ou um cliente descontrolado consumia GPU sem
-# nenhum teto. Réplica única do gateway (ver docstring do módulo), então
-# estado em memória é seguro — mesmo padrão do key_cache/in_flight.
+# rate limit (token bucket, req/min) por chave — sem isso uma chave vazada ou
+# um cliente descontrolado consumia GPU sem nenhum teto. Réplica única do
+# gateway (ver docstring do módulo), então estado em memória é seguro — mesmo
+# padrão do key_cache/in_flight.
 RATE_LIMIT_RPM = float(os.environ.get("RATE_LIMIT_RPM", "60"))
-MAX_CONCURRENT_PER_KEY = int(os.environ.get("MAX_CONCURRENT_PER_KEY", "8"))
+
+# concorrência: ELÁSTICA por MÁQUINA, não um teto fixo por chave — uma stack
+# sozinha no pod pode usar quase toda a capacidade; outras dividem o mesmo
+# teto conforme aparecem (ver check_concurrency). DEFAULT_MAX_CONCURRENT_SEQS
+# só vale quando machines.max_concurrent_seqs (migration 0028) não foi
+# preenchido pro pod ainda — é o fallback conservador, não a capacidade real.
+DEFAULT_MAX_CONCURRENT_SEQS = int(os.environ.get("DEFAULT_MAX_CONCURRENT_SEQS", "8"))
+# pod compartilhado (SHARED_POD_PLANS) sempre reserva esse mínimo de vagas —
+# garante que quem chegar depois de um tenant pesado nunca fica 100%
+# bloqueado esperando, só entra numa fila menor. Pod dedicado não reserva
+# nada: não há vizinho pra proteger.
+MIN_RESERVED_SLOTS_SHARED_POD = int(os.environ.get("MIN_RESERVED_SLOTS_SHARED_POD", "2"))
 # corpo/params da request — nenhum destes existia antes: sem teto, um
 # cliente BYOE podia mandar prompt gigante sem limite de tamanho/mensagens
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(1_000_000)))
@@ -182,10 +193,9 @@ auto_provision_cache: tuple[bool, float] | None = None
 # Em memória: válido apenas com réplica única do gateway.
 in_flight: dict[tuple[str, str], int] = defaultdict(int)
 
-# rate limit (token bucket) e concorrência em voo por chave — key_hash, não
-# account_id: uma conta pode ter várias chaves, cada uma com seu próprio teto
+# rate limit (token bucket) por chave — key_hash, não account_id: uma conta
+# pode ter várias chaves, cada uma com seu próprio teto de RPM
 rate_buckets: dict[str, tuple[float, float]] = {}  # key_hash -> (tokens, last_refill_ts)
-concurrency_per_key: dict[str, int] = defaultdict(int)  # key_hash -> em voo
 
 # cache curto da quota diária de tokens: account_id -> (tokens_usados, expira_em)
 token_usage_cache: dict[str, tuple[int, float]] = {}
@@ -1237,7 +1247,7 @@ MIN_MAX_TOKENS = 8000  # thinking mode (Qwen3.x) corta o raciocínio no meio qua
 # independente do cliente.
 MAX_MAX_TOKENS = int(os.environ.get("MAX_MAX_TOKENS", "16000"))  # teto: sem isso um
 # cliente podia pedir max_tokens arbitrário e a GPU rodava até esgotar o contexto,
-# sem nenhum controle de custo (ver também MAX_CONCURRENT_PER_KEY/RATE_LIMIT_RPM)
+# sem nenhum controle de custo (ver também check_concurrency/RATE_LIMIT_RPM)
 
 ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
@@ -1480,6 +1490,12 @@ THINK_CLOSE = "</think>"
 # filtro, que devolve o buffer acumulado no fim do stream).
 REASONING_LEAK_PLANS = {"VibeCoder", "Pro"}
 
+# planos cujo pod é COMPARTILHADO entre várias stacks/tenants (ver
+# check_concurrency) — hoje coincide em membros com REASONING_LEAK_PLANS, mas
+# são eixos diferentes (parser de reasoning vs. topologia do pod) que podem
+# divergir; não reaproveitar um pelo outro.
+SHARED_POD_PLANS = {"VibeCoder", "Pro"}
+
 
 def split_reasoning(text: str) -> tuple[str | None, str]:
     """Separa o bloco de raciocínio da resposta final. Modelos com thinking
@@ -1492,7 +1508,7 @@ def split_reasoning(text: str) -> tuple[str | None, str]:
     return text[:idx], text[idx + len(THINK_CLOSE) :].lstrip("\n")
 
 
-async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple, key_hash: str):
+async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple):
     """Envolve o stream SSE bruto do vLLM suprimindo os chunks de raciocínio
     (antes de </think>) e só repassando ao cliente o que vem depois. Se o
     teto de tokens for atingido sem nunca fechar </think> (raro, ~0-5% mesmo
@@ -1606,7 +1622,7 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple,
             yield b"data: [DONE]\n\n"
     finally:
         await upstream.aclose()
-        release_flight(flight_key, key_hash)
+        release_flight(flight_key)
 
 
 # ---------- Claude Code (Anthropic Messages API) ----------
@@ -1639,19 +1655,12 @@ async def anthropic_messages(
 
     flight_key = (account_id, machine["id"])
     in_flight[flight_key] += 1
-    concurrency_per_key[key_hash] += 1
-    if concurrency_per_key[key_hash] > MAX_CONCURRENT_PER_KEY:
-        release_flight(flight_key, key_hash)
-        raise HTTPException(
-            status_code=429,
-            detail="limite de requisições simultâneas excedido",
-            headers={"Retry-After": "2"},
-        )
+    check_concurrency(flight_key, machine, effective_plan)
 
     try:
         anthropic_body = json.loads(raw_body)
     except Exception:
-        release_flight(flight_key, key_hash)
+        release_flight(flight_key)
         raise HTTPException(status_code=400, detail="corpo inválido")
 
     openai_body, requested_model = anthropic_to_openai_request(anthropic_body)
@@ -1669,7 +1678,7 @@ async def anthropic_messages(
         # cima (mesma política de todos os outros canais)
         openai_body = await validate_body(openai_body, entry, rewrite_model, machine)
     except HTTPException:
-        release_flight(flight_key, key_hash)
+        release_flight(flight_key)
         raise
 
     upstream_body = json.dumps(openai_body).encode()
@@ -1683,18 +1692,18 @@ async def anthropic_messages(
         )
         upstream = await proxy_client.send(upstream_req, stream=True)
     except httpx.HTTPError as e:
-        release_flight(flight_key, key_hash)
+        release_flight(flight_key)
         logger.warning("anthropic proxy: upstream indisponível para %s (%s)", flight_key, e)
         raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
     except BaseException:
-        release_flight(flight_key, key_hash)
+        release_flight(flight_key)
         raise
 
     if is_stream:
         return StreamingResponse(
             anthropic_sse_from_openai_stream(
                 upstream, requested_model,
-                on_done=lambda: release_flight(flight_key, key_hash),
+                on_done=lambda: release_flight(flight_key),
                 filter_reasoning=filter_reasoning,
             ),
             status_code=upstream.status_code,
@@ -1718,7 +1727,7 @@ async def anthropic_messages(
             pass  # resposta não é o JSON esperado -> repassa como veio
     finally:
         await upstream.aclose()
-        release_flight(flight_key, key_hash)
+        release_flight(flight_key)
     return Response(content=raw, status_code=upstream.status_code, media_type="application/json")
 
 
@@ -1761,9 +1770,40 @@ ALLOWED_V1: dict[str, set[str]] = {
 }
 
 
-def release_flight(flight_key: tuple[str, str], key_hash: str) -> None:
+def release_flight(flight_key: tuple[str, str]) -> None:
     in_flight[flight_key] -= 1
-    concurrency_per_key[key_hash] -= 1
+
+
+def machine_capacity(machine: dict) -> int:
+    """Teto de sequências concorrentes do pod (espelha o --max-num-seqs real
+    do deploy, machines.max_concurrent_seqs — migration 0028). Sem valor
+    configurado ainda, cai no fallback global conservador em vez de travar
+    o request."""
+    cap = machine.get("max_concurrent_seqs")
+    return cap if isinstance(cap, int) and cap > 0 else DEFAULT_MAX_CONCURRENT_SEQS
+
+
+def check_concurrency(flight_key: tuple[str, str], machine: dict, plan: str) -> None:
+    """Concorrência elástica por MÁQUINA, não por chave: uma stack sozinha no
+    pod pode ocupar quase toda a capacidade; outras dividem o mesmo teto
+    conforme aparecem. Em pod compartilhado (SHARED_POD_PLANS) reserva um
+    piso mínimo (MIN_RESERVED_SLOTS_SHARED_POD) pra quem chegar depois nunca
+    ficar 100% bloqueado esperando um tenant pesado — em pod dedicado não há
+    vizinho pra proteger, o teto é a capacidade cheia.
+
+    Chamada logo após incrementar in_flight[flight_key] (mesmo padrão do
+    antigo teto por chave): se estourar, desfaz o incremento e rejeita."""
+    machine_id = flight_key[1]
+    reserved = MIN_RESERVED_SLOTS_SHARED_POD if plan in SHARED_POD_PLANS else 0
+    ceiling = max(machine_capacity(machine) - reserved, 1)
+    total_on_machine = sum(n for (_, m), n in in_flight.items() if m == machine_id)
+    if total_on_machine > ceiling:
+        release_flight(flight_key)
+        raise HTTPException(
+            status_code=429,
+            detail="máquina no limite de capacidade concorrente no momento, tente novamente",
+            headers={"Retry-After": "2"},
+        )
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
@@ -1792,14 +1832,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     # menor a janela pra pausa derrubar a máquina com request já resolvido
     flight_key = (account_id, machine["id"])
     in_flight[flight_key] += 1
-    concurrency_per_key[key_hash] += 1
-    if concurrency_per_key[key_hash] > MAX_CONCURRENT_PER_KEY:
-        release_flight(flight_key, key_hash)
-        raise HTTPException(
-            status_code=429,
-            detail="limite de requisições simultâneas excedido",
-            headers={"Retry-After": "2"},
-        )
+    check_concurrency(flight_key, machine, effective_plan)
 
     body_json = None
     try:
@@ -1834,7 +1867,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         )
         upstream = await proxy_client.send(upstream_req, stream=True)
     except httpx.HTTPError as e:
-        release_flight(flight_key, key_hash)
+        release_flight(flight_key)
         # detalhe da exceção (pode conter a public_url interna do pod) só no
         # log do servidor — o cliente recebe uma mensagem genérica
         logger.warning("proxy: upstream indisponível para %s (%s)", flight_key, e)
@@ -1843,7 +1876,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # cliente desconectou no meio do body (CancelledError) ou qualquer
         # outra falha — nunca vazar o contador, senão a máquina fica com
         # in_flight > 0 pra sempre e a auto-pausa nunca mais dispara
-        release_flight(flight_key, key_hash)
+        release_flight(flight_key)
         raise
 
     if path == "models":
@@ -1863,7 +1896,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                 pass
         finally:
             await upstream.aclose()
-            release_flight(flight_key, key_hash)
+            release_flight(flight_key)
         return Response(
             content=raw,
             status_code=upstream.status_code,
@@ -1889,7 +1922,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                 pass  # resposta não é o JSON de chat completion esperado -> repassa como veio
         finally:
             await upstream.aclose()
-            release_flight(flight_key, key_hash)
+            release_flight(flight_key)
         return Response(
             content=raw,
             status_code=upstream.status_code,
@@ -1898,7 +1931,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
 
     if filter_reasoning:
         return StreamingResponse(
-            filtered_reasoning_stream(upstream, flight_key, key_hash),
+            filtered_reasoning_stream(upstream, flight_key),
             status_code=upstream.status_code,
             media_type=upstream.headers.get("content-type", "text/event-stream"),
         )
@@ -1909,7 +1942,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                 yield chunk
         finally:
             await upstream.aclose()
-            release_flight(flight_key, key_hash)
+            release_flight(flight_key)
 
     return StreamingResponse(
         stream_and_release(),
@@ -1934,8 +1967,14 @@ async def health():
 @app.get("/admin/routes")
 async def admin_routes(x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
+    in_flight_by_machine: dict[str, int] = defaultdict(int)
+    for (_, m), n in in_flight.items():
+        in_flight_by_machine[m] += n
     return {
         "in_flight": {f"{a}@{m}": n for (a, m), n in in_flight.items() if n > 0},
+        # agregado por máquina — o número que importa pra ver o teto elástico
+        # de check_concurrency em ação (compara com machines.max_concurrent_seqs)
+        "in_flight_by_machine": {m: n for m, n in in_flight_by_machine.items() if n > 0},
         "key_cache_size": len(key_cache),
         "provisioning_in_progress": sorted(provisioning_in_progress),
     }
