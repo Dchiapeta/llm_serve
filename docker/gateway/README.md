@@ -29,9 +29,10 @@ cliente → gateway (:8080) → agent do pod (:8000) → vLLM (:8001)
   e MOVE as `api_keys` juntas — a plain key do cliente não muda) para outra
   máquina running com vaga de stack do MESMO plano (`machine_stack_slots`,
   migration 0018); sem vaga em nenhuma → religa a PRÓPRIA máquina do stack
-  (503 + `Retry-After`). Conta sem stack cai no fallback por plano
-  (`accounts.plan` × `templates.plan`) — nunca cai no modelo base de outro
-  plano. Antes de todo proxy do fluxo base, a chave da conta é garantida no
+  (503 + `Retry-After`). Plano é sempre o da stack da chave (`stacks.plan` ×
+  `templates.plan`, migration 0027) — chave sem stack resolvido é rejeitada
+  com 401 no `authenticate`, nunca cai num fallback por plano da conta (essa
+  coluna não existe mais). Antes de todo proxy do fluxo base, a chave da conta é garantida no
   agent via upsert lazy (cache `UPSERT_CACHE_TTL_S`) — o agent perde as
   chaves em memória a cada restart do pod.
 - **Proxy**: reescreve `body.model = "acct-{account_id}"` quando o adapter

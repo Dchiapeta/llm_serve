@@ -5,7 +5,7 @@ import Link from "next/link"
 import { Copy, Search } from "lucide-react"
 import { toast } from "sonner"
 
-import { TEMPLATE_PLANS, type Account, type ApiKey, type Machine, type RoutingState, type Stack } from "@/lib/types"
+import { TEMPLATE_PLANS, type Account, type ApiKey, type Machine, type RoutingState, type Stack, type TemplatePlan } from "@/lib/types"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -36,7 +36,7 @@ import { StackRowActions } from "@/components/contas/stack-row-actions"
 
 // Cor do badge por plano de produto — mantém a mesma paleta usada em
 // components/templates para o plano do template.
-export const PLAN_BADGE_VARIANT: Record<Account["plan"], "secondary" | "info-light" | "success-light" | "warning-light"> = {
+export const PLAN_BADGE_VARIANT: Record<TemplatePlan, "secondary" | "info-light" | "success-light" | "warning-light"> = {
   VibeCoder: "secondary",
   Pro: "info-light",
   Max: "success-light",

@@ -36,7 +36,7 @@ export default async function ContasPage() {
     db.from("accounts").select("*").order("name"),
     db.from("machines").select("*").neq("status", "terminated"),
     db.from("routing_state").select("*"),
-    db.from("lora_adapters").select("account_id, status"),
+    db.from("lora_adapters").select("stack_id, status"),
     db
       .from("api_keys")
       .select("id, account_id, machine_id, stack_id, status, key_prefix, plain_key, created_at"),
@@ -55,7 +55,7 @@ export default async function ContasPage() {
   const accounts = (accountsData ?? []) as Account[]
   const machines = (machinesData ?? []) as Machine[]
   const routes = (routingData ?? []) as RoutingState[]
-  const loras = (lorasData ?? []) as Pick<LoraAdapter, "account_id" | "status">[]
+  const loras = (lorasData ?? []) as Pick<LoraAdapter, "stack_id" | "status">[]
   const keys = (keysData ?? []) as Pick<
     ApiKey,
     "id" | "account_id" | "machine_id" | "stack_id" | "status" | "key_prefix" | "plain_key" | "created_at"
@@ -128,8 +128,8 @@ export default async function ContasPage() {
 
   const templateById = new Map(templates.map((t) => [t.id, t]))
 
-  const readyAdapterAccounts = new Set(
-    loras.filter((l) => l.status === "ready").map((l) => l.account_id)
+  const readyAdapterStacks = new Set(
+    loras.filter((l) => l.status === "ready" && l.stack_id).map((l) => l.stack_id)
   )
 
   // Chunks sem stack_id são legados de contas que tinham 2+ stacks no
@@ -164,8 +164,8 @@ export default async function ContasPage() {
   const rows: StackRow[] = accounts.flatMap((account) => {
     const route = routeByAccount.get(account.id)
     const currentMachine = route?.machine_id ? machineById.get(route.machine_id) : undefined
-    const hasReadyAdapter = readyAdapterAccounts.has(account.id)
     return (stacksByAccount.get(account.id) ?? []).map((s) => {
+      const hasReadyAdapter = readyAdapterStacks.has(s.id)
       const machine = s.machine_id ? machineById.get(s.machine_id) : undefined
       const knowledgeFiles = Array.from(
         knowledgeFilesByStack.get(s.id) ?? [],

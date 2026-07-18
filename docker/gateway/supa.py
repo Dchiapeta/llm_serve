@@ -47,14 +47,15 @@ class SupaClient:
     # ---------- api_keys ----------
 
     async def find_active_key(self, key_hash: str) -> dict | None:
-        """Retorna {account_id, api_key_id, key_prefix, account_name, plan,
-        system_prompt, stack_id, stacks, expires_at} da chave ativa, ou None.
-        Os stacks vêm embutidos (FK reversa accounts → stacks) pro roteamento
-        base ser stack-aware sem query extra por request — o dict inteiro
-        pega carona no key_cache do gateway. `stack_id` (coluna direta de
-        api_keys, migration 0019) identifica QUAL dessas stacks é a da
-        própria chave — sem ele (chave legada), o roteamento cai no
-        heurístico por accounts.plan.
+        """Retorna {account_id, api_key_id, key_prefix, account_name,
+        stack_id, stacks, expires_at} da chave ativa, ou None. Os stacks vêm
+        embutidos (FK reversa accounts → stacks) pro roteamento base ser
+        stack-aware sem query extra por request — o dict inteiro pega carona
+        no key_cache do gateway. `stack_id` (coluna direta de api_keys,
+        migration 0019) identifica QUAL dessas stacks é a da própria chave.
+        `plan` e `system_prompt` não existem mais no nível de conta (migration
+        0027) — toda config de produto vem de dentro de cada item de `stacks`,
+        resolvida por `resolve_key_stack` (main.py).
 
         `api_key_id` (id da própria linha) é o identificador ESTÁVEL da
         chave, sincronizado ao agent (sync-keys/upsert-keys) pra logs e
@@ -62,11 +63,6 @@ class SupaClient:
         colisão possível entre chaves diferentes; usar só o prefixo como
         chave de agregação misturava métricas/logs de duas contas diferentes
         na (baixa, mas não nula) chance de colisão.
-
-        `system_prompt` no nível de `accounts` (migration 0010) é só fallback
-        legado — desde a migration 0020 cada stack tem o seu próprio
-        `system_prompt`, embutido em cada item de `stacks`, resolvido por
-        `resolve_key_stack` (main.py) no lugar do valor da conta inteira.
 
         `expires_at` (migration 0024, nullable) é checado por request em
         `authenticate` — não dá pra confiar só num filtro PostgREST aqui,
@@ -78,7 +74,7 @@ class SupaClient:
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,"
-                "accounts(name,plan,system_prompt,"
+                "accounts(name,"
                 "stacks(id,machine_id,plan,slug,created_at,system_prompt))",
                 "limit": "1",
             },
@@ -97,8 +93,6 @@ class SupaClient:
             "stack_id": row.get("stack_id"),
             "expires_at": row.get("expires_at"),
             "account_name": account.get("name", "?"),
-            "plan": account.get("plan", "VibeCoder"),
-            "system_prompt": account.get("system_prompt"),
             "stacks": account.get("stacks") or [],
         }
 
@@ -416,8 +410,14 @@ class SupaClient:
 
     # ---------- lora_adapters ----------
 
-    async def latest_ready_adapter(self, account_id: str) -> dict | None:
-        """Adapter 'ready' mais recente da conta, confirmado contra o Storage.
+    async def latest_ready_adapter_for_stack(self, stack_id: str) -> dict | None:
+        """Adapter 'ready' mais recente da STACK, confirmado contra o Storage.
+
+        Fine-tune pertence à stack (migration 0026), não à conta — uma conta
+        com várias stacks pode ter adapters diferentes (ou nenhum) em cada
+        uma. Adapters registrados antes da 0026 numa conta com 2+ stacks
+        ficaram com stack_id null (ambíguo, sem como saber qual stack é a
+        dona) — ficam invisíveis aqui até um admin reassociar manualmente.
 
         O status salvo no banco sozinho não é confiável: pode ter sido gravado
         fora da validação (bug já corrigido em registerLoraAdapter, que antes
@@ -430,7 +430,7 @@ class SupaClient:
         r = await self._rest.get(
             "/lora_adapters",
             params={
-                "account_id": f"eq.{account_id}",
+                "stack_id": f"eq.{stack_id}",
                 "status": "eq.ready",
                 "select": "*",
                 "order": "created_at.desc",

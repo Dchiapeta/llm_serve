@@ -5,7 +5,7 @@ import { Layers } from "lucide-react"
 import { toast } from "sonner"
 
 import { registerLoraAdapter } from "@/lib/actions"
-import type { Account } from "@/lib/types"
+import type { Stack } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -25,9 +25,11 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 
-export function RegisterLoraDialog({ accounts }: { accounts: Account[] }) {
+type StackOption = Stack & { accounts: { name: string } | null }
+
+export function RegisterLoraDialog({ stacks }: { stacks: StackOption[] }) {
   const [open, setOpen] = React.useState(false)
-  const [accountId, setAccountId] = React.useState<string>("")
+  const [stackId, setStackId] = React.useState<string>("")
   const [version, setVersion] = React.useState<string>("")
   const [pending, startTransition] = React.useTransition()
 
@@ -35,12 +37,12 @@ export function RegisterLoraDialog({ accounts }: { accounts: Account[] }) {
     startTransition(async () => {
       try {
         const formData = new FormData()
-        formData.set("account_id", accountId)
+        formData.set("stack_id", stackId)
         formData.set("version", version)
         await registerLoraAdapter(formData)
         toast.success("Adapter registrado")
         setOpen(false)
-        setAccountId("")
+        setStackId("")
         setVersion("")
       } catch (e) {
         toast.error(e instanceof Error ? e.message : "Erro ao registrar adapter")
@@ -69,15 +71,15 @@ export function RegisterLoraDialog({ accounts }: { accounts: Account[] }) {
 
         <div className="flex flex-col gap-4">
           <div className="flex flex-col gap-2">
-            <Label>Conta</Label>
-            <Select value={accountId} onValueChange={setAccountId}>
+            <Label>Stack</Label>
+            <Select value={stackId} onValueChange={setStackId}>
               <SelectTrigger>
-                <SelectValue placeholder="Escolha a conta" />
+                <SelectValue placeholder="Escolha a stack" />
               </SelectTrigger>
               <SelectContent>
-                {accounts.map((a) => (
-                  <SelectItem key={a.id} value={a.id}>
-                    {a.name}
+                {stacks.map((s) => (
+                  <SelectItem key={s.id} value={s.id}>
+                    {s.accounts?.name ?? "?"} — {s.slug} ({s.plan})
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -94,7 +96,7 @@ export function RegisterLoraDialog({ accounts }: { accounts: Account[] }) {
           </div>
           <Button
             onClick={onRegister}
-            disabled={pending || !accountId || !version.trim()}
+            disabled={pending || !stackId || !version.trim()}
           >
             {pending ? "Registrando…" : "Registrar adapter"}
           </Button>

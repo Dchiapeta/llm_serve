@@ -1,7 +1,7 @@
 import Link from "next/link"
 
 import { createSupabaseAdmin } from "@/lib/supabase/server"
-import type { Account, ApiKey, LoraAdapter, Machine } from "@/lib/types"
+import type { Account, ApiKey, LoraAdapter, Machine, Stack } from "@/lib/types"
 import { Badge } from "@/components/ui/badge"
 import {
   Card,
@@ -31,29 +31,39 @@ type KeyRow = ApiKey & {
 
 type LoraRow = LoraAdapter & {
   accounts: { name: string } | null
+  stacks: { slug: string } | null
 }
+
+type StackOption = Stack & { accounts: { name: string } | null }
 
 export default async function AccountsPage() {
   const db = createSupabaseAdmin()
 
-  const [{ data: accountsData }, { data: machinesData }, { data: keysData }, { data: lorasData }] =
-    await Promise.all([
-      db.from("accounts").select("*").order("name"),
-      db.from("machines").select("*").in("status", ["running", "stopped", "creating"]),
-      db
-        .from("api_keys")
-        .select("*, accounts(name), machines(id, name)")
-        .order("created_at", { ascending: false }),
-      db
-        .from("lora_adapters")
-        .select("*, accounts(name)")
-        .order("created_at", { ascending: false }),
-    ])
+  const [
+    { data: accountsData },
+    { data: machinesData },
+    { data: keysData },
+    { data: lorasData },
+    { data: stacksData },
+  ] = await Promise.all([
+    db.from("accounts").select("*").order("name"),
+    db.from("machines").select("*").in("status", ["running", "stopped", "creating"]),
+    db
+      .from("api_keys")
+      .select("*, accounts(name), machines(id, name)")
+      .order("created_at", { ascending: false }),
+    db
+      .from("lora_adapters")
+      .select("*, accounts(name), stacks(slug)")
+      .order("created_at", { ascending: false }),
+    db.from("stacks").select("*, accounts(name)").order("created_at", { ascending: false }),
+  ])
 
   const accounts = (accountsData ?? []) as Account[]
   const machines = (machinesData ?? []) as Machine[]
   const keys = (keysData ?? []) as KeyRow[]
   const loras = (lorasData ?? []) as LoraRow[]
+  const stacks = (stacksData ?? []) as StackOption[]
 
   return (
     <div className="flex flex-col gap-6">
@@ -65,7 +75,7 @@ export default async function AccountsPage() {
           </p>
         </div>
         <div className="flex gap-2">
-          <RegisterLoraDialog accounts={accounts} />
+          <RegisterLoraDialog stacks={stacks} />
           <CreateKeyDialog accounts={accounts} machines={machines} />
         </div>
       </div>
@@ -145,6 +155,7 @@ export default async function AccountsPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Conta</TableHead>
+                <TableHead>Stack</TableHead>
                 <TableHead>Versão</TableHead>
                 <TableHead>Path no storage</TableHead>
                 <TableHead>Status</TableHead>
@@ -154,7 +165,7 @@ export default async function AccountsPage() {
             <TableBody>
               {loras.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={5} className="text-center text-muted-foreground">
+                  <TableCell colSpan={6} className="text-center text-muted-foreground">
                     Nenhum adapter registrado.
                   </TableCell>
                 </TableRow>
@@ -162,6 +173,11 @@ export default async function AccountsPage() {
               {loras.map((l) => (
                 <TableRow key={l.id}>
                   <TableCell className="font-medium">{l.accounts?.name ?? "—"}</TableCell>
+                  <TableCell>
+                    {l.stacks?.slug ?? (
+                      <span className="text-muted-foreground">sem stack</span>
+                    )}
+                  </TableCell>
                   <TableCell>{l.version}</TableCell>
                   <TableCell className="font-mono text-xs">loras/{l.storage_path}</TableCell>
                   <TableCell>

@@ -768,9 +768,9 @@ export async function terminateMachine(machineId: string) {
 // ---------- Contas e chaves ----------
 
 // Cria uma stack (produto/LLM contratado). Se não existir conta com o
-// e-mail, cria a conta junto — o plan da conta nova é o plano da primeira
-// stack; accounts.plan segue alimentando o roteamento e não muda para
-// contas existentes. A stack nasce hospedada numa máquina: ou na escolhida
+// e-mail, cria a conta junto — accounts só guarda dado de identidade do
+// cliente (migration 0027); plan é sempre da stack. A stack nasce
+// hospedada numa máquina: ou na escolhida
 // Nome padrão das máquinas de stack: llm-stack-1, llm-stack-2, …
 // Via RPC (nextval de uma sequence, migration 0017) para ser atômico — duas
 // máquinas provisionadas na mesma rodada (ex.: watermark proativo criando
@@ -1015,7 +1015,7 @@ export async function createStack(formData: FormData): Promise<{
   if (!accountId) {
     const { data: created, error } = await db
       .from("accounts")
-      .insert({ name, email, plan })
+      .insert({ name, email })
       .select("id")
       .single<{ id: string }>()
     if (error) throw new Error(error.message)
@@ -1480,10 +1480,21 @@ const LORA_ALLOWED_FILES = new Set([
 // antes de registrar — melhor falhar aqui do que na hora de servir o cliente.
 export async function registerLoraAdapter(formData: FormData) {
   const db = createSupabaseAdmin()
-  const accountId = String(formData.get("account_id"))
+  const stackId = String(formData.get("stack_id"))
   const version = String(formData.get("version") || "").trim()
-  if (!accountId) throw new Error("Conta não informada")
+  if (!stackId) throw new Error("Stack não informada")
   if (!version) throw new Error("Versão não informada")
+
+  // account_id só serve pra manter storage_path/loraName como já são hoje
+  // (convenção física do bucket e do vLLM) — a dona de verdade do adapter,
+  // pro roteamento, é a stack (migration 0026).
+  const { data: stack } = await db
+    .from("stacks")
+    .select("account_id")
+    .eq("id", stackId)
+    .single<{ account_id: string }>()
+  if (!stack) throw new Error("Stack não encontrada")
+  const accountId = stack.account_id
 
   const storagePath = `${accountId}/${version}`
   const { data: files, error: listErr } = await db.storage
@@ -1503,12 +1514,14 @@ export async function registerLoraAdapter(formData: FormData) {
 
   const { error } = await db.from("lora_adapters").insert({
     account_id: accountId,
+    stack_id: stackId,
     storage_path: storagePath,
     version,
     status: "ready",
   })
   if (error) throw new Error(error.message)
   revalidatePath("/accounts")
+  revalidatePath("/stacks")
 }
 
 export async function listLoraAdapters(accountId?: string): Promise<LoraAdapter[]> {

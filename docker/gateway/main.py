@@ -6,7 +6,7 @@ qual pod está.
 
 Fluxo por request:
   1. Autentica a chave HEX (Bearer) contra api_keys no Supabase (cache TTL),
-     junto com o plano e o system_prompt configurado da conta.
+     junto com o plano e o system_prompt configurados da stack da chave.
   2. Resolve a rota (routing_state). Regra primária: machine_id definido →
      proxy direto, independente do status (em 'migrating' a origem segue
      servindo até o flip). Só espera quando não há máquina servindo. Sem
@@ -374,14 +374,14 @@ async def authenticate(authorization: str | None) -> tuple[dict, str]:
         if expiry and expiry <= datetime.now(timezone.utc):
             raise HTTPException(status_code=401, detail="chave expirada")
 
-    # fail-closed: conta com stacks precisa de uma chave com stack_id
-    # resolvido. Sem isso, resolve_key_stack cai no heurístico pick_stack,
-    # que pode escolher a stack ERRADA entre as da mesma conta (ambiguidade
-    # cross-stack). A migration 0021 já fez o backfill de stack_id em toda
-    # chave ativa de conta com stack — esta checagem é o defense-in-depth
-    # pra qualquer chave que escape disso no futuro. Conta SEM nenhuma stack
-    # (roteamento por plano puro) não tem ambiguidade — nada pra rejeitar.
-    if entry.get("stacks") and not entry.get("stack_id"):
+    # fail-closed: toda chave precisa de stack_id resolvido. Plano e
+    # system_prompt são propriedade da stack (migration 0027 removeu
+    # accounts.plan/system_prompt) — sem stack não há config nenhuma pra
+    # resolver, então não existe mais um "roteamento por plano puro" de
+    # fallback. A migration 0021 já fez o backfill de stack_id em toda
+    # chave ativa de conta com stack; esta checagem é o defense-in-depth
+    # pra qualquer chave que escape disso no futuro.
+    if not entry.get("stack_id"):
         raise HTTPException(status_code=401, detail="chave sem stack associada — contate o suporte")
 
     return entry, key_hash
@@ -405,12 +405,15 @@ def check_rate_limit(key_hash: str) -> None:
     rate_buckets[key_hash] = (tokens - 1.0, now)
 
 
-async def check_token_quota(account_id: str, plan: str) -> None:
+async def check_token_quota(account_id: str, plan: str | None) -> None:
     """Quota diária de tokens por conta — protege contra custo real (poucas
     requests, cada uma gerando muito token), o que rate limit/concorrência
     por si não cobrem. Lida de usage_metrics via account_token_usage_today,
     com cache curto (TOKEN_QUOTA_CACHE_TTL_S) pra não bater no Supabase a
-    cada request. 0/plano sem entrada = sem teto (opt-in por plano)."""
+    cada request. 0/plano sem entrada = sem teto (opt-in por plano); `plan`
+    None (chave sem stack resolvível) cai no mesmo caso — resolve_route
+    rejeita a request logo em seguida com 503, então não enforça nada aqui
+    à toa."""
     budget = DAILY_TOKEN_BUDGET.get(plan, 0)
     if budget <= 0:
         return
@@ -935,35 +938,21 @@ async def wait_until_routed(account_id: str) -> dict | None:
     return None
 
 
-def pick_stack(entry: dict) -> dict | None:
-    """Stack "casa" da conta pro modelo base: a mais recente do plano da
-    conta; sem stack do plano, a mais recente de qualquer plano; None quando
-    a conta não tem stacks (aí o fallback é o roteamento por plano puro).
+def resolve_key_stack(entry: dict) -> tuple[dict | None, str | None]:
+    """Stack efetiva da chave e o plano dela pro resto do fluxo.
 
-    Heurístico legado — só usado quando a chave não tem `stack_id` gravado
-    (ver resolve_key_stack). Quebra quando a conta tem stacks de planos
-    diferentes e `accounts.plan` não é o plano da stack que a chave deveria
-    usar (ver [[pro-loadtest-routing-workaround]])."""
-    stacks = entry.get("stacks") or []
-    if not stacks:
-        return None
-    same_plan = [s for s in stacks if s.get("plan") == entry["plan"]]
-    pool = same_plan or stacks
-    return max(pool, key=lambda s: s.get("created_at") or "")
-
-
-def resolve_key_stack(entry: dict) -> tuple[dict | None, str]:
-    """Stack efetiva da chave e o plano a usar no resto do fluxo.
-
-    Chave pós-migration 0019 (tem `stack_id`): resolve DIRETO pela stack
-    dela — sem adivinhar. Chave legada (`stack_id` nulo): cai no heurístico
-    antigo por `accounts.plan` (pick_stack), inalterado."""
+    Plano é propriedade da stack (migration 0027 removeu accounts.plan — uma
+    conta pode ter stacks de planos diferentes, então não existe mais "o
+    plano da conta"). Chave sem `stack_id` resolvível só passa por
+    `authenticate` quando a conta não tem NENHUMA stack — nesse caso não há
+    plano nenhum pra usar; devolve (None, None) e quem chama trata como
+    "conta sem stack configurada" em vez de adivinhar."""
     stack_id = entry.get("stack_id")
     if stack_id:
         stack = next((s for s in entry.get("stacks") or [] if s["id"] == stack_id), None)
         if stack:
             return stack, stack["plan"]
-    return pick_stack(entry), entry["plan"]
+    return None, None
 
 
 async def pick_running_machine_with_stack_slot(
@@ -1055,9 +1044,9 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
 
 async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]:
     """Máquina pro modelo base (conta sem adapter), stack-aware. Retorna
-    (machine, effective_plan) — effective_plan é o plano da STACK resolvida
-    (chave pós-migration 0019) ou, pra chave legada, o accounts.plan de
-    sempre (ver resolve_key_stack).
+    (machine, effective_plan) — effective_plan é sempre o plano da STACK
+    resolvida pela chave (ver resolve_key_stack; chamador já garantiu que
+    não é None antes de chegar aqui).
 
     1. Máquina do stack running → serve nela (chave garantida via upsert
        lazy — o pod pode ter reiniciado e perdido as chaves).
@@ -1120,12 +1109,16 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
     direto (migrating = origem continua servindo). Sem adapter registrado →
     modelo base numa máquina running, sem reescrever "model".
 
-    `effective_plan`: nos branches de adapter LoRA (rewrite_model=True) é
-    sempre `entry["plan"]` — adapter é indexado por account_id, não por
-    stack, então o plano relevante pra escolher a máquina é o da conta
-    mesmo (ver plano de implementação, "fora de escopo"). Só o branch sem
-    adapter (modelo base) usa o plano resolvido por stack_id.
+    `effective_plan` vem sempre de `resolve_key_stack` — plano é propriedade
+    da stack da própria chave (migration 0027 removeu accounts.plan), tanto
+    nos branches de adapter LoRA quanto no modelo base. Adapter LoRA também
+    é resolvido por stack (`latest_ready_adapter_for_stack`, migration 0026)
+    — cada stack pode ter (ou não) seu próprio fine-tune.
     """
+    stack, effective_plan = resolve_key_stack(entry)
+    if effective_plan is None:
+        raise HTTPException(status_code=503, detail="conta sem stack configurada")
+
     route = await store.get_client_location(account_id)
 
     if route and route["machine_id"] and route["lora_status"] in ("loaded", "migrating"):
@@ -1149,22 +1142,22 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
             await store.mark_slot_idle(account_id)
             route = None
         else:
-            return machine, True, entry["plan"]
+            return machine, True, effective_plan
 
     if route and route["lora_status"] == "loading":
         waited = await wait_until_routed(account_id)
         if waited:
             machine = await supa.get_machine(waited["machine_id"])
             if machine:
-                return machine, True, entry["plan"]
+                return machine, True, effective_plan
         raise HTTPException(
             status_code=503,
             detail="adapter carregando, tente novamente",
             headers={"Retry-After": "5"},
         )
 
-    # sem rota ativa: conta tem adapter?
-    adapter = await supa.latest_ready_adapter(account_id)
+    # sem rota ativa: a STACK da chave tem adapter?
+    adapter = await supa.latest_ready_adapter_for_stack(stack["id"]) if stack else None
     if not adapter:
         # sem adapter registrado → serve o modelo base, stack-aware: máquina
         # da stack da chave quando running; pausada → realocação automática
@@ -1173,7 +1166,7 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
         machine, effective_plan = await resolve_base_machine(account_id, entry)
         return machine, False, effective_plan
 
-    machine = await pick_machine_with_free_slot(entry["plan"])
+    machine = await pick_machine_with_free_slot(effective_plan)
     result = await store.claim_client_location(account_id, machine["id"])
     if not result["claimed"]:
         # outro request venceu a corrida — espera o load dele
@@ -1181,7 +1174,7 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
         if waited:
             m = await supa.get_machine(waited["machine_id"])
             if m:
-                return m, True, entry["plan"]
+                return m, True, effective_plan
         raise HTTPException(
             status_code=503,
             detail="adapter carregando, tente novamente",
@@ -1196,7 +1189,7 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str]:
     except Exception as e:
         await store.mark_slot_idle(account_id)
         raise HTTPException(status_code=503, detail=f"falha ao carregar adapter: {e}")
-    return machine, True, entry["plan"]
+    return machine, True, effective_plan
 
 
 # ---------- Proxy ----------
@@ -1342,10 +1335,9 @@ async def build_stack_system_message(messages: list, entry: dict) -> dict | None
     stack, _ = resolve_key_stack(entry)
 
     system_parts = []
-    # stack.system_prompt (por-stack, migration 0020) tem prioridade;
-    # entry["system_prompt"] (accounts.system_prompt) é só fallback legado
-    # para chave sem stack resolvível.
-    system_prompt = (stack or {}).get("system_prompt") or entry.get("system_prompt")
+    # system_prompt é propriedade da stack (migration 0020); accounts.system_prompt
+    # foi removida na 0027 — sem stack resolvida, não há prompt nenhum pra injetar.
+    system_prompt = (stack or {}).get("system_prompt")
     if system_prompt:
         system_parts.append(system_prompt)
 
@@ -1379,7 +1371,7 @@ async def build_stack_instructions(entry: dict, last_user_text: str | None) -> s
     stack, _ = resolve_key_stack(entry)
 
     system_parts = []
-    system_prompt = (stack or {}).get("system_prompt") or entry.get("system_prompt")
+    system_prompt = (stack or {}).get("system_prompt")
     if system_prompt:
         system_parts.append(system_prompt)
 
@@ -1639,7 +1631,8 @@ async def anthropic_messages(
     entry, key_hash, bearer_header = await authenticate_anthropic(authorization, x_api_key)
     check_rate_limit(key_hash)
     account_id = entry["account_id"]
-    await check_token_quota(account_id, entry["plan"])
+    _, key_plan = resolve_key_stack(entry)
+    await check_token_quota(account_id, key_plan)
 
     machine, rewrite_model, effective_plan = await resolve_route(account_id, entry)
     await maybe_touch(account_id, machine["id"])
@@ -1788,7 +1781,8 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     entry, key_hash = await authenticate(authorization)
     check_rate_limit(key_hash)
     account_id = entry["account_id"]
-    await check_token_quota(account_id, entry["plan"])
+    _, key_plan = resolve_key_stack(entry)
+    await check_token_quota(account_id, key_plan)
 
     machine, rewrite_model, effective_plan = await resolve_route(account_id, entry)
     await maybe_touch(account_id, machine["id"])

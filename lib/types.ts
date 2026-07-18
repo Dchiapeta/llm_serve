@@ -46,13 +46,14 @@ export type Machine = {
   created_at: string
 }
 
+// Account = identidade do cliente, só isso. Toda configuração de produto
+// (plano, system_prompt, RAG, fine-tune, máquina) vive em Stack — uma conta
+// pode ter várias stacks com configurações diferentes (migration 0027).
 export type Account = {
   id: string
   name: string
   email: string | null
   user_id: string | null
-  plan: TemplatePlan
-  system_prompt: string | null
   created_at: string
 }
 
@@ -66,9 +67,7 @@ export type Stack = {
   plan: TemplatePlan
   purchase_date: string // date "YYYY-MM-DD"
   slug: string
-  // Override de system prompt da stack; null = sem override. Independente
-  // de accounts.system_prompt (fallback legado só para chaves anteriores à
-  // migration 0019, sem stack_id resolvível).
+  // Override de system prompt da stack; null = sem override.
   system_prompt: string | null
   created_at: string
 }
@@ -106,6 +105,10 @@ export type ApiKey = {
 export type LoraAdapter = {
   id: string
   account_id: string
+  // Stack dona do adapter (migration 0026). Null nos adapters registrados
+  // antes da migration numa conta com 2+ stacks — ambíguo, sem como saber
+  // qual stack é a dona; fica invisível ao roteamento até um admin reassociar.
+  stack_id: string | null
   storage_path: string
   version: string
   status: "ready" | "invalid"
