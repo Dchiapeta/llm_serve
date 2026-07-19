@@ -347,11 +347,15 @@ class SupaClient:
     # ---------- stacks ----------
 
     async def get_stack(self, stack_id: str) -> dict | None:
+        # select "*" (mesmo padrão do get_machine): colunas novas de migration
+        # (ex.: usage_class, 0032) fluem sem acoplar o deploy do gateway à
+        # aplicação da migration — select explícito de coluna inexistente
+        # derrubaria a realocação inteira com 400 do PostgREST
         r = await self._rest.get(
             "/stacks",
             params={
                 "id": f"eq.{stack_id}",
-                "select": "id,account_id,machine_id,plan,slug",
+                "select": "*",
                 "limit": "1",
             },
         )
@@ -398,6 +402,42 @@ class SupaClient:
         )
         r.raise_for_status()
         return r.json()
+
+    async def machine_stack_load(self, machine_id: str) -> float:
+        """Ocupação PONDERADA da máquina — soma dos pesos das classes de uso
+        das stacks hospedadas (migration 0032). Par do machine_stack_slots:
+        vaga efetiva = slots − load ≥ peso do entrante.
+
+        Fallback: RPC indisponível (migration 0032 ainda não aplicada) →
+        contagem simples de stacks (peso 1 por stack, o comportamento
+        anterior). Está no caminho crítico da realocação de request — nunca
+        pode derrubar o fluxo por causa de uma função SQL ausente."""
+        try:
+            r = await self._rest.post(
+                "/rpc/machine_stack_load", json={"p_machine_id": machine_id}
+            )
+            r.raise_for_status()
+            return float(r.json() or 0.0)
+        except Exception:
+            return float(await self.count_stacks_on_machine(machine_id))
+
+    async def stack_usage_stats(self, days: int) -> list[dict]:
+        """Agregados de consumo por stack na janela móvel (RPC da 0032) —
+        insumo do loop de classificação de usage_class."""
+        r = await self._rest.post("/rpc/stack_usage_stats", json={"p_days": days})
+        r.raise_for_status()
+        return r.json() or []
+
+    async def update_stack_usage_class(self, stack_id: str, usage_class: str) -> None:
+        r = await self._rest.patch(
+            "/stacks",
+            params={"id": f"eq.{stack_id}"},
+            json={
+                "usage_class": usage_class,
+                "usage_class_updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        r.raise_for_status()
 
     # ---------- templates ----------
 

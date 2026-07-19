@@ -33,6 +33,10 @@ export type Template = {
   kv_reserve_gb_per_user: number
   lora_footprint_gb: number
   max_users: number | null
+  // Override dos pesos/limiares da classificação de consumo (migration 0032):
+  // {weights: {low, medium, high}, daily_medium, daily_high,
+  //  req_pct_medium, req_pct_high}. Null = defaults do código.
+  usage_class_config: Record<string, unknown> | null
   created_at: string
 }
 
@@ -49,6 +53,9 @@ export type Machine = {
   // alias com que o vLLM SERVE (--served-model-name, ex.: "pro-base"); é o que o
   // gateway fixa no campo "model" das requisições. NULL = sem alias → usa model_name.
   served_model_name: string | null
+  // janela de contexto do vLLM (--max-model-len); o gateway usa para clampar
+  // max_tokens ao orçamento restante. NULL = template sem a flag → sem clamp.
+  max_model_len: number | null
   vram_gb: number | null
   cost_per_hr: number | null
   public_url: string | null
@@ -79,6 +86,10 @@ export type Stack = {
   slug: string
   // Override de system prompt da stack; null = sem override.
   system_prompt: string | null
+  // Classe de consumo (migration 0032), derivada do uso real pelo loop do
+  // gateway; pesa na ocupação de máquina (low=1.0, medium=1.5, high=3.0).
+  usage_class: "low" | "medium" | "high"
+  usage_class_updated_at: string | null
   created_at: string
 }
 

@@ -9,8 +9,10 @@ export type CapacityInput = {
   vramGb: number | null
   modelFootprintGb: number
   kvReserveGbPerUser: number
-  // Slots ocupados. Ocupação padrão = stacks hospedadas na máquina (1 stack
-  // = 1 slot, mesmo quando contas repetidas compartilham a mesma chave).
+  // Slots ocupados. Desde a migration 0032 a ocupação de stacks é PONDERADA
+  // pela classe de uso (machine_stack_load: low=1.0, medium=1.5, high=3.0),
+  // então pode ser fracionária — comparações de vaga devem usar >= 1 (peso
+  // mínimo de um entrante), não > 0.
   occupied: number
   maxUsers?: number | null
 }
@@ -20,6 +22,22 @@ export type CapacityResult = {
   slotsUsed: number
   slotsFree: number
   usagePct: number
+}
+
+// Peso de ocupação por classe de uso — espelho dos DEFAULTS do SQL
+// (usage_class_weight, migration 0032) e do gateway (usage_class.py).
+// A fonte da verdade para ALOCAÇÃO é o SQL (machine_stack_load, que aplica
+// override do template); este espelho serve ao display server-side, que
+// soma pesos em memória para várias máquinas de uma vez.
+export type UsageClass = "low" | "medium" | "high"
+export const USAGE_CLASS_WEIGHTS: Record<UsageClass, number> = {
+  low: 1,
+  medium: 1.5,
+  high: 3,
+}
+
+export function stackWeight(usageClass: string | null | undefined): number {
+  return USAGE_CLASS_WEIGHTS[usageClass as UsageClass] ?? USAGE_CLASS_WEIGHTS.low
 }
 
 export function vramSlots({

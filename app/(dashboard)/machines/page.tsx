@@ -1,7 +1,7 @@
 import Link from "next/link"
 
 import { getAutoProvisionEnabled } from "@/lib/actions"
-import { computeCapacity } from "@/lib/capacity"
+import { computeCapacity, stackWeight } from "@/lib/capacity"
 import { machineDisplayStatus, reconcileMachineStatuses } from "@/lib/machines"
 import { listGpuTypes } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
@@ -62,17 +62,18 @@ export default async function MachinesPage() {
     machines.map((m, i) => [m.id, displayStatuses[i]])
   )
 
-  // Ocupação = stacks hospedadas (1 stack = 1 slot), não chaves ativas:
-  // stacks da mesma conta compartilham uma chave e sumiriam da contagem.
+  // Ocupação = stacks hospedadas PONDERADAS pela classe de uso (0032), não
+  // chaves ativas: stacks da mesma conta compartilham uma chave e sumiriam
+  // da contagem.
   const { data: stackRows } = await db
     .from("stacks")
-    .select("machine_id")
+    .select("machine_id, usage_class")
     .not("machine_id", "is", null)
   const stacksByMachine = new Map<string, number>()
   for (const s of stackRows ?? []) {
     stacksByMachine.set(
       s.machine_id,
-      (stacksByMachine.get(s.machine_id) ?? 0) + 1
+      (stacksByMachine.get(s.machine_id) ?? 0) + stackWeight(s.usage_class)
     )
   }
 

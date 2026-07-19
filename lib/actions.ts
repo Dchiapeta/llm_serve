@@ -6,9 +6,9 @@ import { after } from "next/server"
 import { randomBytes } from "crypto"
 
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
-import { computeCapacity, vramSlots } from "./capacity"
+import { computeCapacity, stackWeight, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
-import { parseServedModelName } from "./machines"
+import { parseMaxModelLen, parseServedModelName } from "./machines"
 import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
 import { generateStackSlug, STACK_SLUG_RE } from "./slug"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
@@ -501,6 +501,11 @@ async function provisionMachine(input: {
       served_model_name:
         parseServedModelName(tpl.env?.VLLM_EXTRA_ARGS) ??
         parseServedModelName(tpl.start_command),
+      // janela de contexto (--max-model-len), pro gateway clampar max_tokens
+      // ao orçamento restante; null se o template não usa a flag
+      max_model_len:
+        parseMaxModelLen(tpl.env?.VLLM_EXTRA_ARGS) ??
+        parseMaxModelLen(tpl.start_command),
       vram_gb: totalVramGb,
       cost_per_hr: pod.costPerHr ?? null,
       public_url: podProxyUrl(pod.id, 8000),
@@ -861,8 +866,10 @@ async function nextStackMachineName(
   return data as string
 }
 
-// Slots de uma máquina contando as stacks hospedadas nela (1 stack = 1
-// slot, mesmo quando stacks da mesma conta compartilham a chave). Retorna
+// Slots de uma máquina com ocupação PONDERADA pela classe de uso das stacks
+// hospedadas (machine_stack_load, migration 0032): um usuário "high"
+// (contexto longo, ex.: Claude Code) pesa 3.0 slots, "medium" 1.5, "low" 1.0
+// — máquina só de lows tem a mesma capacidade da contagem antiga. Retorna
 // null se a máquina não existir; slotsMax 0 = capacidade desconhecida.
 async function machineStackCapacity(
   db: ReturnType<typeof createSupabaseAdmin>,
@@ -881,15 +888,16 @@ async function machineStackCapacity(
         .eq("id", m.template_id)
         .single<Pick<Template, "model_footprint_gb" | "kv_reserve_gb_per_user">>()
     : { data: null }
-  const { count } = await db
-    .from("stacks")
-    .select("id", { count: "exact", head: true })
-    .eq("machine_id", machineId)
+  // fonte única da ponderação é o SQL (usage_class_weight/machine_stack_load,
+  // mesma RPC que o gateway usa) — evita a fórmula divergir entre TS e Python
+  const { data: load } = await db.rpc("machine_stack_load", {
+    p_machine_id: machineId,
+  })
   return computeCapacity({
     vramGb: m.vram_gb,
     modelFootprintGb: tpl?.model_footprint_gb ?? 16,
     kvReserveGbPerUser: tpl?.kv_reserve_gb_per_user ?? 2,
-    occupied: count ?? 0,
+    occupied: Number(load ?? 0),
     maxUsers: m.max_users,
   })
 }
@@ -970,7 +978,10 @@ async function allocateMachineForTemplate(
     Template,
     "id" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
   >,
-  excludeMachineId?: string
+  excludeMachineId?: string,
+  // peso da stack que vai ocupar a vaga (0032): 1 = low (default de stack
+  // nova); migrateStack passa o peso real da classe da stack migrada
+  requiredWeight = 1
 ): Promise<{ machineId: string; created: boolean }> {
   let runningQuery = db
     .from("machines")
@@ -982,7 +993,9 @@ async function allocateMachineForTemplate(
   const { data: running } = await runningQuery
   for (const m of (running ?? []) as Pick<Machine, "id">[]) {
     const cap = await machineStackCapacity(db, m.id)
-    if (!cap || cap.slotsMax === 0 || cap.slotsFree > 0) {
+    // folga ponderada (0032, pode ser fracionária) precisa comportar o PESO
+    // do entrante — 0.5 de folga não comporta nem um low (peso 1.0)
+    if (!cap || cap.slotsMax === 0 || cap.slotsFree >= requiredWeight) {
       return { machineId: m.id, created: false }
     }
   }
@@ -1001,7 +1014,7 @@ async function allocateMachineForTemplate(
     // apontando pra ela) — checa vaga ANTES de religar, senão desperdiça um
     // startPod numa máquina que já está cheia.
     const cap = await machineStackCapacity(db, m.id)
-    if (cap && cap.slotsMax > 0 && cap.slotsFree < 1) continue
+    if (cap && cap.slotsMax > 0 && cap.slotsFree < requiredWeight) continue
     // startMachine devolve void em sucesso (falsy) e {error} em falha —
     // ver definição acima; !result só é true no caso de sucesso.
     const result = await startMachine(m.id)
@@ -1172,10 +1185,18 @@ export async function migrateStack(input: {
 
   const { data: stack } = await db
     .from("stacks")
-    .select("id, account_id, machine_id, plan, slug")
+    .select("id, account_id, machine_id, plan, slug, usage_class")
     .eq("id", input.stackId)
-    .single<Pick<Stack, "id" | "account_id" | "machine_id" | "plan" | "slug">>()
+    .single<
+      Pick<Stack, "id" | "account_id" | "machine_id" | "plan" | "slug" | "usage_class">
+    >()
   if (!stack) throw new Error("Stack não encontrada")
+  // peso real da stack que chega ao destino (0032): um high custa 3 slots —
+  // validar com peso 1 deixaria migrar usuário pesado pra máquina quase
+  // cheia. Limitação conhecida: pesos DEFAULT, sem o override de
+  // templates.usage_class_config (só divergiria com "weights" custom no
+  // template, que nenhum usa hoje)
+  const requiredWeight = stackWeight(stack.usage_class)
 
   const fromMachineId = stack.machine_id
   if (input.targetMachineId && input.targetMachineId === fromMachineId) {
@@ -1214,12 +1235,12 @@ export async function migrateStack(input: {
     if (target.template_id !== templateId) {
       throw new Error("A máquina de destino não usa o mesmo produto da stack")
     }
-    // Lotação por stacks (1 stack = 1 slot) — a checagem de createKey não
-    // cobre stacks da mesma conta, que reutilizam a chave existente.
+    // Lotação por stacks PONDERADA pela classe de uso — a checagem de
+    // createKey não cobre stacks da mesma conta, que reutilizam a chave.
     const cap = await machineStackCapacity(db, targetMachineId)
-    if (cap && cap.slotsMax > 0 && cap.slotsFree < 1) {
+    if (cap && cap.slotsMax > 0 && cap.slotsFree < requiredWeight) {
       throw new Error(
-        `A máquina de destino está lotada (${cap.slotsUsed}/${cap.slotsMax} slots)`
+        `A máquina de destino não comporta esta stack (${cap.slotsUsed}/${cap.slotsMax} slots ocupados; a stack pesa ${requiredWeight})`
       )
     }
   } else {
@@ -1235,7 +1256,9 @@ export async function migrateStack(input: {
       >()
     if (!tpl) throw new Error("Produto não encontrado")
     try {
-      const alloc = await allocateMachineForTemplate(db, tpl, fromMachineId ?? undefined)
+      const alloc = await allocateMachineForTemplate(
+        db, tpl, fromMachineId ?? undefined, requiredWeight
+      )
       targetMachineId = alloc.machineId
       machineCreated = alloc.created
     } catch (e) {

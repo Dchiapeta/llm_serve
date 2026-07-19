@@ -1,7 +1,7 @@
 import Link from "next/link"
 import { Activity, DollarSign, KeyRound, Server } from "lucide-react"
 
-import { computeCapacity } from "@/lib/capacity"
+import { computeCapacity, stackWeight } from "@/lib/capacity"
 import { machineDisplayStatus, reconcileMachineStatuses } from "@/lib/machines"
 import { collectUsageMetrics } from "@/lib/metrics"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
@@ -37,7 +37,7 @@ export default async function DashboardPage() {
   ] = await Promise.all([
     db.from("machines").select("*").neq("status", "terminated"),
     db.from("templates").select("*"),
-    db.from("stacks").select("machine_id").not("machine_id", "is", null),
+    db.from("stacks").select("machine_id, usage_class").not("machine_id", "is", null),
     db
       .from("machine_events")
       .select("*")
@@ -69,12 +69,13 @@ export default async function DashboardPage() {
   const usage = (usageData ?? []) as UsageMetric[]
   const events = (eventsData ?? []) as MachineEvent[]
 
-  // Ocupação = stacks hospedadas (1 stack = 1 slot), não chaves ativas.
+  // Ocupação = stacks hospedadas PONDERADAS pela classe de uso (0032),
+  // não chaves ativas.
   const stacksByMachine = new Map<string, number>()
   for (const s of stacksData ?? []) {
     stacksByMachine.set(
       s.machine_id,
-      (stacksByMachine.get(s.machine_id) ?? 0) + 1
+      (stacksByMachine.get(s.machine_id) ?? 0) + stackWeight(s.usage_class)
     )
   }
 

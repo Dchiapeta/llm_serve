@@ -15,6 +15,16 @@ export function parseServedModelName(args: string | null | undefined): string | 
   return m ? m[1] : null
 }
 
+// Janela de contexto do vLLM (--max-model-len, no VLLM_EXTRA_ARGS do env ou no
+// start command). O gateway guarda na máquina para clampar max_tokens ao
+// orçamento restante da janela. Null = template sem a flag (vLLM usa a janela
+// nativa do config do modelo, que não conhecemos aqui).
+export function parseMaxModelLen(args: string | null | undefined): number | null {
+  if (!args) return null
+  const m = args.match(/--max-model-len[=\s]+(\d+)/)
+  return m ? Number(m[1]) : null
+}
+
 // Status exibido na UI: além dos status do banco, "starting" indica que o
 // pod está de pé mas o vLLM ainda não respondeu (baixando/carregando modelo)
 // e "failed" que o processo do vLLM morreu (ex.: OOM no boot) com o pod vivo.

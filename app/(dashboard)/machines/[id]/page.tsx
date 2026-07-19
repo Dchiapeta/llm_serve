@@ -2,7 +2,7 @@ import Link from "next/link"
 import { notFound } from "next/navigation"
 import { ExternalLink } from "lucide-react"
 
-import { computeCapacity, computeLoraCapacity } from "@/lib/capacity"
+import { computeCapacity, computeLoraCapacity, stackWeight } from "@/lib/capacity"
 import {
   machineDisplayStatus,
   parseServedModelName,
@@ -79,7 +79,7 @@ export default async function MachineDetailPage({
     { data: keysData },
     { data: accountsData },
     { data: usageData },
-    { count: stacksCount },
+    { data: machineStacks },
   ] = await Promise.all([
     machine.template_id
       ? db.from("templates").select("*").eq("id", machine.template_id).single<Template>()
@@ -98,9 +98,15 @@ export default async function MachineDetailPage({
       .limit(500),
     db
       .from("stacks")
-      .select("id", { count: "exact", head: true })
+      .select("id, usage_class")
       .eq("machine_id", id),
   ])
+  const stacksCount = machineStacks?.length ?? 0
+  // ocupação ponderada pela classe de uso (0032) — pode ser fracionária
+  const stacksLoad = (machineStacks ?? []).reduce(
+    (sum, s) => sum + stackWeight(s.usage_class),
+    0
+  )
 
   const template = tplData as Template | null
   const keys = (keysData ?? []) as KeyWithAccount[]
@@ -148,8 +154,9 @@ export default async function MachineDetailPage({
       vramGb: machine.vram_gb,
       modelFootprintGb: template?.model_footprint_gb ?? 16,
       kvReserveGbPerUser: template?.kv_reserve_gb_per_user ?? 2,
-      // 1 stack = 1 slot; chaves são por conta e não medem ocupação
-      occupied: stacksCount ?? 0,
+      // stacks ponderadas pela classe de uso; chaves são por conta e não
+      // medem ocupação
+      occupied: stacksLoad,
       maxUsers: machine.max_users,
     })
   }

@@ -52,7 +52,15 @@ from anthropic_compat import (
     anthropic_to_openai_request,
     openai_to_anthropic_response,
 )
+from context_budget import (
+    ContextWindowExceeded,
+    anthropic_error_body,
+    apply_context_budget,
+    estimate_prompt_tokens,
+    openai_error_body,
+)
 from lifecycle import LifecycleManager, MigrationError
+from usage_class import class_weight, classify_stack
 from routing import RoutingStore
 from runpod_api import RunPodClient
 from supa import SupaClient
@@ -114,6 +122,16 @@ TOKEN_QUOTA_CACHE_TTL_S = float(os.environ.get("TOKEN_QUOTA_CACHE_TTL_S", "60"))
 # uso ilimitado entre duas visitas ao painel sem nenhum registro. Este loop
 # espelha aquela coleta, mas roda sozinho no processo do gateway.
 METRICS_COLLECTION_INTERVAL_S = float(os.environ.get("METRICS_COLLECTION_INTERVAL_S", "120"))
+
+# classificação de stacks por padrão de consumo (usage_class, migration 0032):
+# janela móvel de avaliação, mínimo de dias ativos pra classificar, cooldown
+# entre mudanças (histerese — um dia atípico não muda classe) e cadência do
+# loop. A classe só influencia alocações FUTURAS; 6h de cadência é mais que
+# suficiente pra um sinal que exige dias de uso sustentado.
+USAGE_CLASS_WINDOW_DAYS = int(os.environ.get("USAGE_CLASS_WINDOW_DAYS", "14"))
+USAGE_CLASS_MIN_ACTIVE_DAYS = int(os.environ.get("USAGE_CLASS_MIN_ACTIVE_DAYS", "5"))
+USAGE_CLASS_COOLDOWN_DAYS = int(os.environ.get("USAGE_CLASS_COOLDOWN_DAYS", "7"))
+USAGE_CLASS_INTERVAL_S = float(os.environ.get("USAGE_CLASS_INTERVAL_S", "21600"))
 
 # quanto tempo um request espera por um load em andamento de outro request
 LOAD_WAIT_TIMEOUT_S = float(os.environ.get("LOAD_WAIT_TIMEOUT_S", "20"))
@@ -298,11 +316,13 @@ async def lifespan(app: FastAPI):
     )
     metrics_task = asyncio.create_task(metrics_collection_loop())
     stale_routes_task = asyncio.create_task(stale_route_reconciliation_loop())
+    usage_class_task = asyncio.create_task(usage_class_loop())
     yield
     reaper_task.cancel()
     machine_task.cancel()
     metrics_task.cancel()
     stale_routes_task.cancel()
+    usage_class_task.cancel()
     await proxy_client.aclose()
     await openai_client.aclose()
     await panel_client.aclose()
@@ -313,6 +333,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(ContextWindowExceeded)
+async def context_window_exceeded_handler(request: Request, exc: ContextWindowExceeded):
+    """Formata o estouro de contexto no shape do cliente. Handler dedicado à
+    SUBCLASSE (o Starlette resolve por MRO, então vence o default de
+    HTTPException) — os demais HTTPException seguem no {"detail": ...} padrão,
+    que painel/scripts já parseiam."""
+    if request.url.path.startswith("/v1/messages"):
+        return JSONResponse(status_code=exc.status_code, content=anthropic_error_body(exc.detail))
+    return JSONResponse(status_code=exc.status_code, content=openai_error_body(exc.detail))
+
 
 # O gateway é uma API pra clientes programáticos (SDK OpenAI/Anthropic,
 # Codex/Claude Code, BYOE) — nunca chamada de um browser. CORS explícito e
@@ -556,6 +588,49 @@ async def metrics_collection_loop(interval_s: float = METRICS_COLLECTION_INTERVA
             await collect_usage_metrics_once()
         except Exception as e:
             logger.warning("coleta periódica de métricas falhou: %s", e)
+
+
+async def classify_stacks_once() -> None:
+    """Reclassifica usage_class das stacks pelo consumo real (usage_metrics
+    agregado pela RPC stack_usage_stats, migration 0032). A decisão em si é
+    pura (usage_class.classify_stack: dois fatores, histerese, cooldown);
+    aqui é só o I/O. A classe nova NÃO dispara migração — só pesa nas
+    alocações futuras (pick_running_machine_with_stack_slot ponderado)."""
+    rows = await supa.stack_usage_stats(USAGE_CLASS_WINDOW_DAYS)
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        new_class = classify_stack(
+            row,
+            now,
+            min_active_days=USAGE_CLASS_MIN_ACTIVE_DAYS,
+            cooldown_days=USAGE_CLASS_COOLDOWN_DAYS,
+        )
+        if not new_class:
+            continue
+        try:
+            await supa.update_stack_usage_class(row["stack_id"], new_class)
+            logger.info(
+                "usage_class: stack %s reclassificada %s -> %s",
+                row["stack_id"], row.get("usage_class") or "low", new_class,
+            )
+        except Exception as e:
+            logger.warning(
+                "usage_class: falha ao atualizar stack %s (%s)", row["stack_id"], e
+            )
+
+
+async def usage_class_loop(interval_s: float = USAGE_CLASS_INTERVAL_S):
+    # primeira rodada logo após o boot (delay curto só pra não competir com o
+    # startup): com sleep-first de 6h e redeploy a cada push na main, um
+    # processo que nunca fica 6h de pé jamais classificaria stack nenhuma —
+    # a classificação inteira virava no-op silencioso
+    await asyncio.sleep(60.0)
+    while True:
+        try:
+            await classify_stacks_once()
+        except Exception as e:
+            logger.warning("classificação periódica de usage_class falhou: %s", e)
+        await asyncio.sleep(interval_s)
 
 
 async def reconcile_stale_routes_once() -> None:
@@ -973,18 +1048,21 @@ def resolve_key_stack(entry: dict) -> tuple[dict | None, str | None]:
 
 
 async def pick_running_machine_with_stack_slot(
-    plan: str, exclude_machine_id: str | None = None
+    plan: str, exclude_machine_id: str | None = None, required_weight: float = 1.0
 ) -> dict | None:
-    """Primeira máquina running do plano com vaga de stack ("1 stack = 1
-    slot"). Capacidade desconhecida/sem teto (slots 0) é aceita — mesmo
-    critério do allocateMachineForTemplate do painel (lib/actions.ts)."""
+    """Primeira máquina running do plano com vaga de stack. Ocupação
+    PONDERADA pela classe de uso (migration 0032): a vaga precisa comportar o
+    PESO do entrante (low=1.0 preserva o antigo "1 stack = 1 slot"; um high
+    custa 3.0 — evita empilhar usuários de contexto longo na mesma máquina).
+    Capacidade desconhecida/sem teto (slots 0) é aceita — mesmo critério do
+    allocateMachineForTemplate do painel (lib/actions.ts)."""
     for m in await supa.list_running_machines_for_plan(plan):
         if exclude_machine_id and m["id"] == exclude_machine_id:
             continue
         slots = await supa.machine_stack_slots(m["id"])
         if slots is None or slots == 0:
             return m
-        if slots - await supa.count_stacks_on_machine(m["id"]) > 0:
+        if slots - await supa.machine_stack_load(m["id"]) >= required_weight:
             return m
     return None
 
@@ -1017,7 +1095,15 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
             target = m
         else:
             target = await pick_running_machine_with_stack_slot(
-                stack["plan"], exclude_machine_id=old_machine["id"]
+                stack["plan"],
+                exclude_machine_id=old_machine["id"],
+                # a vaga precisa comportar o peso REAL da stack que chega —
+                # um usuário high (contexto longo) custa 3.0, não 1.
+                # Limitação conhecida: usa os pesos DEFAULT (sem o override de
+                # templates.usage_class_config, que o machine_stack_load do
+                # destino aplica) — só divergiria se algum template definisse
+                # "weights" custom, o que nenhum faz hoje
+                required_weight=class_weight(fresh.get("usage_class")),
             )
             if not target:
                 return None
@@ -1315,6 +1401,15 @@ async def validate_body(
 
     messages = body_json.get("messages")
     if not isinstance(messages, list):
+        # /v1/completions (prompt cru, sem messages): mesmo orçamento de
+        # janela do chat — embeddings e afins não têm max_tokens e o
+        # apply_context_budget vira no-op de clamp neles
+        if isinstance(body_json.get("prompt"), str):
+            apply_context_budget(
+                body_json,
+                machine,
+                est_tokens=estimate_prompt_tokens(extra_texts=[body_json["prompt"]]),
+            )
         return body_json
 
     if len(messages) > MAX_MESSAGES:
@@ -1349,6 +1444,19 @@ async def validate_body(
             messages.insert(0, system_message)
 
     body_json["messages"] = messages
+
+    # Clamp dinâmico pela janela real do modelo — por último, com o prompt
+    # FINAL (system da stack + RAG já injetados). Pode reduzir max_tokens
+    # abaixo de MIN_MAX_TOKENS: entre truncar thinking e devolver o 400 cru
+    # do vLLM, truncar é a degradação aceitável (o filtro de <think> tem
+    # fallback pra stream cortado por length).
+    apply_context_budget(
+        body_json,
+        machine,
+        est_tokens=estimate_prompt_tokens(
+            messages=messages, tools=body_json.get("tools")
+        ),
+    )
     return body_json
 
 
@@ -1493,6 +1601,22 @@ async def validate_responses_body(
         if instructions:
             body_json["instructions"] = instructions
 
+    # mesmo clamp dinâmico do validate_body, no campo da Responses API; o
+    # "input" pode ser string ou lista de itens — json.dumps cobre os dois
+    apply_context_budget(
+        body_json,
+        machine,
+        field="max_output_tokens",
+        est_tokens=estimate_prompt_tokens(
+            tools=body_json.get("tools"),
+            extra_texts=[
+                # ensure_ascii=False: mesmo motivo do estimate_prompt_tokens —
+                # o escape \uXXXX inflaria texto acentuado ~2x
+                json.dumps(body_json.get("input") or "", ensure_ascii=False),
+                body_json.get("instructions") or "",
+            ],
+        ),
+    )
     return body_json
 
 
@@ -1747,10 +1871,7 @@ async def anthropic_messages(
                 message = error_raw.decode(errors="replace") or "erro desconhecido do modelo"
             return JSONResponse(
                 status_code=upstream.status_code,
-                content={
-                    "type": "error",
-                    "error": {"type": "invalid_request_error", "message": message},
-                },
+                content=anthropic_error_body(message),
             )
         return StreamingResponse(
             anthropic_sse_from_openai_stream(
@@ -1803,7 +1924,12 @@ async def anthropic_count_tokens(
     except Exception:
         raise HTTPException(status_code=400, detail="corpo inválido")
     openai_body, _ = anthropic_to_openai_request(anthropic_body)
-    estimated = max(1, len(json.dumps(openai_body.get("messages", []))) // 4)
+    # mesma heurística do clamp de janela (context_budget) — inclui as tools,
+    # que nos clientes agênticos são a maior fatia do prompt; sem elas o
+    # Claude Code subestimava o uso e compactava tarde demais
+    estimated = estimate_prompt_tokens(
+        messages=openai_body.get("messages"), tools=openai_body.get("tools")
+    )
     return {"input_tokens": estimated}
 
 
