@@ -58,6 +58,9 @@ export function MachineAbout({
     "messages": [{"role": "user", "content": "oi"}]
   }'`
 
+  // AUTO_COMPACT_WINDOW: o Claude Code assume janela de 200k e não tem como
+  // saber a real do plano (64k) — sem isso ele só descobre o limite quando o
+  // gateway recusa; com isso ele compacta sozinho antes de estourar.
   const claudeSnippet = `export ANTHROPIC_BASE_URL="${url}"
 export ANTHROPIC_AUTH_TOKEN="<SUA_CHAVE_DE_ACESSO>"
 export ANTHROPIC_API_KEY=""
@@ -65,6 +68,7 @@ export ANTHROPIC_MODEL="${model}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=50000
 claude`
 
   return (
