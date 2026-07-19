@@ -645,9 +645,14 @@ export async function refreshMachineStatus(machineId: string) {
       .eq("id", machineId)
     // Pod acabou de ficar pronto: empurra chaves emitidas durante o boot
     // (createStack pode criar a chave com a máquina ainda em "creating").
+    // status "running" aqui é o desiredStatus do RunPod (container subiu),
+    // não implica o agent já estar respondendo — mesma race de createKey,
+    // delega ao gateway em vez de tentar sincronizar direto do painel.
     if (m.status !== "running" && status === "running") {
-      await syncMachineKeys(machineId).catch((e) =>
-        console.error("Sync pós-boot falhou (tenta de novo no próximo refresh):", e)
+      after(() =>
+        scheduleGatewayKeySync(machineId).catch((e) =>
+          console.error("Agendamento do sync pós-boot falhou:", e)
+        )
       )
     }
   } catch (e) {
@@ -1415,8 +1420,14 @@ export async function createKey(input: {
   if (error) throw new Error(error.message)
 
   await logEvent(input.machineId, "key_created", `Nova chave criada (${keyPrefix(plainKey)}…)`)
-  await syncMachineKeys(input.machineId).catch((e) =>
-    console.error("Sync com agent falhou (a chave foi salva):", e)
+  // Chave pode ter sido criada logo após provisionar a máquina (createStack) —
+  // o agent do pod ainda pode não estar de pé pra receber um sync direto do
+  // painel (mesma race de startMachine, ver scheduleGatewayKeySync acima).
+  // Delega ao gateway, que espera o agent ficar saudável antes de reenviar.
+  after(() =>
+    scheduleGatewayKeySync(input.machineId).catch((e) =>
+      console.error("Agendamento do sync falhou (a chave foi salva, o gateway cobre):", e)
+    )
   )
   revalidatePath("/accounts")
   revalidatePath(`/machines/${input.machineId}`)
@@ -1683,8 +1694,15 @@ export async function unloadLoraOnMachine(machineId: string, stackId: string) {
   return result
 }
 
-// Push da lista de chaves ativas para o agent da máquina
-export async function syncMachineKeys(machineId: string) {
+// Push da lista de chaves ativas para o agent da máquina — replace completo
+// via /sync-keys (agent.syncKeys), não /upsert-keys: preciso disso pra
+// REMOVER do cache do agent uma chave que acabou de ser revogada, o que o
+// upsert nunca faz. Único chamador é revokeKey (abaixo); createKey e
+// refreshMachineStatus usam scheduleGatewayKeySync (delega ao gateway, que
+// espera o agent ficar saudável) porque neles não há nada a remover — só
+// adicionar/atualizar chaves ativas, e frequentemente contra máquina recém-
+// provisionada, onde chamar o agent direto do painel bate 404.
+async function syncMachineKeys(machineId: string) {
   const db = createSupabaseAdmin()
   const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
   if (!m) throw new Error("Máquina não encontrada")
