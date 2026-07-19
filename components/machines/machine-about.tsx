@@ -43,7 +43,10 @@ export function MachineAbout({
 }) {
   // Sempre o gateway, nunca o proxy do pod: o pod muda/pausa e o cliente não
   // pode saber disso — realocação e auto-wake só funcionam via gateway.
-  const url = gatewayUrl?.replace(/\/$/, "") ?? "https://<url-do-gateway>"
+  // Fallback é a URL real de produção (Railway) — GATEWAY_URL pode não estar
+  // setado no ambiente do painel, e um placeholder deixaria o snippet inútil.
+  const url =
+    gatewayUrl?.replace(/\/$/, "") ?? "https://llmserve-docker.up.railway.app"
   const model = modelName ?? "<modelo>"
 
   const curlSnippet = `curl ${url}/v1/chat/completions \\
