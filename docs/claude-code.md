@@ -32,55 +32,64 @@ Regras comuns aos dois planos:
 - `kv_reserve_gb_per_user` = a unidade de um usuário **low** (peso 1.0);
   um high custa 3× isso na ocupação.
 
-### VibeCoder (A40 48GB, Qwen3.5-9B)
+**STATUS: aplicado em 19/07/2026** via API (Supabase + RunPod), com
+verificação de leitura de volta nos dois lados — os templates JÁ têm a
+config abaixo; falta recriar os pods e rodar os load tests.
+
+### VibeCoder (A40 48GB, Qwen3.5-9B) — aplicado
 
 ```
---max-model-len 65536 --kv-cache-dtype fp8 --max-num-seqs 8
+--dtype bfloat16 --max-model-len 65536 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name vibecoder-base
 ```
 
-- Se a janela NATIVA do modelo for menor que 65536 (conferir
-  `max_position_embeddings` no config.json do HF), estender com YaRN via
-  `--hf-overrides` (o vLLM 0.24 removeu `--rope-scaling`):
-  `--hf-overrides {"rope_scaling":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":32768}}`
-- Orçamento: ~19 GB de pesos → ~22-24 GB de KV ≈ **~300k tokens fp8** ≈
-  ~4 sessões cheias de 64k + usuários leves.
+- Janela nativa do Qwen3.5-9B é **262144** (config.json conferido) —
+  **sem YaRN/hf-overrides**, só a flag. Era 16384.
+- KV fp8 do 9B = 64KB/token (32 camadas × 4 KV heads × 256 head_dim):
+  sessão de 64k ≈ 4,2 GB; pool ~22 GB ≈ **~340k tokens ≈ ~5 sessões
+  cheias** + leves.
+- `kv_reserve_gb_per_user`: 1 → **1.5** (high = 4,5 GB ≈ uma sessão cheia;
+  orçamento (48−20)/1.5 = 18 slots ponderados).
 - `--max-num-seqs 8`: ponto de partida; calibrar no load test.
 
-### Pro (L40S 48GB, Qwen3.6-27B-FP8)
+### Pro (L40S 48GB, Qwen3.6-27B-FP8) — aplicado
 
 ```
---max-model-len 65536 --kv-cache-dtype fp8 --max-num-seqs 16
+--max-model-len 65536 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 16 --limit-mm-per-prompt {"image":0,"video":0} --served-model-name pro-base
 ```
 
-- Janela nativa do 27B é 262k — **sem YaRN/hf-overrides**, só a flag.
-- `--kv-cache-dtype fp8` o Pro já usa — conferir que permanece.
+- Era **40960**; janela nativa do 27B é 262k — sem YaRN, só a flag.
+- **`--enable-prefix-caching` foi REMOVIDO**: estava no template em conflito
+  com a política de pod compartilhado (o provisionamento seta
+  `DISABLE_PREFIX_CACHING=true`, mas o `VLLM_EXTRA_ARGS` entra por último na
+  linha de comando e o `--enable` vencia o `--no-enable` — canal lateral de
+  timing entre tenants reaberto sem ninguém perceber).
 - `--max-num-seqs 16` foi o mínimo pro pod SUBIR (histórico de OOM no boot);
-  com sequências 2× maiores, o load test decide se reduz.
+  com sequências maiores, o load test decide se reduz.
 - Orçamento: ~28 GB de pesos → pool de KV **~13 GB ≈ ~130k tokens fp8** ≈
   **~2 sessões cheias de 64k simultâneas** + usuários leves. É apertado de
   propósito (performance-first): quem impede a máquina de aceitar mais
   usuários pesados do que cabe são as classes de uso (high pesa 3.0 slots).
-- Calibrar `kv_reserve_gb_per_user` do template para que high (3×) ≈
-  6-6.5 GB de KV (uma sessão de 64k no 27B ≈ ~100KB/token fp8). Ex.:
-  reserva 2 GB com footprint 28 → orçamento (48−28)/2 = 10 slots; 2 highs
-  (6.0) + 4 lows (4.0) lotam — coerente com o pool real.
+- `kv_reserve_gb_per_user`: 1 → **2** (high = 6 GB ≈ uma sessão cheia de
+  64k no 27B, ~100KB/token fp8; orçamento (48−28)/2 = 10 slots ponderados).
 - **128k no Pro foi avaliado e ADIADO**: uma sessão de 128k consumiria o
   pool inteiro da L40S. Exige A100 80GB (~3 sessões cheias) ou 2× L40S
   TP=2 (~4 sessões) — decisão de custo pendente.
 
-## 3. Aplicação (checklist por template — NÃO pular)
+## 3. Aplicação (o que resta — NÃO pular)
 
-1. Editar o template no painel.
-2. **Conferir no console do RunPod que o template refletiu a mudança** —
-   precedente real: o `updateTemplate` já falhou silenciosamente e o RunPod
-   ficou com a config antiga enquanto o DB mostrava a nova (aconteceu no
-   Pro: DB 32K, pod subindo com 16K).
-3. Subir o pod novo e conferir no log de boot do vLLM:
+1. ~~Editar os templates~~ **FEITO (19/07/2026)**, com verify de leitura de
+   volta no Supabase E no RunPod (precedente do updateTemplate silencioso).
+2. Migrations 0031+0032 → push na main (ordem estrita da seção 1).
+3. **Recriar os pods dos dois planos LOGO APÓS a migration 0031**: o
+   backfill lê o env ATUAL do template (65536), mas os pods rodando ainda
+   têm a janela antiga (VibeCoder 16384, Pro 40960) — até recriar, a coluna
+   `machines.max_model_len` das máquinas antigas fica maior que a janela
+   real e o clamp do gateway não protege (o vLLM volta a responder o 400
+   cru, como hoje; não é pior que o estado atual, mas anula o benefício).
+4. Conferir no log de boot do vLLM de cada pod novo:
    `max_model_len=65536` e `kv_cache_dtype=fp8`.
-4. Conferir o backfill: `select name, max_model_len from machines;`
-   (máquinas novas = 65536; as antigas mantêm o valor de criação até serem
-   recriadas — NÃO fazer UPDATE manual da coluna sem recriar o pod, o
-   gateway passaria a clampar com uma janela que o pod não tem).
+5. Conferir: `select name, max_model_len from machines;` → máquinas novas
+   dos dois planos = 65536.
 
 ## 4. Load test (gate — a mudança só vale se passar)
 
