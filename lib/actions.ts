@@ -693,14 +693,14 @@ export async function stopMachine(
     )
     if (active.length > 0) {
       return {
-        error: `A máquina "${m.name}" tem ${active.length} conta(s) ativa(s) — desativar agora corta as requisições em andamento.`,
+        error: `A máquina "${m.name}" tem ${active.length} conta(s) ativa(s) — pausar agora corta as requisições em andamento.`,
         code: "in_use",
       }
     }
   }
   await runpod.stopPod(m.runpod_pod_id)
   await db.from("machines").update({ status: "stopped" }).eq("id", machineId)
-  await logEvent(machineId, "stopped", `Máquina "${m.name}" desativada`)
+  await logEvent(machineId, "stopped", `Máquina "${m.name}" pausada`)
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
 }

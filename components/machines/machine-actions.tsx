@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Play, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react"
+import { Pause, Play, RefreshCw, RotateCcw, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import {
@@ -41,7 +41,7 @@ export function MachineActions({ machine }: { machine: Machine }) {
           toast.error(result.error)
           // Host sem GPU livre: oferece recriar o pod em outro host
           if (result.code === "no_gpu_on_host") setRecreateOpen(true)
-          // Máquina em uso: oferece desativar mesmo assim (force)
+          // Máquina em uso: oferece pausar mesmo assim (force)
           if (result.code === "in_use") setStopForceOpen(true)
           return
         }
@@ -69,9 +69,9 @@ export function MachineActions({ machine }: { machine: Machine }) {
           variant="outline"
           size="sm"
           disabled={pending}
-          onClick={() => run(() => stopMachine(machine.id), "Máquina desativada")}
+          onClick={() => run(() => stopMachine(machine.id), "Máquina pausada")}
         >
-          <Square className="size-4" /> Desativar
+          <Pause className="size-4" /> Pausar
         </Button>
       ) : machine.status === "stopped" ? (
         <Button
@@ -98,9 +98,9 @@ export function MachineActions({ machine }: { machine: Machine }) {
       <AlertDialog open={stopForceOpen} onOpenChange={setStopForceOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Desativar mesmo com uso ativo?</AlertDialogTitle>
+            <AlertDialogTitle>Pausar mesmo com uso ativo?</AlertDialogTitle>
             <AlertDialogDescription>
-              “{machine.name}” tem requisições em andamento. Desativar agora
+              “{machine.name}” tem requisições em andamento. Pausar agora
               corta os streams em voo dessas contas. Prefira esperar ficar
               ociosa (a auto-pausa faz isso sem cortar ninguém).
             </AlertDialogDescription>
@@ -111,11 +111,11 @@ export function MachineActions({ machine }: { machine: Machine }) {
               disabled={pending}
               onClick={(e) => {
                 e.preventDefault()
-                run(() => stopMachine(machine.id, { force: true }), "Máquina desativada")
+                run(() => stopMachine(machine.id, { force: true }), "Máquina pausada")
                 setStopForceOpen(false)
               }}
             >
-              Desativar mesmo assim
+              Pausar mesmo assim
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

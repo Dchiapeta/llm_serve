@@ -93,7 +93,7 @@ export function MachineRowActions({
           <DropdownMenuSeparator />
           {machine.status === "running" ? (
             <DropdownMenuItem
-              onSelect={() => run(() => stopMachine(machine.id), "Máquina desativada")}
+              onSelect={() => run(() => stopMachine(machine.id), "Máquina pausada")}
             >
               <Pause className="size-4" />
               Pausar
@@ -148,7 +148,7 @@ export function MachineRowActions({
               disabled={pending}
               onClick={(e) => {
                 e.preventDefault()
-                run(() => stopMachine(machine.id, { force: true }), "Máquina desativada")
+                run(() => stopMachine(machine.id, { force: true }), "Máquina pausada")
                 setStopForceOpen(false)
               }}
             >
