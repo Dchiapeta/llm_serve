@@ -260,6 +260,13 @@ last_provision_attempt: dict[str, float] = {}
 # a GPU do pod pausado e só recriar num host novo o traz de volta.
 recreating_in_progress: set[str] = set()
 last_recreate_attempt: dict[str, float] = {}
+# fila de recriações pendentes: máquinas que o caminho reativo (no_gpu) marcou
+# pra recriar e ainda não confirmaram sucesso. O lifecycle loop reprocessa
+# (process_pending_recreates_once) — mesma disciplina do pending_unloads —
+# garantindo o retry se a chamada ao painel falhar/cair, sem depender de um
+# request específico. Uma máquina sai da fila quando a recriação conclui (ou
+# quando ela deixa de estar stopped/error, ex.: subiu por outro caminho).
+pending_recreates: set[str] = set()
 
 logger = logging.getLogger("gateway")
 
@@ -326,6 +333,8 @@ async def lifespan(app: FastAPI):
         pool_watermark_slots=MACHINE_POOL_WATERMARK_SLOTS,
         auto_provision_enabled=auto_provision_enabled,
         on_machine_running=handle_machine_running,
+        try_recreate_machine=try_recreate_machine,
+        pending_recreates=pending_recreates,
     )
     reaper_task = asyncio.create_task(lifecycle_mgr.idle_reaper_loop())
     machine_task = asyncio.create_task(
@@ -971,8 +980,12 @@ async def _recreate_and_track(machine_id: str, reason: str) -> None:
     try:
         result = await recreate_machine_via_panel(machine_id)
         if result is None:
-            logger.warning("recriação de %s não completou (%s)", machine_id, reason)
+            logger.warning(
+                "recriação de %s não completou (%s) — fica na fila pro lifecycle retentar",
+                machine_id, reason,
+            )
         else:
+            pending_recreates.discard(machine_id)  # sucesso: sai da fila de retry
             logger.info("recriação de %s disparada — %s", machine_id, reason)
     finally:
         recreating_in_progress.discard(machine_id)
@@ -985,12 +998,17 @@ async def try_recreate_machine(machine: dict, reason: str) -> bool:
     andamento, ou recente dentro do cooldown) — o chamador levanta
     recreating_503(). Não fica atrás de auto_provision_enabled: recriar restaura
     uma máquina que o usuário já provisionou (o host cedeu a GPU), não cria
-    capacidade nova."""
+    capacidade nova.
+
+    Enfileira a máquina em pending_recreates: se a chamada ao painel falhar (ou
+    o processo cair antes de concluir), o lifecycle loop retenta. A entrada só
+    sai da fila quando uma recriação conclui com sucesso."""
     machine_id = machine["id"]
-    if machine_id in recreating_in_progress:
-        return True
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
         return False
+    pending_recreates.add(machine_id)
+    if machine_id in recreating_in_progress:
+        return True
     now = time.time()
     if now - last_recreate_attempt.get(machine_id, 0) < RECREATE_COOLDOWN_S:
         # recriação recente já disparada — o pod novo está subindo

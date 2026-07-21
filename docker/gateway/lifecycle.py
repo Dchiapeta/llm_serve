@@ -40,6 +40,8 @@ class LifecycleManager:
         pool_watermark_slots: float = 5.0,
         auto_provision_enabled=None,
         on_machine_running=None,
+        try_recreate_machine=None,
+        pending_recreates=None,
     ):
         self.store = store
         self.supa = supa
@@ -63,6 +65,12 @@ class LifecycleManager:
         # promovida a running (ex.: religada pelo console do RunPod) — main.py
         # usa pra agendar o reenvio de chaves ao agent, que reinicia zerado
         self.on_machine_running = on_machine_running
+        # recriação de máquina presa (host sem GPU): try_recreate_machine é o
+        # mesmo callback do caminho reativo (main.py) — cooldown/trava
+        # compartilhados. pending_recreates é a fila (set) que o reativo popula;
+        # o loop reprocessa aqui, garantindo o retry sem religar nada à toa.
+        self.try_recreate_machine = try_recreate_machine
+        self.pending_recreates = pending_recreates if pending_recreates is not None else set()
         # unloads adiados: quando o drain de uma migração estoura o timeout, a
         # origem fica com o adapter carregado (órfão) ocupando slot. Em vez de
         # esperar o pod reiniciar, guardamos (origin_id, account_id) aqui e o
@@ -549,6 +557,35 @@ class LifecycleManager:
                 logger.warning("ensure-capacity: plano %s falhou (%s)", plan, e)
         return triggered
 
+    # ---------- Recriação de máquina presa (host sem GPU) ----------
+
+    async def process_pending_recreates_once(self) -> list[str]:
+        """Reprocessa a fila de recriações pendentes (populada pelo caminho
+        reativo quando o auto-wake falha por 'not enough free GPUs'). Mesma
+        ideia do process_pending_unloads_once: garante que a recriação aconteça
+        de fato mesmo que a chamada reativa ao painel tenha falhado, sem religar
+        nenhuma máquina proativamente (só age sobre o que a demanda já marcou).
+
+        Uma máquina sai da fila quando deixa de estar stopped/error (já subiu
+        por outro caminho, ou a recriação a levou pra creating/running) ou
+        sumiu; caso contrário, dispara try_recreate_machine de novo (que respeita
+        o cooldown e a trava, então é idempotente)."""
+        if self.try_recreate_machine is None or not self.pending_recreates:
+            return []
+        retried: list[str] = []
+        for machine_id in list(self.pending_recreates):
+            m = await self.supa.get_machine(machine_id)
+            if not m or m.get("status") not in ("stopped", "error"):
+                # subiu / creating / running / sumiu → nada a recriar
+                self.pending_recreates.discard(machine_id)
+                continue
+            try:
+                if await self.try_recreate_machine(m, "lifecycle: retry de recriação pendente"):
+                    retried.append(machine_id)
+            except Exception as e:
+                logger.warning("recriação pendente: %s falhou (%s)", machine_id, e)
+        return retried
+
     async def machine_lifecycle_loop(self, interval_s: float = 300.0):
         while True:
             await asyncio.sleep(interval_s)
@@ -578,6 +615,11 @@ class LifecycleManager:
                 await self.ensure_capacity_once()
             except Exception as e:
                 logger.warning("ensure-capacity: ciclo falhou (%s)", e)
+            # retenta recriações que o caminho reativo (no_gpu) deixou pendentes
+            try:
+                await self.process_pending_recreates_once()
+            except Exception as e:
+                logger.warning("recriação pendente: ciclo falhou (%s)", e)
 
 
 class MigrationError(Exception):
