@@ -30,6 +30,13 @@ CONTEXT_TEMPLATE_OVERHEAD = int(os.environ.get("CONTEXT_TEMPLATE_OVERHEAD", "200
 # Abaixo disso não há resposta útil possível — melhor rejeitar com instrução
 # de compactar do que devolver meia dúzia de tokens truncados.
 MIN_VIABLE_COMPLETION_TOKENS = int(os.environ.get("MIN_VIABLE_COMPLETION_TOKENS", "256"))
+# Fração da janela a partir da qual a estimativa heurística (que já embute
+# CONTEXT_SAFETY_FACTOR) é considerada "perto o suficiente" do limite pra
+# valer a pena pagar uma chamada de rede extra (gateway -> agent -> vLLM
+# /tokenize) e decidir aceitar/rejeitar com a contagem real do tokenizer, em
+# vez de confiar só na heurística. Requisições longe do teto nunca pagam
+# esse custo — ver should_use_exact_token_count.
+CONTEXT_EXACT_COUNT_THRESHOLD = float(os.environ.get("CONTEXT_EXACT_COUNT_THRESHOLD", "0.7"))
 
 
 class ContextWindowExceeded(HTTPException):
@@ -82,25 +89,55 @@ def _strip_images(messages: list) -> list:
     return out
 
 
+def prompt_text_for_tokenize(messages=None, tools=None, extra_texts=()) -> str:
+    """Texto usado tanto pela heurística de chars/4 quanto, perto do limite,
+    como "prompt" na contagem real via /tokenize do vLLM (ver
+    should_use_exact_token_count) — um único lugar monta esse texto pra não
+    ter duas versões ligeiramente diferentes do que está sendo contado."""
+    parts = []
+    if isinstance(messages, list):
+        parts.append(json.dumps(_strip_images(messages), ensure_ascii=False))
+    if tools:
+        parts.append(json.dumps(tools, ensure_ascii=False))
+    parts.extend(text for text in extra_texts if isinstance(text, str))
+    return "".join(parts)
+
+
 def estimate_prompt_tokens(messages=None, tools=None, extra_texts=()) -> int:
     """Heurística ~4 chars/token sobre o corpo já em formato OpenAI. Conta
     também as tools (nos clientes agênticos são a maior fatia do prompt — o
     count_tokens antigo ignorava e o Claude Code compactava tarde demais) e
     textos avulsos ("prompt" do /v1/completions, "instructions"/"input" da
-    Responses API)."""
-    # ensure_ascii=False: com o default, cada caractere acentuado vira ç
-    # (6 chars) e texto em português — o público do produto — é superestimado
-    # em ~2x, clampando saída de prompts que cabem e fazendo o count_tokens
-    # mandar o Claude Code compactar na metade útil da janela
-    chars = 0
-    if isinstance(messages, list):
-        chars += len(json.dumps(_strip_images(messages), ensure_ascii=False))
-    if tools:
-        chars += len(json.dumps(tools, ensure_ascii=False))
-    for text in extra_texts:
-        if isinstance(text, str):
-            chars += len(text)
-    return max(1, chars // 4)
+    Responses API).
+
+    ensure_ascii=False (dentro de prompt_text_for_tokenize): com o default,
+    cada caractere acentuado vira ç (6 chars) e texto em português — o
+    público do produto — é superestimado em ~2x, clampando saída de prompts
+    que cabem e fazendo o count_tokens mandar o Claude Code compactar na
+    metade útil da janela."""
+    text = prompt_text_for_tokenize(messages, tools, extra_texts)
+    return max(1, len(text) // 4)
+
+
+def reserved_tokens_for(est_tokens: int) -> int:
+    """Custo real reservado na janela para um prompt estimado em est_tokens:
+    margem de segurança (CONTEXT_SAFETY_FACTOR) + overhead de chat template.
+    Única fonte de verdade dessa conta — usada tanto por apply_context_budget
+    (decide rejeição) quanto por should_use_exact_token_count (decide se vale
+    a pena trocar a heurística pela contagem real)."""
+    return math.ceil(est_tokens * CONTEXT_SAFETY_FACTOR) + CONTEXT_TEMPLATE_OVERHEAD
+
+
+def should_use_exact_token_count(est_tokens: int, machine: dict) -> bool:
+    """Fast-path: a maioria das requisições fica longe do teto e não deve
+    pagar o custo de uma chamada de rede extra ao agent/vLLM só pra confirmar
+    o que a heurística já mostra sobrar de sobra. Só quando a estimativa (que
+    já é pessimista, incluindo CONTEXT_SAFETY_FACTOR) encosta perto da janela
+    real da máquina é que vale a pena pedir a contagem exata do tokenizer."""
+    max_model_len = machine.get("max_model_len")
+    if not isinstance(max_model_len, int) or max_model_len <= 0:
+        return False  # sem janela conhecida, apply_context_budget já é no-op
+    return reserved_tokens_for(est_tokens) >= max_model_len * CONTEXT_EXACT_COUNT_THRESHOLD
 
 
 def apply_context_budget(
@@ -116,7 +153,7 @@ def apply_context_budget(
     max_model_len = machine.get("max_model_len")
     if not isinstance(max_model_len, int) or max_model_len <= 0:
         return
-    reserve = math.ceil(est_tokens * CONTEXT_SAFETY_FACTOR) + CONTEXT_TEMPLATE_OVERHEAD
+    reserve = reserved_tokens_for(est_tokens)
     budget = max_model_len - reserve
     if budget < MIN_VIABLE_COMPLETION_TOKENS:
         raise ContextWindowExceeded(

@@ -14,6 +14,8 @@ from context_budget import (
     apply_context_budget,
     estimate_prompt_tokens,
     openai_error_body,
+    reserved_tokens_for,
+    should_use_exact_token_count,
 )
 
 VIBECODER_WINDOW = 16384
@@ -31,9 +33,7 @@ def test_clampa_abaixo_do_piso_quando_a_janela_exige():
     body = {"max_tokens": 16_000, "messages": [{"role": "user", "content": prompt}]}
     est = estimate_prompt_tokens(messages=body["messages"])
     apply_context_budget(body, _machine(), est_tokens=est)
-    expected_budget = VIBECODER_WINDOW - (
-        int(est * CONTEXT_SAFETY_FACTOR + 0.999999) + CONTEXT_TEMPLATE_OVERHEAD
-    )
+    expected_budget = VIBECODER_WINDOW - reserved_tokens_for(est)
     assert body["max_tokens"] <= expected_budget
     assert body["max_tokens"] < 16_000
 
@@ -102,6 +102,31 @@ def test_imagens_base64_ficam_fora_da_estimativa():
     est_with = estimate_prompt_tokens(messages=with_image)
     est_without = estimate_prompt_tokens(messages=without_image)
     assert est_with - est_without < 100  # a imagem não pode pesar ~25k tokens
+
+
+def test_reserved_tokens_for_aplica_fator_e_overhead():
+    est = 1_000
+    assert reserved_tokens_for(est) == int(est * CONTEXT_SAFETY_FACTOR + 0.999999) + CONTEXT_TEMPLATE_OVERHEAD
+
+
+PRO_WINDOW = 65_536
+
+
+def test_should_use_exact_token_count_longe_do_limite_fica_false():
+    # prompt pequeno numa janela de 65536 — nem perto do threshold (0.7 default)
+    assert should_use_exact_token_count(1_000, _machine(PRO_WINDOW)) is False
+
+
+def test_should_use_exact_token_count_reproduz_incidente():
+    # cenário real: heurística ~54730 contra janela de 65536 — é exatamente o
+    # caso em que a heurística já rejeitaria e vale a pena confirmar com a
+    # contagem real do tokenizer antes de decidir
+    assert should_use_exact_token_count(54_730, _machine(PRO_WINDOW)) is True
+
+
+def test_should_use_exact_token_count_sem_max_model_len_fica_false():
+    for machine in ({"id": "m1"}, _machine(None), _machine(0)):
+        assert should_use_exact_token_count(999_999, machine) is False
 
 
 def test_shapes_de_erro():

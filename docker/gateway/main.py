@@ -58,6 +58,8 @@ from context_budget import (
     apply_context_budget,
     estimate_prompt_tokens,
     openai_error_body,
+    prompt_text_for_tokenize,
+    should_use_exact_token_count,
 )
 from lifecycle import LifecycleManager, MigrationError
 from usage_class import class_weight, classify_stack
@@ -516,6 +518,37 @@ async def call_agent(machine: dict, path: str, body: dict, timeout_s: float = 30
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"agent {path} → {r.status_code}: {r.text}")
     return r.json()
+
+
+async def call_vllm_tokenize(machine: dict, model: str, text: str) -> int | None:
+    """Contagem real de tokens via /admin/tokenize do agent (que chama o
+    /tokenize do vLLM local). None em qualquer falha — o chamador cai de
+    volta pra estimativa heurística; esta checagem extra nunca pode travar
+    uma request por conta própria (pod fora do ar, agent antigo sem o
+    endpoint, timeout — tudo cai no mesmo None)."""
+    try:
+        resp = await call_agent(machine, "/tokenize", {"text": text, "model": model}, timeout_s=8.0)
+    except HTTPException:
+        return None
+    count = resp.get("count")
+    return count if isinstance(count, int) else None
+
+
+async def resolve_est_tokens(
+    machine: dict, heuristic_est: int, exact_text: str, tokenize_fn=call_vllm_tokenize
+) -> int:
+    """Decide o est_tokens final pro apply_context_budget: heurística por
+    padrão (fast-path — maioria das requests fica longe do teto), contagem
+    real do tokenizer via /tokenize do vLLM só quando should_use_exact_token_count
+    já indica proximidade do limite. tokenize_fn injetável só pra testar sem
+    precisar mockar httpx."""
+    if not should_use_exact_token_count(heuristic_est, machine):
+        return heuristic_est
+    model = machine.get("served_model_name") or machine.get("model_name")
+    if not model:
+        return heuristic_est
+    exact = await tokenize_fn(machine, model, exact_text)
+    return exact if exact is not None else heuristic_est
 
 
 async def get_agent_metrics(machine: dict, reset: bool = True) -> dict | None:
@@ -1407,11 +1440,10 @@ async def validate_body(
         # janela do chat — embeddings e afins não têm max_tokens e o
         # apply_context_budget vira no-op de clamp neles
         if isinstance(body_json.get("prompt"), str):
-            apply_context_budget(
-                body_json,
-                machine,
-                est_tokens=estimate_prompt_tokens(extra_texts=[body_json["prompt"]]),
-            )
+            prompt_text = body_json["prompt"]
+            heuristic_est = estimate_prompt_tokens(extra_texts=[prompt_text])
+            est_tokens = await resolve_est_tokens(machine, heuristic_est, prompt_text)
+            apply_context_budget(body_json, machine, est_tokens=est_tokens)
         return body_json
 
     if len(messages) > MAX_MESSAGES:
@@ -1452,13 +1484,11 @@ async def validate_body(
     # abaixo de MIN_MAX_TOKENS: entre truncar thinking e devolver o 400 cru
     # do vLLM, truncar é a degradação aceitável (o filtro de <think> tem
     # fallback pra stream cortado por length).
-    apply_context_budget(
-        body_json,
-        machine,
-        est_tokens=estimate_prompt_tokens(
-            messages=messages, tools=body_json.get("tools")
-        ),
-    )
+    tools = body_json.get("tools")
+    heuristic_est = estimate_prompt_tokens(messages=messages, tools=tools)
+    exact_text = prompt_text_for_tokenize(messages=messages, tools=tools)
+    est_tokens = await resolve_est_tokens(machine, heuristic_est, exact_text)
+    apply_context_budget(body_json, machine, est_tokens=est_tokens)
     return body_json
 
 
@@ -1604,21 +1634,18 @@ async def validate_responses_body(
             body_json["instructions"] = instructions
 
     # mesmo clamp dinâmico do validate_body, no campo da Responses API; o
-    # "input" pode ser string ou lista de itens — json.dumps cobre os dois
-    apply_context_budget(
-        body_json,
-        machine,
-        field="max_output_tokens",
-        est_tokens=estimate_prompt_tokens(
-            tools=body_json.get("tools"),
-            extra_texts=[
-                # ensure_ascii=False: mesmo motivo do estimate_prompt_tokens —
-                # o escape \uXXXX inflaria texto acentuado ~2x
-                json.dumps(body_json.get("input") or "", ensure_ascii=False),
-                body_json.get("instructions") or "",
-            ],
-        ),
-    )
+    # "input" pode ser string ou lista de itens — json.dumps cobre os dois.
+    # ensure_ascii=False: mesmo motivo do estimate_prompt_tokens — o escape
+    # \uXXXX inflaria texto acentuado ~2x
+    tools = body_json.get("tools")
+    extra_texts = [
+        json.dumps(body_json.get("input") or "", ensure_ascii=False),
+        body_json.get("instructions") or "",
+    ]
+    heuristic_est = estimate_prompt_tokens(tools=tools, extra_texts=extra_texts)
+    exact_text = prompt_text_for_tokenize(tools=tools, extra_texts=extra_texts)
+    est_tokens = await resolve_est_tokens(machine, heuristic_est, exact_text)
+    apply_context_budget(body_json, machine, field="max_output_tokens", est_tokens=est_tokens)
     return body_json
 
 

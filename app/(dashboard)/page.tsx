@@ -1,5 +1,5 @@
 import Link from "next/link"
-import { Activity, DollarSign, KeyRound, Server } from "lucide-react"
+import { DollarSign, KeyRound, Server } from "lucide-react"
 
 import { computeCapacity, stackWeight } from "@/lib/capacity"
 import { machineDisplayStatus, reconcileMachineStatuses } from "@/lib/machines"
@@ -21,12 +21,33 @@ import {
 import { CapacityBar } from "@/components/machines/capacity-bar"
 import { StatusBadge } from "@/components/machines/status-badge"
 import { UsageDonut } from "@/components/dashboard/usage-donut"
+import { PeriodSwitch } from "@/components/dashboard/period-switch"
 
 export const dynamic = "force-dynamic"
 
-export default async function DashboardPage() {
+const PERIOD_MS: Record<string, number | null> = {
+  "24h": 24 * 60 * 60 * 1000,
+  "7d": 7 * 24 * 60 * 60 * 1000,
+  total: null,
+}
+
+const PERIOD_LABELS: Record<string, string> = {
+  "24h": "24 horas",
+  "7d": "7 dias",
+  total: "Total",
+}
+
+export default async function DashboardPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ period?: string }>
+}) {
+  const { period: rawPeriod } = await searchParams
+  const period = rawPeriod && rawPeriod in PERIOD_MS ? rawPeriod : "24h"
+
   const db = createSupabaseAdmin()
-  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+  const periodMs = PERIOD_MS[period]
+  const since = periodMs ? new Date(Date.now() - periodMs).toISOString() : null
 
   const [
     { data: machinesData },
@@ -52,10 +73,10 @@ export default async function DashboardPage() {
   const machines = reconciled.filter((m) => m.status !== "terminated")
   const templates = (templatesData ?? []) as Template[]
 
-  const { data: usageData } = await db
-    .from("usage_metrics")
-    .select("*")
-    .gte("window_start", since)
+  const usageQuery = db.from("usage_metrics").select("*")
+  const { data: usageData } = since
+    ? await usageQuery.gte("window_start", since)
+    : await usageQuery
 
   // "Rodando" só quando o vLLM já responde; antes disso, "Subindo".
   const displayStatuses = await Promise.all(machines.map(machineDisplayStatus))
@@ -93,7 +114,8 @@ export default async function DashboardPage() {
 
   const totalSlots = capacities.reduce((s, c) => s + c.cap.slotsMax, 0)
   const usedSlots = capacities.reduce((s, c) => s + c.cap.slotsUsed, 0)
-  const totalRequests24h = usage.reduce((s, u) => s + u.requests, 0)
+  const totalRequests = usage.reduce((s, u) => s + u.requests, 0)
+  const totalTokens = usage.reduce((s, u) => s + u.tokens_in + u.tokens_out, 0)
   const totalCostPerHr = running.reduce((s, m) => s + (m.cost_per_hr ?? 0), 0)
 
   const machineById = new Map(machines.map((m) => [m.id, m]))
@@ -125,14 +147,6 @@ export default async function DashboardPage() {
       icon: KeyRound,
     },
     {
-      label: "Requisições (24h)",
-      value: totalRequests24h.toLocaleString("pt-BR"),
-      sub: `${usage
-        .reduce((s, u) => s + u.tokens_in + u.tokens_out, 0)
-        .toLocaleString("pt-BR")} tokens`,
-      icon: Activity,
-    },
-    {
       label: "Custo por hora",
       value: `$${totalCostPerHr.toFixed(2)}`,
       sub: `~$${(totalCostPerHr * 24 * 30).toFixed(0)}/mês se 24/7`,
@@ -150,7 +164,35 @@ export default async function DashboardPage() {
       </div>
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        {kpis.map((kpi) => (
+        {kpis.slice(0, 2).map((kpi) => (
+          <Card key={kpi.label}>
+            <CardHeader className="flex flex-row items-center justify-between pb-2">
+              <CardDescription>{kpi.label}</CardDescription>
+              <kpi.icon className="size-4 text-muted-foreground" />
+            </CardHeader>
+            <CardContent>
+              <p className="text-3xl font-semibold tracking-tight">{kpi.value}</p>
+              <p className="mt-1 text-xs text-muted-foreground">{kpi.sub}</p>
+            </CardContent>
+          </Card>
+        ))}
+
+        <Card>
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardDescription>Requisições</CardDescription>
+            <PeriodSwitch period={period} />
+          </CardHeader>
+          <CardContent>
+            <p className="text-3xl font-semibold tracking-tight">
+              {totalRequests.toLocaleString("pt-BR")}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {totalTokens.toLocaleString("pt-BR")} tokens
+            </p>
+          </CardContent>
+        </Card>
+
+        {kpis.slice(2).map((kpi) => (
           <Card key={kpi.label}>
             <CardHeader className="flex flex-row items-center justify-between pb-2">
               <CardDescription>{kpi.label}</CardDescription>
@@ -202,7 +244,9 @@ export default async function DashboardPage() {
         <Card>
           <CardHeader>
             <CardTitle>Distribuição de uso</CardTitle>
-            <CardDescription>Requisições por máquina nas últimas 24h</CardDescription>
+            <CardDescription>
+              Requisições por máquina — {PERIOD_LABELS[period]}
+            </CardDescription>
           </CardHeader>
           <CardContent>
             <UsageDonut data={donutData} />

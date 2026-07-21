@@ -330,6 +330,34 @@ async def list_loras(x_admin_secret: str | None = Header(None)):
     return {"loras": [m for m in models if m != MODEL_NAME]}
 
 
+class TokenizeBody(BaseModel):
+    text: str
+    model: str
+
+
+# Contagem real de tokens via /tokenize do vLLM (rota na raiz, sem prefixo
+# /v1 — confirmado no código-fonte da v0.24.0, vllm/entrypoints/serve/tokenize).
+# Usado pelo gateway (context_budget) só perto do limite de contexto, pra
+# decidir aceitar/rejeitar com a mesma contagem que o vLLM realmente usa —
+# não pela allowlist /v1/* client-facing, já que é uma chamada interna do
+# gateway sem uma Bearer key de conta associada.
+@app.post("/admin/tokenize")
+async def admin_tokenize(body: TokenizeBody, x_admin_secret: str | None = Header(None)):
+    require_admin(x_admin_secret)
+    try:
+        resp = await client.post(
+            "/tokenize", json={"model": body.model, "prompt": body.text}, timeout=10.0
+        )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"vLLM tokenize indisponível: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"vLLM tokenize falhou: {resp.text}")
+    count = resp.json().get("count")
+    if not isinstance(count, int):
+        raise HTTPException(status_code=502, detail="vLLM tokenize: resposta sem contagem")
+    return {"count": count}
+
+
 # ---------- Health público ----------
 
 
