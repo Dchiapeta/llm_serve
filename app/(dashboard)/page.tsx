@@ -3,7 +3,6 @@ import { Activity, DollarSign, KeyRound, Server } from "lucide-react"
 
 import { computeCapacity, stackWeight } from "@/lib/capacity"
 import { machineDisplayStatus, reconcileMachineStatuses } from "@/lib/machines"
-import { collectUsageMetrics } from "@/lib/metrics"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type {
   Machine,
@@ -53,8 +52,6 @@ export default async function DashboardPage() {
   const machines = reconciled.filter((m) => m.status !== "terminated")
   const templates = (templatesData ?? []) as Template[]
 
-  // Puxa os contadores dos agents para o banco antes de ler o uso.
-  await collectUsageMetrics(machines, db)
   const { data: usageData } = await db
     .from("usage_metrics")
     .select("*")

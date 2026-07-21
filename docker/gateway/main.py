@@ -537,12 +537,14 @@ async def get_agent_metrics(machine: dict, reset: bool = True) -> dict | None:
 
 
 async def collect_usage_metrics_once() -> None:
-    """Espelha collectUsageMetrics (lib/metrics.ts): puxa os contadores
-    acumulados do agent de cada máquina running (zerando-os na leitura) e
-    grava o delta em usage_metrics. Roda sozinha no processo do gateway —
-    antes disso, usage_metrics só era populado quando um admin abria o
-    painel, o que deixava a quota diária de tokens (check_token_quota)
-    cega a qualquer uso entre duas visitas.
+    """Único escritor de usage_metrics: puxa os contadores acumulados do
+    agent de cada máquina running (zerando-os na leitura) e grava o delta
+    em usage_metrics. Roda sozinha no processo do gateway — antes de existir,
+    usage_metrics só era populado quando um admin abria o painel, o que
+    deixava a quota diária de tokens (check_token_quota) cega a qualquer
+    uso entre duas visitas (esse coletor do painel foi removido depois que
+    causou atribuição incorreta a api_key_id=NULL por divergir do esquema
+    de chave do agent).
 
     `per_key` do agent é indexado por api_key_id (não mais por key_prefix):
     o prefixo tem só 32 bits, colisão entre duas contas diferentes não é

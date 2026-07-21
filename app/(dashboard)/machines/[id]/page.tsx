@@ -8,7 +8,6 @@ import {
   parseServedModelName,
   reconcileMachineStatuses,
 } from "@/lib/machines"
-import { collectUsageMetrics } from "@/lib/metrics"
 import { runpod, runpodConsoleUrl } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type { Account, ApiKey, Machine, Template, UsageMetric } from "@/lib/types"
@@ -70,9 +69,6 @@ export default async function MachineDetailPage({
   // Reflete o estado real do RunPod já no carregamento (não só via botão).
   const [machine] = await reconcileMachineStatuses([machineData], db)
   const displayStatus = await machineDisplayStatus(machine)
-
-  // Puxa os contadores do agent para o banco antes de ler o uso.
-  await collectUsageMetrics([machine], db)
 
   const [
     { data: tplData },
