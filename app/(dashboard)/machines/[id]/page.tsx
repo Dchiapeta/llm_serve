@@ -103,9 +103,17 @@ export default async function MachineDetailPage({
     (sum, s) => sum + stackWeight(s.usage_class),
     0
   )
+  // Stacks que HOJE moram nesta máquina (ou seja, ocupam slot). O idle reaper
+  // libera a vaga zerando stacks.machine_id, mas NÃO toca em api_keys.machine_id
+  // (pin histórico da chave). Por isso a tabela é filtrada pela stack e não por
+  // api_keys.machine_id — senão apareceriam contas que já soltaram o slot.
+  const machineStackIds = new Set((machineStacks ?? []).map((s) => s.id))
 
   const template = tplData as Template | null
-  const keys = (keysData ?? []) as KeyWithAccount[]
+  const allKeys = (keysData ?? []) as KeyWithAccount[]
+  const keys = allKeys.filter(
+    (k) => k.stack_id != null && machineStackIds.has(k.stack_id)
+  )
   const activeKeys = keys.filter((k) => k.status === "active")
   const accounts = (accountsData ?? []) as Account[]
   const usage = (usageData ?? []) as UsageMetric[]
@@ -300,7 +308,7 @@ export default async function MachineDetailPage({
                   {keys.length === 0 && (
                     <TableRow>
                       <TableCell colSpan={7} className="text-center text-muted-foreground">
-                        Nenhuma chave criada para esta máquina.
+                        Nenhuma conta ocupando slot nesta máquina.
                       </TableCell>
                     </TableRow>
                   )}
