@@ -821,19 +821,25 @@ async def wake_machine(machine: dict, reason: str) -> bool:
     return True
 
 
-async def wake_some_machine_for_plan(plan: str) -> bool:
+async def wake_some_machine_for_plan(plan: str) -> str:
     """Religa a primeira máquina pausada do template do plano que aceitar o
-    start. Só é chamado quando não há NENHUMA máquina running com vaga."""
-    for m in await supa.list_stopped_machines_for_plan(plan):
+    start. Só é chamado quando não há NENHUMA máquina running com vaga.
+
+    Retorna: 'woke' = despausou agora; 'waking' = há pausada mas o startPod não
+    saiu agora (cooldown de um wake recente / host sem GPU) — ou seja, uma já
+    está subindo, o cliente deve reintentar; 'none' = não há pausada nenhuma."""
+    stopped = await supa.list_stopped_machines_for_plan(plan)
+    for m in stopped:
         if await wake_machine(m, "requisição recebida sem máquina disponível"):
-            return True
-    return False
+            return "woke"
+    return "waking" if stopped else "none"
 
 
 def waking_503() -> HTTPException:
     return HTTPException(
         status_code=503,
-        detail="máquina religando, tente novamente em alguns minutos",
+        detail="Sua máquina está sendo iniciada e ficará pronta em instantes. "
+        "Tente novamente em alguns segundos.",
         headers={"Retry-After": "60"},
     )
 
@@ -841,8 +847,18 @@ def waking_503() -> HTTPException:
 def provisioning_503() -> HTTPException:
     return HTTPException(
         status_code=503,
-        detail="provisionando uma máquina nova, tente novamente em alguns minutos",
+        detail="Estamos preparando uma máquina nova para você — ficará pronta em "
+        "instantes. Tente novamente em alguns segundos.",
         headers={"Retry-After": str(int(PROVISION_RETRY_AFTER_S))},
+    )
+
+
+def preparing_503() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="Estamos preparando sua máquina — ela ficará disponível em instantes. "
+        "Tente novamente em alguns segundos.",
+        headers={"Retry-After": "30"},
     )
 
 
@@ -1025,7 +1041,7 @@ async def pick_machine_with_free_slot(plan: str) -> dict:
     for m in machines:
         if await machine_free_slots(m) > 0:
             return m
-    if await wake_some_machine_for_plan(plan):
+    if (await wake_some_machine_for_plan(plan)) != "none":
         raise waking_503()
     if plan in provisioning_in_progress or await try_provision_for_request(
         plan, "sem máquina com vaga nem pausada"
@@ -1288,15 +1304,13 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
 
     machines = await supa.list_running_machines_for_plan(effective_plan)
     if not machines:
-        if await wake_some_machine_for_plan(effective_plan):
-            raise waking_503()
+        if (await wake_some_machine_for_plan(effective_plan)) != "none":
+            raise waking_503()  # despausando agora ou uma já está subindo
         if effective_plan in provisioning_in_progress or await try_provision_for_request(
             effective_plan, "sem máquina para o modelo base"
         ):
             raise provisioning_503()
-        raise HTTPException(
-            status_code=503, detail=f"nenhuma máquina disponível para o plano {effective_plan}"
-        )
+        raise preparing_503()
     machine = machines[0]
     await ensure_key_on_machine(entry, machine)
     return machine, effective_plan
