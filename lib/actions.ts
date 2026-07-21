@@ -843,6 +843,11 @@ export async function recreateMachine(
       status: "creating",
       cost_per_hr: pod.costPerHr ?? m.cost_per_hr,
       public_url: podProxyUrl(pod.id, 8000),
+      // reseta o relógio de ociosidade a partir da recriação (mesmo motivo do
+      // startMachine): sem isso o last_activity_at fica velho e o reaper do
+      // gateway auto-pausa a máquina minutos depois de ela subir, antes de
+      // servir qualquer request e enquanto o modelo ainda baixa/carrega.
+      last_activity_at: new Date().toISOString(),
     })
     .eq("id", machineId)
   await logEvent(
