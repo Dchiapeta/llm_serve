@@ -186,6 +186,28 @@ class SupaClient:
         r.raise_for_status()
         return len(r.json())
 
+    async def rebind_stack_keys(
+        self, account_id: str, to_machine_id: str, stack_id: str
+    ) -> int:
+        """Reaponta as chaves ativas de uma stack pra máquina destino SEM
+        condicionar à origem — usado no re-home de uma stack que teve a casa
+        liberada por ociosidade (machine_id era NULL, então não há origem
+        conhecida como no move_account_keys). Mantém api_keys.machine_id
+        coerente com a casa nova pro key-sync de reboot
+        (list_active_keys_for_machine)."""
+        r = await self._rest.patch(
+            "/api_keys",
+            params={
+                "account_id": f"eq.{account_id}",
+                "stack_id": f"eq.{stack_id}",
+                "status": "eq.active",
+            },
+            json={"machine_id": to_machine_id},
+            headers={"Prefer": "return=representation"},
+        )
+        r.raise_for_status()
+        return len(r.json())
+
     # ---------- machines ----------
 
     async def get_machine(self, machine_id: str) -> dict | None:
@@ -380,6 +402,64 @@ class SupaClient:
         )
         r.raise_for_status()
         return len(r.json()) > 0
+
+    async def repoint_stack_from_null(self, stack_id: str, to_machine_id: str) -> bool:
+        """Re-aloca a "casa" de uma stack SEM máquina (idle-released ou nunca
+        homeada), condicionado a machine_id IS NULL — 0 linhas significa que um
+        request concorrente já re-homeou; o chamador re-lê e segue a máquina
+        dele. Par do repoint_stack (origem NULL em vez de origem conhecida)."""
+        r = await self._rest.patch(
+            "/stacks",
+            params={
+                "id": f"eq.{stack_id}",
+                "machine_id": "is.null",
+            },
+            json={"machine_id": to_machine_id},
+            headers={"Prefer": "return=representation"},
+        )
+        r.raise_for_status()
+        return len(r.json()) > 0
+
+    async def release_base_stack(self, stack_id: str, from_machine_id: str) -> bool:
+        """Libera a vaga base da stack (stacks.machine_id → NULL), condicionado
+        à origem esperada — 0 linhas significa que um request concorrente já
+        re-homeou/moveu a stack; o reaper simplesmente ignora. Não descarrega
+        nada no pod: o modelo base segue carregado pros demais co-tenants,
+        liberar é só contábil (baixa machine_stack_load da máquina)."""
+        r = await self._rest.patch(
+            "/stacks",
+            params={
+                "id": f"eq.{stack_id}",
+                "machine_id": f"eq.{from_machine_id}",
+            },
+            json={"machine_id": None},
+            headers={"Prefer": "return=representation"},
+        )
+        r.raise_for_status()
+        return len(r.json()) > 0
+
+    async def touch_stack_activity(self, stack_id: str) -> None:
+        r = await self._rest.patch(
+            "/stacks",
+            params={"id": f"eq.{stack_id}"},
+            json={"last_activity_at": datetime.now(timezone.utc).isoformat()},
+        )
+        r.raise_for_status()
+
+    async def list_idle_base_stacks(self, cutoff_iso: str) -> list[dict]:
+        """Stacks de modelo base candidatas a liberar a vaga por ociosidade:
+        com casa alocada (machine_id) e sem atividade desde o cutoff. usa o
+        índice parcial stacks_idle_idx (0033)."""
+        r = await self._rest.get(
+            "/stacks",
+            params={
+                "machine_id": "not.is.null",
+                "last_activity_at": f"lt.{cutoff_iso}",
+                "select": "id,machine_id,plan,usage_class",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
 
     async def count_stacks_on_machine(self, machine_id: str) -> int:
         """Stacks hospedadas na máquina — ocupação padrão do modelo base

@@ -223,6 +223,9 @@ token_usage_cache: dict[str, tuple[int, float]] = {}
 # último touch por conta e por máquina (throttle)
 last_touch: dict[str, float] = {}
 last_machine_touch: dict[str, float] = {}
+# último touch de stacks.last_activity_at por stack (throttle) — relógio de
+# ociosidade do modelo base, base do reap_idle_base_stacks_once (lifecycle)
+last_stack_touch: dict[str, float] = {}
 
 # última tentativa de auto-wake por máquina — evita tempestade de startPod
 # com requests concorrentes ou falhas repetidas (ex.: host sem GPU livre)
@@ -1180,6 +1183,56 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
     return target
 
 
+async def place_base_stack(entry: dict, stack: dict) -> dict | None:
+    """Re-aloca a "casa" de uma stack de modelo base que teve o slot liberado
+    por ociosidade (stacks.machine_id == NULL, zerado pelo reap_idle_base_stacks
+    do lifecycle). Escolhe uma máquina running do MESMO plano com vaga
+    PONDERADA pela classe de uso (baixo/médio/alto), não necessariamente a
+    anterior. Irmão enxuto do reallocate_stack, sem origem conhecida.
+
+    None = sem vaga em máquina nenhuma (o chamador cai no wake/provision por
+    plano) ou perdeu a corrida sem a máquina do vencedor estar pronta.
+    """
+    async with realloc_locks[stack["plan"]]:
+        fresh = await supa.get_stack(stack["id"])
+        if not fresh:
+            return None
+        if fresh.get("machine_id"):
+            # request concorrente já re-homeou — segue a máquina nova dele
+            m = await supa.get_machine(fresh["machine_id"])
+            if m and m.get("status") == "running" and m.get("public_url"):
+                stack["machine_id"] = m["id"]
+                await ensure_key_on_machine(entry, m)
+                return m
+            return None
+        target = await pick_running_machine_with_stack_slot(
+            stack["plan"],
+            required_weight=class_weight(fresh.get("usage_class")),
+        )
+        if not target:
+            return None
+        if not await supa.repoint_stack_from_null(stack["id"], target["id"]):
+            return None
+        await supa.rebind_stack_keys(entry["account_id"], target["id"], stack["id"])
+
+    # stack é o mesmo objeto do key_cache — mutar in place mantém o cache
+    # coerente pelo resto do TTL sem flush (igual ao reallocate_stack)
+    stack["machine_id"] = target["id"]
+    await ensure_key_on_machine(entry, target)
+    try:
+        await supa.log_machine_event(
+            target["id"], "stack_placed",
+            f"Stack {stack.get('slug') or stack['id']} re-alocada após ociosidade",
+        )
+    except Exception:
+        pass  # histórico é best-effort, nunca derruba o request
+    logger.info(
+        "place_base_stack: stack %s da conta %s re-alocada em %s",
+        stack.get("slug") or stack["id"], entry["account_id"], target["id"],
+    )
+    return target
+
+
 async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]:
     """Máquina pro modelo base (conta sem adapter), stack-aware. Retorna
     (machine, effective_plan) — effective_plan é sempre o plano da STACK
@@ -1223,6 +1276,15 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
                         raise waking_503()
                     # startPod falhou de verdade (ex.: host sem GPU) → segue
                     # pro fallback por plano: serve temporário sem mover stack
+    elif stack and not stack.get("machine_id"):
+        # casa liberada por ociosidade (reap_idle_base_stacks zerou machine_id)
+        # ou stack nunca homeada → re-aloca DE VEZ numa máquina do plano com
+        # vaga ponderada, em vez de cair no fallback "primeira máquina" (que
+        # servia sem contabilizar a vaga e sem re-homear)
+        target = await place_base_stack(entry, stack)
+        if target:
+            return target, effective_plan
+        # sem vaga em lugar nenhum → cai no fallback (wake/provision por plano)
 
     machines = await supa.list_running_machines_for_plan(effective_plan)
     if not machines:
@@ -1354,6 +1416,15 @@ async def maybe_touch(stack_id: str, machine_id: str | None = None):
             await supa.touch_machine_activity(machine_id)
         except Exception:
             pass
+    # atividade por stack (relógio de ociosidade do modelo base) — mantém a
+    # stack "fresca" pra não ser reapada; vale pra base E LoRA, já que a stack
+    # LoRA também tem stacks.machine_id como casa de fallback
+    if now - last_stack_touch.get(stack_id, 0) >= TOUCH_THROTTLE_S:
+        last_stack_touch[stack_id] = now
+        try:
+            await supa.touch_stack_activity(stack_id)
+        except Exception:
+            pass  # touch é best-effort, nunca derruba o request
 
 
 async def embed_query(text: str) -> list[float] | None:

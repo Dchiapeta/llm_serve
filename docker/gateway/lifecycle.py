@@ -163,6 +163,47 @@ class LifecycleManager:
                 logger.warning("idle reaper: unload da stack %s falhou (%s) — mantém loaded", stack_id, e)
         return reaped
 
+    async def reap_idle_base_stacks_once(self) -> list[str]:
+        """Libera a "casa" de stacks de MODELO BASE ociosas (stacks.machine_id
+        → NULL), liberando a vaga ponderada da máquina pros demais. Ao contrário
+        do reap_idle_once (LoRA), NÃO chama o agent: o modelo base segue
+        carregado pros co-tenants, liberar é só contábil. Na próxima request a
+        stack é re-alocada por place_base_stack (main.py). Retorna as stacks
+        liberadas."""
+        if self.idle_unload_minutes <= 0:
+            return []
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.idle_unload_minutes)
+        stacks = await self.supa.list_idle_base_stacks(cutoff.isoformat())
+        released: list[str] = []
+        for s in stacks:
+            stack_id, machine_id = s["id"], s["machine_id"]
+            if not machine_id:
+                continue
+            # nunca libera com request em voo (inclui streams longos) — fica pro
+            # próximo ciclo; in_flight é chaveado por (stack_id, machine_id)
+            if self._in_flight_count(stack_id, machine_id) > 0:
+                continue
+            try:
+                # condicional na origem: 0 linhas = request concorrente já
+                # re-homeou/moveu a stack, então nada a fazer
+                if await self.supa.release_base_stack(stack_id, machine_id):
+                    released.append(stack_id)
+                    logger.info(
+                        "idle reaper: stack base %s liberada de %s", stack_id, machine_id
+                    )
+                    try:
+                        await self.supa.log_machine_event(
+                            machine_id, "stack_released",
+                            f"Stack {stack_id} liberada por ociosidade (vaga base livre)",
+                        )
+                    except Exception:
+                        pass  # histórico é best-effort
+            except Exception as e:
+                logger.warning(
+                    "idle reaper: liberar stack base %s falhou (%s)", stack_id, e
+                )
+        return released
+
     async def idle_reaper_loop(self, interval_s: float = 60.0):
         while True:
             await asyncio.sleep(interval_s)
@@ -170,6 +211,10 @@ class LifecycleManager:
                 await self.reap_idle_once()
             except Exception as e:
                 logger.warning("idle reaper: ciclo falhou (%s)", e)
+            try:
+                await self.reap_idle_base_stacks_once()
+            except Exception as e:
+                logger.warning("idle reaper (base): ciclo falhou (%s)", e)
 
     # ---------- Migração ativa ----------
 

@@ -20,7 +20,7 @@ import {
 } from "@/components/ui/card"
 import { CapacityBar } from "@/components/machines/capacity-bar"
 import { StatusBadge } from "@/components/machines/status-badge"
-import { UsageDonut } from "@/components/dashboard/usage-donut"
+import { UsageDistribution } from "@/components/dashboard/usage-distribution"
 import { PeriodSwitch } from "@/components/dashboard/period-switch"
 
 export const dynamic = "force-dynamic"
@@ -47,7 +47,8 @@ export default async function DashboardPage({
 
   const db = createSupabaseAdmin()
   const periodMs = PERIOD_MS[period]
-  const since = periodMs ? new Date(Date.now() - periodMs).toISOString() : null
+  const now = Date.now()
+  const since = periodMs ? new Date(now - periodMs).toISOString() : null
 
   const [
     { data: machinesData },
@@ -132,6 +133,72 @@ export default async function DashboardPage({
       requests,
     }))
     .sort((a, b) => b.requests - a.requests)
+
+  // Histograma de tokens ao longo do tempo. A granularidade segue o período:
+  // 24h → barras por hora; 7d/total → barras por dia. Buckets contíguos
+  // (incluindo zeros) para barras uniformes. Fuso fixo do Brasil (sem DST
+  // desde 2019) para que "hora a hora" bata com o relógio do usuário,
+  // independente do fuso do server (Railway/UTC).
+  const TZ = "America/Sao_Paulo"
+  const granularity = period === "24h" ? "hour" : "day"
+  const partsFmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    hourCycle: "h23",
+  })
+  const partsOf = (ms: number) =>
+    Object.fromEntries(
+      partsFmt.formatToParts(new Date(ms)).map((p) => [p.type, p.value])
+    ) as Record<string, string>
+  const keyOf = (ms: number) => {
+    const p = partsOf(ms)
+    return granularity === "hour"
+      ? `${p.year}-${p.month}-${p.day}-${p.hour}`
+      : `${p.year}-${p.month}-${p.day}`
+  }
+  const labelOf = (ms: number) => {
+    const p = partsOf(ms)
+    return granularity === "hour" ? `${p.hour}h` : `${p.day}/${p.month}`
+  }
+
+  const HOUR_MS = 60 * 60 * 1000
+  const DAY_MS = 24 * HOUR_MS
+  const step = granularity === "hour" ? HOUR_MS : DAY_MS
+  let bucketCount: number
+  if (granularity === "hour") {
+    bucketCount = 24
+  } else if (period === "7d") {
+    bucketCount = 7
+  } else if (usage.length === 0) {
+    bucketCount = 1
+  } else {
+    const earliest = Math.min(
+      ...usage.map((u) => new Date(u.window_start).getTime())
+    )
+    const days = Math.floor((now - earliest) / DAY_MS) + 1
+    if (days > 30) {
+      console.warn(
+        `[dashboard] histograma "total" com ${days} dias — exibindo só os últimos 30`
+      )
+    }
+    bucketCount = Math.min(30, Math.max(1, days))
+  }
+
+  const tokensByBucket = new Map<string, number>()
+  for (const u of usage) {
+    const k = keyOf(new Date(u.window_start).getTime())
+    tokensByBucket.set(
+      k,
+      (tokensByBucket.get(k) ?? 0) + u.tokens_in + u.tokens_out
+    )
+  }
+  const histogramData = Array.from({ length: bucketCount }, (_, i) => {
+    const ms = now - (bucketCount - 1 - i) * step
+    return { label: labelOf(ms), tokens: tokensByBucket.get(keyOf(ms)) ?? 0 }
+  })
 
   const kpis = [
     {
@@ -245,11 +312,15 @@ export default async function DashboardPage({
           <CardHeader>
             <CardTitle>Distribuição de uso</CardTitle>
             <CardDescription>
-              Requisições por máquina — {PERIOD_LABELS[period]}
+              Requisições por máquina ou tokens no tempo —{" "}
+              {PERIOD_LABELS[period]}
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <UsageDonut data={donutData} />
+            <UsageDistribution
+              donutData={donutData}
+              histogramData={histogramData}
+            />
           </CardContent>
         </Card>
       </div>
