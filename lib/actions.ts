@@ -643,7 +643,11 @@ export async function refreshMachineStatus(machineId: string) {
       EXITED: "stopped",
       TERMINATED: "terminated",
     }
-    const status = statusMap[pod.desiredStatus] ?? m.status
+    const mapped = statusMap[pod.desiredStatus] ?? m.status
+    // Máquina recém-criada pode reportar EXITED por instantes até o container
+    // subir — não a rebaixamos para "stopped" (senão apareceria pausada durante
+    // o boot). Só RUNNING a promove e TERMINATED a encerra.
+    const status = m.status === "creating" && mapped === "stopped" ? "creating" : mapped
     await db
       .from("machines")
       .update({ status, cost_per_hr: pod.costPerHr ?? m.cost_per_hr })
@@ -810,6 +814,25 @@ export async function recreateMachine(
     }
     return {
       error: `O pod antigo foi terminado, mas a criação do novo falhou: ${msg}. Tente recriar de novo.`,
+    }
+  }
+
+  // A RunPod devolve o pod recém-criado parado (EXITED); sem um start
+  // explícito ele nunca sai do "pausado" e o reconciler o marcaria como
+  // stopped. Diferente de um pod pausado antigo (cujo host pode ter cedido a
+  // GPU), o host do pod recém-criado ainda tem a GPU reservada, então o start
+  // sobe. Best-effort: o pod já existe, então uma falha aqui não aborta a
+  // recriação — a máquina fica em "creating" e a sonda de /health cobre.
+  if (pod.desiredStatus !== "RUNNING") {
+    try {
+      await runpod.startPod(pod.id)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      await logEvent(
+        machineId,
+        "error",
+        `Start pós-recriação do pod ${pod.id} falhou: ${msg}`
+      )
     }
   }
 

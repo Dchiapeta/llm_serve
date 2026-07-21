@@ -98,7 +98,12 @@ export async function reconcileMachineStatuses(
       return { ...m, status: "terminated" as const }
     }
 
-    const status = POD_STATUS_MAP[pod.desiredStatus] ?? m.status
+    const mapped = POD_STATUS_MAP[pod.desiredStatus] ?? m.status
+    // Máquina recém-criada pode reportar EXITED por instantes antes de o
+    // container subir — não a rebaixamos para "stopped" (apareceria pausada
+    // durante o boot). Só RUNNING a promove e TERMINATED a encerra; espelha o
+    // guard do pod ausente acima.
+    const status = m.status === "creating" && mapped === "stopped" ? "creating" : mapped
     const cost = pod.costPerHr ?? m.cost_per_hr
     return { ...m, status, cost_per_hr: cost }
   })
