@@ -178,6 +178,11 @@ PROVISION_COOLDOWN_S = float(os.environ.get("PROVISION_COOLDOWN_S", "180"))
 # criar+subir é mais lento que só religar (pode incluir pull de imagem e
 # download de pesos do zero num host novo) — Retry-After maior que o do wake
 PROVISION_RETRY_AFTER_S = float(os.environ.get("PROVISION_RETRY_AFTER_S", "120"))
+# recriação (delete + create + start num host novo): destrutiva e cara, então
+# cooldown por máquina mais folgado que o do wake. Retry-After alinhado ao do
+# provisionamento (é o mesmo custo de subir um pod do zero).
+RECREATE_COOLDOWN_S = float(os.environ.get("RECREATE_COOLDOWN_S", "300"))
+RECREATE_RETRY_AFTER_S = float(os.environ.get("RECREATE_RETRY_AFTER_S", "120"))
 # soma mínima de slots livres do plano (running + a capacidade cheia de uma
 # reserva pausada) — abaixo disso, o loop proativo cria+pausa uma máquina nova
 MACHINE_POOL_WATERMARK_SLOTS = float(os.environ.get("MACHINE_POOL_WATERMARK_SLOTS", "5"))
@@ -248,6 +253,13 @@ realloc_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 # concorrentes pro mesmo plano) e última tentativa (cooldown)
 provisioning_in_progress: set[str] = set()
 last_provision_attempt: dict[str, float] = {}
+
+# recriação automática: máquina -> recriação em andamento (trava contra
+# requests concorrentes recriarem o mesmo pod) e última tentativa (cooldown).
+# Disparada quando o auto-wake falha por "not enough free GPUs" — o host cedeu
+# a GPU do pod pausado e só recriar num host novo o traz de volta.
+recreating_in_progress: set[str] = set()
+last_recreate_attempt: dict[str, float] = {}
 
 logger = logging.getLogger("gateway")
 
@@ -782,25 +794,36 @@ async def auto_provision_enabled() -> bool:
     return value
 
 
-async def wake_machine(machine: dict, reason: str) -> bool:
+async def wake_machine(machine: dict, reason: str) -> str:
     """Religa um pod pausado (startPod) e o devolve ao pool de roteamento.
+
+    Retorna: 'woke' = startPod disparado agora; 'cooldown' = tentativa recente
+    ainda no cooldown (não tenta de novo); 'no_gpu' = o host cedeu a GPU e o
+    start é impossível até recriar o pod (o chamador dispara a recriação);
+    'failed' = falha por outro motivo (ou sem runpod_client/pod).
 
     O touch de atividade vem ANTES do flip para running: sem ele, o
     last_activity_at velho faria a auto-pausa parar a máquina de novo no
     próximo ciclo, enquanto o vLLM ainda carrega o modelo."""
     if runpod_client is None or not machine.get("runpod_pod_id"):
-        return False
+        return "failed"
     now = time.time()
     if now - last_wake_attempt.get(machine["id"], 0) < WAKE_COOLDOWN_S:
-        return False
+        return "cooldown"
     # marca a tentativa antes do primeiro await — atômico dentro do event loop
     last_wake_attempt[machine["id"]] = now
     try:
         await runpod_client.start_pod(machine["runpod_pod_id"])
     except Exception as e:
-        # ex.: "not enough free GPUs" — host cedeu a GPU; o chamador tenta outra
+        if "not enough free GPUs" in str(e):
+            # host cedeu a GPU do pod pausado — religar nunca vai funcionar,
+            # o chamador precisa recriar o pod num host novo
+            logger.warning(
+                "auto-wake: %s sem GPU no host, requer recriação (%s)", machine["id"], e
+            )
+            return "no_gpu"
         logger.warning("auto-wake: startPod de %s falhou (%s)", machine["id"], e)
-        return False
+        return "failed"
     try:
         await supa.touch_machine_activity(machine["id"])
     except Exception:
@@ -818,21 +841,42 @@ async def wake_machine(machine: dict, reason: str) -> bool:
         "auto-wake: máquina %s (pod %s) religada — %s",
         machine["id"], machine["runpod_pod_id"], reason,
     )
-    return True
+    return "woke"
 
 
 async def wake_some_machine_for_plan(plan: str) -> str:
-    """Religa a primeira máquina pausada do template do plano que aceitar o
-    start. Só é chamado quando não há NENHUMA máquina running com vaga.
+    """Tenta pôr de pé alguma máquina pausada do template do plano. Só é chamado
+    quando não há NENHUMA máquina running com vaga.
 
-    Retorna: 'woke' = despausou agora; 'waking' = há pausada mas o startPod não
-    saiu agora (cooldown de um wake recente / host sem GPU) — ou seja, uma já
-    está subindo, o cliente deve reintentar; 'none' = não há pausada nenhuma."""
+    Cascata por máquina pausada: religa (startPod); se o host cedeu a GPU
+    ('no_gpu'), dispara a recriação num host novo. Retorna:
+      - 'woke'      : despausou uma agora → cliente reintenta (religando);
+      - 'recreating': nenhuma religou, mas disparamos/já há uma recriação →
+                      cliente reintenta (recriando);
+      - 'waking'    : há pausada subindo (cooldown de um wake recente bem
+                      encaminhado), cliente reintenta;
+      - 'none'      : não há pausada nenhuma (chamador decide provisionar)."""
     stopped = await supa.list_stopped_machines_for_plan(plan)
+    if not stopped:
+        return "none"
+    recreating = False
+    waking = False
     for m in stopped:
-        if await wake_machine(m, "requisição recebida sem máquina disponível"):
+        if m["id"] in recreating_in_progress:
+            recreating = True
+            continue
+        outcome = await wake_machine(m, "requisição recebida sem máquina disponível")
+        if outcome == "woke":
             return "woke"
-    return "waking" if stopped else "none"
+        if outcome == "no_gpu":
+            if await try_recreate_machine(m, "host sem GPU pra religar sob demanda"):
+                recreating = True
+        elif outcome == "cooldown":
+            # tentativa recente; se não caiu em recreate, tratamos como subindo
+            waking = True
+    if recreating:
+        return "recreating"
+    return "waking" if waking else "none"
 
 
 def waking_503() -> HTTPException:
@@ -850,6 +894,15 @@ def provisioning_503() -> HTTPException:
         detail="Estamos preparando uma máquina nova para você — ficará pronta em "
         "instantes. Tente novamente em alguns segundos.",
         headers={"Retry-After": str(int(PROVISION_RETRY_AFTER_S))},
+    )
+
+
+def recreating_503() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="Estamos recriando sua máquina e ela ficará pronta em instantes. "
+        "Tente novamente em alguns segundos.",
+        headers={"Retry-After": str(int(RECREATE_RETRY_AFTER_S))},
     )
 
 
@@ -885,6 +938,69 @@ async def provision_machine_for_plan(plan: str) -> dict | None:
         )
         return None
     return r.json()
+
+
+async def recreate_machine_via_panel(machine_id: str) -> dict | None:
+    """POST {PANEL_URL}/api/machines/{id}/recreate — pede ao painel pra recriar
+    o pod num host novo (delete + create + start), mantendo a MESMA row de
+    machines (stacks/chaves seguem apontando pra ela). Usado quando o auto-wake
+    falhou por 'not enough free GPUs'. None em qualquer falha (painel desligado/
+    fora do ar, timeout, recusa) — o chamador decide o fallback."""
+    if not PANEL_URL or not PANEL_ADMIN_SECRET:
+        return None
+    try:
+        r = await panel_client.post(
+            f"{PANEL_URL}/api/machines/{machine_id}/recreate",
+            headers={"X-Admin-Secret": PANEL_ADMIN_SECRET},
+        )
+    except httpx.HTTPError as e:
+        logger.warning("recriação: chamada ao painel (%s) falhou (%s)", machine_id, e)
+        return None
+    if r.status_code != 200:
+        logger.warning(
+            "recriação: painel recusou %s (%s): %s", machine_id, r.status_code, r.text
+        )
+        return None
+    return r.json()
+
+
+async def _recreate_and_track(machine_id: str, reason: str) -> None:
+    """Task de background: recria o pod e libera a trava ao fim. O request que
+    disparou já respondeu 503 + Retry-After; o cliente reconverge quando o pod
+    novo sobe (a reconciliação do gateway reenvia as chaves ao ficar running)."""
+    try:
+        result = await recreate_machine_via_panel(machine_id)
+        if result is None:
+            logger.warning("recriação de %s não completou (%s)", machine_id, reason)
+        else:
+            logger.info("recriação de %s disparada — %s", machine_id, reason)
+    finally:
+        recreating_in_progress.discard(machine_id)
+
+
+async def try_recreate_machine(machine: dict, reason: str) -> bool:
+    """Dispara a recriação em background se o painel estiver configurado, não
+    houver uma recriação em andamento pra essa máquina e o cooldown já tiver
+    passado. Retorna True se há recriação encaminhada (disparada agora, já em
+    andamento, ou recente dentro do cooldown) — o chamador levanta
+    recreating_503(). Não fica atrás de auto_provision_enabled: recriar restaura
+    uma máquina que o usuário já provisionou (o host cedeu a GPU), não cria
+    capacidade nova."""
+    machine_id = machine["id"]
+    if machine_id in recreating_in_progress:
+        return True
+    if not PANEL_URL or not PANEL_ADMIN_SECRET:
+        return False
+    now = time.time()
+    if now - last_recreate_attempt.get(machine_id, 0) < RECREATE_COOLDOWN_S:
+        # recriação recente já disparada — o pod novo está subindo
+        return True
+    # checagem + marcação sem await no meio (atômicas dentro do event loop,
+    # mesma disciplina do provisioning_in_progress)
+    last_recreate_attempt[machine_id] = now
+    recreating_in_progress.add(machine_id)
+    asyncio.create_task(_recreate_and_track(machine_id, reason))
+    return True
 
 
 async def _wait_machine_healthy(
@@ -1041,7 +1157,10 @@ async def pick_machine_with_free_slot(plan: str) -> dict:
     for m in machines:
         if await machine_free_slots(m) > 0:
             return m
-    if (await wake_some_machine_for_plan(plan)) != "none":
+    woke = await wake_some_machine_for_plan(plan)
+    if woke == "recreating":
+        raise recreating_503()
+    if woke != "none":
         raise waking_503()
     if plan in provisioning_in_progress or await try_provision_for_request(
         plan, "sem máquina com vaga nem pausada"
@@ -1280,18 +1399,27 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
                     return target, effective_plan
                 if status == "stopped":
                     slug = stack.get("slug") or stack["id"]
-                    if await wake_machine(
+                    if machine["id"] in recreating_in_progress:
+                        # recriação disparada por um request anterior ainda em
+                        # curso — o pod novo está subindo
+                        raise recreating_503()
+                    outcome = await wake_machine(
                         machine, f"stack {slug}: máquina pausada e sem vaga nas demais"
-                    ):
+                    )
+                    if outcome in ("woke", "cooldown"):
+                        # 'cooldown' = request concorrente já disparou o wake e o
+                        # pod está subindo — não religa uma 2ª máquina à toa
                         raise waking_503()
                     fresh = await supa.get_machine(machine["id"])
                     if fresh and fresh.get("status") == "running":
-                        # request concorrente religou primeiro (o cooldown fez
-                        # o wake_machine devolver False) — o pod ainda está
-                        # subindo, não religa uma 2ª máquina à toa
                         raise waking_503()
-                    # startPod falhou de verdade (ex.: host sem GPU) → segue
-                    # pro fallback por plano: serve temporário sem mover stack
+                    if outcome == "no_gpu" and await try_recreate_machine(
+                        machine, f"stack {slug}: host sem GPU pra religar"
+                    ):
+                        # host cedeu a GPU do pod pausado → recria num host novo
+                        raise recreating_503()
+                    # wake e recreate não resolveram → fallback por plano:
+                    # serve temporário sem mover o stack
     elif stack and not stack.get("machine_id"):
         # casa liberada por ociosidade (reap_idle_base_stacks zerou machine_id)
         # ou stack nunca homeada → re-aloca DE VEZ numa máquina do plano com
@@ -1304,7 +1432,10 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
 
     machines = await supa.list_running_machines_for_plan(effective_plan)
     if not machines:
-        if (await wake_some_machine_for_plan(effective_plan)) != "none":
+        woke = await wake_some_machine_for_plan(effective_plan)
+        if woke == "recreating":
+            raise recreating_503()  # host sem GPU → recriando num host novo
+        if woke != "none":
             raise waking_503()  # despausando agora ou uma já está subindo
         if effective_plan in provisioning_in_progress or await try_provision_for_request(
             effective_plan, "sem máquina para o modelo base"
