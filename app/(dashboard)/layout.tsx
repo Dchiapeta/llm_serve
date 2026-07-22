@@ -1,9 +1,13 @@
-import { Cpu } from "lucide-react"
+import { cookies } from "next/headers"
 
 import { createSupabaseServerClient } from "@/lib/supabase/server"
-import { Separator } from "@/components/ui/separator"
-import { SidebarNav } from "@/components/dashboard/sidebar-nav"
-import { SidebarUserMenu } from "@/components/dashboard/sidebar-user-menu"
+import { AppSidebar } from "@/components/dashboard/app-sidebar"
+import { ThemeToggle } from "@/components/dashboard/theme-toggle"
+import {
+  SidebarInset,
+  SidebarProvider,
+  SidebarTrigger,
+} from "@/components/ui/sidebar"
 
 export default async function DashboardLayout({
   children,
@@ -15,26 +19,19 @@ export default async function DashboardLayout({
     data: { user },
   } = await supabase.auth.getUser()
 
+  const cookieStore = await cookies()
+  const defaultOpen = cookieStore.get("sidebar_state")?.value !== "false"
+
   return (
-    <div className="flex min-h-screen">
-      <aside className="fixed inset-y-0 left-0 z-30 flex w-60 flex-col border-r bg-background p-4">
-        <div className="flex items-center gap-2 px-2 py-3">
-          <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <Cpu className="size-4" />
-          </div>
-          <div className="leading-tight">
-            <p className="text-sm font-semibold">LLM Manager</p>
-            <p className="text-xs text-muted-foreground">RunPod</p>
-          </div>
-        </div>
-        <Separator className="my-3" />
-        <SidebarNav />
-        <div className="mt-auto">
-          <Separator className="my-3" />
-          <SidebarUserMenu email={user?.email ?? "Conta"} />
-        </div>
-      </aside>
-      <main className="ml-60 flex-1 p-6 lg:p-8">{children}</main>
-    </div>
+    <SidebarProvider defaultOpen={defaultOpen}>
+      <AppSidebar email={user?.email ?? "Conta"} />
+      <SidebarInset>
+        <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
+          <SidebarTrigger className="-ml-1" />
+          <ThemeToggle className="ml-auto" />
+        </header>
+        <div className="flex-1 p-6 lg:p-8">{children}</div>
+      </SidebarInset>
+    </SidebarProvider>
   )
 }
