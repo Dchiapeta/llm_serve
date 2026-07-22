@@ -1,12 +1,12 @@
 "use client"
 
 import * as React from "react"
-import { MoreHorizontal, Pencil, Trash2 } from "lucide-react"
+import { Info, MoreHorizontal, Pencil, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { deleteTemplate } from "@/lib/actions"
 import type { GpuType } from "@/lib/runpod"
-import type { Template } from "@/lib/types"
+import type { Machine, Template } from "@/lib/types"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -26,14 +26,18 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { EditTemplateDialog } from "@/components/templates/edit-template-dialog"
+import { TemplateInfoDialog } from "@/components/templates/template-info-dialog"
 
 export function TemplateRowActions({
   template,
   gpus,
+  machines,
 }: {
   template: Template
   gpus: GpuType[]
+  machines: Machine[]
 }) {
+  const [infoOpen, setInfoOpen] = React.useState(false)
   const [editOpen, setEditOpen] = React.useState(false)
   const [deleteOpen, setDeleteOpen] = React.useState(false)
   const [pending, startTransition] = React.useTransition()
@@ -51,6 +55,10 @@ export function TemplateRowActions({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
+          <DropdownMenuItem onSelect={() => setInfoOpen(true)}>
+            <Info className="size-4" />
+            Info
+          </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setEditOpen(true)}>
             <Pencil className="size-4" />
             Editar
@@ -65,6 +73,13 @@ export function TemplateRowActions({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+
+      <TemplateInfoDialog
+        template={template}
+        machines={machines}
+        open={infoOpen}
+        onOpenChange={setInfoOpen}
+      />
 
       <EditTemplateDialog
         template={template}

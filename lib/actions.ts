@@ -1994,3 +1994,85 @@ export async function migrateStackToMachine(stackId: string, targetMachineId: st
   revalidatePath(`/machines/${targetMachineId}`)
 }
 
+export type MachineInfoDetails = {
+  people: number
+  stacks: number
+  tokensIn: number
+  tokensOut: number
+  requests: number
+  lastStartedAt: string | null
+}
+
+// Janela para "pessoas agora": chaves com requisição neste intervalo contam
+// como ativas. O gateway grava usage_metrics a cada METRICS_COLLECTION_INTERVAL_S
+// (120s) e só para chaves com requests>0, então 5 min cobre ~2-3 coletas — é o
+// "agora" mais fino que dá para ler do banco (a concorrência viva, in_flight,
+// só existe em memória no gateway e não é persistida).
+const PEOPLE_NOW_WINDOW_MS = 5 * 60_000
+
+// Detalhes sob demanda de uma máquina (usado no expand do dialog de Info do
+// produto): pessoas = chaves ativas nos últimos minutos, uso somado de
+// usage_metrics por machine_id, e lastStartedAt do RunPod para o "tempo ligado".
+// Só é chamado ao expandir uma máquina, então o load da página de produtos não
+// ganha nenhuma chamada extra.
+export async function getMachineInfoDetails(
+  machineId: string
+): Promise<MachineInfoDetails> {
+  const db = createSupabaseAdmin()
+
+  const [machineRes, stacksRes, usageRes] = await Promise.all([
+    db.from("machines").select("runpod_pod_id").eq("id", machineId).single(),
+    db
+      .from("stacks")
+      .select("id", { count: "exact", head: true })
+      .eq("machine_id", machineId),
+    db
+      .from("usage_metrics")
+      .select("api_key_id, tokens_in, tokens_out, requests, window_start")
+      .eq("machine_id", machineId),
+  ])
+
+  const usage = (usageRes.data ?? []) as {
+    api_key_id: string | null
+    tokens_in: number
+    tokens_out: number
+    requests: number
+    window_start: string
+  }[]
+  const since = Date.now() - PEOPLE_NOW_WINDOW_MS
+  const activeKeys = new Set<string>()
+  let tokensIn = 0
+  let tokensOut = 0
+  let requests = 0
+  for (const u of usage) {
+    tokensIn += u.tokens_in
+    tokensOut += u.tokens_out
+    requests += u.requests
+    if (u.api_key_id && new Date(u.window_start).getTime() >= since) {
+      activeKeys.add(u.api_key_id)
+    }
+  }
+
+  // lastStartedAt vem do RunPod; best-effort — se a chamada falhar (rede, pod
+  // já apagado), o resto dos dados ainda volta e o "tempo ligado" fica "—".
+  let lastStartedAt: string | null = null
+  const podId = machineRes.data?.runpod_pod_id
+  if (podId) {
+    try {
+      const pod = await runpod.getPod(podId)
+      lastStartedAt = pod.lastStartedAt ?? null
+    } catch {
+      // ignora — mantém lastStartedAt null
+    }
+  }
+
+  return {
+    people: activeKeys.size,
+    stacks: stacksRes.count ?? 0,
+    tokensIn,
+    tokensOut,
+    requests,
+    lastStartedAt,
+  }
+}
+

@@ -8,14 +8,9 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
-import { CopyableId } from "@/components/contas/copyable-id"
+  UsuariosTable,
+  type UsuarioRow,
+} from "@/components/contas/usuarios-table"
 
 export const dynamic = "force-dynamic"
 
@@ -69,6 +64,16 @@ export default async function ContasPage() {
     usageByAccount.set(accountId, agg)
   }
 
+  const rows: UsuarioRow[] = accounts.map((account) => ({
+    id: account.id,
+    name: account.name,
+    email: account.email ?? null,
+    stacks: stackCountByAccount.get(account.id) ?? 0,
+    tokens: usageByAccount.get(account.id)?.tokens ?? 0,
+    requests: usageByAccount.get(account.id)?.requests ?? 0,
+    createdAt: account.created_at,
+  }))
+
   return (
     <div className="flex flex-col gap-6">
       <div>
@@ -84,60 +89,7 @@ export default async function ContasPage() {
           <CardDescription>{accounts.length} conta(s)</CardDescription>
         </CardHeader>
         <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>ID</TableHead>
-                <TableHead>Nome</TableHead>
-                <TableHead>E-mail</TableHead>
-                <TableHead>Stacks</TableHead>
-                <TableHead>Tokens</TableHead>
-                <TableHead>Requests</TableHead>
-                <TableHead>Criada em</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {accounts.length === 0 && (
-                <TableRow>
-                  <TableCell
-                    colSpan={7}
-                    className="text-center text-muted-foreground"
-                  >
-                    Nenhuma conta ainda.
-                  </TableCell>
-                </TableRow>
-              )}
-              {accounts.map((account) => (
-                <TableRow key={account.id}>
-                  <TableCell>
-                    <CopyableId value={account.id} />
-                  </TableCell>
-                  <TableCell className="text-sm font-medium">
-                    {account.name}
-                  </TableCell>
-                  <TableCell className="text-sm text-muted-foreground">
-                    {account.email ?? "—"}
-                  </TableCell>
-                  <TableCell className="text-sm tabular-nums">
-                    {stackCountByAccount.get(account.id) ?? 0}
-                  </TableCell>
-                  <TableCell className="text-sm tabular-nums">
-                    {(usageByAccount.get(account.id)?.tokens ?? 0).toLocaleString(
-                      "pt-BR"
-                    )}
-                  </TableCell>
-                  <TableCell className="text-sm tabular-nums">
-                    {(
-                      usageByAccount.get(account.id)?.requests ?? 0
-                    ).toLocaleString("pt-BR")}
-                  </TableCell>
-                  <TableCell className="text-sm">
-                    {new Date(account.created_at).toLocaleDateString("pt-BR")}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+          <UsuariosTable rows={rows} />
         </CardContent>
       </Card>
     </div>
