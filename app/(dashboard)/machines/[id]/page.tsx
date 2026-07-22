@@ -388,8 +388,9 @@ export default async function MachineDetailPage({
             <CardHeader>
               <CardTitle>Como usar</CardTitle>
               <CardDescription>
-                Exemplos de requisição via gateway (terminal e Claude Code CLI) — o
-                gateway roteia para a máquina certa e religa pods pausados
+                Exemplos de integração via gateway (terminal, SDKs e ferramentas de
+                código) — o gateway roteia para a máquina certa e religa pods
+                pausados. Material entregável ao cliente em <code>docs/integracao.md</code>
               </CardDescription>
             </CardHeader>
             <CardContent>

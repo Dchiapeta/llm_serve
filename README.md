@@ -54,14 +54,20 @@ npm run dev
 1. **Templates** → criar template (imagem, modelo, GPUs, parâmetros de capacidade)
 2. **Máquinas** → nova máquina (template + GPU) — cria o pod no RunPod
 3. **Contas & Chaves** → criar conta e gerar chave HEX (exibida uma única vez)
-4. O usuário chama a LLM:
+4. O usuário chama a LLM **sempre pelo gateway**, nunca pelo proxy do pod — só o
+   gateway roteia para a máquina certa, realoca stacks e religa pods pausados:
 
 ```bash
-curl https://<pod-id>-8000.proxy.runpod.net/v1/chat/completions \
+curl https://llmserve-docker.up.railway.app/v1/chat/completions \
   -H "Authorization: Bearer <chave-hex>" \
   -H "Content-Type: application/json" \
-  -d '{"model": "Qwen/Qwen2.5-7B-Instruct", "messages": [{"role": "user", "content": "Olá"}]}'
+  -d '{"model": "qualquer-valor", "max_tokens": 8000, "messages": [{"role": "user", "content": "Olá"}]}'
 ```
+
+O campo `model` é livre: o gateway o reescreve para o modelo do plano em toda
+request. O endpoint é compatível com as APIs da OpenAI e da Anthropic — o guia
+de integração entregável ao cliente (SDKs Python/JS, Claude Code, Codex, Cursor,
+limites e retry) está em [docs/integracao.md](docs/integracao.md).
 
 5. **Dashboard** → alocação de capacidade, distribuição de uso e atividade;
    detalhe da máquina mostra slots, uso por conta, logs e variáveis, com ações
