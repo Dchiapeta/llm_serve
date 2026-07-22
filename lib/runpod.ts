@@ -2,6 +2,8 @@
 // REST (rest.runpod.io/v1): pods e templates.
 // GraphQL (api.runpod.io/graphql): tipos de GPU (não exposto na REST).
 
+import { unstable_cache } from "next/cache"
+
 const REST_BASE = "https://rest.runpod.io/v1"
 const GRAPHQL_URL = "https://api.runpod.io/graphql"
 
@@ -134,7 +136,7 @@ export type GpuType = {
   communityPrice: number | null
 }
 
-export async function listGpuTypes(): Promise<GpuType[]> {
+async function fetchGpuTypes(): Promise<GpuType[]> {
   const res = await fetch(GRAPHQL_URL, {
     method: "POST",
     headers: {
@@ -151,6 +153,16 @@ export async function listGpuTypes(): Promise<GpuType[]> {
   if (data.errors?.length) throw new Error(data.errors[0].message)
   return data.data.gpuTypes
 }
+
+// Os tipos de GPU do RunPod praticamente não mudam, mas eram refetchados a cada
+// navegação para /machines e /templates (a página é force-dynamic). Cacheamos no
+// Data Cache por 1h — independente do modo da rota — para tirar essa chamada
+// externa do caminho crítico. Invalidável por revalidateTag("gpu-types").
+export const listGpuTypes: () => Promise<GpuType[]> = unstable_cache(
+  fetchGpuTypes,
+  ["runpod-gpu-types"],
+  { revalidate: 3600, tags: ["gpu-types"] }
+)
 
 // URL pública do proxy do RunPod para uma porta do pod
 export function podProxyUrl(podId: string, port: number): string {

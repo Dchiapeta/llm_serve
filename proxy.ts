@@ -32,9 +32,13 @@ export async function proxy(request: NextRequest) {
     }
   )
 
+  // getClaims valida o JWT localmente (via JWKS) quando o projeto usa signing
+  // keys assimétricas — sem round-trip ao Supabase Auth a cada navegação. Com
+  // HS256 faz fallback seguro para getUser(); nunca confia num JWT não validado.
   const {
-    data: { user },
-  } = await supabase.auth.getUser()
+    data: claims,
+  } = await supabase.auth.getClaims()
+  const user = claims?.claims ?? null
 
   const { pathname } = request.nextUrl
   const isAuthPage =

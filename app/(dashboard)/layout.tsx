@@ -15,16 +15,18 @@ export default async function DashboardLayout({
   children: React.ReactNode
 }) {
   const supabase = await createSupabaseServerClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  // Só precisamos do email para exibir; getClaims lê do JWT (sem round-trip
+  // quando há signing keys assimétricas). A proteção da rota já é feita no
+  // middleware (proxy.ts).
+  const { data: claims } = await supabase.auth.getClaims()
+  const email = (claims?.claims?.email as string | undefined) ?? "Conta"
 
   const cookieStore = await cookies()
   const defaultOpen = cookieStore.get("sidebar_state")?.value !== "false"
 
   return (
     <SidebarProvider defaultOpen={defaultOpen}>
-      <AppSidebar email={user?.email ?? "Conta"} />
+      <AppSidebar email={email} />
       <SidebarInset>
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />

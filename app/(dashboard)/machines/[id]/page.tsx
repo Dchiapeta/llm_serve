@@ -1,10 +1,10 @@
 import Link from "next/link"
 import { notFound } from "next/navigation"
+import { Suspense } from "react"
 import { ExternalLink } from "lucide-react"
 
 import { computeCapacity, computeLoraCapacity, stackWeight } from "@/lib/capacity"
 import {
-  machineDisplayStatus,
   parseServedModelName,
   reconcileMachineStatuses,
 } from "@/lib/machines"
@@ -35,6 +35,8 @@ import { CapacityBar } from "@/components/machines/capacity-bar"
 import { MachineAbout } from "@/components/machines/machine-about"
 import { MachineActions } from "@/components/machines/machine-actions"
 import { StatusBadge } from "@/components/machines/status-badge"
+
+import { LiveStatusBadge } from "../live-status-badge"
 
 export const dynamic = "force-dynamic"
 
@@ -68,7 +70,6 @@ export default async function MachineDetailPage({
 
   // Reflete o estado real do RunPod já no carregamento (não só via botão).
   const [machine] = await reconcileMachineStatuses([machineData], db)
-  const displayStatus = await machineDisplayStatus(machine)
 
   const [
     { data: tplData },
@@ -181,7 +182,9 @@ export default async function MachineDetailPage({
         <div>
           <div className="flex items-center gap-3">
             <h1 className="text-2xl font-semibold">{machine.name}</h1>
-            <StatusBadge status={displayStatus} />
+            <Suspense fallback={<StatusBadge status={machine.status} />}>
+              <LiveStatusBadge machine={machine} />
+            </Suspense>
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
             {machine.gpu_type} · {machine.model_name ?? "sem modelo"} ·{" "}
