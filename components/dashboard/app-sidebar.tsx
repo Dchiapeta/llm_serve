@@ -16,6 +16,7 @@ import {
   Server,
   Sun,
   Users,
+  Wallet,
 } from "lucide-react"
 import { useTheme } from "next-themes"
 
@@ -48,7 +49,12 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar"
 
-const dashboardItem = { href: "/", label: "Dashboard", icon: LayoutDashboard }
+// Dashboard usa comparação exata no isActive (todo path começa com "/");
+// os demais itens do grupo casam por prefixo, como os de navGroups.
+const topItems = [
+  { href: "/", label: "Dashboard", icon: LayoutDashboard, exact: true },
+  { href: "/financeiro", label: "Financeiro", icon: Wallet, exact: false },
+]
 
 const navGroups = [
   {
@@ -99,18 +105,24 @@ export function AppSidebar({
       <SidebarContent>
         <SidebarGroup>
           <SidebarMenu>
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                asChild
-                isActive={pathname === dashboardItem.href}
-                tooltip={dashboardItem.label}
-              >
-                <Link href={dashboardItem.href}>
-                  <dashboardItem.icon />
-                  <span>{dashboardItem.label}</span>
-                </Link>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
+            {topItems.map((item) => (
+              <SidebarMenuItem key={item.href}>
+                <SidebarMenuButton
+                  asChild
+                  isActive={
+                    item.exact
+                      ? pathname === item.href
+                      : pathname.startsWith(item.href)
+                  }
+                  tooltip={item.label}
+                >
+                  <Link href={item.href}>
+                    <item.icon />
+                    <span>{item.label}</span>
+                  </Link>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            ))}
           </SidebarMenu>
         </SidebarGroup>
 
