@@ -280,7 +280,7 @@ class SupaClient:
             params={
                 "status": "in.(creating,running,stopped)",
                 "runpod_pod_id": "not.is.null",
-                "select": "id,status,runpod_pod_id",
+                "select": "id,status,runpod_pod_id,public_url",
             },
         )
         r.raise_for_status()

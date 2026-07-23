@@ -40,6 +40,7 @@ class LifecycleManager:
         pool_watermark_slots: float = 5.0,
         auto_provision_enabled=None,
         on_machine_running=None,
+        vllm_health_check=None,
         try_recreate_machine=None,
         pending_recreates=None,
     ):
@@ -65,6 +66,11 @@ class LifecycleManager:
         # promovida a running (ex.: religada pelo console do RunPod) — main.py
         # usa pra agendar o reenvio de chaves ao agent, que reinicia zerado
         self.on_machine_running = on_machine_running
+        # gate de prontidão do vLLM para a reconciliação de status: só promove a
+        # máquina a 'running' quando o /health do agent reporta vllm_ready.
+        # Injetado por main.py (check_vllm_health). None em testes → sem gate
+        # (comportamento antigo: promove assim que o pod do RunPod fica RUNNING).
+        self.vllm_health_check = vllm_health_check
         # recriação de máquina presa (host sem GPU): try_recreate_machine é o
         # mesmo callback do caminho reativo (main.py) — cooldown/trava
         # compartilhados. pending_recreates é a fila (set) que o reativo popula;
@@ -437,6 +443,27 @@ class LifecycleManager:
             if new_status == m["status"]:
                 continue
             if new_status == "running":
+                # Só promove a 'running' quando o vLLM está REALMENTE pronto pra
+                # servir. O pod do RunPod fica RUNNING (contêiner) assim que sobe,
+                # mas o modelo ainda leva minutos/dezenas de minutos carregando
+                # (download + compile + captura de CUDA graph). Promover cedo faz
+                # o relógio de ociosidade (last_activity_at, zerado logo abaixo)
+                # começar no meio do boot, e a auto-pausa (stop_idle_machines_once,
+                # que filtra status=running) mata a máquina antes de ela servir —
+                # foi o que derrubou o 1º pod do Pro 2×A40 (boot > 30 min). Enquanto
+                # o vLLM está vivo mas não-ready, mantém em creating/stopped
+                # (invisível ao reaper). Crash (vllm_alive=false) ou /health
+                # inacessível caem no comportamento antigo (promove; o reaper
+                # reclama depois) pra não deixar pod preso cobrando GPU.
+                if self.vllm_health_check is not None:
+                    health = await self.vllm_health_check(m)
+                    loading = (
+                        health is not None
+                        and not health.get("vllm_ready")
+                        and health.get("vllm_alive")
+                    )
+                    if loading:
+                        continue
                 # o relógio de ociosidade zera em QUALQUER promoção a running
                 # (creating→running ou stopped→running via console do RunPod):
                 # sem isso, uma máquina religada com last_activity_at velho é

@@ -411,6 +411,12 @@ function podInputFromTemplate(input: {
     ...(startCmd.length > 0 ? { dockerStartCmd: startCmd } : {}),
     env: {
       ...tpl.env,
+      // Token READ do HuggingFace do PAINEL (opcional), injetado em todo pod: o
+      // vLLM baixa o modelo autenticado e escapa do throttle anônimo do HF Hub
+      // (boot em minutos, não dezenas). Centralizado aqui — um lugar só, fora do
+      // env de cada template no banco. Vem depois de ...tpl.env pra sobrepor um
+      // valor herdado; huggingface_hub lê HF_TOKEN do ambiente sozinho.
+      ...(process.env.HF_TOKEN ? { HF_TOKEN: process.env.HF_TOKEN } : {}),
       MODEL_NAME: tpl.model_name,
       AGENT_ADMIN_SECRET: input.adminSecret,
       GPU_COUNT: String(gpuCount),

@@ -352,6 +352,7 @@ async def lifespan(app: FastAPI):
         pool_watermark_slots=MACHINE_POOL_WATERMARK_SLOTS,
         auto_provision_enabled=auto_provision_enabled,
         on_machine_running=handle_machine_running,
+        vllm_health_check=check_vllm_health,
         try_recreate_machine=try_recreate_machine,
         pending_recreates=pending_recreates,
     )
@@ -605,6 +606,27 @@ async def get_agent_metrics(machine: dict, reset: bool = True) -> dict | None:
             params={"reset": "true"} if reset else {},
             headers={"X-Admin-Secret": machine["admin_secret"]},
             timeout=httpx.Timeout(10.0, connect=5.0),
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+async def check_vllm_health(machine: dict) -> dict | None:
+    """GET /health do agent do pod (rota aberta, sem admin secret): devolve
+    {vllm_ready, vllm_alive, ...}. Usado pela reconciliação de status para só
+    promover a máquina a 'running' quando o vLLM está REALMENTE pronto — o pod
+    do RunPod fica RUNNING (contêiner de pé) minutos/dezenas de minutos antes de
+    o modelo terminar de carregar; promover cedo faz o relógio de ociosidade
+    começar durante o boot e a auto-pausa matar a máquina antes de servir.
+    None em qualquer falha (o chamador trata como 'não dá pra confirmar')."""
+    url = machine.get("public_url")
+    if not url:
+        return None
+    try:
+        r = await proxy_client.get(
+            f"{url}/health", timeout=httpx.Timeout(8.0, connect=5.0)
         )
         r.raise_for_status()
         return r.json()
