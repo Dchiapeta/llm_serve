@@ -39,14 +39,16 @@ config abaixo; falta recriar os pods e rodar os load tests.
 ### VibeCoder (A40 48GB, Qwen3.5-9B) — aplicado
 
 ```
---dtype bfloat16 --max-model-len 65536 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name vibecoder-base
+--dtype bfloat16 --max-model-len 131072 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name vibecoder-base
 ```
 
 - Janela nativa do Qwen3.5-9B é **262144** (config.json conferido) —
-  **sem YaRN/hf-overrides**, só a flag. Era 16384.
+  **sem YaRN/hf-overrides**, só a flag. Era 16384 → 65536 → **131072 (128k,
+  aplicado 23/07/2026)**; admissão mantida (kv_reserve 1.5, max_users 18).
 - KV fp8 do 9B = 64KB/token (32 camadas × 4 KV heads × 256 head_dim):
-  sessão de 64k ≈ 4,2 GB; pool ~22 GB ≈ **~340k tokens ≈ ~5 sessões
-  cheias** + leves.
+  pool ~22 GB ≈ **~340k tokens**; sessão cheia de 128k ≈ 8,4 GB ≈ **~2,6
+  sessões simultâneas** antes de preempção (era ~5 a 64k). Subir o teto não
+  consome mais VRAM — o pool é fixado pelo gpu-memory-utilization.
 - `kv_reserve_gb_per_user`: 1 → **1.5** (high = 4,5 GB ≈ uma sessão cheia;
   orçamento (48−20)/1.5 = 18 slots ponderados).
 - `--max-num-seqs 8`: ponto de partida; calibrar no load test.
@@ -127,15 +129,16 @@ Cuidado ao testar direto no pod (bypass do gateway): o idle-reaper não vê
 atividade e pode pausar a máquina no meio do teste — preferir sempre o
 gateway.
 
-## 5. Setup do usuário (onboarding — igual nos dois planos)
+## 5. Setup do usuário (onboarding — só o auto-compact difere entre planos)
 
 ```bash
 export ANTHROPIC_BASE_URL=https://llmserve-docker.up.railway.app
 export ANTHROPIC_AUTH_TOKEN=<sua chave do plano>
 export ANTHROPIC_MODEL=<alias do modelo do plano>
-# a janela real é 64k — sem isso o Claude Code assume 200k e só descobre o
-# limite quando o gateway recusa; com isso ele compacta sozinho antes
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=50000
+# sem isso o Claude Code assume 200k e só descobre o limite quando o gateway
+# recusa; com isso ele compacta sozinho antes. Valor = janela real do plano:
+# VibeCoder 128k -> 100000 ; Pro 64k -> 50000 (folga já embutida p/ a saída).
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000   # VibeCoder; no Pro use 50000
 ```
 
 Notas para o usuário:
@@ -144,9 +147,12 @@ Notas para o usuário:
   é o mecanismo suportado para compactar antes do limite real.
 - O gateway responde com erro claro quando o contexto estoura, com instrução
   de usar `/compact`.
-- Boas práticas na janela de 64k: CLAUDE.md do projeto enxuto, usar
-  subagents para pesquisa longa (contexto zerado), `/compact` manual em
-  sessões longas.
+- Codex CLI: o equivalente é `model_auto_compact_token_limit` no
+  `~/.codex/config.toml` (VibeCoder 100000, Pro 50000). NÃO usar
+  `model_context_window` (bug openai/codex#16068 quebra a compaction).
+- Boas práticas na janela do plano (VibeCoder 128k, Pro 64k): CLAUDE.md do
+  projeto enxuto, usar subagents para pesquisa longa (contexto zerado),
+  `/compact` manual em sessões longas.
 
 ## 6. O que protege os outros usuários
 

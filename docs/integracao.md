@@ -309,13 +309,16 @@ export ANTHROPIC_MODEL="vibecoder-base"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=50000
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000   # VibeCoder (janela 128k); no Pro use 50000 (janela 64k)
 claude
 ```
 
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` não é opcional: o Claude Code assume uma janela de
 200k e não tem como descobrir a real do seu plano. Sem essa variável ele só percebe o
 limite quando a chamada é recusada; com ela, compacta a conversa antes de estourar.
+Use **100000** no VibeCoder (janela de 128k) e **50000** no Pro (janela de 64k) — os
+valores já deixam folga para a reserva de saída, então a compactação acontece antes do
+gateway recusar.
 
 ### Codex CLI
 
@@ -325,6 +328,11 @@ Em `~/.codex/config.toml`:
 model_provider = "llmserve"
 model = "vibecoder-base"
 
+# Compacta o histórico antes de estourar a janela do plano. O Codex assume 200k
+# por padrão e só descobriria o limite ao ser recusado. VibeCoder (128k): 100000;
+# Pro (64k): 50000.
+model_auto_compact_token_limit = 100000
+
 [model_providers.llmserve]
 name = "llmserve"
 base_url = "https://llmserve-docker.up.railway.app/v1"
@@ -333,6 +341,12 @@ wire_api = "responses"
 ```
 
 A chave vai na variável de ambiente `LLMSERVE_API_KEY`.
+
+Não configure `model_context_window`: há um bug conhecido do Codex
+([openai/codex#16068](https://github.com/openai/codex/issues/16068)) em que essa chave
+quebra a auto-compaction de forma permanente após o primeiro overflow — use só o
+`model_auto_compact_token_limit`. Se a sua versão do Codex ignorar a config (comportamento
+reportado em algumas builds), o fallback é `/compact` manual em sessões longas.
 
 ### Cursor, Cline, Continue e outras
 
