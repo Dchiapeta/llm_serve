@@ -62,6 +62,7 @@ from context_budget import (
     should_use_exact_token_count,
 )
 from lifecycle import LifecycleManager, MigrationError
+from recovery import is_no_gpu_error, lock_active, spawn_tracked
 from usage_class import class_weight, classify_stack
 from routing import RoutingStore
 from runpod_api import RunPodClient
@@ -188,6 +189,20 @@ RECREATE_RETRY_AFTER_S = float(os.environ.get("RECREATE_RETRY_AFTER_S", "120"))
 MACHINE_POOL_WATERMARK_SLOTS = float(os.environ.get("MACHINE_POOL_WATERMARK_SLOTS", "5"))
 MACHINE_HEALTH_TIMEOUT_S = float(os.environ.get("MACHINE_HEALTH_TIMEOUT_S", "900"))
 MACHINE_HEALTH_POLL_INTERVAL_S = float(os.environ.get("MACHINE_HEALTH_POLL_INTERVAL_S", "10"))
+# TTL das travas em memória (recreating/provisioning/key_sync): rede de
+# segurança contra trava presa. Se a task que deveria liberar a trava morre
+# antes do `finally` (GC, exceção fora do try, processo travado), a trava fica
+# grudada até restart e todo request seguinte é barrado. Passado o TTL, a trava
+# é tratada como vazada e liberada, deixando o fluxo re-disparar. Cada TTL é
+# FOLGADAMENTE maior que a duração legítima da sua task — nunca deve expirar no
+# meio de uma operação válida (senão dispararia trabalho duplicado, ex.: um 2º
+# provisionamento com custo real de GPU):
+#   recreate  → task ≤ PANEL_PROVISION_TIMEOUT_S (60s) → 180s
+#   provision → task espera health até MACHINE_HEALTH_TIMEOUT_S (900s) → 1200s
+#   key_sync  → idem provision (espera health) → 1200s
+RECREATE_LOCK_TTL_S = float(os.environ.get("RECREATE_LOCK_TTL_S", "180"))
+PROVISION_LOCK_TTL_S = float(os.environ.get("PROVISION_LOCK_TTL_S", "1200"))
+KEY_SYNC_LOCK_TTL_S = float(os.environ.get("KEY_SYNC_LOCK_TTL_S", "1200"))
 # TTL do cache em memória do interruptor liga/desliga (system_settings) —
 # evita 1 round-trip ao Supabase por request na hot path
 SETTINGS_CACHE_TTL_S = float(os.environ.get("SETTINGS_CACHE_TTL_S", "30"))
@@ -242,7 +257,7 @@ agent_key_upserts: dict[tuple[str, str], float] = {}
 
 # máquinas com re-sync de chaves agendado/em andamento (pós-religada) —
 # mesma disciplina do provisioning_in_progress
-key_sync_in_progress: set[str] = set()
+key_sync_in_progress: dict[str, float] = {}
 
 # serializa a realocação de stacks por plano: escolher alvo + contar vaga +
 # repontar precisa ser atômico entre requests concorrentes (réplica única)
@@ -251,14 +266,14 @@ realloc_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 # provisionamento automático: plano -> criação em andamento (cascata reativa
 # e reposição proativa compartilham essa trava, pra nunca criar 2 máquinas
 # concorrentes pro mesmo plano) e última tentativa (cooldown)
-provisioning_in_progress: set[str] = set()
+provisioning_in_progress: dict[str, float] = {}
 last_provision_attempt: dict[str, float] = {}
 
 # recriação automática: máquina -> recriação em andamento (trava contra
 # requests concorrentes recriarem o mesmo pod) e última tentativa (cooldown).
 # Disparada quando o auto-wake falha por "not enough free GPUs" — o host cedeu
 # a GPU do pod pausado e só recriar num host novo o traz de volta.
-recreating_in_progress: set[str] = set()
+recreating_in_progress: dict[str, float] = {}
 last_recreate_attempt: dict[str, float] = {}
 # fila de recriações pendentes: máquinas que o caminho reativo (no_gpu) marcou
 # pra recriar e ainda não confirmaram sucesso. O lifecycle loop reprocessa
@@ -268,23 +283,9 @@ last_recreate_attempt: dict[str, float] = {}
 # quando ela deixa de estar stopped/error, ex.: subiu por outro caminho).
 pending_recreates: set[str] = set()
 
-# Tasks fire-and-forget (recriação, provisionamento, key-sync). O event loop só
-# guarda referência FRACA às tasks: uma task sem referência forte pode ser
-# coletada pelo GC no meio de um await (ex.: o POST de 60s ao painel), e aí o
-# `finally` que libera recreating_in_progress/provisioning_in_progress NUNCA
-# roda — a trava fica presa e todo request seguinte responde "recriando" sem
-# nunca recriar de novo. Segurar a referência aqui até a task terminar é o
-# padrão canônico contra isso.
-_background_tasks: set[asyncio.Task] = set()
-
-
-def spawn_tracked(coro) -> asyncio.Task:
-    """create_task que mantém referência forte à task até ela concluir."""
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
-
+# spawn_tracked (referência forte às tasks fire-and-forget), lock_active (travas
+# com TTL) e is_no_gpu_error vivem em recovery.py — puros e testáveis sem
+# fastapi/env (test_recovery.py). Os dicts-trava e os *_LOCK_TTL_S ficam aqui.
 
 logger = logging.getLogger("gateway")
 
@@ -842,9 +843,15 @@ async def wake_machine(machine: dict, reason: str) -> str:
     try:
         await runpod_client.start_pod(machine["runpod_pod_id"])
     except Exception as e:
-        if "not enough free GPUs" in str(e):
-            # host cedeu a GPU do pod pausado — religar nunca vai funcionar,
-            # o chamador precisa recriar o pod num host novo
+        if is_no_gpu_error(e):
+            # host cedeu a GPU do pod pausado — religar nunca vai funcionar, o
+            # chamador precisa recriar o pod num host novo. Limpa o cooldown de
+            # wake desta máquina: caso contrário, nos WAKE_COOLDOWN_S seguintes
+            # novas tentativas retornariam "cooldown" → o loop reportaria
+            # "waking" ("está subindo") em vez de recriar. A recriação tem o
+            # próprio cooldown/trava (try_recreate_machine), então o wake não
+            # deve segurar a máquina que precisa ser recriada.
+            last_wake_attempt.pop(machine["id"], None)
             logger.warning(
                 "auto-wake: %s sem GPU no host, requer recriação (%s)", machine["id"], e
             )
@@ -889,7 +896,7 @@ async def wake_some_machine_for_plan(plan: str) -> str:
     recreating = False
     waking = False
     for m in stopped:
-        if m["id"] in recreating_in_progress:
+        if lock_active(recreating_in_progress, m["id"], RECREATE_LOCK_TTL_S):
             recreating = True
             continue
         outcome = await wake_machine(m, "requisição recebida sem máquina disponível")
@@ -1006,7 +1013,7 @@ async def _recreate_and_track(machine_id: str, reason: str) -> None:
             pending_recreates.discard(machine_id)  # sucesso: sai da fila de retry
             logger.info("recriação de %s disparada — %s", machine_id, reason)
     finally:
-        recreating_in_progress.discard(machine_id)
+        recreating_in_progress.pop(machine_id, None)
 
 
 async def try_recreate_machine(machine: dict, reason: str) -> bool:
@@ -1025,7 +1032,7 @@ async def try_recreate_machine(machine: dict, reason: str) -> bool:
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
         return False
     pending_recreates.add(machine_id)
-    if machine_id in recreating_in_progress:
+    if lock_active(recreating_in_progress, machine_id, RECREATE_LOCK_TTL_S):
         return True
     now = time.time()
     if now - last_recreate_attempt.get(machine_id, 0) < RECREATE_COOLDOWN_S:
@@ -1034,7 +1041,7 @@ async def try_recreate_machine(machine: dict, reason: str) -> bool:
     # checagem + marcação sem await no meio (atômicas dentro do event loop,
     # mesma disciplina do provisioning_in_progress)
     last_recreate_attempt[machine_id] = now
-    recreating_in_progress.add(machine_id)
+    recreating_in_progress[machine_id] = now
     spawn_tracked(_recreate_and_track(machine_id, reason))
     return True
 
@@ -1067,9 +1074,9 @@ def schedule_key_sync(machine_id: str) -> None:
     zero chaves em memória; sem isso, todo request pós-religada vira 401 até
     um sync manual. Checagem + marcação sem await no meio (atômicas dentro
     do event loop, mesma disciplina do provisioning_in_progress)."""
-    if machine_id in key_sync_in_progress:
+    if lock_active(key_sync_in_progress, machine_id, KEY_SYNC_LOCK_TTL_S):
         return
-    key_sync_in_progress.add(machine_id)
+    key_sync_in_progress[machine_id] = time.time()
     spawn_tracked(_sync_keys_when_healthy(machine_id))
 
 
@@ -1101,7 +1108,7 @@ async def _sync_keys_when_healthy(machine_id: str) -> None:
     except Exception as e:
         logger.warning("key-sync: reenvio de chaves para %s falhou (%s)", machine_id, e)
     finally:
-        key_sync_in_progress.discard(machine_id)
+        key_sync_in_progress.pop(machine_id, None)
 
 
 async def _provision_and_track(plan: str, reason: str, pause_when_healthy: bool) -> None:
@@ -1138,7 +1145,7 @@ async def _provision_and_track(plan: str, reason: str, pause_when_healthy: bool)
     except Exception as e:
         logger.warning("provisionamento automático (%s) falhou (%s)", plan, e)
     finally:
-        provisioning_in_progress.discard(plan)
+        provisioning_in_progress.pop(plan, None)
 
 
 async def _try_provision_machine_for_plan(
@@ -1158,7 +1165,7 @@ async def _try_provision_machine_for_plan(
         # None — sem essa checagem aqui, o chamador levantaria um
         # provisioning_503() mentiroso (promete retry, mas nunca vai criar)
         return False
-    if plan in provisioning_in_progress:
+    if lock_active(provisioning_in_progress, plan, PROVISION_LOCK_TTL_S):
         return False
     now = time.time()
     if now - last_provision_attempt.get(plan, 0) < PROVISION_COOLDOWN_S:
@@ -1167,7 +1174,7 @@ async def _try_provision_machine_for_plan(
     # checagem + marcação são atômicas dentro do event loop (mesmo cuidado
     # do wake_machine existente)
     last_provision_attempt[plan] = now
-    provisioning_in_progress.add(plan)
+    provisioning_in_progress[plan] = now
     spawn_tracked(_provision_and_track(plan, reason, pause_when_healthy))
     return True
 
@@ -1198,9 +1205,9 @@ async def pick_machine_with_free_slot(plan: str) -> dict:
         raise recreating_503()
     if woke != "none":
         raise waking_503()
-    if plan in provisioning_in_progress or await try_provision_for_request(
-        plan, "sem máquina com vaga nem pausada"
-    ):
+    if lock_active(
+        provisioning_in_progress, plan, PROVISION_LOCK_TTL_S
+    ) or await try_provision_for_request(plan, "sem máquina com vaga nem pausada"):
         raise provisioning_503()
     if not machines:
         raise HTTPException(status_code=503, detail="nenhuma máquina disponível")
@@ -1435,7 +1442,7 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
                     return target, effective_plan
                 if status == "stopped":
                     slug = stack.get("slug") or stack["id"]
-                    if machine["id"] in recreating_in_progress:
+                    if lock_active(recreating_in_progress, machine["id"], RECREATE_LOCK_TTL_S):
                         # recriação disparada por um request anterior ainda em
                         # curso — o pod novo está subindo
                         raise recreating_503()
@@ -1473,7 +1480,9 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
             raise recreating_503()  # host sem GPU → recriando num host novo
         if woke != "none":
             raise waking_503()  # despausando agora ou uma já está subindo
-        if effective_plan in provisioning_in_progress or await try_provision_for_request(
+        if lock_active(
+            provisioning_in_progress, effective_plan, PROVISION_LOCK_TTL_S
+        ) or await try_provision_for_request(
             effective_plan, "sem máquina para o modelo base"
         ):
             raise provisioning_503()
@@ -2431,13 +2440,21 @@ async def admin_routes(x_admin_secret: str | None = Header(None)):
     in_flight_by_machine: dict[str, int] = defaultdict(int)
     for (_, m), n in in_flight.items():
         in_flight_by_machine[m] += n
+    now = time.time()
     return {
         "in_flight": {f"{a}@{m}": n for (a, m), n in in_flight.items() if n > 0},
         # agregado por máquina — o número que importa pra ver o teto elástico
         # de check_concurrency em ação (compara com machines.max_concurrent_seqs)
         "in_flight_by_machine": {m: n for m, n in in_flight_by_machine.items() if n > 0},
         "key_cache_size": len(key_cache),
-        "provisioning_in_progress": sorted(provisioning_in_progress),
+        # travas em memória → há quantos segundos cada uma está setada. Idade
+        # acima do TTL respectivo (RECREATE/PROVISION/KEY_SYNC_LOCK_TTL_S) é uma
+        # trava vazada sendo tolerada até o próximo request expirá-la — antes
+        # dava pra diagnosticar isso só reiniciando o processo.
+        "provisioning_in_progress": {p: round(now - ts, 1) for p, ts in provisioning_in_progress.items()},
+        "recreating_in_progress": {m: round(now - ts, 1) for m, ts in recreating_in_progress.items()},
+        "key_sync_in_progress": {m: round(now - ts, 1) for m, ts in key_sync_in_progress.items()},
+        "pending_recreates": sorted(pending_recreates),
     }
 
 
