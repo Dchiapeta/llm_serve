@@ -6,9 +6,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 export function MachineAbout({
   gatewayUrl,
   modelName,
+  maxModelLen,
 }: {
   gatewayUrl: string | null
   modelName: string | null
+  maxModelLen: number | null
 }) {
   // Sempre o gateway, nunca o proxy do pod: o pod muda/pausa e o cliente não
   // pode saber disso — realocação e auto-wake só funcionam via gateway.
@@ -180,9 +182,19 @@ var json = await res.Content.ReadFromJsonAsync<JsonElement>();
 Console.WriteLine(json.GetProperty("choices")[0]
     .GetProperty("message").GetProperty("content").GetString());`
 
-  // AUTO_COMPACT_WINDOW: o Claude Code assume janela de 200k e não tem como
-  // saber a real do plano (64k) — sem isso ele só descobre o limite quando o
-  // gateway recusa; com isso ele compacta sozinho antes de estourar.
+  // AUTO_COMPACT_WINDOW: quando o Claude Code compacta antes de estourar a
+  // janela real do plano (sem isso ele assume 200k e só descobre o limite
+  // quando o gateway recusa). DERIVADO do --max-model-len da máquina,
+  // espelhando a conta do gateway (context_budget.py): a saída garantida
+  // (8000 = MIN_MAX_TOKENS) e o CONTEXT_SAFETY_FACTOR (1.2) comem a janela
+  // crua, então o input útil ≈ (janela − 8000 − 200) / 1.2 — NÃO a janela
+  // cheia (ex.: 131072 → ~102000, não 126k, senão o gateway rejeita).
+  // Fallback 50000 (assume ≥64k) quando a janela é desconhecida (template sem
+  // --max-model-len / pod anterior à migration 0031).
+  const autoCompactWindow = maxModelLen
+    ? Math.floor((maxModelLen - 8000 - 200) / 1.2 / 1000) * 1000
+    : 50000
+
   const claudeSnippet = `export ANTHROPIC_BASE_URL="${url}"
 export ANTHROPIC_AUTH_TOKEN="<SUA_CHAVE_DE_ACESSO>"
 export ANTHROPIC_API_KEY=""
@@ -190,7 +202,7 @@ export ANTHROPIC_MODEL="${model}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=50000
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=${autoCompactWindow}
 claude`
 
   const codexSnippet = `model_provider = "llmserve"

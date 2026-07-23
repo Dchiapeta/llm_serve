@@ -5,6 +5,7 @@ import { ExternalLink } from "lucide-react"
 
 import { computeCapacity, computeLoraCapacity, stackWeight } from "@/lib/capacity"
 import {
+  parseMaxModelLen,
   parseServedModelName,
   reconcileMachineStatuses,
 } from "@/lib/machines"
@@ -413,6 +414,14 @@ export default async function MachineDetailPage({
                   parseServedModelName(podEnv.VLLM_EXTRA_ARGS) ??
                   parseServedModelName(template?.start_command) ??
                   machine.model_name
+                }
+                // mesma prioridade do modelName: env real do pod > template >
+                // valor gravado na máquina (migration 0031). Deriva a janela de
+                // auto-compact do Claude Code no snippet.
+                maxModelLen={
+                  parseMaxModelLen(podEnv.VLLM_EXTRA_ARGS) ??
+                  parseMaxModelLen(template?.start_command) ??
+                  machine.max_model_len
                 }
               />
             </CardContent>
