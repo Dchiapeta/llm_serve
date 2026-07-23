@@ -268,6 +268,24 @@ last_recreate_attempt: dict[str, float] = {}
 # quando ela deixa de estar stopped/error, ex.: subiu por outro caminho).
 pending_recreates: set[str] = set()
 
+# Tasks fire-and-forget (recriação, provisionamento, key-sync). O event loop só
+# guarda referência FRACA às tasks: uma task sem referência forte pode ser
+# coletada pelo GC no meio de um await (ex.: o POST de 60s ao painel), e aí o
+# `finally` que libera recreating_in_progress/provisioning_in_progress NUNCA
+# roda — a trava fica presa e todo request seguinte responde "recriando" sem
+# nunca recriar de novo. Segurar a referência aqui até a task terminar é o
+# padrão canônico contra isso.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def spawn_tracked(coro) -> asyncio.Task:
+    """create_task que mantém referência forte à task até ela concluir."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 logger = logging.getLogger("gateway")
 
 lifecycle_mgr: "LifecycleManager"
@@ -1017,7 +1035,7 @@ async def try_recreate_machine(machine: dict, reason: str) -> bool:
     # mesma disciplina do provisioning_in_progress)
     last_recreate_attempt[machine_id] = now
     recreating_in_progress.add(machine_id)
-    asyncio.create_task(_recreate_and_track(machine_id, reason))
+    spawn_tracked(_recreate_and_track(machine_id, reason))
     return True
 
 
@@ -1052,7 +1070,7 @@ def schedule_key_sync(machine_id: str) -> None:
     if machine_id in key_sync_in_progress:
         return
     key_sync_in_progress.add(machine_id)
-    asyncio.create_task(_sync_keys_when_healthy(machine_id))
+    spawn_tracked(_sync_keys_when_healthy(machine_id))
 
 
 async def _sync_keys_when_healthy(machine_id: str) -> None:
@@ -1150,7 +1168,7 @@ async def _try_provision_machine_for_plan(
     # do wake_machine existente)
     last_provision_attempt[plan] = now
     provisioning_in_progress.add(plan)
-    asyncio.create_task(_provision_and_track(plan, reason, pause_when_healthy))
+    spawn_tracked(_provision_and_track(plan, reason, pause_when_healthy))
     return True
 
 
