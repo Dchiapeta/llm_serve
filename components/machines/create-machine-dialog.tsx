@@ -50,11 +50,14 @@ export function CreateMachineDialog({
       : gpus
 
   const selectedGpu = availableGpus.find((g) => g.id === gpuTypeId)
-  // quantos usuários a GPU escolhida comporta para este modelo
+  // quantos usuários a GPU escolhida comporta para este modelo — com TP/multi-GPU
+  // a VRAM útil é a da GPU × gpu_count (mesma conta de provisionMachine e
+  // viableGpuIdsForTemplate). Sem o × gpu_count, um template TP=2 era barrado
+  // aqui com metade da capacidade real (o servidor deixaria passar).
   const gpuCapacity =
     selectedTemplate && selectedGpu?.memoryInGb != null
       ? vramSlots({
-          vramGb: selectedGpu.memoryInGb,
+          vramGb: selectedGpu.memoryInGb * (selectedTemplate.gpu_count ?? 1),
           modelFootprintGb: selectedTemplate.model_footprint_gb,
           kvReserveGbPerUser: selectedTemplate.kv_reserve_gb_per_user,
         })
