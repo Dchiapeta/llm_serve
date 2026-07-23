@@ -112,12 +112,32 @@ export default async function MachineDetailPage({
 
   const template = tplData as Template | null
   const allKeys = (keysData ?? []) as KeyWithAccount[]
-  const keys = allKeys.filter(
-    (k) => k.stack_id != null && machineStackIds.has(k.stack_id)
-  )
-  const activeKeys = keys.filter((k) => k.status === "active")
   const accounts = (accountsData ?? []) as Account[]
   const usage = (usageData ?? []) as UsageMetric[]
+
+  // Uso agregado por chave. Só existe linha em usage_metrics quando houve request
+  // real (o coletor filtra requests > 0), então a presença no mapa já significa
+  // que a chave efetivamente acessou esta máquina.
+  const usageByKey = new Map<string, { requests: number; tokensIn: number; tokensOut: number }>()
+  for (const u of usage) {
+    if (!u.api_key_id) continue
+    const acc = usageByKey.get(u.api_key_id) ?? { requests: 0, tokensIn: 0, tokensOut: 0 }
+    acc.requests += u.requests
+    acc.tokensIn += u.tokens_in
+    acc.tokensOut += u.tokens_out
+    usageByKey.set(u.api_key_id, acc)
+  }
+
+  // Só as chaves que EFETIVAMENTE acessaram esta máquina (têm uso registrado).
+  // Uma conta pode ter várias chaves para a mesma stack; aqui aparece só a(s) que
+  // foi(ram) usada(s). Mantém o escopo por stack que ocupa slot: o idle reaper
+  // zera stacks.machine_id mas não api_keys.machine_id (pin histórico da chave).
+  const keys = allKeys.filter(
+    (k) =>
+      k.stack_id != null &&
+      machineStackIds.has(k.stack_id) &&
+      usageByKey.has(k.id)
+  )
 
   // env vars reais do pod (se ainda existir no RunPod)
   let podEnv: Record<string, string> = template?.env ?? {}
@@ -164,16 +184,6 @@ export default async function MachineDetailPage({
       occupied: stacksLoad,
       maxUsers: machine.max_users,
     })
-  }
-
-  const usageByKey = new Map<string, { requests: number; tokensIn: number; tokensOut: number }>()
-  for (const u of usage) {
-    if (!u.api_key_id) continue
-    const acc = usageByKey.get(u.api_key_id) ?? { requests: 0, tokensIn: 0, tokensOut: 0 }
-    acc.requests += u.requests
-    acc.tokensIn += u.tokens_in
-    acc.tokensOut += u.tokens_out
-    usageByKey.set(u.api_key_id, acc)
   }
 
   return (
@@ -284,8 +294,8 @@ export default async function MachineDetailPage({
               <div>
                 <CardTitle>Contas nesta máquina</CardTitle>
                 <CardDescription>
-                  {stacksCount ?? 0} stack(s) · {activeKeys.length} chave(s)
-                  ativa(s) · {cap.slotsFree} slot(s) livre(s)
+                  {stacksCount ?? 0} stack(s) · {keys.length} chave(s) em uso ·{" "}
+                  {cap.slotsFree} slot(s) livre(s)
                 </CardDescription>
               </div>
               <CreateKeyDialog
@@ -311,7 +321,7 @@ export default async function MachineDetailPage({
                   {keys.length === 0 && (
                     <TableRow>
                       <TableCell colSpan={7} className="text-center text-muted-foreground">
-                        Nenhuma conta ocupando slot nesta máquina.
+                        Nenhuma chave acessou esta máquina ainda.
                       </TableCell>
                     </TableRow>
                   )}
