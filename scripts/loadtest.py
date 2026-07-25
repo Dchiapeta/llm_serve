@@ -25,7 +25,6 @@ import argparse
 import asyncio
 import json
 import random
-import statistics
 import time
 
 import httpx
@@ -124,7 +123,6 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
     usage = None
     error = None
     first_byte = False
-    ttft_s = None
     try:
         async with client.stream(
             "POST", "/v1/chat/completions",
@@ -132,10 +130,9 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
             json=payload,
             # read = teto de silêncio ENTRE chunks (não duração total): pega
             # tanto o primeiro byte que nunca chega (conexão zumbi) quanto um
-            # stream que congelou. Antes do fix do "buraco negro" de reasoning
-            # do gateway, o 1º byte visível só saía quando o raciocínio
-            # fechava — dimensionar o default pra isso caso o fix não esteja
-            # em produção ainda (120s cobria os ~85s observados no VibeCoder).
+            # stream que congelou. Com o filtro de reasoning do gateway, o 1º
+            # byte visível só sai quando o raciocínio fecha — dimensionar o
+            # default pra isso (120s cobre os ~85s observados no VibeCoder).
             timeout=httpx.Timeout(args.first_byte_timeout, connect=15.0),
         ) as resp:
             if resp.status_code != 200:
@@ -143,8 +140,6 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
                 error = f"HTTP {resp.status_code}: {body[:300]!r}"
             else:
                 async for line in resp.aiter_lines():
-                    if not first_byte:
-                        ttft_s = time.monotonic() - t0
                     first_byte = True
                     if not line or not line.startswith("data:"):
                         continue
@@ -167,24 +162,13 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
         error = f"{type(e).__name__}: {e}"
 
     total_time = time.monotonic() - t0
-    completion_tokens = (usage or {}).get("completion_tokens")
-    # tokens/s de DECODIFICAÇÃO isolado do TTFT — sem isso, tempo de espera
-    # (prefill, fila de concorrência, ou o "buraco negro" de reasoning
-    # escondido) se mistura com velocidade real de geração e o número vira
-    # inútil pra diagnosticar qual das duas causas está pesando.
-    decode_tokens_per_s = None
-    if completion_tokens and ttft_s is not None:
-        decode_s = max(total_time - ttft_s, 0.01)
-        decode_tokens_per_s = round(completion_tokens / decode_s, 1)
     return {
         "task_id": task["id"],
         "cat": task["cat"],
         "dif": task["dif"],
         "total_s": round(total_time, 2),
-        "ttft_s": round(ttft_s, 2) if ttft_s is not None else None,
-        "decode_tokens_per_s": decode_tokens_per_s,
         "chars": len(full_text),
-        "completion_tokens": completion_tokens,
+        "completion_tokens": (usage or {}).get("completion_tokens"),
         "prompt_tokens": (usage or {}).get("prompt_tokens"),
         "finish_reason": finish_reason,
         "error": error,
@@ -220,8 +204,7 @@ async def run_user(client: httpx.AsyncClient, args, user_idx: int, level: int) -
         retry_info = f" retries={r['retries_used']}" if r.get("retries_used") else ""
         print(
             f"    [lvl{level} u{user_idx} #{seq}] {task['id']:<10} "
-            f"total={r['total_s']}s ttft={r['ttft_s']}s tok/s={r['decode_tokens_per_s']} "
-            f"tok={r['completion_tokens']} finish={r['finish_reason']} {err_info}{retry_info}",
+            f"total={r['total_s']}s tok={r['completion_tokens']} finish={r['finish_reason']} {err_info}{retry_info}",
             flush=True,
         )
     return out
@@ -245,8 +228,7 @@ async def run_account(
         err_info = f"err={r['error']} phase={r['error_phase']}" if r["error"] else "err=None"
         print(
             f"    [{mode} acct{account_idx} #{seq}] {task['id']:<10} "
-            f"total={r['total_s']}s ttft={r['ttft_s']}s tok/s={r['decode_tokens_per_s']} "
-            f"tok={r['completion_tokens']} finish={r['finish_reason']} {err_info}",
+            f"total={r['total_s']}s tok={r['completion_tokens']} finish={r['finish_reason']} {err_info}",
             flush=True,
         )
     return out
@@ -294,22 +276,10 @@ async def run_level(client: httpx.AsyncClient, args, level: int) -> list[dict]:
     pre = sum(1 for r in errors if r["error_phase"] == "pre_byte")
     mid = len(errors) - pre
     retried_ok = sum(1 for r in flat if not r["error"] and r.get("retries_used"))
-    # medianas de TTFT/tokens-por-s SÓ das requests OK — são os dois números
-    # que separam "buraco negro" de raciocínio escondido (TTFT alto) de
-    # motor genuinamente lento (tok/s baixo mesmo com TTFT ok); ver
-    # docs/claude-code.md §4 e o plano de throughput.
-    ttfts = [r["ttft_s"] for r in flat if not r["error"] and r["ttft_s"] is not None]
-    tps = [r["decode_tokens_per_s"] for r in flat if not r["error"] and r["decode_tokens_per_s"] is not None]
-    median_info = ""
-    if ttfts and tps:
-        median_info = (
-            f", ttft mediano={statistics.median(ttfts):.1f}s, "
-            f"tok/s mediano={statistics.median(tps):.1f}"
-        )
     print(
         f"--- nivel {level} concluido em {elapsed:.1f}s, {len(flat)} reqs, "
         f"{len(errors)} erros ({pre} pre_byte, {mid} mid_stream), "
-        f"{retried_ok} recuperadas por retry{median_info} ---",
+        f"{retried_ok} recuperadas por retry ---",
         flush=True,
     )
     return flat
