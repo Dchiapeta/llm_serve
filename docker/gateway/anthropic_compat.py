@@ -10,12 +10,15 @@ MESMO backend vLLM (chat/completions), reaproveitando todo o pipeline de
 autenticação/pinning/limites/RAG que já existe pra chat/completions.
 
 Cobertura: texto e tool use (function calling), streaming e não-streaming.
+O raciocínio (<think>...</think>) dos planos em REASONING_LEAK_PLANS
+(main.py) é transmitido ao vivo como content block "thinking" de
+verdade, best-effort e sem signature_delta — não é o "thinking" pedido
+pelo cliente (o campo "thinking" do corpo da request Anthropic não é
+lido aqui, nenhum plano hoje aceita configurá-lo), é só o veículo pra
+não esconder o que o vLLM já gerou (ver anthropic_sse_from_openai_stream).
 NÃO coberto (fora de escopo por ora): imagens em base64 são convertidas
-best-effort para image_url mas não testadas contra o vLLM; extended
-thinking (campo "thinking" da Anthropic) é ignorado — o reasoning do
-vLLM, quando ligado (ENABLE_TOOL_CALLING), não tem equivalente 1:1 no
-formato de "thinking blocks" da Anthropic; prompt caching (cache_control)
-é ignorado, sem efeito no vLLM.
+best-effort para image_url mas não testadas contra o vLLM; prompt
+caching (cache_control) é ignorado, sem efeito no vLLM.
 """
 
 import json
@@ -255,9 +258,17 @@ async def anthropic_sse_from_openai_stream(
     concorrência, mesmo padrão de filtered_reasoning_stream em main.py.
 
     `filter_reasoning=True` (planos em REASONING_LEAK_PLANS, main.py)
-    suprime o bloco de raciocínio (antes de </think>) do "content" — mesmo
-    filtro que chat/completions já aplica; sem isso o Claude Code recebia
-    o raciocínio cru misturado no texto exibido nesses planos."""
+    transmite o bloco de raciocínio (antes de </think>) como um content
+    block "thinking" de verdade da Anthropic Messages API, em vez de
+    empacotar no "text" junto com o resto da resposta. ANTES esse
+    raciocínio ficava bufferizado inteiro e NENHUM byte chegava ao
+    cliente até o fechamento de </think> (85s+ observados em tarefas
+    difíceis, ver scripts/loadtest.py) — numa tarefa agêntica isso se
+    repete a cada chamada de ferramenta, porque o modelo "pensa" de novo
+    antes de cada decisão. Agora o raciocínio é transmitido ao vivo assim
+    que sai do vLLM. Sem signature_delta (não tem como assinar como a
+    Anthropic real) — seguro porque _assistant_content_to_openai_message
+    já ignora blocks desconhecidos ao reconstruir histórico."""
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     yield _sse("message_start", {
         "type": "message_start",
@@ -275,13 +286,20 @@ async def anthropic_sse_from_openai_stream(
 
     text_block_open = False
     text_block_index = None
+    thinking_block_open = False
+    thinking_block_index = None
     tool_blocks: dict[int, int] = {}  # índice do tool_call OpenAI -> índice do content block Anthropic
     next_block_index = 0
     finish_reason = None
     usage = None
     pending = b""
     in_reasoning = filter_reasoning
-    reasoning_buffer = ""
+    # cauda pendente entre chunks: só o bastante pra não cortar "</think>"
+    # ao meio quando o delimitador cai na fronteira de dois chunks SSE —
+    # ao contrário do buffer antigo, NÃO acumula o raciocínio inteiro (já
+    # foi transmitido incrementalmente assim que chegou).
+    reasoning_tail = ""
+    tail_len = len(THINK_CLOSE) - 1
 
     try:
         try:
@@ -313,14 +331,45 @@ async def anthropic_sse_from_openai_stream(
 
                     text = delta.get("content")
                     if text and in_reasoning:
-                        reasoning_buffer += text
-                        if THINK_CLOSE in reasoning_buffer:
-                            _, visible = reasoning_buffer.split(THINK_CLOSE, 1)
+                        buf = reasoning_tail + text
+                        if THINK_CLOSE in buf:
+                            before, after = buf.split(THINK_CLOSE, 1)
+                            if before:
+                                if not thinking_block_open:
+                                    thinking_block_index = next_block_index
+                                    next_block_index += 1
+                                    yield _sse("content_block_start", {
+                                        "type": "content_block_start", "index": thinking_block_index,
+                                        "content_block": {"type": "thinking", "thinking": ""},
+                                    })
+                                    thinking_block_open = True
+                                yield _sse("content_block_delta", {
+                                    "type": "content_block_delta", "index": thinking_block_index,
+                                    "delta": {"type": "thinking_delta", "thinking": before},
+                                })
+                            if thinking_block_open:
+                                yield _sse("content_block_stop", {"type": "content_block_stop", "index": thinking_block_index})
+                                thinking_block_open = False
                             in_reasoning = False
-                            reasoning_buffer = ""
-                            text = visible.lstrip("\n") or None
+                            reasoning_tail = ""
+                            text = after.lstrip("\n") or None
                         else:
-                            text = None  # ainda represado, nada a emitir agora
+                            safe = buf[:-tail_len] if len(buf) > tail_len else ""
+                            reasoning_tail = buf[-tail_len:] if len(buf) > tail_len else buf
+                            if safe:
+                                if not thinking_block_open:
+                                    thinking_block_index = next_block_index
+                                    next_block_index += 1
+                                    yield _sse("content_block_start", {
+                                        "type": "content_block_start", "index": thinking_block_index,
+                                        "content_block": {"type": "thinking", "thinking": ""},
+                                    })
+                                    thinking_block_open = True
+                                yield _sse("content_block_delta", {
+                                    "type": "content_block_delta", "index": thinking_block_index,
+                                    "delta": {"type": "thinking_delta", "thinking": safe},
+                                })
+                            text = None  # ainda dentro do raciocínio, sem texto visível ainda
                     if text:
                         if not text_block_open:
                             text_block_index = next_block_index
@@ -341,6 +390,9 @@ async def anthropic_sse_from_openai_stream(
                             if text_block_open:
                                 yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
                                 text_block_open = False
+                            if thinking_block_open:
+                                yield _sse("content_block_stop", {"type": "content_block_stop", "index": thinking_block_index})
+                                thinking_block_open = False
                             tool_blocks[oi] = next_block_index
                             next_block_index += 1
                             function = tc.get("function") or {}
@@ -365,23 +417,27 @@ async def anthropic_sse_from_openai_stream(
             # abertos com o que já foi gerado, em vez de sumir sem nada
             pass
 
-        if in_reasoning and reasoning_buffer:
-            # bateu o fim do stream sem nunca fechar </think> — devolve o
-            # que foi acumulado em vez de descartar a resposta inteira
-            # (mesmo fallback de filtered_reasoning_stream em main.py)
-            if not text_block_open:
-                text_block_index = next_block_index
+        if reasoning_tail and in_reasoning:
+            # bateu o fim do stream sem nunca fechar </think> (raro, ~0-5%
+            # mesmo com o piso de max_tokens) — o que já foi gerado já foi
+            # transmitido ao vivo como thinking_delta; só falta soltar a
+            # cauda pendente (até tail_len chars, nunca confirmada como
+            # início de "</think>" real) antes de fechar o bloco.
+            if not thinking_block_open:
+                thinking_block_index = next_block_index
                 next_block_index += 1
                 yield _sse("content_block_start", {
-                    "type": "content_block_start", "index": text_block_index,
-                    "content_block": {"type": "text", "text": ""},
+                    "type": "content_block_start", "index": thinking_block_index,
+                    "content_block": {"type": "thinking", "thinking": ""},
                 })
-                text_block_open = True
+                thinking_block_open = True
             yield _sse("content_block_delta", {
-                "type": "content_block_delta", "index": text_block_index,
-                "delta": {"type": "text_delta", "text": reasoning_buffer},
+                "type": "content_block_delta", "index": thinking_block_index,
+                "delta": {"type": "thinking_delta", "thinking": reasoning_tail},
             })
 
+        if thinking_block_open:
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": thinking_block_index})
         if text_block_open:
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
         for idx in tool_blocks.values():
