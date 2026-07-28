@@ -215,7 +215,7 @@ export function CreateStackDialog({
           <Plus /> Nova stack
         </Button>
       </DialogTrigger>
-      <DialogContent className="sm:max-w-md" ref={contentRef}>
+      <DialogContent className="sm:max-w-lg" ref={contentRef}>
         <DialogHeader>
           <DialogTitle>Nova stack</DialogTitle>
           <DialogDescription>
@@ -376,7 +376,7 @@ export function CreateStackDialog({
                       />
                     </div>
                     <Select value={machineId} onValueChange={setMachineId}>
-                      <SelectTrigger>
+                      <SelectTrigger className="w-fit max-w-full self-start">
                         <SelectValue placeholder="Escolha a máquina" />
                       </SelectTrigger>
                       <SelectContent>
