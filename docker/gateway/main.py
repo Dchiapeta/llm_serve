@@ -663,10 +663,19 @@ async def collect_usage_metrics_once() -> None:
         if not active:
             continue
         window_start = datetime.now(timezone.utc).isoformat()
+        try:
+            stack_by_key = await supa.stack_ids_for_keys(list(active.keys()))
+        except Exception as e:
+            logger.warning(
+                "coleta de métricas: falha ao resolver stack_id das chaves da máquina %s (%s)",
+                machine["id"], e,
+            )
+            stack_by_key = {}
         rows = [
             {
                 "api_key_id": api_key_id,
                 "machine_id": machine["id"],
+                "stack_id": stack_by_key.get(api_key_id),
                 "window_start": window_start,
                 "requests": v.get("requests", 0),
                 "tokens_in": v.get("tokens_in", 0),

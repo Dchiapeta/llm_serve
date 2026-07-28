@@ -358,6 +358,21 @@ class SupaClient:
         r = await self._rest.post("/usage_metrics", json=rows)
         r.raise_for_status()
 
+    async def stack_ids_for_keys(self, api_key_ids: list[str]) -> dict[str, str | None]:
+        """Resolve api_key_id -> stack_id em lote (migration 0036), pra
+        denormalizar stack_id em usage_metrics no momento do insert. Chaves
+        órfãs (sem stack_id, ex.: chave avulsa gerada sem stack no contexto)
+        entram no dict com valor None."""
+        if not api_key_ids:
+            return {}
+        ids = ",".join(dict.fromkeys(api_key_ids))
+        r = await self._rest.get(
+            "/api_keys",
+            params={"id": f"in.({ids})", "select": "id,stack_id"},
+        )
+        r.raise_for_status()
+        return {row["id"]: row.get("stack_id") for row in r.json()}
+
     async def account_token_usage_today(self, account_id: str) -> int:
         """Soma tokens_in+tokens_out de usage_metrics do dia corrente, via
         todas as chaves/máquinas da conta — base da quota diária no gateway."""
