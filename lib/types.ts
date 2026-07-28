@@ -84,6 +84,10 @@ export type Stack = {
   plan: TemplatePlan
   purchase_date: string // date "YYYY-MM-DD"
   slug: string
+  // Coluna do TryStac (supabase/SHARED_SCHEMA.md), não deste repo — hoje
+  // sempre igual ao slug; existe porque o TryStac dá grant de UPDATE nela
+  // pro usuário final renomear a stack.
+  name: string
   // Override de system prompt da stack; null = sem override.
   system_prompt: string | null
   // Defaults de sampling aplicados pelo gateway quando o cliente não manda o

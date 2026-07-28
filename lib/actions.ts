@@ -1155,6 +1155,10 @@ export async function createStack(formData: FormData): Promise<{
         account_id: accountId,
         plan,
         slug,
+        // `name` é coluna do TryStac (supabase/SHARED_SCHEMA.md), NOT NULL
+        // sem default — sem isso o insert falha com 23502 (violação de
+        // not-null), não com 23505, e nem cai no retry de colisão de slug.
+        name: slug,
         ...(purchaseDate ? { purchase_date: purchaseDate } : {}),
       })
       .select("id")
