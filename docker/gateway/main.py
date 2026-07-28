@@ -1285,6 +1285,20 @@ def resolve_key_stack(entry: dict) -> tuple[dict | None, str | None]:
     return None, None
 
 
+def apply_stack_sampling_defaults(body_json: dict, entry: dict) -> None:
+    """Aplica default_temperature/default_top_p da stack (migration 0035)
+    quando o cliente não mandou o parâmetro. Roda ANTES do clamp de
+    segurança em validate_body/validate_responses_body, que cobre tanto o
+    valor do cliente quanto o default recém-aplicado."""
+    stack, _ = resolve_key_stack(entry)
+    if not stack:
+        return
+    if "temperature" not in body_json and stack.get("default_temperature") is not None:
+        body_json["temperature"] = stack["default_temperature"]
+    if "top_p" not in body_json and stack.get("default_top_p") is not None:
+        body_json["top_p"] = stack["default_top_p"]
+
+
 async def pick_running_machine_with_stack_slot(
     plan: str, exclude_machine_id: str | None = None, required_weight: float = 1.0
 ) -> dict | None:
@@ -1706,6 +1720,12 @@ async def validate_body(
     # de abuso trivial (n=100 = 100x o custo de uma request só)
     if isinstance(body_json.get("n"), int):
         body_json["n"] = 1
+
+    # Default de sampling da stack (migration 0035) — só entra quando o
+    # cliente NÃO mandou o parâmetro; 0.0 é um valor explícito válido, por
+    # isso o check é "not in body_json", não um isinstance/truthy check.
+    apply_stack_sampling_defaults(body_json, entry)
+
     for param, lo, hi in (
         ("temperature", 0.0, 2.0),
         ("top_p", 0.0, 1.0),
@@ -1883,6 +1903,8 @@ async def validate_responses_body(
         body_json["max_output_tokens"] = MIN_MAX_TOKENS
     elif max_output_tokens > MAX_MAX_TOKENS:
         body_json["max_output_tokens"] = MAX_MAX_TOKENS
+
+    apply_stack_sampling_defaults(body_json, entry)
 
     for param, lo, hi in (("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)):
         value = body_json.get(param)

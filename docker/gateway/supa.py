@@ -75,7 +75,8 @@ class SupaClient:
                 "status": "eq.active",
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,"
                 "accounts(name,"
-                "stacks(id,machine_id,plan,slug,created_at,system_prompt))",
+                "stacks(id,machine_id,plan,slug,created_at,system_prompt,"
+                "default_temperature,default_top_p))",
                 "limit": "1",
             },
         )

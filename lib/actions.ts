@@ -1492,8 +1492,12 @@ export async function createKey(input: {
 }
 
 // Invalida o cache de chaves do gateway (best-effort) — sem isso, uma chave
-// revogada continuaria válida no gateway até o TTL do cache expirar.
-async function flushGatewayKeyCache() {
+// revogada continuaria válida no gateway até o TTL do cache expirar. Exportada
+// porque também é chamada por rotas de API que alteram campos da stack
+// embutidos nesse mesmo cache (ex.: default_temperature/default_top_p, ver
+// app/api/stacks/[id]/model-config/route.ts) — sem o flush, o gateway serviria
+// valores desatualizados por até KEY_CACHE_TTL_S (60s).
+export async function flushGatewayKeyCache() {
   const url = process.env.GATEWAY_URL
   const secret = process.env.GATEWAY_ADMIN_SECRET
   if (!url || !secret) return // gateway ainda não configurado
@@ -1845,6 +1849,49 @@ async function embedTexts(texts: string[]): Promise<number[][]> {
   return data.data.map((d) => d.embedding)
 }
 
+function assertSupportedKnowledgeExtension(name: string) {
+  if (!/\.(txt|md)$/i.test(name)) {
+    throw new Error("Só arquivos .txt ou .md são aceitos por enquanto")
+  }
+}
+
+// Chunka, gera embeddings e substitui a indexação anterior do mesmo arquivo
+// nessa stack. Núcleo compartilhado por uploadKnowledgeFile (Server Action,
+// já tem o texto em mãos) e ingestKnowledgeFile (API externa, baixa do
+// Storage antes de chamar isso).
+async function chunkAndIndex(input: {
+  accountId: string
+  stackId: string
+  storagePath: string
+  text: string
+}): Promise<{ chunks: number }> {
+  const db = createSupabaseAdmin()
+  const chunks = chunkText(input.text)
+  if (chunks.length === 0) throw new Error("Arquivo vazio")
+
+  const embeddings = await embedTexts(chunks)
+
+  await db
+    .from("knowledge_chunks")
+    .delete()
+    .eq("stack_id", input.stackId)
+    .eq("storage_path", input.storagePath)
+  const { error: insertErr } = await db.from("knowledge_chunks").insert(
+    chunks.map((content, i) => ({
+      account_id: input.accountId,
+      stack_id: input.stackId,
+      storage_path: input.storagePath,
+      chunk_index: i,
+      content,
+      embedding: embeddings[i],
+    }))
+  )
+  if (insertErr) throw new Error(`Falha ao indexar chunks: ${insertErr.message}`)
+
+  revalidatePath("/stacks")
+  return { chunks: chunks.length }
+}
+
 // Sobe um arquivo de texto pro bucket de conhecimento, chunka e indexa os
 // embeddings — só texto puro/Markdown (sem parsing de PDF/DOCX nesta rodada).
 export async function uploadKnowledgeFile(formData: FormData) {
@@ -1855,13 +1902,7 @@ export async function uploadKnowledgeFile(formData: FormData) {
   if (!accountId) throw new Error("Conta não informada")
   if (!stackId) throw new Error("Stack não informada")
   if (!(file instanceof File) || file.size === 0) throw new Error("Arquivo não informado")
-  if (!/\.(txt|md)$/i.test(file.name)) {
-    throw new Error("Só arquivos .txt ou .md são aceitos por enquanto")
-  }
-
-  const text = await file.text()
-  const chunks = chunkText(text)
-  if (chunks.length === 0) throw new Error("Arquivo vazio")
+  assertSupportedKnowledgeExtension(file.name)
 
   // prefixo por stack (não por conta): evita que duas stacks da mesma conta
   // com arquivo de mesmo nome se sobrescrevam mutuamente
@@ -1871,27 +1912,35 @@ export async function uploadKnowledgeFile(formData: FormData) {
     .upload(storagePath, file, { upsert: true, contentType: "text/plain" })
   if (uploadErr) throw new Error(`Falha ao subir arquivo: ${uploadErr.message}`)
 
-  const embeddings = await embedTexts(chunks)
+  await chunkAndIndex({ accountId, stackId, storagePath, text: await file.text() })
+}
 
-  // substitui qualquer indexação anterior deste mesmo arquivo nesta stack
-  await db
-    .from("knowledge_chunks")
-    .delete()
-    .eq("stack_id", stackId)
-    .eq("storage_path", storagePath)
-  const { error: insertErr } = await db.from("knowledge_chunks").insert(
-    chunks.map((content, i) => ({
-      account_id: accountId,
-      stack_id: stackId,
-      storage_path: storagePath,
-      chunk_index: i,
-      content,
-      embedding: embeddings[i],
-    }))
-  )
-  if (insertErr) throw new Error(`Falha ao indexar chunks: ${insertErr.message}`)
+// Dispara o processamento (chunk+embedding+index) de um arquivo que o
+// CHAMADOR já subiu direto pro bucket "knowledge" do Storage (ex.: outro
+// sistema com a service role key deste projeto Supabase). Usada pela rota
+// POST /api/knowledge/ingest — ver app/api/knowledge/ingest/route.ts.
+export async function ingestKnowledgeFile(input: {
+  accountId: string
+  stackId: string
+  storagePath: string
+}): Promise<{ chunks: number }> {
+  // convenção de path é "{stack_id}/{filename}" (ver uploadKnowledgeFile) —
+  // exige aqui pra um storage_path de outra stack não poder ser indexado
+  // sob um stack_id que não é o dono do arquivo.
+  if (!input.storagePath.startsWith(`${input.stackId}/`)) {
+    throw new Error("storage_path precisa começar com '{stack_id}/'")
+  }
+  assertSupportedKnowledgeExtension(input.storagePath)
 
-  revalidatePath("/stacks")
+  const db = createSupabaseAdmin()
+  const { data, error: downloadErr } = await db.storage
+    .from(KNOWLEDGE_BUCKET)
+    .download(input.storagePath)
+  if (downloadErr || !data) {
+    throw new Error(`Falha ao baixar arquivo do Storage: ${downloadErr?.message ?? "não encontrado"}`)
+  }
+
+  return chunkAndIndex({ ...input, text: await data.text() })
 }
 
 export async function listKnowledgeFiles(
