@@ -127,11 +127,6 @@ export function ContasTable({
   const [productFilter, setProductFilter] = React.useState(ALL)
   const [statusFilter, setStatusFilter] = React.useState(ALL)
 
-  function copySlug(slug: string) {
-    navigator.clipboard.writeText(slug)
-    toast.success("ID copiado")
-  }
-
   function copyStackId(stackId: string) {
     navigator.clipboard.writeText(stackId)
     toast.success("Stack ID copiado")
@@ -140,7 +135,8 @@ export function ContasTable({
   const normalizedQuery = query.trim().toLowerCase()
   const filteredRows = rows.filter((r) => {
     const matchesQuery = normalizedQuery
-      ? r.stack.slug.toLowerCase().includes(normalizedQuery) ||
+      ? r.stack.name.toLowerCase().includes(normalizedQuery) ||
+        r.stack.slug.toLowerCase().includes(normalizedQuery) ||
         r.account.name.toLowerCase().includes(normalizedQuery) ||
         r.account.email?.toLowerCase().includes(normalizedQuery)
       : true
@@ -223,19 +219,8 @@ export function ContasTable({
               : NO_MACHINE_BADGE
             return (
               <TableRow key={stack.id}>
-                <TableCell>
-                  <div className="flex items-center gap-1">
-                    <code className="font-mono text-xs">{stack.slug}</code>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="size-6"
-                      onClick={() => copySlug(stack.slug)}
-                      aria-label="Copiar ID"
-                    >
-                      <Copy className="size-3" />
-                    </Button>
-                  </div>
+                <TableCell className="text-sm font-medium">
+                  {stack.name}
                 </TableCell>
                 <TableCell>
                   <div className="flex items-center gap-1">
