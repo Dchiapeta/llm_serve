@@ -94,7 +94,12 @@ export function CreateMachineDialog({
       open={open}
       onOpenChange={(next) => {
         setOpen(next)
-        if (!next) setError(null)
+        if (next) {
+          setError(null)
+          setTemplateId("")
+          setGpuTypeId("")
+          setMaxUsers("")
+        }
       }}
     >
       <DialogTrigger asChild>
