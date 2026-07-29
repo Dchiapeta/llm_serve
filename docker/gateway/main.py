@@ -1005,11 +1005,17 @@ async def ensure_key_on_machine(entry: dict, machine: dict) -> None:
     no fluxo base, a conta pode ser servida por uma máquina onde a chave
     nunca foi sincronizada (a chave é vinculada à máquina do stack) — sem o
     upsert, o pod rejeitaria com 401. Enquanto o pod boota, o call_agent
-    devolve o 503 padrão e o retry do cliente converge sozinho."""
+    devolve o 503 padrão e o retry do cliente converge sozinho.
+
+    Existe ainda uma janela em que o status já é "running" no banco mas o
+    processo do agent dentro do pod ainda não terminou de montar as rotas
+    /admin — nesse caso o agent responde 404, que o call_agent propagaria
+    como 502 cru. Fazemos algumas tentativas curtas e, se persistir,
+    convertemos para um 503 amigável (mesmo padrão de waking_503/etc)."""
     cache_key = (entry["key_hash"], machine["id"])
     if agent_key_upserts.get(cache_key, 0) > time.time():
         return
-    await call_agent(machine, "/upsert-keys", {"keys": [{
+    body = {"keys": [{
         "key_hash": entry["key_hash"],
         "api_key_id": entry.get("api_key_id"),
         "key_prefix": entry["key_prefix"],
@@ -1019,7 +1025,16 @@ async def ensure_key_on_machine(entry: dict, machine: dict) -> None:
         # degradado `kh:` e o cache dele é invalidado
         "stack_id": entry.get("stack_id"),
         "expires_at": entry.get("expires_at"),
-    }]})
+    }]}
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            await call_agent(machine, "/upsert-keys", body)
+            break
+        except HTTPException as e:
+            if e.status_code != 502 or attempt == attempts:
+                raise agent_starting_503() if e.status_code == 502 else e
+            await asyncio.sleep(1.5 * attempt)
     agent_key_upserts[cache_key] = time.time() + UPSERT_CACHE_TTL_S
 
 
@@ -1164,6 +1179,15 @@ def preparing_503() -> HTTPException:
         detail="Estamos preparando sua máquina — ela ficará disponível em instantes. "
         "Tente novamente em alguns segundos.",
         headers={"Retry-After": "30"},
+    )
+
+
+def agent_starting_503() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="O serviço está iniciando e ficará pronto em instantes. "
+        "Tente novamente em alguns segundos.",
+        headers={"Retry-After": "15"},
     )
 
 
