@@ -30,22 +30,31 @@ if [ "${ENABLE_LORA}" = "true" ]; then
 fi
 
 # Tool-calling nativo (opt-in): o Codex CLI fala só a Responses API
-# (/v1/responses) e depende do vLLM parsear tool calls e reasoning
-# nativamente — sem isso o raciocínio vaza pro campo "content" (por isso o
-# filtro <think> do gateway existe hoje) e chamadas de ferramenta não
-# funcionam. Desligado por padrão pra não mudar templates já em produção;
-# ligar por template via ENABLE_TOOL_CALLING=true + os parsers certos pro
-# modelo (ex.: Qwen3.x -> TOOL_CALL_PARSER=qwen3_coder REASONING_PARSER=qwen3
-# — ver docs.vllm.ai/serving/integrations/codex). Ligar isso torna o filtro
-# <think> do gateway redundante pra esse template (reasoning já vem separado
-# em "reasoning_content", não mais em "content") — reconciliar depois.
+# (/v1/responses) e depende do vLLM parsear tool calls nativamente. Ligar
+# por template via ENABLE_TOOL_CALLING=true + TOOL_CALL_PARSER (ex.:
+# qwen3_coder — ver docs.vllm.ai/serving/integrations/codex).
 ENABLE_TOOL_CALLING="${ENABLE_TOOL_CALLING:-false}"
 TOOL_CALLING_ARGS=""
 if [ "${ENABLE_TOOL_CALLING}" = "true" ]; then
   : "${TOOL_CALL_PARSER:?TOOL_CALL_PARSER é obrigatória quando ENABLE_TOOL_CALLING=true}"
-  : "${REASONING_PARSER:?REASONING_PARSER é obrigatória quando ENABLE_TOOL_CALLING=true}"
-  TOOL_CALLING_ARGS="--enable-auto-tool-choice --tool-call-parser ${TOOL_CALL_PARSER} --reasoning-parser ${REASONING_PARSER}"
+  TOOL_CALLING_ARGS="--enable-auto-tool-choice --tool-call-parser ${TOOL_CALL_PARSER}"
   echo "[entrypoint] tool-calling habilitado (${TOOL_CALLING_ARGS})"
+fi
+
+# Reasoning-parser nativo (opt-in, independente do tool-calling acima):
+# modelos com "thinking" ligado (ex.: Qwen3.x) emitem o raciocínio (até
+# </think>) misturado no campo "content" quando essa flag está desligada —
+# por isso o filtro <think> do gateway existe hoje (REASONING_LEAK_PLANS em
+# docker/gateway/main.py). Ligar via ENABLE_REASONING_PARSER=true +
+# REASONING_PARSER (ex.: qwen3) faz o vLLM separar o raciocínio em
+# "reasoning_content", o que o gateway já detecta e usa para não represar
+# a resposta inteira até o fim do stream.
+ENABLE_REASONING_PARSER="${ENABLE_REASONING_PARSER:-false}"
+REASONING_PARSER_ARGS=""
+if [ "${ENABLE_REASONING_PARSER}" = "true" ]; then
+  : "${REASONING_PARSER:?REASONING_PARSER é obrigatória quando ENABLE_REASONING_PARSER=true}"
+  REASONING_PARSER_ARGS="--reasoning-parser ${REASONING_PARSER}"
+  echo "[entrypoint] reasoning-parser habilitado (${REASONING_PARSER_ARGS})"
 fi
 
 # Prefix caching automático (opt-in pra DESLIGAR — vLLM liga por padrão em
@@ -76,6 +85,7 @@ python3 -m vllm.entrypoints.openai.api_server \
   ${TP_ARGS} \
   ${LORA_ARGS} \
   ${TOOL_CALLING_ARGS} \
+  ${REASONING_PARSER_ARGS} \
   ${PREFIX_CACHING_ARGS} \
   ${VLLM_EXTRA_ARGS:-} \
   2>&1 | sed -u 's/^/[vllm] /' | tee "${VLLM_LOG_FILE}" &

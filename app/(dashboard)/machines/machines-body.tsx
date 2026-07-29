@@ -1,7 +1,7 @@
 import { Suspense } from "react"
 
 import { getAutoProvisionEnabled } from "@/lib/actions"
-import { computeCapacity, stackWeight } from "@/lib/capacity"
+import { computeCapacity } from "@/lib/capacity"
 import { reconcileMachineStatuses } from "@/lib/machines"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type { Machine } from "@/lib/types"
@@ -65,12 +65,11 @@ export async function MachinesBody() {
     .from("stacks")
     .select("machine_id, usage_class")
     .not("machine_id", "is", null)
+  // CONTAGEM de stacks (migration 0037), não a soma ponderada da 0032: a
+  // classe de uso limita a mistura (teto de heavy), não a capacidade.
   const stacksByMachine = new Map<string, number>()
   for (const s of stackRows ?? []) {
-    stacksByMachine.set(
-      s.machine_id,
-      (stacksByMachine.get(s.machine_id) ?? 0) + stackWeight(s.usage_class)
-    )
+    stacksByMachine.set(s.machine_id, (stacksByMachine.get(s.machine_id) ?? 0) + 1)
   }
 
   return (

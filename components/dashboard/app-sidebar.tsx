@@ -4,6 +4,7 @@ import * as React from "react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import {
+  Activity,
   Boxes,
   ChevronsUpDown,
   Cpu,
@@ -63,6 +64,7 @@ const navGroups = [
       { href: "/machines", label: "Máquinas", icon: Server },
       { href: "/templates", label: "Produtos", icon: Boxes },
       { href: "/stacks", label: "Stacks", icon: Layers },
+      { href: "/requisicoes", label: "Requisições", icon: Activity },
     ],
   },
   {

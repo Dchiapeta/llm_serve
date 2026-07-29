@@ -2,7 +2,7 @@ import Link from "next/link"
 import { Suspense } from "react"
 import { DollarSign, KeyRound, Server } from "lucide-react"
 
-import { computeCapacity, stackWeight } from "@/lib/capacity"
+import { computeCapacity } from "@/lib/capacity"
 import { reconcileMachineStatuses } from "@/lib/machines"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type {
@@ -88,14 +88,12 @@ export async function DashboardBody({
   const usage = (usageData ?? []) as UsageMetric[]
   const events = (eventsData ?? []) as MachineEvent[]
 
-  // Ocupação = stacks hospedadas PONDERADAS pela classe de uso (0032),
-  // não chaves ativas.
+  // Ocupação = CONTAGEM de stacks hospedadas (migration 0037), não chaves
+  // ativas e não mais a soma ponderada da 0032 — a classe de uso limita a
+  // MISTURA (teto de heavy por máquina), não quantos clientes cabem.
   const stacksByMachine = new Map<string, number>()
   for (const s of stacksData ?? []) {
-    stacksByMachine.set(
-      s.machine_id,
-      (stacksByMachine.get(s.machine_id) ?? 0) + stackWeight(s.usage_class)
-    )
+    stacksByMachine.set(s.machine_id, (stacksByMachine.get(s.machine_id) ?? 0) + 1)
   }
 
   const running = machines.filter((m) => m.status === "running")

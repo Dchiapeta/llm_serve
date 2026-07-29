@@ -5,7 +5,7 @@
 
 from datetime import datetime, timedelta, timezone
 
-from usage_class import DEFAULT_WEIGHTS, class_weight, classify_stack
+from usage_class import DEFAULT_WEIGHTS, class_weight, classify_stack, high_cap
 
 NOW = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
 
@@ -97,3 +97,28 @@ def test_pesos_default_e_override():
     assert class_weight(None) == 1.0
     assert class_weight("high", {"weights": {"high": 4}}) == 4.0
     assert class_weight("invalida") == 1.0
+
+
+# ---------- teto de heavy por máquina (migration 0037) ----------
+
+
+def test_teto_de_heavy_lido_do_template():
+    assert high_cap({"max_high": 7}) == 7
+    assert high_cap({"max_high": "4"}) == 4  # jsonb devolve string
+
+
+def test_teto_ausente_e_fail_open():
+    """Sem teto configurado a máquina se comporta como antes da 0037. Um teto
+    que não pôde ser lido nunca pode bloquear a alocação de um cliente."""
+    assert high_cap(None) is None
+    assert high_cap({}) is None
+    assert high_cap({"weights": {"high": 3}}) is None
+    assert high_cap({"max_high": None}) is None
+    assert high_cap({"max_high": "abc"}) is None
+
+
+def test_teto_zero_ou_negativo_vira_sem_teto():
+    """max_high=0 tornaria impossível alocar QUALQUER stack high em lugar
+    nenhum — muito mais provável ser engano de digitação do que intenção."""
+    assert high_cap({"max_high": 0}) is None
+    assert high_cap({"max_high": -1}) is None

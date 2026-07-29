@@ -250,9 +250,11 @@ async def anthropic_sse_from_openai_stream(
     """Converte o stream SSE do vLLM (chat/completions, formato OpenAI) pro
     formato de eventos da Anthropic Messages API (message_start ->
     content_block_start/delta/stop* -> message_delta -> message_stop), que
-    é o que o Claude Code espera receber. `on_done` (opcional, sem args) é
-    chamado no finally — usado pelo chamador pra liberar in_flight/
-    concorrência, mesmo padrão de filtered_reasoning_stream em main.py.
+    é o que o Claude Code espera receber. `on_done(usage)` (opcional) é
+    chamado no finally com o último `usage` visto no stream (ou None se o
+    vLLM nunca mandou) — usado pelo chamador pra liberar in_flight/
+    concorrência (mesmo padrão de filtered_reasoning_stream em main.py) e
+    pra logar tokens_in/tokens_out da requisição (migration 0038).
 
     `filter_reasoning=True` (planos em REASONING_LEAK_PLANS, main.py)
     suprime o bloco de raciocínio (antes de </think>) do "content" — mesmo
@@ -396,4 +398,4 @@ async def anthropic_sse_from_openai_stream(
         yield _sse("message_stop", {"type": "message_stop"})
     finally:
         if on_done:
-            on_done()
+            on_done(usage)

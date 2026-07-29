@@ -63,7 +63,7 @@ from context_budget import (
 )
 from lifecycle import LifecycleManager, MigrationError
 from recovery import is_no_gpu_error, lock_active, spawn_tracked
-from usage_class import class_weight, classify_stack
+from usage_class import classify_stack
 from routing import RoutingStore
 from runpod_api import RunPodClient
 from supa import SupaClient
@@ -129,12 +129,22 @@ METRICS_COLLECTION_INTERVAL_S = float(os.environ.get("METRICS_COLLECTION_INTERVA
 # classificação de stacks por padrão de consumo (usage_class, migration 0032):
 # janela móvel de avaliação, mínimo de dias ativos pra classificar, cooldown
 # entre mudanças (histerese — um dia atípico não muda classe) e cadência do
-# loop. A classe só influencia alocações FUTURAS; 6h de cadência é mais que
-# suficiente pra um sinal que exige dias de uso sustentado.
+# loop. 6h de cadência é mais que suficiente pra um sinal que exige dias de
+# uso sustentado.
 USAGE_CLASS_WINDOW_DAYS = int(os.environ.get("USAGE_CLASS_WINDOW_DAYS", "14"))
 USAGE_CLASS_MIN_ACTIVE_DAYS = int(os.environ.get("USAGE_CLASS_MIN_ACTIVE_DAYS", "5"))
 USAGE_CLASS_COOLDOWN_DAYS = int(os.environ.get("USAGE_CLASS_COOLDOWN_DAYS", "7"))
 USAGE_CLASS_INTERVAL_S = float(os.environ.get("USAGE_CLASS_INTERVAL_S", "21600"))
+# Rebalanceamento do teto de heavy (migration 0037): quando não há destino
+# running com vaga, a cascata despausa/cria uma máquina, que leva minutos pra
+# ficar de pé. Este é o atraso até a nova passada que efetivamente usa essa
+# máquina — sem ele o desbalanceamento esperaria o próximo ciclo de 6h.
+HIGH_CAP_RETRY_DELAY_S = float(os.environ.get("HIGH_CAP_RETRY_DELAY_S", "180"))
+# Teto de novas tentativas encadeadas: sem ele, um desbalanceamento que nunca
+# consegue destino (auto-provisionamento desligado, plano sem máquina livre)
+# reagendaria a si mesmo pra sempre a cada 3 min. Esgotado o orçamento, o
+# desbalanceamento espera o próximo ciclo de classificação.
+HIGH_CAP_MAX_RETRIES = int(os.environ.get("HIGH_CAP_MAX_RETRIES", "3"))
 
 # quanto tempo um request espera por um load em andamento de outro request
 LOAD_WAIT_TIMEOUT_S = float(os.environ.get("LOAD_WAIT_TIMEOUT_S", "20"))
@@ -699,14 +709,15 @@ async def metrics_collection_loop(interval_s: float = METRICS_COLLECTION_INTERVA
             logger.warning("coleta periódica de métricas falhou: %s", e)
 
 
-async def classify_stacks_once() -> None:
+async def classify_stacks_once() -> int:
     """Reclassifica usage_class das stacks pelo consumo real (usage_metrics
     agregado pela RPC stack_usage_stats, migration 0032). A decisão em si é
     pura (usage_class.classify_stack: dois fatores, histerese, cooldown);
-    aqui é só o I/O. A classe nova NÃO dispara migração — só pesa nas
-    alocações futuras (pick_running_machine_with_stack_slot ponderado)."""
+    aqui é só o I/O. Devolve quantas stacks mudaram de classe — o chamador usa
+    pra decidir se vale rodar o rebalanceamento de teto de heavy."""
     rows = await supa.stack_usage_stats(USAGE_CLASS_WINDOW_DAYS)
     now = datetime.now(timezone.utc)
+    changed = 0
     for row in rows:
         new_class = classify_stack(
             row,
@@ -718,6 +729,7 @@ async def classify_stacks_once() -> None:
             continue
         try:
             await supa.update_stack_usage_class(row["stack_id"], new_class)
+            changed += 1
             logger.info(
                 "usage_class: stack %s reclassificada %s -> %s",
                 row["stack_id"], row.get("usage_class") or "low", new_class,
@@ -726,6 +738,169 @@ async def classify_stacks_once() -> None:
             logger.warning(
                 "usage_class: falha ao atualizar stack %s (%s)", row["stack_id"], e
             )
+    return changed
+
+
+def _evict_key_cache_for_stack(stack_id: str) -> None:
+    """Derruba as entradas do key_cache da stack depois de ela mudar de
+    máquina fora do caminho de request.
+
+    Sem isto, requests continuariam sendo roteados pra máquina ANTIGA até o
+    TTL do cache expirar. O reallocate_stack não precisa disto porque muta o
+    dict do stack in place (ele tem o objeto cacheado em mãos); aqui o
+    movimento nasce no loop de background, sem acesso ao objeto cacheado.
+
+    Casa por dois caminhos: `stack_id` direto da chave (migration 0019) e a
+    lista `stacks` embutida da conta — chaves legadas sem stack_id gravado só
+    são alcançáveis pelo segundo. Mesmo se ambos falhassem, o estrago é
+    limitado pelo TTL do key_cache (KEY_CACHE_TTL_S)."""
+    stale = [
+        kh
+        for kh, (entry, _) in key_cache.items()
+        if entry
+        and (
+            entry.get("stack_id") == stack_id
+            or any(s.get("id") == stack_id for s in entry.get("stacks") or [])
+        )
+    ]
+    for key_hash in stale:
+        key_cache.pop(key_hash, None)
+
+
+async def relocate_stack_for_balance(stack: dict, reason: str) -> dict | None:
+    """Move uma stack pra outra máquina do plano por BALANCEAMENTO (teto de
+    heavy estourado, migration 0037) — não por indisponibilidade da origem,
+    que é o caso do reallocate_stack.
+
+    Como o reallocate_stack: MOVE as chaves (api_keys.machine_id) em vez de
+    criar/revogar, então a plain key configurada no cliente do usuário
+    continua funcionando. Diferente dele: roda fora do caminho de request,
+    então não há `entry` em mãos — a invalidação de cache e o reenvio de
+    chaves são feitos explicitamente no fim.
+
+    None = sem destino com vaga (o chamador dispara a cascata de wake/
+    provisionamento) ou perdeu a corrida pra um request concorrente."""
+    plan = stack["plan"]
+    old_id = stack.get("machine_id")
+    if not old_id:
+        return None
+    async with realloc_locks[plan]:
+        fresh = await supa.get_stack(stack["id"])
+        if not fresh or fresh.get("machine_id") != old_id:
+            return None  # request concorrente já moveu; a próxima passada reavalia
+        usage_class = fresh.get("usage_class") or "low"
+        target = await pick_running_machine_with_stack_slot(
+            plan, exclude_machine_id=old_id, usage_class=usage_class
+        )
+        if not target:
+            return None
+        if not await supa.repoint_stack(stack["id"], old_id, target["id"]):
+            return None
+        await supa.move_account_keys(
+            fresh["account_id"], old_id, target["id"], stack_id=stack["id"]
+        )
+
+    _evict_key_cache_for_stack(stack["id"])
+    # sync nas DUAS pontas: no destino pra chave passar a ser aceita; na
+    # ORIGEM porque o /admin/sync-keys do agent faz clear() + substituição
+    # total, e sem ele a chave movida continuaria válida em memória no pod
+    # antigo — que é alcançável direto pela URL pública da RunPod
+    schedule_key_sync(target["id"])
+    schedule_key_sync(old_id)
+    try:
+        await store.record_reallocation(
+            fresh["account_id"], from_machine_id=old_id, machine_id=target["id"]
+        )
+        await supa.log_machine_event(
+            target["id"], "stack_migrated",
+            f"Stack {fresh.get('slug') or stack['id']} realocada por balanceamento "
+            f"de carga ({reason})",
+        )
+    except Exception:
+        pass  # histórico é best-effort, nunca desfaz um movimento já concluído
+    logger.info(
+        "rebalance: stack %s (%s) movida de %s para %s — %s",
+        fresh.get("slug") or stack["id"], fresh.get("usage_class"),
+        old_id, target["id"], reason,
+    )
+    return target
+
+
+async def rebalance_high_caps_once(retry_budget: int = HIGH_CAP_MAX_RETRIES) -> None:
+    """Faz valer o teto de stacks 'high' por máquina (migration 0037).
+
+    Roda depois de cada passada de classificação: uma stack que sobe pra
+    'high' pode estourar o teto da máquina onde já está, e é justamente ela
+    que sai — list_stacks_on_machine ordena por usage_class_updated_at desc,
+    então o excedente despejado é sempre quem mudou de classe mais
+    recentemente, nunca o co-tenant que estava lá e não mudou nada.
+
+    Rebaixamento (high -> medium/low) não move ninguém: só LIBERA espaço no
+    teto, e o próximo desbalanceamento aproveita.
+
+    A cabeça liberada na origem fica livre pra qualquer classe — o teto de
+    heavy é sub-teto, não reserva.
+
+    Só planos de pod compartilhado: Max/Enterprise têm pod dedicado, onde
+    "mistura de perfis" não existe."""
+    retry_needed = False
+    for plan in SHARED_POD_PLANS:
+        for machine in await supa.list_running_machines_for_plan(plan):
+            cap = await supa.machine_high_cap(machine["id"])
+            if cap is None:
+                continue  # template sem teto configurado: fail-open
+            highs = await supa.list_stacks_on_machine(machine["id"], usage_class="high")
+            excess = len(highs) - cap
+            if excess <= 0:
+                continue
+            reason = f"{len(highs)} stacks de uso alto para um teto de {cap}"
+            logger.info(
+                "rebalance: máquina %s (%s) acima do teto de heavy — %s",
+                machine.get("name") or machine["id"], plan, reason,
+            )
+            for stack in highs[:excess]:
+                if await relocate_stack_for_balance(stack, reason):
+                    continue
+                # Sem destino running com vaga de heavy: cascata igual à do
+                # caminho de request — despausa uma parada; se não houver
+                # nenhuma, provisiona. pause_when_healthy=False porque a
+                # máquina nasce pra receber esta stack, não pro pool.
+                # As travas de custo (interruptor auto_provision_enabled,
+                # cooldown e lock por plano) vivem dentro dessas funções.
+                outcome = await wake_some_machine_for_plan(plan)
+                if outcome == "none":
+                    await _try_provision_machine_for_plan(
+                        plan,
+                        f"rebalanceamento de uso alto: {reason}",
+                        pause_when_healthy=False,
+                    )
+                retry_needed = True
+                try:
+                    await supa.log_machine_event(
+                        machine["id"], "rebalance_pending",
+                        f"Stack de uso alto aguardando máquina com vaga ({reason})",
+                    )
+                except Exception:
+                    pass
+                break  # sem destino agora, os demais excedentes também não teriam
+    if retry_needed and retry_budget > 0:
+        spawn_tracked(_rebalance_after_delay(retry_budget - 1))
+
+
+async def _rebalance_after_delay(retry_budget: int) -> None:
+    """Nova passada de rebalanceamento depois que a máquina despausada/criada
+    teve tempo de subir. Sem isto, um desbalanceamento que disparou a cascata
+    só seria resolvido no próximo ciclo de classificação (6h) — a máquina
+    subiria e ficaria ociosa até lá.
+
+    retry_budget decresce a cada elo da cadeia (ver HIGH_CAP_MAX_RETRIES):
+    quando não há destino possível, a cadeia termina em vez de se reagendar
+    indefinidamente."""
+    await asyncio.sleep(HIGH_CAP_RETRY_DELAY_S)
+    try:
+        await rebalance_high_caps_once(retry_budget)
+    except Exception as e:
+        logger.warning("rebalanceamento (nova tentativa) falhou: %s", e)
 
 
 async def usage_class_loop(interval_s: float = USAGE_CLASS_INTERVAL_S):
@@ -736,9 +911,17 @@ async def usage_class_loop(interval_s: float = USAGE_CLASS_INTERVAL_S):
     await asyncio.sleep(60.0)
     while True:
         try:
-            await classify_stacks_once()
+            changed = await classify_stacks_once()
         except Exception as e:
             logger.warning("classificação periódica de usage_class falhou: %s", e)
+            changed = 0
+        try:
+            # roda mesmo com changed == 0: o teto também é estourado por
+            # caminhos que não passam pela classificação (migrateStack do
+            # painel, realocação de emergência com fail-open por RPC ausente)
+            await rebalance_high_caps_once()
+        except Exception as e:
+            logger.warning("rebalanceamento de teto de heavy falhou: %s", e)
         await asyncio.sleep(interval_s)
 
 
@@ -1308,22 +1491,42 @@ def apply_stack_sampling_defaults(body_json: dict, entry: dict) -> None:
         body_json["top_p"] = stack["default_top_p"]
 
 
+async def machine_admits(machine_id: str, usage_class: str = "low") -> bool:
+    """A máquina aceita mais uma stack da classe dada? Duas restrições
+    INDEPENDENTES (migration 0037):
+
+      1. cabeça livre: machine_stack_load < machine_stack_slots. Vale igual
+         para qualquer classe — 18 slots comportam 18 contas, seja qual for a
+         mistura. (Era isto que a ocupação ponderada da 0032 quebrava: um
+         high comia 3 cabeças e a máquina "enchia" com 6 clientes.)
+      2. teto de mistura: só stacks 'high' são limitadas, por
+         machine_high_cap. É SUB-TETO, não reserva — os lugares de heavy não
+         ficam parados quando não há heavy, então 1 high + 17 low/medium numa
+         máquina de 18 é perfeitamente válido.
+
+    Capacidade desconhecida/sem teto (slots 0 ou None) é aceita, mesmo
+    critério do allocateMachineForTemplate do painel (lib/actions.ts)."""
+    slots = await supa.machine_stack_slots(machine_id)
+    if slots:  # 0 e None = capacidade desconhecida/sem teto
+        if await supa.machine_stack_load(machine_id) >= slots:
+            return False
+    if usage_class != "high":
+        return True
+    cap = await supa.machine_high_cap(machine_id)
+    if cap is None:
+        return True  # template sem teto configurado: fail-open
+    return await supa.machine_high_count(machine_id) < cap
+
+
 async def pick_running_machine_with_stack_slot(
-    plan: str, exclude_machine_id: str | None = None, required_weight: float = 1.0
+    plan: str, exclude_machine_id: str | None = None, usage_class: str = "low"
 ) -> dict | None:
-    """Primeira máquina running do plano com vaga de stack. Ocupação
-    PONDERADA pela classe de uso (migration 0032): a vaga precisa comportar o
-    PESO do entrante (low=1.0 preserva o antigo "1 stack = 1 slot"; um high
-    custa 3.0 — evita empilhar usuários de contexto longo na mesma máquina).
-    Capacidade desconhecida/sem teto (slots 0) é aceita — mesmo critério do
-    allocateMachineForTemplate do painel (lib/actions.ts)."""
+    """Primeira máquina running do plano que admite uma stack da classe dada
+    (ver machine_admits para as duas restrições)."""
     for m in await supa.list_running_machines_for_plan(plan):
         if exclude_machine_id and m["id"] == exclude_machine_id:
             continue
-        slots = await supa.machine_stack_slots(m["id"])
-        if slots is None or slots == 0:
-            return m
-        if slots - await supa.machine_stack_load(m["id"]) >= required_weight:
+        if await machine_admits(m["id"], usage_class):
             return m
     return None
 
@@ -1358,13 +1561,11 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
             target = await pick_running_machine_with_stack_slot(
                 stack["plan"],
                 exclude_machine_id=old_machine["id"],
-                # a vaga precisa comportar o peso REAL da stack que chega —
-                # um usuário high (contexto longo) custa 3.0, não 1.
-                # Limitação conhecida: usa os pesos DEFAULT (sem o override de
-                # templates.usage_class_config, que o machine_stack_load do
-                # destino aplica) — só divergiria se algum template definisse
-                # "weights" custom, o que nenhum faz hoje
-                required_weight=class_weight(fresh.get("usage_class")),
+                # o destino precisa ter cabeça livre E, se esta stack for
+                # high, espaço no teto de heavy — senão a realocação de
+                # emergência (máquina pausada) resolveria a indisponibilidade
+                # às custas de criar um pod desbalanceado
+                usage_class=fresh.get("usage_class") or "low",
             )
             if not target:
                 return None
@@ -1430,7 +1631,7 @@ async def place_base_stack(entry: dict, stack: dict) -> dict | None:
             return None
         target = await pick_running_machine_with_stack_slot(
             stack["plan"],
-            required_weight=class_weight(fresh.get("usage_class")),
+            usage_class=fresh.get("usage_class") or "low",
         )
         if not target:
             return None
@@ -1965,11 +2166,15 @@ async def validate_responses_body(
 
 THINK_CLOSE = "</think>"
 
-# planos cujo modelo padrão roda com "thinking" ligado — o vLLM sobe sem
-# --reasoning-parser (ver docker/entrypoint.sh, bug conhecido dessa combinação
-# com Qwen3.5/3.6), então o raciocínio inteiro vaza pro campo "content" que o
-# cliente exibe. Filtrado aqui porque o produto é BYOE: nenhuma ferramenta
-# cliente (Cursor, Continue etc.) sabe separar isso sozinha.
+# planos cujo modelo padrão roda com "thinking" ligado — sem
+# ENABLE_REASONING_PARSER=true no template (ver docker/entrypoint.sh), o vLLM
+# sobe sem --reasoning-parser e o raciocínio inteiro vaza pro campo "content"
+# que o cliente exibe. Filtrado aqui porque o produto é BYOE: nenhuma
+# ferramenta cliente (Cursor, Continue etc.) sabe separar isso sozinha.
+# Quando o template liga ENABLE_REASONING_PARSER, o vLLM já separa o
+# raciocínio em "reasoning_content" e este filtro se desliga sozinho pra
+# essa resposta (ver o branch "reasoning_content" em
+# filtered_reasoning_stream) — streaming deixa de ficar represado.
 # Pro (Qwen3.6-27B) validado em 17/07/2026: 14/15 respostas fecham com
 # </think> (a exceção foi truncada por length — coberta pelo fallback do
 # filtro, que devolve o buffer acumulado no fim do stream).
@@ -1993,15 +2198,20 @@ def split_reasoning(text: str) -> tuple[str | None, str]:
     return text[:idx], text[idx + len(THINK_CLOSE) :].lstrip("\n")
 
 
-async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple):
+async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple, log_ctx: dict):
     """Envolve o stream SSE bruto do vLLM suprimindo os chunks de raciocínio
     (antes de </think>) e só repassando ao cliente o que vem depois. Se o
     teto de tokens for atingido sem nunca fechar </think> (raro, ~0-5% mesmo
     com o piso de max_tokens), devolve o raciocínio acumulado no chunk final
-    em vez de descartar a resposta em silêncio."""
+    em vez de descartar a resposta em silêncio.
+
+    `log_ctx` alimenta o registro fire-and-forget em gateway_requests
+    (migration 0038) no finally — `usage` é capturado de graça aqui porque
+    todo chunk já passa por json.loads pra filtrar o raciocínio."""
     buffer_text = ""
     in_reasoning = True
     pending = b""
+    usage = None
     try:
         try:
             async for raw in upstream.aiter_bytes():
@@ -2022,6 +2232,9 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple)
                     except Exception:
                         yield line + b"\n"
                         continue
+
+                    if isinstance(chunk, dict) and chunk.get("usage"):
+                        usage = chunk["usage"]
 
                     choices = chunk.get("choices") or []
                     choice0 = choices[0] if choices and isinstance(choices[0], dict) else None
@@ -2108,6 +2321,7 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple)
     finally:
         await upstream.aclose()
         release_flight(flight_key)
+        log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=True, usage=usage)
 
 
 # ---------- Claude Code (Anthropic Messages API) ----------
@@ -2125,6 +2339,7 @@ async def anthropic_messages(
     authorization: str | None = Header(None),
     x_api_key: str | None = Header(None),
 ):
+    started = time.monotonic()
     raw_body = await request.body()
     if len(raw_body) > MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
@@ -2141,6 +2356,11 @@ async def anthropic_messages(
     flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
     check_concurrency(flight_key, machine, effective_plan)
+
+    log_ctx = dict(
+        account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
+        machine_id=machine["id"], path="messages", model=rewrite_model, started=started,
+    )
 
     try:
         anthropic_body = json.loads(raw_body)
@@ -2212,24 +2432,32 @@ async def anthropic_messages(
                 )
             except Exception:
                 message = error_raw.decode(errors="replace") or "erro desconhecido do modelo"
+            log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=True, usage=None)
             return JSONResponse(
                 status_code=upstream.status_code,
                 content=anthropic_error_body(message),
             )
+
+        def _on_stream_done(usage: dict | None) -> None:
+            release_flight(flight_key)
+            log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=True, usage=usage)
+
         return StreamingResponse(
             anthropic_sse_from_openai_stream(
                 upstream, requested_model,
-                on_done=lambda: release_flight(flight_key),
+                on_done=_on_stream_done,
                 filter_reasoning=filter_reasoning,
             ),
             status_code=upstream.status_code,
             media_type="text/event-stream",
         )
 
+    usage = None
     try:
         raw = await upstream.aread()
         try:
             openai_resp = json.loads(raw)
+            usage = openai_resp.get("usage")
             if filter_reasoning:
                 for choice in openai_resp.get("choices", []):
                     message = choice.get("message")
@@ -2244,6 +2472,7 @@ async def anthropic_messages(
     finally:
         await upstream.aclose()
         release_flight(flight_key)
+        log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=False, usage=usage)
     return Response(content=raw, status_code=upstream.status_code, media_type="application/json")
 
 
@@ -2295,6 +2524,43 @@ def release_flight(flight_key: tuple[str, str]) -> None:
     in_flight[flight_key] -= 1
 
 
+def log_gateway_request(
+    *, account_id: str, stack_id: str | None, api_key_id: str, machine_id: str,
+    path: str, model: str | None, status_code: int, stream: bool,
+    started: float, usage: dict | None = None,
+) -> None:
+    """Log fire-and-forget de uma requisição completada (migration 0038,
+    tabela gateway_requests). `started` é o time.monotonic() capturado na
+    entrada do handler; `usage` é o dict OpenAI ({prompt_tokens,
+    completion_tokens, ...}) quando disponível, ou None. Chamado só nos
+    pontos que já têm flight_key (mesmo escopo de in_flight/release_flight)
+    — nunca no caminho crítico da resposta ao cliente, e nunca deixa
+    exceção escapar (spawn_tracked evita o bug conhecido de create_task sem
+    referência sendo coletado pelo GC antes de terminar)."""
+    usage = usage or {}
+    row = {
+        "account_id": account_id,
+        "stack_id": stack_id,
+        "api_key_id": api_key_id,
+        "machine_id": machine_id,
+        "path": path,
+        "model": model,
+        "status_code": status_code,
+        "stream": stream,
+        "tokens_in": usage.get("prompt_tokens"),
+        "tokens_out": usage.get("completion_tokens"),
+        "duration_ms": int((time.monotonic() - started) * 1000),
+    }
+    spawn_tracked(_write_gateway_request(row))
+
+
+async def _write_gateway_request(row: dict) -> None:
+    try:
+        await supa.insert_gateway_request(row)
+    except httpx.HTTPError as e:
+        logger.warning("gateway_requests: falha ao gravar log (%s)", e)
+
+
 def machine_capacity(machine: dict) -> int:
     """Teto de sequências concorrentes do pod (espelha o --max-num-seqs real
     do deploy, machines.max_concurrent_seqs — migration 0028). Sem valor
@@ -2329,6 +2595,7 @@ def check_concurrency(flight_key: tuple[str, str], machine: dict, plan: str) -> 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request, authorization: str | None = Header(None)):
+    started = time.monotonic()
     allowed_methods = ALLOWED_V1.get(path)
     if not allowed_methods or request.method not in allowed_methods:
         raise HTTPException(status_code=404, detail="not found")
@@ -2354,6 +2621,11 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
     check_concurrency(flight_key, machine, effective_plan)
+
+    log_ctx = dict(
+        account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
+        machine_id=machine["id"], path=path, model=rewrite_model, started=started,
+    )
 
     body_json = None
     try:
@@ -2430,10 +2702,12 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     is_stream_request = isinstance(body_json, dict) and body_json.get("stream") is True
 
     if filter_reasoning and not is_stream_request:
+        usage = None
         try:
             raw = await upstream.aread()
             try:
                 payload = json.loads(raw)
+                usage = payload.get("usage")
                 for choice in payload.get("choices", []):
                     message = choice.get("message")
                     if isinstance(message, dict) and isinstance(message.get("content"), str):
@@ -2446,6 +2720,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         finally:
             await upstream.aclose()
             release_flight(flight_key)
+            log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=False, usage=usage)
         return Response(
             content=raw,
             status_code=upstream.status_code,
@@ -2454,18 +2729,59 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
 
     if filter_reasoning:
         return StreamingResponse(
-            filtered_reasoning_stream(upstream, flight_key),
+            filtered_reasoning_stream(upstream, flight_key, log_ctx),
             status_code=upstream.status_code,
             media_type=upstream.headers.get("content-type", "text/event-stream"),
         )
 
     async def stream_and_release():
+        # requisição não-streamed (embeddings, completions sem stream, etc.):
+        # o corpo cabe todo em memória (mesmo custo já pago pelos branches de
+        # "models" e do filtro de reasoning acima via aread()) — acumula pra
+        # extrair "usage" no fim sem mudar o mecanismo de resposta.
+        collect_full = not is_stream_request
+        full = b"" if collect_full else None
+        pending = b""
+        usage = None
         try:
             async for chunk in upstream.aiter_bytes():
                 yield chunk
+                if collect_full:
+                    full += chunk
+                    continue
+                # streaming de verdade: só vale a pena fazer json.loads na
+                # linha rara que carrega "usage" (chunk final do SSE, quando
+                # o vLLM manda) — as demais linhas (deltas de conteúdo) nunca
+                # chegam a ser parseadas aqui.
+                pending += chunk
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    if b'"usage"' not in line:
+                        continue
+                    stripped = line.strip()
+                    if not stripped.startswith(b"data:"):
+                        continue
+                    data = stripped[len(b"data:") :].strip()
+                    if data in (b"[DONE]", b""):
+                        continue
+                    try:
+                        parsed = json.loads(data)
+                    except Exception:
+                        continue
+                    if isinstance(parsed, dict) and parsed.get("usage"):
+                        usage = parsed["usage"]
         finally:
+            if collect_full and full:
+                try:
+                    usage = json.loads(full).get("usage")
+                except Exception:
+                    pass
             await upstream.aclose()
             release_flight(flight_key)
+            log_gateway_request(
+                **log_ctx, status_code=upstream.status_code,
+                stream=is_stream_request, usage=usage,
+            )
 
     return StreamingResponse(
         stream_and_release(),

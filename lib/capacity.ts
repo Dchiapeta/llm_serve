@@ -9,10 +9,14 @@ export type CapacityInput = {
   vramGb: number | null
   modelFootprintGb: number
   kvReserveGbPerUser: number
-  // Slots ocupados. Desde a migration 0032 a ocupação de stacks é PONDERADA
-  // pela classe de uso (machine_stack_load: low=1.0, medium=1.5, high=3.0),
-  // então pode ser fracionária — comparações de vaga devem usar >= 1 (peso
-  // mínimo de um entrante), não > 0.
+  // Slots ocupados = CONTAGEM de stacks hospedadas (machine_stack_load,
+  // migration 0037). A 0032 tinha feito disto uma soma PONDERADA pela classe
+  // de uso (high valia 3), o que encolhia a capacidade comercial conforme o
+  // perfil dos clientes — uma máquina de 18 slots "enchia" com 6 heavies.
+  // Hoje 18 slots comportam 18 contas, seja qual for a mistura; o que a
+  // classe de uso limita é quantas stacks 'high' coexistem no mesmo pod
+  // (machine_high_cap), uma restrição INDEPENDENTE desta e que não é
+  // modelada aqui.
   occupied: number
   maxUsers?: number | null
 }
@@ -24,11 +28,14 @@ export type CapacityResult = {
   usagePct: number
 }
 
-// Peso de ocupação por classe de uso — espelho dos DEFAULTS do SQL
-// (usage_class_weight, migration 0032) e do gateway (usage_class.py).
-// A fonte da verdade para ALOCAÇÃO é o SQL (machine_stack_load, que aplica
-// override do template); este espelho serve ao display server-side, que
-// soma pesos em memória para várias máquinas de uma vez.
+// Peso relativo por classe de uso — espelho dos DEFAULTS do SQL
+// (usage_class_weight) e do gateway (usage_class.py:class_weight).
+//
+// NÃO é mais usado em capacidade nem em admissão desde a migration 0037:
+// ocupação voltou a ser contagem de cabeças, e o que a classe restringe é o
+// teto de heavy por máquina (machine_high_cap). Sobrevive como escala de
+// intensidade de uso para exibição; as três definições (SQL, Python, TS)
+// continuam espelhadas de propósito para não divergirem se voltar a pesar.
 export type UsageClass = "low" | "medium" | "high"
 export const USAGE_CLASS_WEIGHTS: Record<UsageClass, number> = {
   low: 1,

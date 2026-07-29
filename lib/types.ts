@@ -183,6 +183,27 @@ export type UsageMetric = {
   concurrent_peak: number
 }
 
+// Uma linha por requisição individual completada pelo gateway (migration
+// 0038) — diferente de UsageMetric, que é agregado por janela de ~2min.
+// Gravado fire-and-forget no fechamento de cada requisição; só cobre as que
+// passaram de autenticação e resolução de rota (mesmo escopo do in_flight
+// do gateway), então rejeições precoces (401/429/503) não aparecem aqui.
+export type GatewayRequest = {
+  id: string
+  account_id: string | null
+  stack_id: string | null
+  api_key_id: string | null
+  machine_id: string | null
+  path: string
+  model: string | null
+  status_code: number
+  stream: boolean
+  tokens_in: number | null
+  tokens_out: number | null
+  duration_ms: number | null
+  created_at: string
+}
+
 export type MachineEvent = {
   id: string
   machine_id: string | null

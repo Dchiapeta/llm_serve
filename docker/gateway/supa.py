@@ -358,6 +358,13 @@ class SupaClient:
         r = await self._rest.post("/usage_metrics", json=rows)
         r.raise_for_status()
 
+    async def insert_gateway_request(self, row: dict) -> None:
+        """Uma linha por requisição completada (migration 0038). Chamado
+        fire-and-forget (spawn_tracked) no fechamento de cada requisição —
+        nunca no caminho crítico da resposta ao cliente."""
+        r = await self._rest.post("/gateway_requests", json=row)
+        r.raise_for_status()
+
     async def stack_ids_for_keys(self, api_key_ids: list[str]) -> dict[str, str | None]:
         """Resolve api_key_id -> stack_id em lote (migration 0036), pra
         denormalizar stack_id em usage_metrics no momento do insert. Chaves
@@ -500,14 +507,14 @@ class SupaClient:
         return r.json()
 
     async def machine_stack_load(self, machine_id: str) -> float:
-        """Ocupação PONDERADA da máquina — soma dos pesos das classes de uso
-        das stacks hospedadas (migration 0032). Par do machine_stack_slots:
-        vaga efetiva = slots − load ≥ peso do entrante.
+        """Ocupação da máquina em CABEÇAS — contagem de stacks hospedadas
+        (migration 0037, que reverteu a soma de pesos da 0032). Par do
+        machine_stack_slots: vaga = load < slots.
 
-        Fallback: RPC indisponível (migration 0032 ainda não aplicada) →
-        contagem simples de stacks (peso 1 por stack, o comportamento
-        anterior). Está no caminho crítico da realocação de request — nunca
-        pode derrubar o fluxo por causa de uma função SQL ausente."""
+        Fallback: RPC indisponível → contagem simples de stacks, que desde a
+        0037 é exatamente o mesmo resultado (antes era uma degradação). Está
+        no caminho crítico da realocação de request — nunca pode derrubar o
+        fluxo por causa de uma função SQL ausente."""
         try:
             r = await self._rest.post(
                 "/rpc/machine_stack_load", json={"p_machine_id": machine_id}
@@ -516,6 +523,74 @@ class SupaClient:
             return float(r.json() or 0.0)
         except Exception:
             return float(await self.count_stacks_on_machine(machine_id))
+
+    async def machine_high_count(self, machine_id: str) -> int:
+        """Quantas stacks 'high' a máquina hospeda (migration 0037).
+
+        Fallback por contagem direta na tabela quando a RPC não existe — a
+        restrição de mistura não pode derrubar a alocação por causa de uma
+        migration ainda não aplicada."""
+        try:
+            r = await self._rest.post(
+                "/rpc/machine_high_count", json={"p_machine_id": machine_id}
+            )
+            r.raise_for_status()
+            return int(r.json() or 0)
+        except Exception:
+            r = await self._rest.get(
+                "/stacks",
+                params={
+                    "machine_id": f"eq.{machine_id}",
+                    "usage_class": "eq.high",
+                    "select": "id",
+                },
+                headers={"Prefer": "count=exact"},
+            )
+            r.raise_for_status()
+            return len(r.json() or [])
+
+    async def machine_high_cap(self, machine_id: str) -> int | None:
+        """Teto de stacks 'high' da máquina (migration 0037), de
+        templates.usage_class_config->>'max_high'.
+
+        None = sem teto. Vale tanto para template sem a chave configurada
+        quanto para RPC ausente: nos dois casos o comportamento é o de antes
+        da 0037 (fail-open), porque um teto que não pôde ser lido jamais deve
+        bloquear a alocação de um cliente."""
+        try:
+            r = await self._rest.post(
+                "/rpc/machine_high_cap", json={"p_machine_id": machine_id}
+            )
+            r.raise_for_status()
+            value = r.json()
+        except Exception:
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    async def list_stacks_on_machine(
+        self, machine_id: str, usage_class: str | None = None
+    ) -> list[dict]:
+        """Stacks hospedadas na máquina, opcionalmente filtradas por classe.
+        Insumo do rebalanceamento de teto de heavy (migration 0037).
+
+        Ordenado por usage_class_updated_at desc (nulls last): quem mudou de
+        classe mais recentemente aparece primeiro, que é exatamente a ordem
+        de despejo — sai quem acabou de alterar o contrato da máquina, não o
+        co-tenant que já estava lá e não mudou nada."""
+        params = {
+            "machine_id": f"eq.{machine_id}",
+            "select": "*",
+            "order": "usage_class_updated_at.desc.nullslast",
+        }
+        if usage_class:
+            params["usage_class"] = f"eq.{usage_class}"
+        r = await self._rest.get("/stacks", params=params)
+        r.raise_for_status()
+        return r.json() or []
 
     async def stack_usage_stats(self, days: int) -> list[dict]:
         """Agregados de consumo por stack na janela móvel (RPC da 0032) —

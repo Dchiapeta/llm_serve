@@ -3,7 +3,7 @@ import { notFound } from "next/navigation"
 import { Suspense } from "react"
 import { ExternalLink } from "lucide-react"
 
-import { computeCapacity, computeLoraCapacity, stackWeight } from "@/lib/capacity"
+import { computeCapacity, computeLoraCapacity } from "@/lib/capacity"
 import {
   parseMaxModelLen,
   parseServedModelName,
@@ -100,11 +100,11 @@ export default async function MachineDetailPage({
       .eq("machine_id", id),
   ])
   const stacksCount = machineStacks?.length ?? 0
-  // ocupação ponderada pela classe de uso (0032) — pode ser fracionária
-  const stacksLoad = (machineStacks ?? []).reduce(
-    (sum, s) => sum + stackWeight(s.usage_class),
-    0
-  )
+  // Ocupação = contagem de cabeças (migration 0037). Era a soma ponderada da
+  // 0032, que fazia a máquina "encher" com menos clientes do que o plano
+  // promete. O que a classe de uso limita agora é o nº de stacks 'high'
+  // (machine_high_cap), restrição independente desta.
+  const stacksLoad = stacksCount
   // Stacks que HOJE moram nesta máquina (ou seja, ocupam slot). O idle reaper
   // libera a vaga zerando stacks.machine_id, mas NÃO toca em api_keys.machine_id
   // (pin histórico da chave). Por isso a tabela é filtrada pela stack e não por
@@ -112,6 +112,13 @@ export default async function MachineDetailPage({
   const machineStackIds = new Set((machineStacks ?? []).map((s) => s.id))
 
   const template = tplData as Template | null
+  // Teto de mistura (migration 0037): quantas stacks 'high' esta máquina
+  // aceita. undefined = template sem teto configurado (fail-open).
+  const highCount = (machineStacks ?? []).filter(
+    (s) => s.usage_class === "high"
+  ).length
+  const highCap = (template?.usage_class_config as { max_high?: number } | null)
+    ?.max_high
   const allKeys = (keysData ?? []) as KeyWithAccount[]
   const accounts = (accountsData ?? []) as Account[]
   const usage = (usageData ?? []) as UsageMetric[]
@@ -250,6 +257,12 @@ export default async function MachineDetailPage({
               {cap.slotsUsed} de {cap.slotsMax}{" "}
               {loraMode ? "adapters em VRAM" : "slots"} · {cap.slotsFree} livres
             </p>
+            {!loraMode && highCap != null && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Uso alto: {highCount} de {highCap}
+                {highCount > highCap && " · acima do teto, rebalanceando"}
+              </p>
+            )}
           </CardContent>
         </Card>
         <Card>

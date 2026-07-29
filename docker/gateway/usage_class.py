@@ -1,10 +1,16 @@
 """Classificação de stacks por padrão de consumo (low/medium/high).
 
-A classe alimenta a ocupação PONDERADA de máquina (migration 0032): um
-usuário de contexto longo (ex.: Claude Code no VibeCoder-64k) consome um
-múltiplo do KV de um usuário de chat, então a vaga que ele ocupa também pesa
-mais. A classe só influencia alocações FUTURAS (realocação automática,
-migração manual, stack nova) — nunca dispara migração forçada.
+A classe alimenta o TETO DE MISTURA por máquina (migration 0037): capacidade
+em cabeças é sempre capacidade em cabeças (18 slots comportam 18 contas,
+qualquer que seja a mistura), e o que a classe limita é quantas stacks 'high'
+podem coexistir no mesmo pod — um usuário de contexto longo custa dezenas de
+GPU-segundos de prefill por turno, e empilhá-los degrada todo mundo.
+
+Diferente do desenho original da 0032 (ocupação ponderada, onde um high comia
+3 cabeças), a classe aqui NÃO reduz quantos clientes cabem. E, também
+diferente da 0032, ela é ATIVA: quando uma reclassificação estoura o teto de
+heavy da máquina, a stack que mudou de classe é realocada
+(enforce_high_cap_for_stack no gateway).
 
 Dois fatores, classe final = o maior dos dois:
   1. média de tokens por request como FRAÇÃO da janela do plano
@@ -18,7 +24,7 @@ na janela, e respeita cooldown entre mudanças — um dia atípico não pode fic
 migrando o usuário de classe (e de máquina) pra lá e pra cá.
 
 Módulo puro (sem I/O) de propósito: espelha usage_class_weight/limiares do
-SQL (0032) e do TS (lib/capacity.ts) — manter os três em sincronia — e é
+SQL (0032/0037) e do TS (lib/capacity.ts) — manter os três em sincronia — e é
 importável pelos testes sem as env vars do main.py.
 """
 
@@ -46,13 +52,37 @@ DEFAULT_DAILY_THRESHOLDS = {
 
 
 def class_weight(usage_class: str | None, config: dict | None = None) -> float:
-    """Peso de ocupação de uma stack pela classe (espelho do SQL/TS)."""
+    """Peso de ocupação de uma stack pela classe (espelho do SQL/TS).
+
+    Desde a 0037 NÃO é mais usado em admissão (a ocupação voltou a ser
+    contagem de cabeças) — sobrevive porque o painel usa o peso para exibir
+    intensidade de uso, e porque o espelho SQL usage_class_weight segue
+    definido pelo mesmo motivo."""
     klass = usage_class if usage_class in CLASS_ORDER else "low"
     weights = (config or {}).get("weights") or {}
     try:
         return float(weights[klass])
     except (KeyError, TypeError, ValueError):
         return DEFAULT_WEIGHTS[klass]
+
+
+def high_cap(config: dict | None) -> int | None:
+    """Teto de stacks 'high' por máquina, de templates.usage_class_config.
+    Espelho Python do machine_high_cap (0037).
+
+    None = SEM TETO, e o fail-open é deliberado: template sem a chave
+    configurada se comporta como antes da 0037. Um teto ausente jamais pode
+    impedir alocação — o pior caso de fail-open é uma máquina desbalanceada,
+    o de fail-closed seria cliente sem máquina nenhuma.
+
+    Valor <= 0 também vira None: "zero heavy permitido" tornaria impossível
+    alocar qualquer stack high em lugar nenhum, e um 0 em config é muito mais
+    provavelmente engano de digitação do que intenção."""
+    try:
+        value = int((config or {})["max_high"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _config_float(config: dict | None, key: str, default: float) -> float:

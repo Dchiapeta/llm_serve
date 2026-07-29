@@ -28,6 +28,8 @@ docker push SEU_USUARIO/vllm-agent:latest
 | `MAX_LORAS`          | não         | Máx. de adapters simultâneos em VRAM (default 8) |
 | `MAX_LORA_RANK`      | não         | Rank máximo aceito nos adapters (default 64; o vLLM 0.24 só aceita 1, 8, 16, 32, 64, 128, 256, 320 ou 512) |
 | `LORA_DIR`           | não         | Diretório local dos adapters baixados (default `/workspace/loras`) |
+| `ENABLE_REASONING_PARSER` | não    | `true` liga `--reasoning-parser` do vLLM, separando o raciocínio em `reasoning_content` (default `false`) |
+| `REASONING_PARSER`   | se `ENABLE_REASONING_PARSER=true` | Parser do modelo (ex.: `qwen3`) |
 
 O painel injeta `MODEL_NAME`, `AGENT_ADMIN_SECRET` e `GPU_COUNT` (a partir de
 `templates.gpu_count`) automaticamente ao criar a máquina a partir de um
