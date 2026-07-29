@@ -10,6 +10,11 @@ export type AgentKeyEntry = {
   api_key_id: string
   key_prefix: string
   account_name: string
+  // fronteira de isolamento do prefix cache dentro do pod: o agent deriva um
+  // cache_salt por stack a partir daqui (docker/agent/proxy_policy.py). Omitir
+  // o campo faz o salt cair no ramo degradado `kh:` e invalida o cache do
+  // tenant — o agent tem carry-over, mas mandar é o certo.
+  stack_id: string | null
   expires_at: string | null
 }
 

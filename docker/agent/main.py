@@ -25,6 +25,13 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from proxy_policy import (
+    ALLOWED_V1,
+    UnparseableBody,
+    merge_key_entry,
+    prepare_proxy_body,
+)
+
 VLLM_URL = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
 ADMIN_SECRET = os.environ.get("AGENT_ADMIN_SECRET", "")
 MODEL_NAME = os.environ.get("MODEL_NAME", "")
@@ -35,9 +42,21 @@ VLLM_LOG_FILE = os.environ.get("VLLM_LOG_FILE", "/var/log/vllm.log")
 # diretório local onde adapters LoRA baixados do storage ficam antes do load
 LORA_DIR = os.environ.get("LORA_DIR", "/workspace/loras")
 
+# Isolamento de prefix cache entre tenants do mesmo pod (ver proxy_policy.py).
+# Contrato de DUAS variáveis com o entrypoint: esta MESMA env é o que liga o
+# --enable-prefix-caching no vLLM (docker/entrypoint.sh) e o que prova que o
+# agent desta imagem sabe isolar. As duas viajam no mesmo container, então
+# nenhuma ordem de deploy consegue ligar o caching sem o salt:
+#   imagem velha + var no template -> vLLM antigo ignora a var, caching off
+#   imagem nova  + var ausente     -> caching off, salt off
+# Qualquer valor diferente de "cache_salt" deixa tudo desligado (fail-closed).
+SALT_ENABLED = (
+    os.environ.get("PREFIX_CACHE_ISOLATION", "").strip().lower() == "cache_salt"
+)
+
 STARTED_AT = time.time()
 
-# chaves sincronizadas: hash -> {api_key_id, key_prefix, account_name}
+# chaves sincronizadas: hash -> entrada montada por proxy_policy.merge_key_entry
 keys_by_hash: dict[str, dict] = {}
 
 # métricas por api_key_id (não por key_prefix: 8 hex chars = 32 bits, uma
@@ -55,6 +74,16 @@ client = httpx.AsyncClient(base_url=VLLM_URL, timeout=httpx.Timeout(600.0))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if SALT_ENABLED:
+        if ADMIN_SECRET:
+            print("[agent] prefix cache isolado por cache_salt (salt por stack)")
+        else:
+            # sem segredo não há salt derivável; o entrypoint já terá ligado o
+            # caching, então o pod fica COM caching e SEM isolamento — grita.
+            print(
+                "[agent] ATENÇÃO: PREFIX_CACHE_ISOLATION=cache_salt sem "
+                "AGENT_ADMIN_SECRET — nenhum salt será injetado"
+            )
     yield
     await client.aclose()
 
@@ -114,6 +143,11 @@ class SyncKeysBody(BaseModel):
 @app.post("/admin/sync-keys")
 async def sync_keys(body: SyncKeysBody, x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
+    # snapshot ANTES do clear(): merge_key_entry preserva o stack_id conhecido
+    # quando o payload não traz (produtor antigo), e sem isso o salt do tenant
+    # trocaria de ident a cada sync, zerando o cache dele. O clear() continua
+    # necessário — é como uma chave revogada sai da memória do agent.
+    previous = dict(keys_by_hash)
     keys_by_hash.clear()
     for k in body.keys:
         # .get() em vez de indexação direta: um registro sem key_hash não
@@ -123,12 +157,7 @@ async def sync_keys(body: SyncKeysBody, x_admin_secret: str | None = Header(None
         key_hash = k.get("key_hash")
         if not key_hash:
             continue
-        keys_by_hash[key_hash] = {
-            "api_key_id": k.get("api_key_id"),
-            "key_prefix": k.get("key_prefix", "?"),
-            "account_name": k.get("account_name", "?"),
-            "expires_at": k.get("expires_at"),
-        }
+        keys_by_hash[key_hash] = merge_key_entry(previous.get(key_hash), k, key_hash)
     return {"ok": True, "count": len(keys_by_hash)}
 
 
@@ -179,7 +208,32 @@ async def get_metrics(
 @app.get("/admin/health")
 async def admin_health(x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
-    return {"ok": True, "model": MODEL_NAME, "max_users": MAX_USERS}
+    return {
+        "ok": True,
+        "model": MODEL_NAME,
+        "max_users": MAX_USERS,
+        # o painel/gateway conseguem confirmar que ESTE pod está isolando sem
+        # ter que ler o log de boot
+        "prefix_cache_isolation": "cache_salt" if SALT_ENABLED else None,
+    }
+
+
+# Métricas cruas do vLLM (formato Prometheus), incluindo
+# vllm:prefix_cache_hits / vllm:prefix_cache_queries — é como se mede o hit
+# rate real do pod. Fica SOB require_admin e NUNCA em /v1/*: os contadores são
+# do processo inteiro e agregam todos os co-tenants; expor a um cliente
+# devolveria justamente a informação de vizinho que o cache_salt existe pra
+# negar.
+@app.get("/admin/vllm-metrics")
+async def vllm_metrics(x_admin_secret: str | None = Header(None)):
+    require_admin(x_admin_secret)
+    try:
+        resp = await client.get("/metrics", timeout=10.0)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"vLLM indisponível: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"vLLM /metrics falhou: {resp.status_code}")
+    return {"metrics": resp.text}
 
 
 # Insere/atualiza chaves SEM limpar as existentes (diferente do sync-keys).
@@ -192,12 +246,7 @@ async def upsert_keys(body: SyncKeysBody, x_admin_secret: str | None = Header(No
         key_hash = k.get("key_hash")
         if not key_hash:
             continue
-        keys_by_hash[key_hash] = {
-            "api_key_id": k.get("api_key_id"),
-            "key_prefix": k.get("key_prefix", "?"),
-            "account_name": k.get("account_name", "?"),
-            "expires_at": k.get("expires_at"),
-        }
+        keys_by_hash[key_hash] = merge_key_entry(keys_by_hash.get(key_hash), k, key_hash)
     return {"ok": True, "count": len(keys_by_hash)}
 
 
@@ -406,32 +455,57 @@ async def health():
 # ---------- Proxy OpenAI-compatible ----------
 
 
+def cached_tokens_of(usage: dict | None) -> int:
+    """Tokens de prompt servidos pelo prefix cache nesta request.
+
+    Só existe com --enable-prompt-tokens-details no vLLM (default off); sem a
+    flag o campo nunca vem e isto devolve 0 — o que é indistinguível de
+    "caching ligado e sem hit nenhum". É por isso que a flag entra junto com
+    PREFIX_CACHE_ISOLATION no template: sem ela a verificação do rollout fica
+    sem ground truth."""
+    if not isinstance(usage, dict):
+        return 0
+    details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        return 0
+    value = details.get("cached_tokens")
+    return value if isinstance(value, int) else 0
+
+
 def track_usage(api_key_id: str | None, usage: dict | None):
     if not api_key_id:
         return  # chave sem id sincronizado (sync antigo) — nada seguro pra agregar
     m = metrics_per_key.setdefault(
-        api_key_id, {"requests": 0, "tokens_in": 0, "tokens_out": 0, "last_used": None}
+        api_key_id,
+        {"requests": 0, "tokens_in": 0, "tokens_out": 0, "tokens_cached": 0,
+         "last_used": None},
     )
     m["requests"] += 1
     m["last_used"] = time.time()
     if usage:
         m["tokens_in"] += usage.get("prompt_tokens", 0) or 0
         m["tokens_out"] += usage.get("completion_tokens", 0) or 0
+        # setdefault: métricas criadas por uma versão anterior do agent (sem
+        # esta chave) não podem estourar KeyError no primeiro incremento
+        m["tokens_cached"] = m.get("tokens_cached", 0) + cached_tokens_of(usage)
 
 
-# paths do vLLM que o agent repassa — mesmo conjunto que o gateway permite
-# (docker/gateway/main.py ALLOWED_V1). Sem esta allowlist aqui TAMBÉM, quem
-# descobrisse a URL pública do pod (proxy da RunPod) podia chamar endpoints
-# administrativos do vLLM (load/unload_lora_adapter etc.) direto, contornando
-# qualquer allowlist que existisse só no gateway — o agent é alcançável
-# diretamente, sem passar pelo proxy central.
-ALLOWED_V1: dict[str, set[str]] = {
-    "chat/completions": {"POST"},
-    "completions": {"POST"},
-    "embeddings": {"POST"},
-    "models": {"GET"},
-    "responses": {"POST"},  # Codex CLI (0.59+) só fala essa API
-}
+def usage_summary(usage: dict | None) -> str:
+    """Sufixo de log com tokens e hit rate de cache, pra /admin/logs."""
+    if not usage:
+        return "? tokens"
+    total = usage.get("total_tokens", "?")
+    prompt = usage.get("prompt_tokens") or 0
+    cached = cached_tokens_of(usage)
+    if prompt and cached:
+        return f"{total} tokens · cache {cached}/{prompt} ({cached * 100 // prompt}%)"
+    return f"{total} tokens"
+
+
+# ALLOWED_V1 e a política de cache_salt vivem em proxy_policy.py (importados no
+# topo) — funções puras, testáveis sem subir o agent. O teste-guarda de
+# test_proxy_policy.py exige que todo POST da allowlist esteja classificado
+# como salgado ou isento, pra que um endpoint novo não passe sem isolamento.
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
@@ -454,18 +528,17 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
     log_line(api_key_id, prefix, account, f"{request.method} /v1/{path}")
 
     try:
-        # detecta streaming para repassar SSE; injeta include_usage para o
-        # vLLM emitir o chunk final com usage (senão tokens não são contados)
-        is_stream = False
+        # Reescrita do corpo (detecção de streaming + include_usage + salt) em
+        # proxy_policy.prepare_proxy_body — módulo puro, testável sem subir o
+        # agent. Cuidado histórico: o json.dumps ficava DENTRO do `if
+        # is_stream`, então requisição não-streaming reenviava o corpo original
+        # e qualquer reescrita era perdida em silêncio.
         try:
-            body_json = json.loads(body)
-            is_stream = body_json.get("stream") is True
-            if is_stream:
-                opts = body_json.setdefault("stream_options", {})
-                opts.setdefault("include_usage", True)
-                body = json.dumps(body_json).encode()
-        except Exception:
-            pass  # body não-JSON: segue como não-streaming
+            body, is_stream = prepare_proxy_body(
+                body, path, entry, salt_enabled=SALT_ENABLED, secret=ADMIN_SECRET
+            )
+        except UnparseableBody:
+            raise HTTPException(status_code=400, detail="corpo inválido (JSON esperado)")
 
         if is_stream:
             upstream_req = client.build_request(
@@ -499,7 +572,7 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
                     log_line(
                         api_key_id, prefix, account,
                         f"stream concluído ({upstream.status_code}) · "
-                        f"{usage.get('total_tokens', '?') if usage else '?'} tokens",
+                        f"{usage_summary(usage)}",
                     )
 
             return StreamingResponse(
@@ -531,7 +604,7 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
         track_usage(api_key_id, usage)
         log_line(
             api_key_id, prefix, account,
-            f"{resp.status_code} · {usage.get('total_tokens', '?') if usage else '?'} tokens",
+            f"{resp.status_code} · {usage_summary(usage)}",
         )
         if path == "models" and isinstance(parsed, dict):
             # espelha o filtro do gateway (main.py, path == "models"): remove os

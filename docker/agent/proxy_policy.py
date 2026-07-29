@@ -1,0 +1,205 @@
+"""Política do proxy do agent: allowlist de rotas e isolamento de prefix cache.
+
+Funções PURAS, sem env/rede/FastAPI — importáveis pelos testes sem subir o
+agent (mesma disciplina de docker/gateway/context_budget.py).
+
+---------------------------------------------------------------------------
+Por que o salt existe
+---------------------------------------------------------------------------
+Nos planos de pod COMPARTILHADO (VibeCoder, Pro) várias stacks de contas
+diferentes dividem o mesmo processo vLLM. Com prefix caching ligado, um
+cache hit reduz o TTFT de forma observável: um tenant mede o próprio tempo
+de resposta e infere se um prefixo já foi processado por outro. Canal
+lateral de tempo, e foi por isso que o caching ficou desligado até agora.
+
+O vLLM 0.24.0 resolve com `cache_salt`: o valor entra no hash do PRIMEIRO
+bloco de KV e o encadeamento propaga pro resto da sequência
+(vllm/v1/core/kv_cache_utils.py). Salts distintos nunca colidem no cache;
+o mesmo tenant segue reaproveitando o próprio prefixo entre turnos. Vale
+para todos os grupos de KV, inclusive o grupo mamba dos modelos híbridos
+(Qwen3.5/3.6) — o hash é da REQUEST, e cada grupo indexa pelo mesmo
+BlockHash.
+
+---------------------------------------------------------------------------
+INVARIANTE: a granularidade do salt NUNCA pode ser mais grossa que a stack
+---------------------------------------------------------------------------
+Salt por conta ou por plano reintroduz exatamente o vazamento que isto
+fecha. A stack é a fronteira de isolamento que o resto do sistema já usa
+(adapter LoRA por stack, system_prompt/RAG por stack) — e é o que permite
+dois devs da MESMA stack compartilharem o prefixo de ~26k tokens de
+system+tools do Claude Code, que é de onde vem quase todo o ganho.
+
+---------------------------------------------------------------------------
+Por que aqui no agent, e não no gateway
+---------------------------------------------------------------------------
+O pod é alcançável direto pela URL pública do RunPod — é a mesma razão de
+ALLOWED_V1 e do filtro de modelos `acct-*` já serem duplicados aqui. Se o
+salt fosse injetado só no gateway, um tenant chamaria o pod direto mandando
+`cache_salt` arbitrário e colidiria de propósito com o cache da vítima. A
+defesa que importa é apply_cache_salt SEMPRE descartar o campo do cliente.
+"""
+
+import hashlib
+import hmac
+import json
+
+# Paths do vLLM que o agent repassa — mesmo conjunto que o gateway permite
+# (docker/gateway/main.py ALLOWED_V1). Sem esta allowlist aqui TAMBÉM, quem
+# descobrisse a URL pública do pod (proxy da RunPod) podia chamar endpoints
+# administrativos do vLLM (load/unload_lora_adapter etc.) direto, contornando
+# qualquer allowlist que existisse só no gateway.
+ALLOWED_V1: dict[str, set[str]] = {
+    "chat/completions": {"POST"},
+    "completions": {"POST"},
+    "embeddings": {"POST"},
+    "models": {"GET"},
+    "responses": {"POST"},  # Codex CLI (0.59+) só fala essa API
+}
+
+# Rotas que aceitam `cache_salt` no corpo (os 3 protocolos generativos do
+# vLLM 0.24.0). SALT_EXEMPT_PATHS existe pra que o teste-guarda em
+# test_proxy_policy.py force uma decisão CONSCIENTE sobre cada POST novo:
+# uma allowlist positiva sozinha falharia aberta (endpoint novo entra em
+# ALLOWED_V1, ninguém lembra do salt, e ele passa sem isolamento).
+SALTED_PATHS = frozenset({"chat/completions", "completions", "responses"})
+SALT_EXEMPT_PATHS = frozenset({"embeddings"})
+
+# Prefixo versionado no HMAC: se um dia a granularidade ou o formato do
+# identificador mudar, bumpar isto invalida os salts antigos de uma vez em
+# vez de deixar dois esquemas coexistindo no mesmo pool de cache.
+_SALT_DOMAIN = "cache-salt:v1:"
+
+# memo do HMAC — o salt é recalculado a cada request e o ident muda pouco
+_salt_cache: dict[tuple[str, str], str] = {}
+
+
+def salt_ident(entry: dict) -> str:
+    """Identificador de isolamento de uma entrada de chave.
+
+    EXATAMENTE duas ramificações, nunca uma cadeia de três: qualquer fallback
+    a mais é mais uma chance de o mesmo tenant receber idents diferentes em
+    momentos diferentes, e cada troca de ident invalida 100% do cache dele.
+
+        stack_id          quando presente e truthy
+        "kh:" + key_hash  caso contrário
+
+    O ramo `kh:` é degradado de propósito: isola igual (chave é por conta),
+    mas fragmenta o cache entre chaves da mesma stack e não sobrevive a uma
+    rotação de chave. Só deve aparecer com agent novo + gateway/painel antigo
+    (ver merge_key_entry)."""
+    stack_id = entry.get("stack_id")
+    if stack_id:
+        return str(stack_id)
+    return "kh:" + str(entry.get("key_hash") or "")
+
+
+def tenant_cache_salt(ident: str, secret: str) -> str:
+    """HMAC-SHA256(segredo do pod, domínio + ident).
+
+    HMAC e não o ident cru por dois motivos: o AGENT_ADMIN_SECRET é por pod e
+    nunca sai dele, e um erro de validação do pydantic no vLLM pode ecoar o
+    corpo da request — com o ident cru isso vazaria o stack_id de volta pro
+    cliente."""
+    cached = _salt_cache.get((ident, secret))
+    if cached is not None:
+        return cached
+    salt = hmac.new(
+        secret.encode(), (_SALT_DOMAIN + ident).encode(), hashlib.sha256
+    ).hexdigest()
+    _salt_cache[(ident, secret)] = salt
+    return salt
+
+
+def merge_key_entry(prev: dict | None, incoming: dict, key_hash: str) -> dict:
+    """Monta a entrada de keys_by_hash preservando o stack_id já conhecido.
+
+    O agent SUBSTITUI a entrada inteira a cada /admin/sync-keys e
+    /admin/upsert-keys, e os produtores de payload divergem: nem todos
+    mandam stack_id (versões antigas do gateway/painel, ou um deploy parcial).
+    Sem carry-over, o salt alternaria entre `stack_id` e `kh:*` a cada
+    re-sync e **invalidaria todo o cache do tenant a cada flip** — o pior dos
+    dois mundos, porque o custo de VRAM do caching continuaria sendo pago.
+
+    Regra: `stack_id` AUSENTE no payload preserva o valor conhecido;
+    PRESENTE (mesmo None) sobrescreve — é como uma stack desvinculada
+    consegue voltar pro ramo `kh:`.
+
+    O carry-over vale SÓ pra stack_id. Em expires_at seria um bug de
+    segurança: um None novo precisa poder limpar uma expiração antiga."""
+    prev = prev or {}
+    entry = {
+        "api_key_id": incoming.get("api_key_id"),
+        "key_prefix": incoming.get("key_prefix", "?"),
+        "account_name": incoming.get("account_name", "?"),
+        "expires_at": incoming.get("expires_at"),
+        "key_hash": key_hash,
+    }
+    entry["stack_id"] = (
+        incoming.get("stack_id") if "stack_id" in incoming else prev.get("stack_id")
+    )
+    return entry
+
+
+def apply_cache_salt(
+    body_json: dict, path: str, salt: str | None, enabled: bool
+) -> dict:
+    """Descarta o `cache_salt` do cliente e injeta o do tenant quando cabe.
+
+    O pop é INCONDICIONAL — é a defesa contra quem chama o pod direto pela
+    URL pública tentando colidir de propósito com o cache de outro tenant.
+    Vale inclusive com o salting desligado: aí o campo simplesmente não
+    existe pra ninguém, em vez de existir só pra quem souber mandá-lo."""
+    body_json.pop("cache_salt", None)
+    if enabled and salt and path in SALTED_PATHS:
+        body_json["cache_salt"] = salt
+    return body_json
+
+
+class UnparseableBody(ValueError):
+    """Corpo que precisa de salt e não é um objeto JSON. O chamador traduz
+    para 400 — deixar passar seria uma request sem salt num pod COM caching."""
+
+
+def prepare_proxy_body(
+    raw: bytes, path: str, entry: dict, *, salt_enabled: bool, secret: str
+) -> tuple[bytes, bool]:
+    """Reescreve o corpo antes do proxy. Devolve (corpo, is_stream).
+
+    Faz três coisas de uma vez porque as três dependem de parsear o JSON uma
+    única vez: detecta streaming, injeta stream_options.include_usage (sem
+    isso o vLLM não manda o chunk final com usage e nenhum token é contado) e
+    aplica a política de cache_salt.
+
+    Levanta UnparseableBody quando o corpo não é um objeto JSON num path que
+    exige salt. Nos outros paths um corpo ilegível segue adiante como antes —
+    quem valida o formato é o vLLM."""
+    try:
+        body_json = json.loads(raw)
+    except Exception:
+        body_json = None
+
+    if not isinstance(body_json, dict):
+        if salt_enabled and path in SALTED_PATHS:
+            raise UnparseableBody(path)
+        return raw, False
+
+    is_stream = body_json.get("stream") is True
+    if is_stream:
+        # get + isinstance em vez de setdefault: um "stream_options": null
+        # explícito do cliente faria o setdefault devolver None e o
+        # .setdefault seguinte estourar AttributeError. Antes isso era
+        # engolido por um `except Exception: pass` no chamador; agora que a
+        # reescrita do corpo é obrigatória, não pode mais escapar.
+        opts = body_json.get("stream_options")
+        if not isinstance(opts, dict):
+            opts = {}
+            body_json["stream_options"] = opts
+        opts.setdefault("include_usage", True)
+
+    apply_cache_salt(
+        body_json,
+        path,
+        tenant_cache_salt(salt_ident(entry), secret) if secret else None,
+        salt_enabled,
+    )
+    return json.dumps(body_json).encode(), is_stream

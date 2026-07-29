@@ -1779,7 +1779,7 @@ async function syncMachineKeys(machineId: string) {
 
   const { data: keys } = await db
     .from("api_keys")
-    .select("id, key_hash, key_prefix, status, expires_at, accounts(name)")
+    .select("id, key_hash, key_prefix, stack_id, status, expires_at, accounts(name)")
     .eq("machine_id", machineId)
     .eq("status", "active")
 
@@ -1787,6 +1787,7 @@ async function syncMachineKeys(machineId: string) {
     key_hash: k.key_hash,
     api_key_id: k.id,
     key_prefix: k.key_prefix,
+    stack_id: k.stack_id,
     account_name:
       (k.accounts as unknown as { name: string } | null)?.name ?? "desconhecida",
     expires_at: k.expires_at,

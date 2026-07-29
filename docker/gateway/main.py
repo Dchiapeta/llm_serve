@@ -1014,6 +1014,10 @@ async def ensure_key_on_machine(entry: dict, machine: dict) -> None:
         "api_key_id": entry.get("api_key_id"),
         "key_prefix": entry["key_prefix"],
         "account_name": entry["account_name"],
+        # identificador de isolamento do prefix cache no agent
+        # (proxy_policy.salt_ident) — sem ele o salt do tenant cai no ramo
+        # degradado `kh:` e o cache dele é invalidado
+        "stack_id": entry.get("stack_id"),
         "expires_at": entry.get("expires_at"),
     }]})
     agent_key_upserts[cache_key] = time.time() + UPSERT_CACHE_TTL_S
@@ -1946,6 +1950,13 @@ async def validate_body(
         if isinstance(value, (int, float)):
             body_json[param] = min(max(value, lo), hi)
     body_json.pop("logit_bias", None)
+    # cache_salt é campo DO SERVIDOR: quem decide o valor é o agent dentro do
+    # pod (docker/agent/proxy_policy.py), a partir do stack_id. Deixar o
+    # cliente escolher seria deixá-lo colidir de propósito com o cache de
+    # outro tenant. A defesa real é o pop incondicional do agent — o pod é
+    # alcançável direto pela URL pública, então tirar aqui não fecha nada
+    # sozinho. Isto é documentação executável, não a trava.
+    body_json.pop("cache_salt", None)
 
     messages = body_json.get("messages")
     if not isinstance(messages, list):
@@ -2120,6 +2131,9 @@ async def validate_responses_body(
         value = body_json.get(param)
         if isinstance(value, (int, float)):
             body_json[param] = min(max(value, lo), hi)
+
+    # campo do servidor — mesmo motivo do validate_body acima
+    body_json.pop("cache_salt", None)
 
     input_items = body_json.get("input")
     if isinstance(input_items, list):

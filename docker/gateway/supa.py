@@ -105,13 +105,20 @@ class SupaClient:
         apagava o api_key_id/expires_at que um upsert anterior (via
         ensure_key_on_machine) já tinha gravado, derrotando silenciosamente
         a quota de tokens (track_usage descarta uso sem api_key_id) e a
-        expiração no agent pra essa chave."""
+        expiração no agent pra essa chave.
+
+        stack_id pelo mesmo motivo, e com uma consequência a mais: é o
+        identificador de isolamento do prefix cache no agent
+        (proxy_policy.salt_ident). Um payload sem ele faria o salt do tenant
+        cair no ramo degradado `kh:` e INVALIDAR todo o cache dele — o agent
+        tem carry-over pra sobreviver a isso, mas mandar o campo é o que
+        evita o problema em vez de remediar."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "account_id": f"eq.{account_id}",
                 "status": "eq.active",
-                "select": "id,key_hash,key_prefix,expires_at,accounts(name)",
+                "select": "id,key_hash,key_prefix,stack_id,expires_at,accounts(name)",
             },
         )
         r.raise_for_status()
@@ -120,6 +127,7 @@ class SupaClient:
                 "key_hash": row["key_hash"],
                 "api_key_id": row["id"],
                 "key_prefix": row["key_prefix"],
+                "stack_id": row.get("stack_id"),
                 "expires_at": row.get("expires_at"),
                 "account_name": (row.get("accounts") or {}).get("name", "?"),
             }
@@ -131,14 +139,14 @@ class SupaClient:
         Espelho do select do syncMachineKeys (lib/actions.ts) — usado no
         re-sync pós-religada, já que o agent perde as chaves ao reiniciar.
 
-        Mesmo motivo de api_key_id/expires_at do docstring de
+        Mesmo motivo de api_key_id/expires_at/stack_id do docstring de
         list_active_keys_for_account acima."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "machine_id": f"eq.{machine_id}",
                 "status": "eq.active",
-                "select": "id,key_hash,key_prefix,expires_at,accounts(name)",
+                "select": "id,key_hash,key_prefix,stack_id,expires_at,accounts(name)",
             },
         )
         r.raise_for_status()
@@ -147,6 +155,7 @@ class SupaClient:
                 "key_hash": row["key_hash"],
                 "api_key_id": row["id"],
                 "key_prefix": row["key_prefix"],
+                "stack_id": row.get("stack_id"),
                 "expires_at": row.get("expires_at"),
                 "account_name": (row.get("accounts") or {}).get("name", "?"),
             }

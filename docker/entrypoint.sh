@@ -57,20 +57,51 @@ if [ "${ENABLE_REASONING_PARSER}" = "true" ]; then
   echo "[entrypoint] reasoning-parser habilitado (${REASONING_PARSER_ARGS})"
 fi
 
-# Prefix caching automático (opt-in pra DESLIGAR — vLLM liga por padrão em
-# versões recentes): em pod COMPARTILHADO entre tenants (várias stacks/
-# contas no mesmo processo vLLM), um cache hit de prefixo (prompt com o
-# mesmo início de outro tenant) reduz o TTFT de forma observável — um canal
-# lateral de tempo que pode vazar informação sobre o prompt de outro
-# tenant por inferência. Planos de pod DEDICADO não têm esse problema (sem
-# co-tenant pra inferir nada) e não precisam desta flag. Desligar por
-# template de pod compartilhado via DISABLE_PREFIX_CACHING=true. Flag
-# exata depende da versão do vLLM em produção (BooleanOptionalAction:
-# --no-enable-prefix-caching nas versões recentes) — validar antes de
-# ligar em produção.
+# Prefix caching, controlado por um contrato de DUAS variáveis.
+#
+# O problema: em pod COMPARTILHADO (várias stacks/contas no mesmo processo
+# vLLM), um cache hit de prefixo reduz o TTFT de forma observável — um tenant
+# mede o próprio tempo de resposta e infere se um prefixo já foi processado
+# por outro. Canal lateral de tempo. Por isso o caching ficou desligado nesses
+# planos via DISABLE_PREFIX_CACHING=true. O custo era severo: cliente agêntico
+# manda ~85k tokens por turno e reprocessava TUDO a cada mensagem.
+#
+# A solução: PREFIX_CACHE_ISOLATION=cache_salt liga o caching E prova, na mesma
+# variável, que o agent desta imagem sabe isolar (ele injeta um cache_salt por
+# stack em toda request — ver docker/agent/proxy_policy.py). As duas coisas
+# viajam no mesmo container, então nenhuma ordem de deploy consegue ligar o
+# caching sem o isolamento:
+#
+#   imagem velha + var no template -> shell antigo ignora a var  -> off, seguro
+#   imagem nova  + var ausente     -> nada liga                  -> off, seguro
+#   imagem nova  + var no template -> caching ON, salt ON        -> objetivo
+#
+# DISABLE_PREFIX_CACHING=true continua sendo injetado pelo painel em todo pod
+# compartilhado (lib/actions.ts) e continua sendo o padrão fail-closed: se a
+# variável nova sumir do template por engano, o pod volta pro comportamento
+# lento e seguro em vez de ficar rápido e vazando.
+#
+# --enable-prefix-caching EXPLÍCITO é obrigatório, não redundante: modelos
+# híbridos (Qwen3.5/3.6, linear + full attention) têm attn_type == "hybrid", e
+# em vllm/config/model.py:is_prefix_caching_supported o default para esses é
+# DESLIGADO ("the feature is still experimental"). Só tirar o --no- deixaria o
+# caching off em silêncio. O flag explícito não é sobrescrito para modelo
+# generativo (o aviso em arg_utils.py só vale pra runner_type == "pooling").
+# Não passar --mamba-block-size: com caching ligado o vLLM alinha sozinho ao
+# block_size, e passá-lo num pod SEM caching é erro fatal de boot.
+#
+# Canal residual aceito conscientemente: todos os tenants disputam o mesmo pool
+# LRU, então a variância do próprio hit rate ainda dá um sinal grosseiro de
+# VOLUME de atividade dos vizinhos — sem conteúdo, e em parte já presente hoje
+# via contenção de fila.
+PREFIX_CACHE_ISOLATION="${PREFIX_CACHE_ISOLATION:-}"
 DISABLE_PREFIX_CACHING="${DISABLE_PREFIX_CACHING:-false}"
 PREFIX_CACHING_ARGS=""
-if [ "${DISABLE_PREFIX_CACHING}" = "true" ]; then
+if [ "${PREFIX_CACHE_ISOLATION}" = "cache_salt" ]; then
+  : "${AGENT_ADMIN_SECRET:?AGENT_ADMIN_SECRET é obrigatória com PREFIX_CACHE_ISOLATION=cache_salt}"
+  PREFIX_CACHING_ARGS="--enable-prefix-caching"
+  echo "[entrypoint] prefix caching LIGADO, isolado por cache_salt (salt por stack, injetado pelo agent)"
+elif [ "${DISABLE_PREFIX_CACHING}" = "true" ]; then
   PREFIX_CACHING_ARGS="--no-enable-prefix-caching"
   echo "[entrypoint] prefix caching desligado (pod compartilhado entre tenants)"
 fi

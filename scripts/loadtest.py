@@ -123,6 +123,7 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
     usage = None
     error = None
     first_byte = False
+    ttft = None  # time-to-first-token: o que o usuário sente como "travou"
     try:
         async with client.stream(
             "POST", "/v1/chat/completions",
@@ -140,6 +141,8 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
                 error = f"HTTP {resp.status_code}: {body[:300]!r}"
             else:
                 async for line in resp.aiter_lines():
+                    if not first_byte:
+                        ttft = time.monotonic() - t0
                     first_byte = True
                     if not line or not line.startswith("data:"):
                         continue
@@ -167,9 +170,16 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
         "cat": task["cat"],
         "dif": task["dif"],
         "total_s": round(total_time, 2),
+        # TTFT é a métrica que o prefix caching move: sem cache o prefill do
+        # prompt inteiro acontece ANTES do primeiro token. total_s inclui a
+        # geração e dilui o efeito.
+        "ttft_s": round(ttft, 2) if ttft is not None else None,
         "chars": len(full_text),
         "completion_tokens": (usage or {}).get("completion_tokens"),
         "prompt_tokens": (usage or {}).get("prompt_tokens"),
+        # ground truth do prefix cache — exige --enable-prompt-tokens-details
+        # no vLLM, senão vem sempre None (indistinguível de "sem hit nenhum")
+        "cached_tokens": ((usage or {}).get("prompt_tokens_details") or {}).get("cached_tokens"),
         "finish_reason": finish_reason,
         "error": error,
         "error_phase": None if not error else ("mid_stream" if first_byte else "pre_byte"),
@@ -215,8 +225,11 @@ async def run_account(
 ) -> list[dict]:
     """Sessão de uma conta no cenário de isolamento: requests sequenciais,
     mesma fila de tasks nos dois modos (comparação justa baseline vs full)."""
-    # contexto grande estável por conta (único entre contas) — ver build_big_context
-    ctx = build_big_context(5000 + account_idx, args.context_tokens)
+    # contexto grande estável por conta (único entre contas) — ver build_big_context.
+    # Com --shared-context TODAS as contas usam o MESMO seed: é o teste de
+    # isolamento de prefix cache, que precisa de um prompt byte-idêntico entre
+    # tenants pra que um hit na primeira request da conta B prove vazamento.
+    ctx = build_big_context(5000 if args.shared_context else 5000 + account_idx, args.context_tokens)
     out = []
     for seq, task in enumerate(queue, start=1):
         r = await run_one(
@@ -240,8 +253,21 @@ async def run_isolation(client: httpx.AsyncClient, args) -> list[dict]:
     sozinha, em série; full = todas simultâneas. O delta de tempo médio
     por conta entre os modos é o "custo do vizinho"."""
     keys = args.isolation_keys
-    # fila fixa por conta (seed própria): as MESMAS tasks nos dois modos
-    queues = [build_user_queue(5000 + i, 0, args.requests_per_user) for i in range(len(keys))]
+    # fila fixa por conta (seed própria): as MESMAS tasks nos dois modos.
+    # Com --shared-context a fila também precisa ser idêntica entre contas —
+    # senão o prompt difere depois do bloco de contexto e o teste de vazamento
+    # perde o sentido (o hit dependeria da task sorteada).
+    queues = [
+        build_user_queue(5000 if args.shared_context else 5000 + i, 0, args.requests_per_user)
+        for i in range(len(keys))
+    ]
+    if args.shared_context:
+        print(
+            "!!! --shared-context: prompt IDÊNTICO entre contas. Um "
+            "cached_tokens > 0 na PRIMEIRA request de uma conta que ainda não "
+            "rodou = isolamento de prefix cache QUEBRADO.",
+            flush=True,
+        )
     all_results = []
 
     print(f"=== isolamento: modo BASELINE ({len(keys)} contas, uma por vez) ===", flush=True)
@@ -263,7 +289,72 @@ async def run_isolation(client: httpx.AsyncClient, args) -> list[dict]:
             print(f"  conta {i}: baseline={mb:.1f}s full={mf:.1f}s delta={100 * (mf - mb) / mb:+.0f}%", flush=True)
         else:
             print(f"  conta {i}: dados insuficientes (erros demais em um dos modos)", flush=True)
+
+    for modo in ("baseline", "full"):
+        print_cache_summary(modo, [r for r in all_results if r.get("mode") == modo])
+    if args.shared_context:
+        print("\n--- isolamento: cache na PRIMEIRA request de cada conta ---", flush=True)
+        # No modo baseline as contas rodam EM SÉRIE: a conta 0 aquece o prompt
+        # e as seguintes o repetem byte a byte. Se o salt estiver funcionando,
+        # a 1a request de cada conta continua fria mesmo assim.
+        for i in range(len(keys)):
+            fria = next(
+                (r for r in all_results
+                 if r.get("account") == i and r.get("mode") == "baseline" and r.get("seq") == 1),
+                None,
+            )
+            if not fria or not isinstance(fria.get("cached_tokens"), int):
+                print(f"  conta {i}: SEM DADO de cached_tokens", flush=True)
+                continue
+            pct = 100 * fria["cached_tokens"] // max(fria.get("prompt_tokens") or 1, 1)
+            veredito = "OK (fria)" if pct < 10 else "!!! VAZOU — prefixo de outro tenant"
+            print(f"  conta {i}: {fria['cached_tokens']}/{fria['prompt_tokens']} ({pct}%) {veredito}", flush=True)
+        print(
+            "  (controle negativo obrigatório: repita com duas chaves da MESMA "
+            "stack — ali a 2a conta DEVE dar hit. Sem esse controle, um cache "
+            "que nunca ligou passa como 'isolamento perfeito'.)",
+            flush=True,
+        )
     return all_results
+
+
+def _pct(values: list[float], p: float) -> float:
+    """Percentil por interpolação simples — amostras aqui são pequenas
+    (dezenas), não vale trazer numpy."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * p
+    lo, hi = int(k), min(int(k) + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def print_cache_summary(label: str, results: list[dict]) -> None:
+    """TTFT e hit rate de prefix cache — as duas métricas que dizem se o
+    cache_salt está funcionando. cached_tokens None em TODAS as requests
+    significa que falta --enable-prompt-tokens-details no vLLM: sem ele o
+    resultado "0% de cache" é indistinguível de "a feature não ligou", e o
+    teste deixa de ser falseável."""
+    ok = [r for r in results if not r["error"]]
+    ttfts = [r["ttft_s"] for r in ok if r.get("ttft_s") is not None]
+    with_cache = [r for r in ok if isinstance(r.get("cached_tokens"), int) and r.get("prompt_tokens")]
+    line = f"--- {label}: TTFT p50={_pct(ttfts, 0.5):.1f}s p95={_pct(ttfts, 0.95):.1f}s"
+    if with_cache:
+        cached = sum(r["cached_tokens"] for r in with_cache)
+        prompt = sum(r["prompt_tokens"] for r in with_cache)
+        primeiras = [r for r in with_cache if r.get("seq") == 1]
+        seguintes = [r for r in with_cache if r.get("seq", 1) > 1]
+        line += f" · cache {100 * cached // max(prompt, 1)}%"
+        # a request 1 de cada sessão é fria por definição; o que importa pro
+        # aceite é a 2 em diante
+        for nome, grupo in (("1a req", primeiras), ("2a+", seguintes)):
+            if grupo:
+                c = sum(r["cached_tokens"] for r in grupo)
+                p = sum(r["prompt_tokens"] for r in grupo)
+                line += f" ({nome} {100 * c // max(p, 1)}%)"
+    else:
+        line += " · cache SEM DADO (falta --enable-prompt-tokens-details no vLLM?)"
+    print(line + " ---", flush=True)
 
 
 async def run_level(client: httpx.AsyncClient, args, level: int) -> list[dict]:
@@ -282,6 +373,7 @@ async def run_level(client: httpx.AsyncClient, args, level: int) -> list[dict]:
         f"{retried_ok} recuperadas por retry ---",
         flush=True,
     )
+    print_cache_summary(f"nivel {level}", flat)
     return flat
 
 
@@ -309,6 +401,15 @@ async def main():
         "A contagem é aproximada; o prompt_tokens real vem no usage.",
     )
     parser.add_argument(
+        "--shared-context", action="store_true",
+        help="Só no modo --isolation-keys: todas as contas usam o MESMO "
+        "contexto e a MESMA fila de tasks, byte a byte. É o teste decisivo de "
+        "isolamento de prefix cache — com prompt idêntico, um cached_tokens > 0 "
+        "na primeira request de uma conta nova prova que o cache vazou entre "
+        "tenants. Sem a flag o seed embute o índice da conta (comportamento "
+        "padrão, que serve ao teste de CAPACIDADE, não ao de isolamento).",
+    )
+    parser.add_argument(
         "--first-byte-timeout", type=float, default=120.0,
         help="Teto de silêncio entre chunks (s). Com o filtro de reasoning do "
         "gateway, o 1º byte visível só sai quando o raciocínio fecha — não "
@@ -325,6 +426,8 @@ async def main():
     args.isolation_keys = args.isolation_keys.split(",") if args.isolation_keys else None
     if not args.api_key and not args.isolation_keys:
         parser.error("informe --api-key (modo níveis) ou --isolation-keys (modo isolamento)")
+    if args.shared_context and not args.isolation_keys:
+        parser.error("--shared-context só faz sentido com --isolation-keys")
 
     # keepalive DESLIGADO de propósito: após um blip de rede, conexões
     # keepalive mortas no pool são reutilizadas como "zumbis" — o request é
