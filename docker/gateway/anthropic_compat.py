@@ -13,7 +13,7 @@ Cobertura: texto e tool use (function calling), streaming e não-streaming.
 NÃO coberto (fora de escopo por ora): imagens em base64 são convertidas
 best-effort para image_url mas não testadas contra o vLLM; extended
 thinking (campo "thinking" da Anthropic) é ignorado — o reasoning do
-vLLM, quando ligado (ENABLE_TOOL_CALLING), não tem equivalente 1:1 no
+vLLM, quando ligado (ENABLE_REASONING_PARSER), não tem equivalente 1:1 no
 formato de "thinking blocks" da Anthropic; prompt caching (cache_control)
 é ignorado, sem efeito no vLLM.
 """
@@ -312,6 +312,28 @@ async def anthropic_sse_from_openai_stream(
                     delta = choice0.get("delta") or {}
                     if choice0.get("finish_reason"):
                         finish_reason = choice0["finish_reason"]
+
+                    # vLLM com --reasoning-parser (ENABLE_REASONING_PARSER, ver
+                    # docker/entrypoint.sh) já separa o raciocínio em
+                    # "reasoning_content" — nesse caso "content" NUNCA traz um
+                    # </think> pra fechar o buffer abaixo, e a resposta inteira
+                    # sairia de uma vez só no fallback de fim de stream (o
+                    # Claude Code perde streaming incremental por completo).
+                    # Detectar aqui e desligar o filtro nesta resposta.
+                    # PAR a manter sincronizado: o mesmo branch em
+                    # main.py:filtered_reasoning_stream (REASONING_LEAK_PLANS) —
+                    # são duas cópias do mesmo filtro, uma por protocolo.
+                    if "reasoning_content" in delta:
+                        in_reasoning = False
+                        # o buffer pode já ter texto se o vLLM mandou "content"
+                        # antes do primeiro chunk de raciocínio; descartá-lo
+                        # comeria resposta do usuário. Prepende ao delta atual.
+                        if reasoning_buffer:
+                            delta = {
+                                **delta,
+                                "content": reasoning_buffer + (delta.get("content") or ""),
+                            }
+                            reasoning_buffer = ""
 
                     text = delta.get("content")
                     if text and in_reasoning:

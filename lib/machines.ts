@@ -25,6 +25,19 @@ export function parseMaxModelLen(args: string | null | undefined): number | null
   return m ? Number(m[1]) : null
 }
 
+// Teto de sequências concorrentes do vLLM (--max-num-seqs). O gateway lê isso
+// de machines.max_concurrent_seqs (migration 0028) em check_concurrency para
+// decidir quando devolver 429. Sem esta função a coluna nunca era preenchida
+// por ninguém e TODA máquina caía no DEFAULT_MAX_CONCURRENT_SEQS do gateway —
+// o valor real do template não chegava lá, então mexer no --max-num-seqs de um
+// template não tinha efeito nenhum no teto aplicado. Null = template sem a
+// flag (aí o fallback do gateway continua valendo, e é o certo).
+export function parseMaxNumSeqs(args: string | null | undefined): number | null {
+  if (!args) return null
+  const m = args.match(/--max-num-seqs[=\s]+(\d+)/)
+  return m ? Number(m[1]) : null
+}
+
 // Status exibido na UI: além dos status do banco, "starting" indica que o
 // pod está de pé mas o vLLM ainda não respondeu (baixando/carregando modelo)
 // e "failed" que o processo do vLLM morreu (ex.: OOM no boot) com o pod vivo.

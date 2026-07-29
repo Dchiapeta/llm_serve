@@ -56,6 +56,10 @@ export type Machine = {
   // janela de contexto do vLLM (--max-model-len); o gateway usa para clampar
   // max_tokens ao orçamento restante. NULL = template sem a flag → sem clamp.
   max_model_len: number | null
+  // teto de sequências concorrentes do vLLM (--max-num-seqs); o gateway aplica
+  // o 429 por máquina a partir daqui (check_concurrency). NULL = template sem a
+  // flag → o gateway usa o próprio fallback (DEFAULT_MAX_CONCURRENT_SEQS).
+  max_concurrent_seqs: number | null
   vram_gb: number | null
   cost_per_hr: number | null
   public_url: string | null

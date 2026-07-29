@@ -2244,7 +2244,7 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple,
 
                     delta = choice0.get("delta") or {}
 
-                    # vLLM com --reasoning-parser (ENABLE_TOOL_CALLING, ver
+                    # vLLM com --reasoning-parser (ENABLE_REASONING_PARSER, ver
                     # entrypoint.sh) já separa o raciocínio em
                     # "reasoning_content" — nesse caso "content" nunca vem
                     # com <think>, e o buffer abaixo nunca veria um </think>
@@ -2372,7 +2372,7 @@ async def anthropic_messages(
     is_stream = bool(anthropic_body.get("stream"))
     # mesmo filtro de <think> do chat/completions (main.py:REASONING_LEAK_PLANS)
     # — sem isso, Claude Code apontado pra um plano sem reasoning-parser
-    # (ver ENABLE_TOOL_CALLING) recebia o raciocínio cru misturado no texto
+    # (ver ENABLE_REASONING_PARSER) recebia o raciocínio cru misturado no texto
     filter_reasoning = effective_plan in REASONING_LEAK_PLANS
 
     try:
