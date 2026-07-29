@@ -1,3 +1,8 @@
+// Vendorado de keenthemes/reui (MIT), registry/bases/radix/ui/native-select.tsx
+// — ver o cabeçalho de pagination.tsx pro porquê de não usar o registry.
+// É o <select> nativo, usado pelo padrão c-pagination-15 no seletor de
+// itens-por-página. Não substitui components/ui/select.tsx (Radix), que
+// continua sendo o certo para filtros com estados/ícones.
 import * as React from "react"
 
 import { cn } from "@/lib/utils"
@@ -41,8 +46,17 @@ function NativeSelect({
   )
 }
 
-function NativeSelectOption({ ...props }: React.ComponentProps<"option">) {
-  return <option data-slot="native-select-option" {...props} />
+function NativeSelectOption({
+  className,
+  ...props
+}: React.ComponentProps<"option">) {
+  return (
+    <option
+      data-slot="native-select-option"
+      className={cn("bg-[Canvas] text-[CanvasText]", className)}
+      {...props}
+    />
+  )
 }
 
 function NativeSelectOptGroup({
@@ -52,7 +66,7 @@ function NativeSelectOptGroup({
   return (
     <optgroup
       data-slot="native-select-optgroup"
-      className={cn(className)}
+      className={cn("bg-[Canvas] text-[CanvasText]", className)}
       {...props}
     />
   )

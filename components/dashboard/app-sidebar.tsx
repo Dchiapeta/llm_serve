@@ -5,6 +5,7 @@ import Link from "next/link"
 import { usePathname } from "next/navigation"
 import {
   Activity,
+  BookOpen,
   Boxes,
   ChevronsUpDown,
   Cpu,
@@ -153,6 +154,18 @@ export function AppSidebar({
 
       <SidebarFooter>
         <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              asChild
+              isActive={pathname.startsWith("/documentacao")}
+              tooltip="Documentação"
+            >
+              <Link href="/documentacao">
+                <BookOpen />
+                <span>Documentação</span>
+              </Link>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
           <SidebarMenuItem>
             <UserMenu email={email} />
           </SidebarMenuItem>
