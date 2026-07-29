@@ -504,7 +504,7 @@ function MachineSlotsDialog({
               <TableHead>Produto</TableHead>
               <TableHead>Modelo</TableHead>
               <TableHead>Slots</TableHead>
-              <TableHead className="text-right">Vagas</TableHead>
+              <TableHead className="text-right!">Vagas</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>

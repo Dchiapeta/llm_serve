@@ -17,7 +17,7 @@ export default async function RequisicoesPage() {
 
   const { data: requestsData } = await db
     .from("gateway_requests")
-    .select("*, stacks(slug), api_keys(key_prefix), accounts(name)")
+    .select("*, stacks(slug, plan), api_keys(key_prefix), accounts(name)")
     .order("created_at", { ascending: false })
     .limit(REQUEST_LIMIT)
 

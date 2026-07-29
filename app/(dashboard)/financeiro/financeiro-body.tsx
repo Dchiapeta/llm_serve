@@ -199,12 +199,12 @@ export async function FinanceiroBody({
                 <TableRow>
                   <TableHead>Máquina</TableHead>
                   <TableHead>GPU</TableHead>
-                  <TableHead className="text-right">$/h</TableHead>
-                  <TableHead className="text-right">Ligada</TableHead>
-                  <TableHead className="text-right">Uptime</TableHead>
-                  <TableHead className="text-right">Gasto</TableHead>
-                  <TableHead className="text-right">Se 24/7</TableHead>
-                  <TableHead className="text-right">Economia</TableHead>
+                  <TableHead className="text-right!">$/h</TableHead>
+                  <TableHead className="text-right!">Ligada</TableHead>
+                  <TableHead className="text-right!">Uptime</TableHead>
+                  <TableHead className="text-right!">Gasto</TableHead>
+                  <TableHead className="text-right!">Se 24/7</TableHead>
+                  <TableHead className="text-right!">Economia</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>

@@ -200,6 +200,10 @@ export type GatewayRequest = {
   machine_id: string | null
   path: string
   model: string | null
+  // User-Agent cru do cliente (migration 0041), classificado em rótulo de
+  // origem na UI por lib/request-origin.ts. NULL em requisições anteriores à
+  // migration ou em cliente sem o header — aí o fallback é o path.
+  user_agent: string | null
   status_code: number
   stream: boolean
   tokens_in: number | null

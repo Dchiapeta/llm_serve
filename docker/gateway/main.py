@@ -1896,6 +1896,18 @@ MAX_MAX_TOKENS = int(os.environ.get("MAX_MAX_TOKENS", "16000"))  # teto: sem iss
 ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
 
 
+def effective_model_name(stack_id: str, rewrite_model: bool, machine: dict) -> str | None:
+    """Nome com que o vLLM realmente vai servir esta requisição.
+
+    Extraído de pin_model porque o log de requisições (gateway_requests)
+    precisa do MESMO valor — e a primeira versão dele gravava `rewrite_model`,
+    o booleano, fazendo a coluna `model` virar a string "false" na tela.
+    Uma função só, dois consumidores: as duas não podem divergir de novo."""
+    if rewrite_model:
+        return lora_name(stack_id)
+    return machine.get("served_model_name") or machine.get("model_name")
+
+
 def pin_model(body_json: dict, stack_id: str, rewrite_model: bool, machine: dict) -> None:
     """Trava o campo "model": nunca confia no que o cliente mandou. Stack com
     adapter LoRA -> nome do adapter da PRÓPRIA stack (antes disso, além do
@@ -1908,10 +1920,7 @@ def pin_model(body_json: dict, stack_id: str, rewrite_model: bool, machine: dict
     Roda sempre, mesmo se o cliente omitiu "model" ou mandou um --model
     diferente na CLI dele (Codex/Claude Code guardam isso em config local, que
     não temos como fiscalizar — a única trava confiável é no servidor)."""
-    if rewrite_model:
-        body_json["model"] = lora_name(stack_id)
-    else:
-        body_json["model"] = machine.get("served_model_name") or machine.get("model_name")
+    body_json["model"] = effective_model_name(stack_id, rewrite_model, machine)
 
 
 async def validate_body(
@@ -2373,7 +2382,9 @@ async def anthropic_messages(
 
     log_ctx = dict(
         account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
-        machine_id=machine["id"], path="messages", model=rewrite_model, started=started,
+        machine_id=machine["id"], path="messages",
+        model=effective_model_name(stack_id, rewrite_model, machine),
+        user_agent=request.headers.get("user-agent"), started=started,
     )
 
     try:
@@ -2538,10 +2549,13 @@ def release_flight(flight_key: tuple[str, str]) -> None:
     in_flight[flight_key] -= 1
 
 
+MAX_USER_AGENT_CHARS = 200  # string do cliente: registrar sim, confiar não
+
+
 def log_gateway_request(
     *, account_id: str, stack_id: str | None, api_key_id: str, machine_id: str,
     path: str, model: str | None, status_code: int, stream: bool,
-    started: float, usage: dict | None = None,
+    started: float, usage: dict | None = None, user_agent: str | None = None,
 ) -> None:
     """Log fire-and-forget de uma requisição completada (migration 0038,
     tabela gateway_requests). `started` é o time.monotonic() capturado na
@@ -2559,6 +2573,9 @@ def log_gateway_request(
         "machine_id": machine_id,
         "path": path,
         "model": model,
+        # cru, classificado só na UI (lib/request-origin.ts) — ver o comment
+        # da coluna na migration 0041. Truncado porque o header é do cliente.
+        "user_agent": user_agent[:MAX_USER_AGENT_CHARS] if user_agent else None,
         "status_code": status_code,
         "stream": stream,
         "tokens_in": usage.get("prompt_tokens"),
@@ -2638,7 +2655,9 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
 
     log_ctx = dict(
         account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
-        machine_id=machine["id"], path=path, model=rewrite_model, started=started,
+        machine_id=machine["id"], path=path,
+        model=effective_model_name(stack_id, rewrite_model, machine),
+        user_agent=request.headers.get("user-agent"), started=started,
     )
 
     body_json = None
