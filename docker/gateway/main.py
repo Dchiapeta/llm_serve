@@ -2325,6 +2325,23 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple,
                 while b"\n" in pending:
                     line, pending = pending.split(b"\n", 1)
                     stripped = line.strip()
+
+                    # o chunk final de usage (choices: [], só "usage") chega
+                    # DEPOIS que in_reasoning já virou False (raciocínio já
+                    # fechado) — sem isso aqui, o branch abaixo repassa a
+                    # linha crua e sai do loop antes de nunca ver esse chunk,
+                    # deixando tokens_in/tokens_out null pra sempre nos
+                    # planos com filtro de raciocínio (VibeCoder/Pro).
+                    if usage is None and b'"usage"' in stripped and stripped.startswith(b"data:"):
+                        usage_payload = stripped[len(b"data:") :].strip()
+                        if usage_payload not in (b"[DONE]", b""):
+                            try:
+                                maybe_chunk = json.loads(usage_payload)
+                            except Exception:
+                                maybe_chunk = None
+                            if isinstance(maybe_chunk, dict) and maybe_chunk.get("usage"):
+                                usage = maybe_chunk["usage"]
+
                     if not in_reasoning or not stripped.startswith(b"data:") or stripped in (
                         b"data: [DONE]",
                         b"data:[DONE]",
