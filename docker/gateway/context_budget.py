@@ -37,6 +37,16 @@ MIN_VIABLE_COMPLETION_TOKENS = int(os.environ.get("MIN_VIABLE_COMPLETION_TOKENS"
 # vez de confiar só na heurística. Requisições longe do teto nunca pagam
 # esse custo — ver should_use_exact_token_count.
 CONTEXT_EXACT_COUNT_THRESHOLD = float(os.environ.get("CONTEXT_EXACT_COUNT_THRESHOLD", "0.7"))
+# Custo em tokens de janela de UMA imagem. O base64 fica fora da heurística de
+# chars/4 (ver _strip_images) porque superestimaria absurdamente — mas contar
+# ZERO subestima igualmente: num modelo VL a imagem ocupa janela de verdade
+# (~1k-3k tokens no Qwen3-VL, dependendo da resolução, que não conhecemos aqui).
+# Zero fazia o prompt perto do teto passar pelo orçamento e voltar como um 400
+# de contexto do vLLM — que, num cliente que reenvia a conversa toda, envenena
+# a sessão inteira (ver docker/gateway/content_policy.py).
+# Estimativa fixa e deliberadamente grosseira: perto do limite quem decide é a
+# contagem real do tokenizer (should_use_exact_token_count).
+CONTEXT_IMAGE_TOKENS = int(os.environ.get("CONTEXT_IMAGE_TOKENS", "1600"))
 
 
 class ContextWindowExceeded(HTTPException):
@@ -71,32 +81,40 @@ def openai_error_body(message: str) -> dict:
     }
 
 
-def _strip_images(messages: list) -> list:
-    """Remove partes image_url do cálculo — base64 a ~4 chars/token
-    superestimaria absurdamente (imagem não tokeniza como texto)."""
+def _strip_images(messages: list) -> tuple[list, int]:
+    """Remove partes image_url do cálculo de texto e devolve quantas eram.
+
+    O base64 sai da heurística de chars/4 porque superestimaria absurdamente
+    (imagem não tokeniza como texto), mas a CONTAGEM volta pelo chamador como
+    CONTEXT_IMAGE_TOKENS cada — antes eram descartadas e valiam zero, o que
+    subestimava a janela ocupada."""
     out = []
+    images = 0
     for m in messages:
         if isinstance(m, dict) and isinstance(m.get("content"), list):
-            m = {
-                **m,
-                "content": [
-                    part
-                    for part in m["content"]
-                    if not (isinstance(part, dict) and part.get("type") == "image_url")
-                ],
-            }
+            kept = []
+            for part in m["content"]:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    images += 1
+                    continue
+                kept.append(part)
+            m = {**m, "content": kept}
         out.append(m)
-    return out
+    return out, images
 
 
 def prompt_text_for_tokenize(messages=None, tools=None, extra_texts=()) -> str:
     """Texto usado tanto pela heurística de chars/4 quanto, perto do limite,
     como "prompt" na contagem real via /tokenize do vLLM (ver
     should_use_exact_token_count) — um único lugar monta esse texto pra não
-    ter duas versões ligeiramente diferentes do que está sendo contado."""
+    ter duas versões ligeiramente diferentes do que está sendo contado.
+
+    Só TEXTO: as imagens saem daqui e entram na conta por
+    CONTEXT_IMAGE_TOKENS em estimate_prompt_tokens."""
     parts = []
     if isinstance(messages, list):
-        parts.append(json.dumps(_strip_images(messages), ensure_ascii=False))
+        text_only, _ = _strip_images(messages)
+        parts.append(json.dumps(text_only, ensure_ascii=False))
     if tools:
         parts.append(json.dumps(tools, ensure_ascii=False))
     parts.extend(text for text in extra_texts if isinstance(text, str))
@@ -114,9 +132,14 @@ def estimate_prompt_tokens(messages=None, tools=None, extra_texts=()) -> int:
     cada caractere acentuado vira ç (6 chars) e texto em português — o
     público do produto — é superestimado em ~2x, clampando saída de prompts
     que cabem e fazendo o count_tokens mandar o Claude Code compactar na
-    metade útil da janela."""
+    metade útil da janela.
+
+    Imagens entram por CONTEXT_IMAGE_TOKENS cada, não pela heurística de
+    chars (o base64 não tokeniza como texto) — e não por zero, que era o
+    comportamento anterior e subestimava a janela ocupada."""
     text = prompt_text_for_tokenize(messages, tools, extra_texts)
-    return max(1, len(text) // 4)
+    images = _strip_images(messages)[1] if isinstance(messages, list) else 0
+    return max(1, len(text) // 4 + images * CONTEXT_IMAGE_TOKENS)
 
 
 def reserved_tokens_for(est_tokens: int) -> int:

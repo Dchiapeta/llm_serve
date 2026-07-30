@@ -52,6 +52,7 @@ from anthropic_compat import (
     anthropic_to_openai_request,
     openai_to_anthropic_response,
 )
+from content_policy import clamp_media
 from context_budget import (
     ContextWindowExceeded,
     anthropic_error_body,
@@ -103,8 +104,16 @@ DEFAULT_MAX_CONCURRENT_SEQS = int(os.environ.get("DEFAULT_MAX_CONCURRENT_SEQS", 
 # nada: não há vizinho pra proteger.
 MIN_RESERVED_SLOTS_SHARED_POD = int(os.environ.get("MIN_RESERVED_SLOTS_SHARED_POD", "2"))
 # corpo/params da request — nenhum destes existia antes: sem teto, um
-# cliente BYOE podia mandar prompt gigante sem limite de tamanho/mensagens
-MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(1_000_000)))
+# cliente BYOE podia mandar prompt gigante sem limite de tamanho/mensagens.
+#
+# 8 MB e não 1 MB: um screenshot colado no Claude Code vira base64 de
+# 300 KB-1,5 MB, mais ~100 KB do system+tools em JSON — com 1 MB o mesmo gesto
+# funcionava umas vezes e dava 400 outras, que é o pior comportamento possível
+# (e um 400 aqui envenena a sessão inteira, ver content_policy.py).
+# O teto de corpo nunca foi a defesa real contra abuso: quem limita custo é
+# RATE_LIMIT_RPM, a quota diária de tokens e check_concurrency. Este teto é
+# contra corpo absurdo/malformado, e 8 MB continua cumprindo esse papel.
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(8_000_000)))
 MAX_MESSAGES = int(os.environ.get("MAX_MESSAGES", "200"))
 
 # quota diária de tokens por conta (controle de custo real — rate limit e
@@ -2034,6 +2043,19 @@ async def validate_body(
         if system_message:
             messages.insert(0, system_message)
 
+    # Recorta imagem acima do que o pod aceita (machines.max_images_per_prompt,
+    # lido do --limit-mm-per-prompt do template). Tem que ser ANTES da
+    # estimativa de tokens, senão o orçamento conta imagem que não vai ser
+    # enviada. Sem isso o vLLM devolveria 400, e num cliente que reenvia a
+    # conversa toda esse 400 se repete pra sempre — ver content_policy.py.
+    messages, dropped_images = clamp_media(
+        messages, machine.get("max_images_per_prompt")
+    )
+    if dropped_images:
+        logger.info(
+            "conteúdo: %d imagem(ns) recortada(s) da stack %s (teto do pod: %s)",
+            dropped_images, stack_id, machine.get("max_images_per_prompt"),
+        )
     body_json["messages"] = messages
 
     # Clamp dinâmico pela janela real do modelo — por último, com o prompt
@@ -2187,6 +2209,22 @@ async def validate_responses_body(
             if is_replayed_output:
                 item.setdefault("id", f"synth_{i}")
                 item.setdefault("status", "completed")
+
+        # mesmo recorte de imagem do validate_body, na forma da Responses API
+        # ("input_image"/"input_text" em vez de "image_url"/"text") — sem isso
+        # uma imagem acima do teto do pod viraria 400 e, como o Codex reenvia o
+        # input inteiro a cada turno, o 400 se repetiria pra sempre
+        input_items, dropped_images = clamp_media(
+            input_items,
+            machine.get("max_images_per_prompt"),
+            text_part_type="input_text",
+        )
+        body_json["input"] = input_items
+        if dropped_images:
+            logger.info(
+                "conteúdo: %d imagem(ns) recortada(s) da stack %s (teto do pod: %s)",
+                dropped_images, stack_id, machine.get("max_images_per_prompt"),
+            )
 
     if not body_json.get("instructions"):
         instructions = await build_stack_instructions(

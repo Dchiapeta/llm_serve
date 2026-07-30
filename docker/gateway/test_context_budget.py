@@ -7,6 +7,7 @@ precisar das env vars do main.py nem de rede. Rodar de docker/gateway/:
 import pytest
 
 from context_budget import (
+    CONTEXT_IMAGE_TOKENS,
     CONTEXT_SAFETY_FACTOR,
     CONTEXT_TEMPLATE_OVERHEAD,
     ContextWindowExceeded,
@@ -14,6 +15,7 @@ from context_budget import (
     apply_context_budget,
     estimate_prompt_tokens,
     openai_error_body,
+    prompt_text_for_tokenize,
     reserved_tokens_for,
     should_use_exact_token_count,
 )
@@ -85,23 +87,42 @@ def test_tools_aumentam_a_estimativa():
     )
 
 
-def test_imagens_base64_ficam_fora_da_estimativa():
+def _messages_with_images(n: int):
     fake_b64 = "A" * 100_000
-    with_image = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "descreva"},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{fake_b64}"}},
-            ],
-        }
-    ]
-    without_image = [
-        {"role": "user", "content": [{"type": "text", "text": "descreva"}]}
-    ]
-    est_with = estimate_prompt_tokens(messages=with_image)
-    est_without = estimate_prompt_tokens(messages=without_image)
-    assert est_with - est_without < 100  # a imagem não pode pesar ~25k tokens
+    parts = [{"type": "text", "text": "descreva"}]
+    for _ in range(n):
+        parts.append(
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{fake_b64}"}}
+        )
+    return [{"role": "user", "content": parts}]
+
+
+def test_base64_da_imagem_fica_fora_da_estimativa_de_texto():
+    """O base64 a 4 chars/token contaria ~25k tokens por imagem — absurdo, uma
+    imagem não tokeniza como texto."""
+    est_with = estimate_prompt_tokens(messages=_messages_with_images(1))
+    est_without = estimate_prompt_tokens(messages=_messages_with_images(0))
+    assert est_with - est_without < 25_000
+
+
+def test_imagem_custa_CONTEXT_IMAGE_TOKENS_e_nao_zero():
+    """Contar zero era o comportamento anterior e subestimava a janela: num
+    modelo VL a imagem ocupa contexto de verdade, e o prompt perto do teto
+    passava pelo orçamento pra voltar como 400 do vLLM — que, num cliente que
+    reenvia a conversa toda, envenena a sessão inteira."""
+    base = estimate_prompt_tokens(messages=_messages_with_images(0))
+    uma = estimate_prompt_tokens(messages=_messages_with_images(1))
+    tres = estimate_prompt_tokens(messages=_messages_with_images(3))
+    assert uma - base == CONTEXT_IMAGE_TOKENS
+    assert tres - base == 3 * CONTEXT_IMAGE_TOKENS
+
+
+def test_prompt_text_for_tokenize_nao_leva_o_base64():
+    """O mesmo texto vai pro /tokenize do vLLM perto do limite; mandar 100k de
+    base64 pra lá seria uma chamada de rede enorme e uma contagem errada."""
+    texto = prompt_text_for_tokenize(messages=_messages_with_images(2))
+    assert "base64" not in texto and "AAAA" not in texto
+    assert "descreva" in texto
 
 
 def test_reserved_tokens_for_aplica_fator_e_overhead():

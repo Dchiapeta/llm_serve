@@ -38,6 +38,39 @@ export function parseMaxNumSeqs(args: string | null | undefined): number | null 
   return m ? Number(m[1]) : null
 }
 
+// Máximo de imagens por prompt que o pod aceita (--limit-mm-per-prompt). O
+// gateway usa isso para RECORTAR imagem excedente antes de enviar: sem o
+// recorte o vLLM devolve 400, e como clientes agênticos reenviam a conversa
+// inteira a cada turno, esse 400 se repete pra sempre e mata a sessão (ver
+// docker/gateway/content_policy.py).
+//
+// A flag aceita duas formas, ambas tratadas aqui:
+//   {"image":4,"video":0}                 (contagem)
+//   {"image":{"count":4,"width":512}}     (com opções)
+// Sem a flag o vLLM assume 999 por modalidade (config/multimodal.py), e é isso
+// que devolvemos — não null — pra que o gateway saiba que imagem é permitida.
+// Null fica reservado pra "não sei" (template sem VLLM_EXTRA_ARGS nenhum), onde
+// o gateway não recorta nada.
+export function parseImageLimit(args: string | null | undefined): number | null {
+  if (!args) return null
+  const m = args.match(/--limit-mm-per-prompt[=\s]+(\S+)/)
+  if (!m) return 999 // flag ausente: default do vLLM
+  try {
+    const parsed = JSON.parse(m[1]) as Record<string, unknown>
+    const image = parsed.image
+    if (typeof image === "number") return image
+    if (image && typeof image === "object") {
+      const count = (image as Record<string, unknown>).count
+      if (typeof count === "number") return count
+    }
+    // flag presente mas sem falar de imagem: outras modalidades limitadas,
+    // imagem segue no default
+    return 999
+  } catch {
+    return null // JSON malformado: não arriscar recortar com base em palpite
+  }
+}
+
 // Status exibido na UI: além dos status do banco, "starting" indica que o
 // pod está de pé mas o vLLM ainda não respondeu (baixando/carregando modelo)
 // e "failed" que o processo do vLLM morreu (ex.: OOM no boot) com o pod vivo.

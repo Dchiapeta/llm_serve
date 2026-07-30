@@ -60,6 +60,11 @@ export type Machine = {
   // o 429 por máquina a partir daqui (check_concurrency). NULL = template sem a
   // flag → o gateway usa o próprio fallback (DEFAULT_MAX_CONCURRENT_SEQS).
   max_concurrent_seqs: number | null
+  // teto de imagens por prompt do vLLM (--limit-mm-per-prompt). O gateway
+  // recorta imagem acima disso e avisa no prompt, em vez de deixar o pod
+  // devolver 400 — que num cliente que reenvia a conversa toda envenenaria a
+  // sessão inteira. NULL = desconhecido → o gateway não recorta nada.
+  max_images_per_prompt: number | null
   vram_gb: number | null
   cost_per_hr: number | null
   public_url: string | null

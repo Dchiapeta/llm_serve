@@ -8,7 +8,12 @@ import { randomBytes } from "crypto"
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { computeCapacity, stackWeight, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
-import { parseMaxModelLen, parseMaxNumSeqs, parseServedModelName } from "./machines"
+import {
+  parseImageLimit,
+  parseMaxModelLen,
+  parseMaxNumSeqs,
+  parseServedModelName,
+} from "./machines"
 import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
 import { generateStackSlug, STACK_SLUG_RE } from "./slug"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
@@ -517,6 +522,11 @@ async function provisionMachine(input: {
       max_concurrent_seqs:
         parseMaxNumSeqs(tpl.env?.VLLM_EXTRA_ARGS) ??
         parseMaxNumSeqs(tpl.start_command),
+      // teto de imagens por prompt (--limit-mm-per-prompt), pro gateway
+      // recortar excedente em vez de deixar o pod devolver 400
+      max_images_per_prompt:
+        parseImageLimit(tpl.env?.VLLM_EXTRA_ARGS) ??
+        parseImageLimit(tpl.start_command),
       vram_gb: totalVramGb,
       cost_per_hr: pod.costPerHr ?? null,
       public_url: podProxyUrl(pod.id, 8000),
