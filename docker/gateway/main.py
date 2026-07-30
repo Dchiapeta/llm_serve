@@ -1972,6 +1972,20 @@ async def validate_body(
     "messages"), filtra roles e injeta system prompt da stack + RAG."""
     pin_model(body_json, stack_id, rewrite_model, machine)
 
+    # vLLM só manda "usage" no chunk final do SSE quando o pedido inclui
+    # stream_options.include_usage (spec OpenAI) — sem isso, tokens_in/
+    # tokens_out ficam null em gateway_requests pra QUALQUER requisição
+    # streaming cujo client não sete essa flag sozinho (achado com a chave
+    # "playground": um teste manual não mandava o campo e a página de
+    # Requisições ficava sem os tokens). Forçado aqui, ponto único de
+    # validação do corpo, pra logar tokens sempre, independente do client.
+    if body_json.get("stream") is True:
+        stream_options = body_json.get("stream_options")
+        if not isinstance(stream_options, dict):
+            stream_options = {}
+        stream_options["include_usage"] = True
+        body_json["stream_options"] = stream_options
+
     current_max_tokens = body_json.get("max_tokens")
     if not isinstance(current_max_tokens, int) or current_max_tokens < MIN_MAX_TOKENS:
         body_json["max_tokens"] = MIN_MAX_TOKENS
