@@ -1223,16 +1223,21 @@ export async function createStack(formData: FormData): Promise<{
 export async function getOrCreatePlaygroundKey(stackId: string): Promise<{ plainKey: string }> {
   const db = createSupabaseAdmin()
 
-  const { data: existing } = await db
-    .from("api_keys")
-    .select("plain_key")
-    .eq("stack_id", stackId)
-    .eq("purpose", "playground")
-    .eq("status", "active")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle<{ plain_key: string | null }>()
-  if (existing?.plain_key) return { plainKey: existing.plain_key }
+  const findActivePlaygroundKey = async (): Promise<string | null> => {
+    const { data } = await db
+      .from("api_keys")
+      .select("plain_key")
+      .eq("stack_id", stackId)
+      .eq("purpose", "playground")
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ plain_key: string | null }>()
+    return data?.plain_key ?? null
+  }
+
+  const existing = await findActivePlaygroundKey()
+  if (existing) return { plainKey: existing }
 
   const { data: stack } = await db
     .from("stacks")
@@ -1265,12 +1270,22 @@ export async function getOrCreatePlaygroundKey(stackId: string): Promise<{ plain
     throw new Error("Stack sem histórico de máquina associada — verifique manualmente")
   }
 
-  return createKey({
-    accountId: stack.account_id,
-    machineId,
-    stackId: stack.id,
-    purpose: "playground",
-  })
+  try {
+    return await createKey({
+      accountId: stack.account_id,
+      machineId,
+      stackId: stack.id,
+      purpose: "playground",
+    })
+  } catch (e) {
+    // Corrida: duas chamadas concorrentes passaram pelo check acima antes de
+    // qualquer uma terminar o insert — o índice único parcial (migration
+    // 0045: 1 chave "playground" ativa por stack) barra a segunda. Devolve a
+    // que venceu em vez de propagar o erro de violação de constraint.
+    const raced = await findActivePlaygroundKey()
+    if (raced) return { plainKey: raced }
+    throw e
+  }
 }
 
 // Remove uma stack do painel. A máquina que a hospeda (se houver) não é
