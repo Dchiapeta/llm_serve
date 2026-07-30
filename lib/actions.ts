@@ -1240,11 +1240,34 @@ export async function getOrCreatePlaygroundKey(stackId: string): Promise<{ plain
     .eq("id", stackId)
     .single<{ id: string; account_id: string; machine_id: string | null }>()
   if (!stack) throw new Error("Stack não encontrada")
-  if (!stack.machine_id) throw new Error("Stack sem máquina associada")
+
+  // stacks.machine_id pode estar null (idle reaper de modelo base liberou a
+  // vaga contábil — o gateway resolve isso sozinho a cada request real, via
+  // resolve_route → place_base_stack, que também resincroniza a chave na
+  // máquina resolvida naquele momento). O valor aqui só precisa satisfazer a
+  // FK NOT NULL de api_keys.machine_id — nunca é usado pra decidir rota.
+  // Reaproveita o pin histórico da própria chave "customer" da stack, a
+  // mesma fonte que já convive com esse estado sem problema.
+  let machineId = stack.machine_id
+  if (!machineId) {
+    const { data: customerKey } = await db
+      .from("api_keys")
+      .select("machine_id")
+      .eq("stack_id", stackId)
+      .eq("purpose", "customer")
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ machine_id: string }>()
+    machineId = customerKey?.machine_id ?? null
+  }
+  if (!machineId) {
+    throw new Error("Stack sem histórico de máquina associada — verifique manualmente")
+  }
 
   return createKey({
     accountId: stack.account_id,
-    machineId: stack.machine_id,
+    machineId,
     stackId: stack.id,
     purpose: "playground",
   })
