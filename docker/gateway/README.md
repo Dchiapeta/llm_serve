@@ -78,8 +78,8 @@ advisory lock.
 | `OPENAI_API_KEY`          | não*        | Embeddings do RAG — sem ela, a injeção de contexto é pulada (best-effort) |
 | `EMBEDDING_MODEL`         | não         | Modelo de embedding (default `text-embedding-3-small`, precisa bater com a indexação do painel) |
 | `RAG_TOP_K`               | não         | Quantidade de chunks injetados como contexto (default 4)       |
-| `PANEL_URL`               | não*        | URL base do painel Next.js — sem ela, o provisionamento automático de máquina fica desligado (warning no boot) |
-| `PANEL_ADMIN_SECRET`      | não*        | Secret enviado como `X-Admin-Secret` para `POST {PANEL_URL}/api/machines/provision` — dedicado, não reaproveita `GATEWAY_ADMIN_SECRET` |
+| `STAC_LLM_PANEL_URL`      | não*        | URL base do painel Next.js — sem ela, o provisionamento automático de máquina fica desligado (warning no boot) |
+| `PANEL_ADMIN_SECRET`      | não*        | Secret enviado como `X-Admin-Secret` para `POST {STAC_LLM_PANEL_URL}/api/machines/provision` — dedicado, não reaproveita `GATEWAY_ADMIN_SECRET` |
 | `PANEL_PROVISION_TIMEOUT_S` | não      | Timeout da chamada ao painel pra criar máquina (default 60)    |
 | `PROVISION_COOLDOWN_S`    | não         | Intervalo mínimo entre tentativas de criação por plano (default 180) |
 | `PROVISION_RETRY_AFTER_S` | não         | `Retry-After` do 503 "provisionando" (default 120 — maior que o do wake, já que criar é mais lento que só religar) |

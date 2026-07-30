@@ -176,11 +176,11 @@ RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 # provisionamento automático de máquina (3º nível da cascata de alocação,
 # além de rodando-com-vaga e despausar): o gateway nunca fala com a API de
 # criação da RunPod diretamente — chama de volta o painel Next.js (que já
-# tem toda a lógica de GPU/template/stockout), via PANEL_URL protegido por
-# um secret dedicado (não reaproveita GATEWAY_ADMIN_SECRET — ver README).
-# Sem PANEL_URL/PANEL_ADMIN_SECRET, esse nível fica desligado (mesmo padrão
-# de RUNPOD_API_KEY ausente).
-PANEL_URL = os.environ.get("PANEL_URL", "").rstrip("/")
+# tem toda a lógica de GPU/template/stockout), via STAC_LLM_PANEL_URL protegido
+# por um secret dedicado (não reaproveita GATEWAY_ADMIN_SECRET — ver README).
+# Sem STAC_LLM_PANEL_URL/PANEL_ADMIN_SECRET, esse nível fica desligado (mesmo
+# padrão de RUNPOD_API_KEY ausente).
+PANEL_URL = os.environ.get("STAC_LLM_PANEL_URL", "").rstrip("/")
 PANEL_ADMIN_SECRET = os.environ.get("PANEL_ADMIN_SECRET", "")
 PANEL_PROVISION_TIMEOUT_S = float(os.environ.get("PANEL_PROVISION_TIMEOUT_S", "60"))
 # intervalo mínimo entre tentativas de criação por plano — evita bombardear
@@ -343,7 +343,7 @@ async def lifespan(app: FastAPI):
         )
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
         logger.warning(
-            "PANEL_URL/PANEL_ADMIN_SECRET ausente — provisionamento automático de máquina desligado"
+            "STAC_LLM_PANEL_URL/PANEL_ADMIN_SECRET ausente — provisionamento automático de máquina desligado"
         )
     lifecycle_mgr = LifecycleManager(
         store=store,
