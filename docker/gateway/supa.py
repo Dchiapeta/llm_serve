@@ -48,7 +48,7 @@ class SupaClient:
 
     async def find_active_key(self, key_hash: str) -> dict | None:
         """Retorna {account_id, api_key_id, key_prefix, account_name,
-        stack_id, stacks, expires_at} da chave ativa, ou None. Os stacks vêm
+        stack_id, stacks, expires_at, purpose} da chave ativa, ou None. Os stacks vêm
         embutidos (FK reversa accounts → stacks) pro roteamento base ser
         stack-aware sem query extra por request — o dict inteiro pega carona
         no key_cache do gateway. `stack_id` (coluna direta de api_keys,
@@ -67,13 +67,17 @@ class SupaClient:
         `expires_at` (migration 0024, nullable) é checado por request em
         `authenticate` — não dá pra confiar só num filtro PostgREST aqui,
         porque o key_cache do gateway (TTL de 60s) manteria uma chave
-        expirada válida por até mais um TTL depois do vencimento."""
+        expirada válida por até mais um TTL depois do vencimento.
+
+        `purpose` (migration 0044) distingue chave "customer" de chave
+        "playground" — esta última é interna (nunca exibida ao cliente,
+        gerada junto com a stack) e isenta de check_token_quota (main.py)."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
-                "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,"
+                "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,purpose,"
                 "accounts(name,"
                 "stacks(id,machine_id,plan,slug,created_at,system_prompt,"
                 "default_temperature,default_top_p))",
@@ -93,6 +97,7 @@ class SupaClient:
             "key_hash": row["key_hash"],
             "stack_id": row.get("stack_id"),
             "expires_at": row.get("expires_at"),
+            "purpose": row.get("purpose", "customer"),
             "account_name": account.get("name", "?"),
             "stacks": account.get("stacks") or [],
         }

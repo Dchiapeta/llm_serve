@@ -1207,11 +1207,47 @@ export async function createStack(formData: FormData): Promise<{
   if (linkError) throw new Error(linkError.message)
 
   const { plainKey } = await createKey({ accountId, machineId, stackId })
+  // Chave interna de Playground, gerada junto e nunca exibida ao cliente —
+  // ver getOrCreatePlaygroundKey para o caminho de backfill de stacks antigas.
+  await createKey({ accountId, machineId, stackId, purpose: "playground" })
 
   revalidatePath("/stacks")
   revalidatePath("/accounts")
   if (machineCreated) revalidatePath("/machines")
   return { slug, machineId, machineCreated, plainKey }
+}
+
+// Devolve a chave interna de Playground de uma stack (texto puro), criando-a
+// sob demanda se a stack foi criada antes desta feature existir. Nunca deve
+// ser exposta ao cliente — só o admin, via tela de Playground, a consome.
+export async function getOrCreatePlaygroundKey(stackId: string): Promise<{ plainKey: string }> {
+  const db = createSupabaseAdmin()
+
+  const { data: existing } = await db
+    .from("api_keys")
+    .select("plain_key")
+    .eq("stack_id", stackId)
+    .eq("purpose", "playground")
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle<{ plain_key: string | null }>()
+  if (existing?.plain_key) return { plainKey: existing.plain_key }
+
+  const { data: stack } = await db
+    .from("stacks")
+    .select("id, account_id, machine_id")
+    .eq("id", stackId)
+    .single<{ id: string; account_id: string; machine_id: string | null }>()
+  if (!stack) throw new Error("Stack não encontrada")
+  if (!stack.machine_id) throw new Error("Stack sem máquina associada")
+
+  return createKey({
+    accountId: stack.account_id,
+    machineId: stack.machine_id,
+    stackId: stack.id,
+    purpose: "playground",
+  })
 }
 
 // Remove uma stack do painel. A máquina que a hospeda (se houver) não é
@@ -1424,12 +1460,16 @@ export async function createKey(input: {
   // sempre passar uma data — chave "de produção" emitida manualmente pelo
   // painel para um cliente já validado pode ficar sem teto.
   expiresAt?: string | null
+  // "customer" (default) conta pro slot de capacidade da máquina e pra cota
+  // diária de tokens da conta. "playground" é a chave interna gerada junto
+  // com a stack para o admin testar o modelo do cliente — nunca exibida ao
+  // cliente, isenta de slot e de cota (ver migration 0044 e
+  // docker/gateway/main.py:check_token_quota).
+  purpose?: "customer" | "playground"
 }): Promise<{ plainKey: string }> {
+  const purpose = input.purpose ?? "customer"
   const db = createSupabaseAdmin()
 
-  // Valida o limite de slots da máquina antes de emitir a chave.
-  // Check-then-insert: há corrida teórica entre duas emissões simultâneas,
-  // aceitável para um painel de administração.
   const { data: m } = await db
     .from("machines")
     .select("*")
@@ -1437,28 +1477,34 @@ export async function createKey(input: {
     .single<Machine>()
   if (!m) throw new Error("Máquina não encontrada")
 
-  const { count: activeKeys } = await db
-    .from("api_keys")
-    .select("id", { count: "exact", head: true })
-    .eq("machine_id", input.machineId)
-    .eq("status", "active")
+  // Chave de playground não ocupa slot de capacidade — só chave "customer"
+  // entra no backstop abaixo. Check-then-insert: há corrida teórica entre
+  // duas emissões simultâneas, aceitável para um painel de administração.
+  if (purpose === "customer") {
+    const { count: activeKeys } = await db
+      .from("api_keys")
+      .select("id", { count: "exact", head: true })
+      .eq("machine_id", input.machineId)
+      .eq("status", "active")
+      .eq("purpose", "customer")
 
-  const { data: tpl } = m.template_id
-    ? await db.from("templates").select("*").eq("id", m.template_id).single<Template>()
-    : { data: null }
+    const { data: tpl } = m.template_id
+      ? await db.from("templates").select("*").eq("id", m.template_id).single<Template>()
+      : { data: null }
 
-  const cap = computeCapacity({
-    vramGb: m.vram_gb,
-    modelFootprintGb: tpl?.model_footprint_gb ?? 16,
-    kvReserveGbPerUser: tpl?.kv_reserve_gb_per_user ?? 2,
-    // Backstop por chaves (1 chave por conta): a lotação por stacks é
-    // validada em createStack/migrateStack via machineStackCapacity.
-    occupied: activeKeys ?? 0,
-    maxUsers: m.max_users,
-  })
-  // slotsMax = 0 significa capacidade desconhecida (sem VRAM nem teto) — não bloqueia
-  if (cap.slotsMax > 0 && cap.slotsUsed >= cap.slotsMax) {
-    throw new Error(`Limite de ${cap.slotsMax} usuário(s) atingido nesta máquina`)
+    const cap = computeCapacity({
+      vramGb: m.vram_gb,
+      modelFootprintGb: tpl?.model_footprint_gb ?? 16,
+      kvReserveGbPerUser: tpl?.kv_reserve_gb_per_user ?? 2,
+      // Backstop por chaves (1 chave por conta): a lotação por stacks é
+      // validada em createStack/migrateStack via machineStackCapacity.
+      occupied: activeKeys ?? 0,
+      maxUsers: m.max_users,
+    })
+    // slotsMax = 0 significa capacidade desconhecida (sem VRAM nem teto) — não bloqueia
+    if (cap.slotsMax > 0 && cap.slotsUsed >= cap.slotsMax) {
+      throw new Error(`Limite de ${cap.slotsMax} usuário(s) atingido nesta máquina`)
+    }
   }
 
   // Sem stackId explícito (ex.: CreateKeyDialog, que só pergunta conta +
@@ -1492,10 +1538,17 @@ export async function createKey(input: {
     plain_key: plainKey,
     status: "active",
     expires_at: input.expiresAt ?? null,
+    purpose,
   })
   if (error) throw new Error(error.message)
 
-  await logEvent(input.machineId, "key_created", `Nova chave criada (${keyPrefix(plainKey)}…)`)
+  await logEvent(
+    input.machineId,
+    "key_created",
+    purpose === "playground"
+      ? "Chave interna de Playground criada"
+      : `Nova chave criada (${keyPrefix(plainKey)}…)`
+  )
   // Chave pode ter sido criada logo após provisionar a máquina (createStack) —
   // o agent do pod ainda pode não estar de pé pra receber um sync direto do
   // painel (mesma race de startMachine, ver scheduleGatewayKeySync acima).

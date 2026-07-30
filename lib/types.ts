@@ -136,6 +136,10 @@ export type ApiKey = {
   // antes da migration 0014 ficam null (só o prefixo é recuperável).
   plain_key: string | null
   status: "active" | "revoked"
+  // "customer" conta pro slot de capacidade e pra cota diária de tokens;
+  // "playground" é a chave interna gerada junto com a stack (migration
+  // 0044), nunca exibida ao cliente, isenta dos dois.
+  purpose: "customer" | "playground"
   created_at: string
 }
 

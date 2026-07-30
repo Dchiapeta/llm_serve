@@ -517,7 +517,7 @@ def check_rate_limit(key_hash: str) -> None:
     rate_buckets[key_hash] = (tokens - 1.0, now)
 
 
-async def check_token_quota(account_id: str, plan: str | None) -> None:
+async def check_token_quota(account_id: str, plan: str | None, purpose: str = "customer") -> None:
     """Quota diária de tokens por conta — protege contra custo real (poucas
     requests, cada uma gerando muito token), o que rate limit/concorrência
     por si não cobrem. Lida de usage_metrics via account_token_usage_today,
@@ -525,7 +525,14 @@ async def check_token_quota(account_id: str, plan: str | None) -> None:
     cada request. 0/plano sem entrada = sem teto (opt-in por plano); `plan`
     None (chave sem stack resolvível) cai no mesmo caso — resolve_route
     rejeita a request logo em seguida com 503, então não enforça nada aqui
-    à toa."""
+    à toa.
+
+    `purpose == "playground"` (migration 0044, chave interna gerada junto com
+    a stack pro admin testar) nunca tem cota — não é uso do cliente, e
+    account_token_usage_today já exclui essas chaves da soma pra não inflar a
+    cota "customer" da mesma conta."""
+    if purpose == "playground":
+        return
     budget = DAILY_TOKEN_BUDGET.get(plan, 0)
     if budget <= 0:
         return
@@ -2433,7 +2440,7 @@ async def anthropic_messages(
     check_rate_limit(key_hash)
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
-    await check_token_quota(account_id, key_plan)
+    await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
 
     machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
     await maybe_touch(stack_id, machine["id"])
@@ -2703,7 +2710,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     check_rate_limit(key_hash)
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
-    await check_token_quota(account_id, key_plan)
+    await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
 
     machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
     await maybe_touch(stack_id, machine["id"])
