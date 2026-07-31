@@ -51,14 +51,14 @@ Além de `/v1/chat/completions`, o serviço aceita `/v1/completions`, `/v1/embed
 ## Exemplos
 
 Todos os exemplos abaixo fazem a mesma chamada e leem a chave da variável de ambiente
-`LLM_API_KEY`.
+`STACK_API_KEY`.
 
 ### curl
 
 ```bash
 curl https://llmserve-docker.up.railway.app/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $LLM_API_KEY" \
+  -H "Authorization: Bearer $STACK_API_KEY" \
   -d '{
     "model": "vibecoder-base",
     "max_tokens": 8000,
@@ -71,7 +71,7 @@ No formato Anthropic, se preferir:
 ```bash
 curl https://llmserve-docker.up.railway.app/v1/messages \
   -H "Content-Type: application/json" \
-  -H "x-api-key: $LLM_API_KEY" \
+  -H "x-api-key: $STACK_API_KEY" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
     "model": "vibecoder-base",
@@ -87,22 +87,29 @@ curl https://llmserve-docker.up.railway.app/v1/messages \
 import os
 import requests
 
+message = "content here"
+
 r = requests.post(
     "https://llmserve-docker.up.railway.app/v1/chat/completions",
     headers={
         "Content-Type": "application/json",
-        "Authorization": "Bearer " + os.environ["LLM_API_KEY"],
+        "Authorization": "Bearer " + os.environ["STACK_API_KEY"],
     },
-    json={
-        "model": "vibecoder-base",
-        "max_tokens": 8000,
-        "messages": [{"role": "user", "content": "oi"}],
-    },
-    timeout=120,
+    json={"messages": [{"role": "user", "content": message}]},
 )
 r.raise_for_status()
 print(r.json()["choices"][0]["message"]["content"])
 ```
+
+Sem `timeout` aqui de propósito — é o exemplo mais simples possível. Para produção,
+veja a seção [Retry](#retry-o-ponto-mais-importante-para-produção): a primeira
+chamada depois de um período parado pode levar dezenas de segundos religando a
+infraestrutura, e lá o timeout generoso (120s) é parte do tratamento, não um
+detalhe cosmético.
+
+`model` e `max_tokens` são opcionais: se você não mandar, o serviço usa o modelo do
+seu plano e um teto de tokens padrão. Só mande esses campos se quiser controlar
+explicitamente o teto de tokens da resposta.
 
 `requests` não faz parte da biblioteca padrão. Para evitar a dependência, dá para usar
 `urllib.request` com `json.dumps()` no corpo — a request é a mesma.
@@ -115,7 +122,7 @@ const r = await fetch("https://llmserve-docker.up.railway.app/v1/chat/completion
   method: "POST",
   headers: {
     "Content-Type": "application/json",
-    Authorization: "Bearer " + process.env.LLM_API_KEY,
+    Authorization: "Bearer " + process.env.STACK_API_KEY,
   },
   body: JSON.stringify({
     model: "vibecoder-base",
@@ -143,7 +150,7 @@ curl_setopt_array($ch, [
     CURLOPT_TIMEOUT => 120,
     CURLOPT_HTTPHEADER => [
         "Content-Type: application/json",
-        "Authorization: Bearer " . getenv("LLM_API_KEY"),
+        "Authorization: Bearer " . getenv("STACK_API_KEY"),
     ],
     CURLOPT_POSTFIELDS => json_encode([
         "model" => "vibecoder-base",
@@ -184,7 +191,7 @@ func main() {
 		"https://llmserve-docker.up.railway.app/v1/chat/completions",
 		bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("LLM_API_KEY"))
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("STACK_API_KEY"))
 
 	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
 	if err != nil {
@@ -220,7 +227,7 @@ String body = """
 HttpRequest req = HttpRequest.newBuilder()
     .uri(URI.create("https://llmserve-docker.up.railway.app/v1/chat/completions"))
     .header("Content-Type", "application/json")
-    .header("Authorization", "Bearer " + System.getenv("LLM_API_KEY"))
+    .header("Authorization", "Bearer " + System.getenv("STACK_API_KEY"))
     .timeout(Duration.ofSeconds(120))
     .POST(HttpRequest.BodyPublishers.ofString(body))
     .build();
@@ -240,7 +247,7 @@ using System.Text.Json;
 
 using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(120) };
 http.DefaultRequestHeaders.Add(
-    "Authorization", "Bearer " + Environment.GetEnvironmentVariable("LLM_API_KEY"));
+    "Authorization", "Bearer " + Environment.GetEnvironmentVariable("STACK_API_KEY"));
 
 var res = await http.PostAsJsonAsync(
     "https://llmserve-docker.up.railway.app/v1/chat/completions", new
@@ -267,17 +274,16 @@ um fluxo SSE: linhas começando com `data: `, cada uma com um pedaço em
 ```python
 import json, os, requests
 
+message = "content here"
+
 r = requests.post(
     "https://llmserve-docker.up.railway.app/v1/chat/completions",
-    headers={"Authorization": "Bearer " + os.environ["LLM_API_KEY"]},
+    headers={"Authorization": "Bearer " + os.environ["STACK_API_KEY"]},
     json={
-        "model": "vibecoder-base",
-        "max_tokens": 8000,
         "stream": True,
-        "messages": [{"role": "user", "content": "escreva um haiku"}],
+        "messages": [{"role": "user", "content": message}],
     },
     stream=True,
-    timeout=120,
 )
 r.raise_for_status()
 
@@ -443,7 +449,7 @@ import os, time, requests
 URL = "https://llmserve-docker.up.railway.app/v1/chat/completions"
 HEADERS = {
     "Content-Type": "application/json",
-    "Authorization": "Bearer " + os.environ["LLM_API_KEY"],
+    "Authorization": "Bearer " + os.environ["STACK_API_KEY"],
 }
 
 def chamar(payload, tentativas=5):
@@ -460,7 +466,7 @@ def chamar(payload, tentativas=5):
 const URL = "https://llmserve-docker.up.railway.app/v1/chat/completions"
 const HEADERS = {
   "Content-Type": "application/json",
-  Authorization: "Bearer " + process.env.LLM_API_KEY,
+  Authorization: "Bearer " + process.env.STACK_API_KEY,
 }
 
 async function chamar(payload, tentativas = 5) {

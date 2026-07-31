@@ -44,18 +44,15 @@ export function MachineAbout({
 import os
 import requests
 
+message = "content here"
+
 r = requests.post(
     "${url}/v1/chat/completions",
     headers={
         "Content-Type": "application/json",
-        "Authorization": "Bearer " + os.environ["LLM_API_KEY"],
+        "Authorization": "Bearer " + os.environ["STACK_API_KEY"],
     },
-    json={
-        "model": "${model}",
-        "max_tokens": 8000,
-        "messages": [{"role": "user", "content": "oi"}],
-    },
-    timeout=120,
+    json={"messages": [{"role": "user", "content": message}]},
 )
 r.raise_for_status()
 print(r.json()["choices"][0]["message"]["content"])`
@@ -65,7 +62,7 @@ const r = await fetch("${url}/v1/chat/completions", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
-    Authorization: "Bearer " + process.env.LLM_API_KEY,
+    Authorization: "Bearer " + process.env.STACK_API_KEY,
   },
   body: JSON.stringify({
     model: "${model}",
@@ -86,7 +83,7 @@ curl_setopt_array($ch, [
     CURLOPT_TIMEOUT => 120,
     CURLOPT_HTTPHEADER => [
         "Content-Type: application/json",
-        "Authorization: Bearer " . getenv("LLM_API_KEY"),
+        "Authorization: Bearer " . getenv("STACK_API_KEY"),
     ],
     CURLOPT_POSTFIELDS => json_encode([
         "model" => "${model}",
@@ -121,7 +118,7 @@ func main() {
 
 	req, _ := http.NewRequest("POST", "${url}/v1/chat/completions", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("LLM_API_KEY"))
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("STACK_API_KEY"))
 
 	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
 	if err != nil {
@@ -153,7 +150,7 @@ String body = """
 HttpRequest req = HttpRequest.newBuilder()
     .uri(URI.create("${url}/v1/chat/completions"))
     .header("Content-Type", "application/json")
-    .header("Authorization", "Bearer " + System.getenv("LLM_API_KEY"))
+    .header("Authorization", "Bearer " + System.getenv("STACK_API_KEY"))
     .timeout(Duration.ofSeconds(120))
     .POST(HttpRequest.BodyPublishers.ofString(body))
     .build();
@@ -169,7 +166,7 @@ using System.Text.Json;
 
 using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(120) };
 http.DefaultRequestHeaders.Add(
-    "Authorization", "Bearer " + Environment.GetEnvironmentVariable("LLM_API_KEY"));
+    "Authorization", "Bearer " + Environment.GetEnvironmentVariable("STACK_API_KEY"));
 
 var res = await http.PostAsJsonAsync("${url}/v1/chat/completions", new
 {
