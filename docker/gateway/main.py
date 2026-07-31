@@ -54,14 +54,19 @@ from anthropic_compat import (
 )
 from content_policy import clamp_media
 from context_budget import (
+    CONTEXT_IMAGE_TOKENS,
     ContextWindowExceeded,
+    EstimateKind,
+    PromptBudget,
+    RESERVED_OUTPUT_TOKENS as MIN_MAX_TOKENS,
     anthropic_error_body,
     apply_context_budget,
+    count_images,
     estimate_prompt_tokens,
     openai_error_body,
     prompt_text_for_tokenize,
-    should_use_exact_token_count,
 )
+from context_budget import resolve_est_tokens as _resolve_est_tokens
 from lifecycle import LifecycleManager, MigrationError
 from recovery import is_no_gpu_error, lock_active, spawn_tracked
 from usage_class import classify_stack
@@ -605,20 +610,15 @@ async def call_vllm_tokenize(machine: dict, model: str, text: str) -> int | None
 
 
 async def resolve_est_tokens(
-    machine: dict, heuristic_est: int, exact_text: str, tokenize_fn=call_vllm_tokenize
-) -> int:
-    """Decide o est_tokens final pro apply_context_budget: heurística por
-    padrão (fast-path — maioria das requests fica longe do teto), contagem
-    real do tokenizer via /tokenize do vLLM só quando should_use_exact_token_count
-    já indica proximidade do limite. tokenize_fn injetável só pra testar sem
-    precisar mockar httpx."""
-    if not should_use_exact_token_count(heuristic_est, machine):
-        return heuristic_est
-    model = machine.get("served_model_name") or machine.get("model_name")
-    if not model:
-        return heuristic_est
-    exact = await tokenize_fn(machine, model, exact_text)
-    return exact if exact is not None else heuristic_est
+    machine: dict, heuristic_est: int, exact_text: str, image_tokens: int = 0
+) -> tuple[int, EstimateKind]:
+    """Wrapper de context_budget.resolve_est_tokens fechando o tokenize_fn.
+
+    A lógica mora no módulo puro (testável sem as env vars obrigatórias daqui);
+    aqui só se amarra a implementação concreta da contagem."""
+    return await _resolve_est_tokens(
+        machine, heuristic_est, exact_text, call_vllm_tokenize, image_tokens=image_tokens
+    )
 
 
 async def get_agent_metrics(machine: dict, reset: bool = True) -> dict | None:
@@ -1782,6 +1782,32 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
     return machine, effective_plan
 
 
+async def resolve_machine_readonly(entry: dict) -> dict | None:
+    """Máquina que ATUALMENTE serve a stack da chave, ou None — sem alocar nada.
+
+    Existe porque resolve_route não serve pra endpoint de metadado: ele aloca
+    máquina, espera lora_status "loading" (wait_until_routed) e pode acordar
+    pod. O /v1/messages/count_tokens é chamado pelo cliente a cada turno pra
+    decidir se compacta; fazê-lo acordar pod seria absurdo. Aqui é só leitura:
+    rota existente + máquina viva, ou None.
+
+    None é sempre aceitável pra quem chama (cai na heurística), então qualquer
+    falha de rede vira None em vez de derrubar a request."""
+    stack, _plan = resolve_key_stack(entry)
+    if not stack:
+        return None
+    try:
+        route = await store.get_client_location(stack["id"])
+        if not route or not route.get("machine_id"):
+            return None
+        machine = await supa.get_machine(route["machine_id"])
+    except httpx.HTTPError:
+        return None
+    if not machine or machine.get("status") != "running" or not machine.get("public_url"):
+        return None
+    return machine
+
+
 async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str, str]:
     """Resolve (machine, rewrite_model, effective_plan, stack_id) para a conta.
 
@@ -1923,12 +1949,16 @@ async def embed_query(text: str) -> list[float] | None:
         return None
 
 
-MIN_MAX_TOKENS = 8000  # thinking mode (Qwen3.x) corta o raciocínio no meio quando o
-# cliente manda um teto baixo — comum em ferramentas de terceiro (Cursor, Continue,
-# Cline etc.) que fixam max_tokens curto por padrão. Como o produto é BYOE (o usuário
-# aponta a ferramenta dele direto pro endpoint, sem UI de chat própria controlando
-# esse parâmetro), o gateway impõe o piso aqui pra garantir qualidade consistente
-# independente do cliente.
+# MIN_MAX_TOKENS é importado de context_budget (RESERVED_OUTPUT_TOKENS) — mora
+# lá porque é ele que calcula a janela de input recomendada pro cliente
+# (usable_input_tokens/auto_compact_window) e é o único módulo importável sem as
+# env vars obrigatórias daqui. Piso de max_tokens: thinking mode (Qwen3.x) corta
+# o raciocínio no meio quando o cliente manda um teto baixo — comum em
+# ferramentas de terceiro (Cursor, Continue, Cline etc.) que fixam max_tokens
+# curto por padrão. Como o produto é BYOE (o usuário aponta a ferramenta dele
+# direto pro endpoint, sem UI de chat própria controlando esse parâmetro), o
+# gateway impõe o piso aqui pra garantir qualidade consistente independente do
+# cliente.
 MAX_MAX_TOKENS = int(os.environ.get("MAX_MAX_TOKENS", "16000"))  # teto: sem isso um
 # cliente podia pedir max_tokens arbitrário e a GPU rodava até esgotar o contexto,
 # sem nenhum controle de custo (ver também check_concurrency/RATE_LIMIT_RPM)
@@ -1964,12 +1994,25 @@ def pin_model(body_json: dict, stack_id: str, rewrite_model: bool, machine: dict
 
 
 async def validate_body(
-    body_json: dict, entry: dict, rewrite_model: bool, machine: dict, stack_id: str
+    body_json: dict,
+    entry: dict,
+    rewrite_model: bool,
+    machine: dict,
+    stack_id: str,
+    budget_out: dict | None = None,
 ) -> dict:
     """Ponto único de validação/transformação do corpo antes do proxy:
     trava o modelo, aplica piso/teto de max_tokens e clamp de parâmetros
     (qualquer endpoint /v1/*) e, só para chat completions (body com
-    "messages"), filtra roles e injeta system prompt da stack + RAG."""
+    "messages"), filtra roles e injeta system prompt da stack + RAG.
+
+    budget_out (opcional): recebe {"budget": PromptBudget} com o que o clamp
+    dinâmico concluiu. Out-param em vez de mudar o tipo de retorno porque são
+    3 chamadores e só um (o /v1/messages) precisa do dado — ele usa o
+    est_tokens pra emitir usage.input_tokens no message_start, sem o qual o
+    rastreador de contexto do Claude Code fica em zero e o auto-compact nunca
+    dispara. Guardar no próprio body_json sob chave privada foi descartado: um
+    pop esquecido mandaria campo desconhecido pro vLLM."""
     pin_model(body_json, stack_id, rewrite_model, machine)
 
     # vLLM só manda "usage" no chunk final do SSE quando o pedido inclui
@@ -2029,8 +2072,10 @@ async def validate_body(
         if isinstance(body_json.get("prompt"), str):
             prompt_text = body_json["prompt"]
             heuristic_est = estimate_prompt_tokens(extra_texts=[prompt_text])
-            est_tokens = await resolve_est_tokens(machine, heuristic_est, prompt_text)
-            apply_context_budget(body_json, machine, est_tokens=est_tokens)
+            est_tokens, kind = await resolve_est_tokens(machine, heuristic_est, prompt_text)
+            budget = apply_context_budget(body_json, machine, est_tokens=est_tokens, kind=kind)
+            if budget_out is not None:
+                budget_out["budget"] = budget
         return body_json
 
     if len(messages) > MAX_MESSAGES:
@@ -2087,8 +2132,17 @@ async def validate_body(
     tools = body_json.get("tools")
     heuristic_est = estimate_prompt_tokens(messages=messages, tools=tools)
     exact_text = prompt_text_for_tokenize(messages=messages, tools=tools)
-    est_tokens = await resolve_est_tokens(machine, heuristic_est, exact_text)
-    apply_context_budget(body_json, machine, est_tokens=est_tokens)
+    # image_tokens: exact_text não leva as imagens (base64 não tokeniza como
+    # texto), então o custo delas tem que voltar por fora na contagem exata —
+    # senão perto do limite um prompt com imagem vale menos do que valia pela
+    # heurística. Único call site com messages, logo o único que precisa disso.
+    image_tokens = count_images(messages) * CONTEXT_IMAGE_TOKENS
+    est_tokens, kind = await resolve_est_tokens(
+        machine, heuristic_est, exact_text, image_tokens=image_tokens
+    )
+    budget = apply_context_budget(body_json, machine, est_tokens=est_tokens, kind=kind)
+    if budget_out is not None:
+        budget_out["budget"] = budget
     return body_json
 
 
@@ -2265,8 +2319,10 @@ async def validate_responses_body(
     ]
     heuristic_est = estimate_prompt_tokens(tools=tools, extra_texts=extra_texts)
     exact_text = prompt_text_for_tokenize(tools=tools, extra_texts=extra_texts)
-    est_tokens = await resolve_est_tokens(machine, heuristic_est, exact_text)
-    apply_context_budget(body_json, machine, field="max_output_tokens", est_tokens=est_tokens)
+    est_tokens, kind = await resolve_est_tokens(machine, heuristic_est, exact_text)
+    apply_context_budget(
+        body_json, machine, field="max_output_tokens", est_tokens=est_tokens, kind=kind
+    )
     return body_json
 
 
@@ -2500,16 +2556,29 @@ async def anthropic_messages(
     # (ver ENABLE_REASONING_PARSER) recebia o raciocínio cru misturado no texto
     filter_reasoning = effective_plan in REASONING_LEAK_PLANS
 
+    budget_out: dict = {}
     try:
         # mesmo validate_body do chat/completions: trava o model, aplica
         # piso/teto de max_tokens e clamp de parâmetros. O "system"
         # convertido acima já entra como client_systems (é o system prompt
         # do próprio Claude Code) — respeitado, sem injetar o da stack por
         # cima (mesma política de todos os outros canais)
-        openai_body = await validate_body(openai_body, entry, rewrite_model, machine, stack_id)
+        openai_body = await validate_body(
+            openai_body, entry, rewrite_model, machine, stack_id, budget_out=budget_out
+        )
     except HTTPException:
         release_flight(flight_key)
         raise
+
+    # tokens de input a reportar ao cliente. O Claude Code rastreia o contexto
+    # pelo usage.input_tokens que a gente devolve; em streaming o vLLM só manda
+    # usage no chunk FINAL, então sem esta estimativa o message_start sai com 0
+    # e o contador do cliente nunca sai do lugar — auto-compact nunca dispara.
+    # Na faixa que importa (perto do teto) este número é a contagem exata do
+    # tokenizer, e o valor real do vLLM corrige no message_delta.
+    budget = budget_out.get("budget")
+    log_ctx["budget"] = budget
+    input_tokens_estimate = budget.est_tokens if budget else 0
 
     upstream_body = json.dumps(openai_body).encode()
 
@@ -2572,6 +2641,7 @@ async def anthropic_messages(
                 upstream, requested_model,
                 on_done=_on_stream_done,
                 filter_reasoning=filter_reasoning,
+                input_tokens_estimate=input_tokens_estimate,
             ),
             status_code=upstream.status_code,
             media_type="text/event-stream",
@@ -2590,7 +2660,10 @@ async def anthropic_messages(
                         reasoning, visible = split_reasoning(message["content"])
                         if reasoning is not None:
                             message["content"] = visible
-            anthropic_resp = openai_to_anthropic_response(openai_resp, requested_model)
+            anthropic_resp = openai_to_anthropic_response(
+                openai_resp, requested_model,
+                input_tokens_fallback=input_tokens_estimate,
+            )
             raw = json.dumps(anthropic_resp).encode()
         except Exception:
             pass  # resposta não é o JSON esperado -> repassa como veio
@@ -2607,12 +2680,23 @@ async def anthropic_count_tokens(
     authorization: str | None = Header(None),
     x_api_key: str | None = Header(None),
 ):
-    """Estimativa heurística (~4 chars/token), não a contagem exata do
-    tokenizer do modelo servido — o Claude Code usa isso pra gerenciar a
-    janela de contexto, não pra billing, então a aproximação é aceitável.
-    Não passa por rate limit/quota/concorrência: não há inferência aqui,
-    só autenticação (mesma chave) e um cálculo local barato."""
-    await authenticate_anthropic(authorization, x_api_key)
+    """Tokens de input do prompt, pela MESMA conta que a admissão usa.
+
+    O cliente (Claude Code) chama isso pra decidir quando compactar, então
+    divergir da admissão é o pior dos mundos: ele compacta cedo demais
+    (desperdiça janela) ou tarde demais (leva 400). Por isso reusa
+    resolve_est_tokens — heurística ~4 chars/token longe do teto, contagem real
+    do tokenizer do vLLM perto dele, exatamente como em validate_body. Antes
+    daqui saía só a heurística.
+
+    Devolve o número CRU, sem margem de segurança: a margem é do orçamento do
+    servidor (reserved_tokens_for): aplicá-la aqui faria o cliente compactar
+    ~20% mais cedo do que precisa.
+
+    Passa por rate limit (mas não por quota/concorrência): deixou de ser um
+    cálculo puramente local — perto do teto faz uma chamada ao pod."""
+    entry, key_hash, _bearer = await authenticate_anthropic(authorization, x_api_key)
+    check_rate_limit(key_hash)
     raw_body = await request.body()
     if len(raw_body) > MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
@@ -2621,13 +2705,24 @@ async def anthropic_count_tokens(
     except Exception:
         raise HTTPException(status_code=400, detail="corpo inválido")
     openai_body, _ = anthropic_to_openai_request(anthropic_body)
-    # mesma heurística do clamp de janela (context_budget) — inclui as tools,
-    # que nos clientes agênticos são a maior fatia do prompt; sem elas o
-    # Claude Code subestimava o uso e compactava tarde demais
-    estimated = estimate_prompt_tokens(
-        messages=openai_body.get("messages"), tools=openai_body.get("tools")
+    messages = openai_body.get("messages")
+    tools = openai_body.get("tools")
+    # inclui as tools: nos clientes agênticos são a maior fatia do prompt, e
+    # sem elas o Claude Code subestimava o uso e compactava tarde demais
+    heuristic_est = estimate_prompt_tokens(messages=messages, tools=tools)
+    # sem máquina viva (stack pausada, pod dormindo) não há tokenizer pra
+    # consultar — a heurística é a melhor resposta disponível, e é melhor que
+    # acordar pod num endpoint de metadado
+    machine = await resolve_machine_readonly(entry)
+    if machine is None:
+        return {"input_tokens": heuristic_est}
+    est_tokens, _kind = await resolve_est_tokens(
+        machine,
+        heuristic_est,
+        prompt_text_for_tokenize(messages=messages, tools=tools),
+        image_tokens=count_images(messages) * CONTEXT_IMAGE_TOKENS,
     )
-    return {"input_tokens": estimated}
+    return {"input_tokens": est_tokens}
 
 
 # paths do vLLM que o gateway repassa — qualquer coisa fora daqui (ex.:
@@ -2656,6 +2751,7 @@ def log_gateway_request(
     *, account_id: str, stack_id: str | None, api_key_id: str, machine_id: str,
     path: str, model: str | None, status_code: int, stream: bool,
     started: float, usage: dict | None = None, user_agent: str | None = None,
+    budget: PromptBudget | None = None,
 ) -> None:
     """Log fire-and-forget de uma requisição completada (migration 0038,
     tabela gateway_requests). `started` é o time.monotonic() capturado na
@@ -2664,8 +2760,14 @@ def log_gateway_request(
     pontos que já têm flight_key (mesmo escopo de in_flight/release_flight)
     — nunca no caminho crítico da resposta ao cliente, e nunca deixa
     exceção escapar (spawn_tracked evita o bug conhecido de create_task sem
-    referência sendo coletado pelo GC antes de terminar)."""
+    referência sendo coletado pelo GC antes de terminar).
+
+    `budget` (opcional) só alimenta a linha de log abaixo, não a tabela: é
+    instrumentação temporária pra medir o erro de CONTEXT_EXACT_SAFETY_FACTOR
+    (1.02) contra o prompt_tokens real do vLLM antes de mexer nele de novo —
+    não vale uma migration."""
     usage = usage or {}
+    _log_estimate_drift(budget, usage, path)
     row = {
         "account_id": account_id,
         "stack_id": stack_id,
@@ -2683,6 +2785,27 @@ def log_gateway_request(
         "duration_ms": int((time.monotonic() - started) * 1000),
     }
     spawn_tracked(_write_gateway_request(row))
+
+
+def _log_estimate_drift(budget: PromptBudget | None, usage: dict, path: str) -> None:
+    """Compara o que o orçamento reservou com o que o vLLM realmente contou.
+
+    A margem da contagem exata é de 2% (CONTEXT_EXACT_SAFETY_FACTOR) + 200
+    tokens de chat template, apostando que o json.dumps que mandamos pro
+    /tokenize sobra em relação ao template renderizado. Se a aposta estiver
+    errada em algum template, o sintoma é o 400 cru do vLLM voltando — e num
+    cliente que reenvia a conversa toda isso envenena a sessão inteira. Esta
+    linha é o que permite ver a deriva ANTES do sintoma."""
+    real = usage.get("prompt_tokens")
+    if budget is None or not isinstance(real, int) or real <= 0:
+        return
+    drift = (budget.reserved - real) / real
+    log = logger.warning if budget.reserved < real else logger.info
+    log(
+        "orçamento de contexto (%s): est=%d (%s) reservado=%d real=%d folga=%+.1f%% janela=%s",
+        path, budget.est_tokens, budget.kind.value, budget.reserved, real,
+        drift * 100, budget.max_model_len,
+    )
 
 
 async def _write_gateway_request(row: dict) -> None:

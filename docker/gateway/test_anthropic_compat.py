@@ -28,13 +28,26 @@ def _chunk(**delta) -> bytes:
     return b"data: " + json.dumps(payload).encode() + b"\n\n"
 
 
-def _collect(chunks: list[bytes], *, filter_reasoning: bool) -> list[dict]:
+def _usage_chunk(prompt_tokens: int, completion_tokens: int) -> bytes:
+    """Chunk final que o vLLM manda quando stream_options.include_usage está
+    ligado (validate_body força isso em toda request streaming)."""
+    payload = {
+        "choices": [],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+    }
+    return b"data: " + json.dumps(payload).encode() + b"\n\n"
+
+
+def _collect(
+    chunks: list[bytes], *, filter_reasoning: bool, input_tokens_estimate: int = 0
+) -> list[dict]:
     """Roda o conversor e devolve os eventos SSE já decodificados."""
 
     async def run():
         out = []
         gen = anthropic_sse_from_openai_stream(
-            FakeUpstream(chunks), "claude-x", filter_reasoning=filter_reasoning
+            FakeUpstream(chunks), "claude-x", filter_reasoning=filter_reasoning,
+            input_tokens_estimate=input_tokens_estimate,
         )
         async for raw in gen:
             for line in raw.decode().split("\n"):
@@ -115,6 +128,50 @@ def test_filtro_desligado_repassa_tudo():
         [_chunk(content="a"), _chunk(content="b")], filter_reasoning=False
     )
     assert _texts(events) == ["a", "b"]
+
+
+def _only(events: list[dict], kind: str) -> dict:
+    (event,) = [e for e in events if e.get("type") == kind]
+    return event
+
+
+def test_message_start_leva_a_estimativa_de_input_tokens():
+    """O Claude Code rastreia o contexto pelo usage.input_tokens que a gente
+    devolve, e em streaming o vLLM só manda usage no chunk FINAL. Zero aqui
+    (o comportamento anterior) fazia o contador do cliente nunca sair do lugar
+    e o auto-compact nunca disparar."""
+    events = _collect([_chunk(content="oi")], filter_reasoning=False, input_tokens_estimate=1234)
+    usage = _only(events, "message_start")["message"]["usage"]
+    assert usage["input_tokens"] == 1234
+    assert usage["output_tokens"] == 0
+    # presentes e zerados, não ausentes: há cliente que soma os três
+    assert usage["cache_creation_input_tokens"] == 0
+    assert usage["cache_read_input_tokens"] == 0
+
+
+def test_message_delta_corrige_a_estimativa_com_a_contagem_do_vllm():
+    events = _collect(
+        [_chunk(content="oi"), _usage_chunk(prompt_tokens=999, completion_tokens=7)],
+        filter_reasoning=False,
+        input_tokens_estimate=1234,
+    )
+    assert _only(events, "message_start")["message"]["usage"]["input_tokens"] == 1234
+    usage = _only(events, "message_delta")["usage"]
+    assert usage["input_tokens"] == 999  # real do vLLM vence a estimativa
+    assert usage["output_tokens"] == 7
+
+
+def test_message_delta_sem_usage_do_vllm_repete_a_estimativa():
+    """Stream cortado ou vLLM sem include_usage: melhor repetir a estimativa
+    do que zerar o contador de contexto do cliente."""
+    events = _collect([_chunk(content="oi")], filter_reasoning=False, input_tokens_estimate=1234)
+    assert _only(events, "message_delta")["usage"]["input_tokens"] == 1234
+
+
+def test_sem_estimativa_o_input_tokens_fica_zero():
+    """Regressão dos chamadores que não passam o parâmetro (proxy genérico)."""
+    events = _collect([_chunk(content="oi")], filter_reasoning=False)
+    assert _only(events, "message_start")["message"]["usage"]["input_tokens"] == 0
 
 
 def test_tool_call_depois_de_reasoning_content_abre_o_bloco_certo():

@@ -2,6 +2,7 @@
 
 import { CodeBlock } from "@/components/ui/code-block"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { autoCompactWindow } from "@/lib/context-window"
 
 export function MachineAbout({
   gatewayUrl,
@@ -182,18 +183,12 @@ var json = await res.Content.ReadFromJsonAsync<JsonElement>();
 Console.WriteLine(json.GetProperty("choices")[0]
     .GetProperty("message").GetProperty("content").GetString());`
 
-  // AUTO_COMPACT_WINDOW: quando o Claude Code compacta antes de estourar a
-  // janela real do plano (sem isso ele assume 200k e só descobre o limite
-  // quando o gateway recusa). DERIVADO do --max-model-len da máquina,
-  // espelhando a conta do gateway (context_budget.py): a saída garantida
-  // (8000 = MIN_MAX_TOKENS) e o CONTEXT_SAFETY_FACTOR (1.2) comem a janela
-  // crua, então o input útil ≈ (janela − 8000 − 200) / 1.2 — NÃO a janela
-  // cheia (ex.: 131072 → ~102000, não 126k, senão o gateway rejeita).
-  // Fallback 50000 (assume ≥64k) quando a janela é desconhecida (template sem
-  // --max-model-len / pod anterior à migration 0031).
-  const autoCompactWindow = maxModelLen
-    ? Math.floor((maxModelLen - 8000 - 200) / 1.2 / 1000) * 1000
-    : 50000
+  // AUTO_COMPACT_WINDOW: 80% da janela real do plano — é o que faz o Claude
+  // Code compactar antes de estourar. Sem isso ele assume 200k (não há como
+  // anunciar a janela real pela API: ele ignora /v1/models e só tem o env var)
+  // e só descobre o limite quando o gateway recusa. Conta centralizada em
+  // lib/context-window.ts, espelho de docker/gateway/context_budget.py.
+  const compactWindow = autoCompactWindow(maxModelLen)
 
   const claudeSnippet = `export ANTHROPIC_BASE_URL="${url}"
 export ANTHROPIC_AUTH_TOKEN="<SUA_CHAVE_DE_ACESSO>"
@@ -202,8 +197,25 @@ export ANTHROPIC_MODEL="${model}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=${autoCompactWindow}
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=${compactWindow}
 claude`
+
+  // Mesma config, persistente: o export de shell vale só pra sessão em que foi
+  // rodado, e esquecê-lo é o caminho para a sessão travar em 400 de contexto.
+  // Note que aqui os valores são STRINGS e não há interpolação — o nome do
+  // modelo é repetido literalmente, "$ANTHROPIC_MODEL" não funciona em JSON.
+  const claudeSettings = `{
+  "env": {
+    "ANTHROPIC_BASE_URL": "${url}",
+    "ANTHROPIC_AUTH_TOKEN": "<SUA_CHAVE_DE_ACESSO>",
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_MODEL": "${model}",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "${model}",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${model}",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "${model}",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "${compactWindow}"
+  }
+}`
 
   const codexSnippet = `model_provider = "llmserve"
 model = "${model}"
@@ -299,6 +311,35 @@ wire_api = "responses"`
           <div>
             <h3 className="mb-2 text-sm font-medium">Claude Code CLI</h3>
             <CodeBlock code={claudeSnippet} />
+            <p className="mt-2 text-xs text-muted-foreground">
+              O{" "}
+              <code className="font-mono">
+                CLAUDE_CODE_AUTO_COMPACT_WINDOW
+              </code>{" "}
+              é o que faz o Claude Code compactar a conversa sozinho, por volta
+              de 80% da janela do plano
+              {maxModelLen ? ` (${maxModelLen.toLocaleString("pt-BR")} tokens)` : ""}
+              . Sem ele o Claude Code assume 200 mil tokens e a sessão trava com
+              erro de contexto antes de compactar. O valor é a capacidade que ele
+              passa a assumir, não o ponto exato da compactação — ele compacta um
+              pouco antes; o resto da janela fica reservado para a resposta.
+            </p>
+          </div>
+          <div>
+            <h3 className="mb-2 text-sm font-medium">
+              Claude Code CLI — configuração permanente
+            </h3>
+            <CodeBlock code={claudeSettings} label="~/.claude/settings.json" />
+            <p className="mt-2 text-xs text-muted-foreground">
+              Os <code className="font-mono">export</code> acima valem só para a
+              sessão do terminal em que foram rodados; este arquivo vale para
+              todas. Use o{" "}
+              <code className="font-mono">~/.claude/settings.json</code> da sua
+              conta, não o{" "}
+              <code className="font-mono">.claude/settings.json</code> do
+              projeto — esse vai para o git e levaria a sua chave de acesso com
+              ele.
+            </p>
           </div>
           <div>
             <h3 className="mb-2 text-sm font-medium">Codex CLI</h3>

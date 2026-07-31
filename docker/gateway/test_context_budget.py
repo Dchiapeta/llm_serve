@@ -4,20 +4,30 @@ precisar das env vars do main.py nem de rede. Rodar de docker/gateway/:
     python3 -m pytest test_context_budget.py
 """
 
+import math
+
 import pytest
 
 from context_budget import (
+    CONTEXT_EXACT_SAFETY_FACTOR,
+    CONTEXT_FALLBACK_SAFETY_FACTOR,
     CONTEXT_IMAGE_TOKENS,
     CONTEXT_SAFETY_FACTOR,
     CONTEXT_TEMPLATE_OVERHEAD,
+    RESERVED_OUTPUT_TOKENS,
     ContextWindowExceeded,
+    EstimateKind,
     anthropic_error_body,
     apply_context_budget,
+    auto_compact_window,
+    context_exceeded_message,
+    count_images,
     estimate_prompt_tokens,
     openai_error_body,
     prompt_text_for_tokenize,
     reserved_tokens_for,
     should_use_exact_token_count,
+    usable_input_tokens,
 )
 
 VIBECODER_WINDOW = 16384
@@ -128,6 +138,124 @@ def test_prompt_text_for_tokenize_nao_leva_o_base64():
 def test_reserved_tokens_for_aplica_fator_e_overhead():
     est = 1_000
     assert reserved_tokens_for(est) == int(est * CONTEXT_SAFETY_FACTOR + 0.999999) + CONTEXT_TEMPLATE_OVERHEAD
+
+
+def test_reserved_tokens_for_por_tipo_de_estimativa():
+    """Cada procedência tem margem própria: 1.2 pra chute, ~1.02 pra contagem
+    do tokenizer, meio-termo quando a contagem foi tentada e falhou."""
+    est = 10_000
+    for kind, factor in (
+        (EstimateKind.HEURISTIC, CONTEXT_SAFETY_FACTOR),
+        (EstimateKind.EXACT, CONTEXT_EXACT_SAFETY_FACTOR),
+        (EstimateKind.FALLBACK, CONTEXT_FALLBACK_SAFETY_FACTOR),
+    ):
+        esperado = math.ceil(est * factor) + CONTEXT_TEMPLATE_OVERHEAD
+        assert reserved_tokens_for(est, kind) == esperado
+    # default preservado pra quem não passa kind (should_use_exact_token_count)
+    assert reserved_tokens_for(est) == reserved_tokens_for(est, EstimateKind.HEURISTIC)
+    # ordenação: exata é a mais folgada, heurística a mais apertada
+    assert (
+        reserved_tokens_for(est, EstimateKind.EXACT)
+        < reserved_tokens_for(est, EstimateKind.FALLBACK)
+        < reserved_tokens_for(est, EstimateKind.HEURISTIC)
+    )
+
+
+CLAUDE_CODE_WINDOW = 131_072  # VibeCoder e Pro, padronizados
+
+
+def test_contagem_exata_nao_rejeita_prompt_que_cabe():
+    """Regressão do incidente que quebrava o /compact do Claude Code: 122658
+    tokens EXATOS numa janela de 131072 cabem com ~8k de sobra pra resposta, mas
+    o fator 1.2 (de estimativa) reservava 147390 e o gateway rejeitava. Como
+    /compact reenvia a transcrição inteira, era justamente o pedido que morria —
+    e a mensagem de erro mandava usar /compact, fechando o beco sem saída."""
+    body = {"max_tokens": 8_000}
+    budget = apply_context_budget(
+        body, _machine(CLAUDE_CODE_WINDOW), est_tokens=122_658, kind=EstimateKind.EXACT
+    )
+    esperado = CLAUDE_CODE_WINDOW - reserved_tokens_for(122_658, EstimateKind.EXACT)
+    assert budget.output_budget == esperado > 0
+    assert body["max_tokens"] == esperado  # clampado, não rejeitado
+
+
+def test_mesmo_prompt_ainda_e_rejeitado_quando_e_so_estimativa():
+    """O outro lado: sem contagem do tokenizer o número é um chute e a margem
+    de 1.2 continua valendo — comportamento antigo preservado."""
+    with pytest.raises(ContextWindowExceeded):
+        apply_context_budget(
+            {"max_tokens": 8_000},
+            _machine(CLAUDE_CODE_WINDOW),
+            est_tokens=122_658,
+            kind=EstimateKind.HEURISTIC,
+        )
+
+
+def test_janela_recomendada_ao_cliente():
+    """Contrato replicado em lib/context-window.ts (o painel gera o
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW do snippet a partir da mesma conta).
+    Mudou aqui? Atualize lá."""
+    assert auto_compact_window(CLAUDE_CODE_WINDOW) == 120_000
+    assert auto_compact_window(65_536) == 56_000  # janela do Pro antes de padronizar
+    # nunca acima do que o gateway aceita — recomendar mais que isso recriaria o
+    # 400 de contexto que o módulo existe pra evitar
+    for window in (VIBECODER_WINDOW, 65_536, CLAUDE_CODE_WINDOW):
+        assert auto_compact_window(window) <= usable_input_tokens(window)
+
+
+def test_janela_recomendada_nao_e_80_por_cento_da_janela():
+    """Documenta a escolha que confunde: CLAUDE_CODE_AUTO_COMPACT_WINDOW é a
+    CAPACIDADE que o cliente assume, não o gatilho — ele compacta numa fração
+    interna (~80%-92%) dela. Declarar 80% da janela (104000 em 131072) faria
+    compactar em 63%-73%; o valor máximo admissível faz cair em 73%-84%, que é
+    o que se pediu ("auto-compact em 80%"). Se alguém "corrigir" isto pra
+    0.8 * janela, este teste explica por que não."""
+    declarado = auto_compact_window(CLAUDE_CODE_WINDOW)
+    assert declarado > int(CLAUDE_CODE_WINDOW * 0.8)
+    # onde a compactação realmente cai, nos dois extremos da fração interna
+    assert 0.70 < declarado * 0.80 / CLAUDE_CODE_WINDOW < 0.80
+    assert 0.80 < declarado * 0.92 / CLAUDE_CODE_WINDOW < 0.90
+
+
+@pytest.mark.parametrize("window", [VIBECODER_WINDOW, 65_536, CLAUDE_CODE_WINDOW])
+def test_janela_recomendada_deixa_a_saida_garantida(window):
+    """Auto-consistência entre o valor que recomendamos ao cliente e o que o
+    gateway aceita: um prompt exatamente do tamanho recomendado tem que passar
+    E ainda deixar a saída mínima. Sem isto, mexer num fator de segurança
+    quebra a recomendação sem nenhum teste reclamar."""
+    budget = apply_context_budget(
+        {"max_tokens": RESERVED_OUTPUT_TOKENS},
+        _machine(window),
+        est_tokens=auto_compact_window(window),
+        kind=EstimateKind.EXACT,
+    )
+    assert budget.output_budget >= RESERVED_OUTPUT_TOKENS
+
+
+def test_mensagem_de_erro_nao_manda_usar_compact():
+    """/compact reenvia a transcrição INTEIRA, então é o pedido que dispara
+    este erro — mandar o usuário usá-lo travava a sessão sem saída."""
+    msg = context_exceeded_message(200_000, CLAUDE_CODE_WINDOW, EstimateKind.EXACT)
+    assert "/compact" not in msg
+    assert "/clear" in msg
+    assert str(CLAUDE_CODE_WINDOW) in msg
+    assert str(auto_compact_window(CLAUDE_CODE_WINDOW)) in msg
+    assert "tokenizer" in msg
+    assert "estimado" in context_exceeded_message(
+        200_000, CLAUDE_CODE_WINDOW, EstimateKind.HEURISTIC
+    )
+
+
+def test_sem_max_model_len_o_budget_sai_sem_janela():
+    budget = apply_context_budget({"max_tokens": 16_000}, {"id": "m1"}, est_tokens=999_999)
+    assert budget.max_model_len is None and budget.output_budget is None
+    assert budget.est_tokens == 999_999
+
+
+def test_count_images_e_publico_e_conta_igual_a_estimativa():
+    assert count_images(_messages_with_images(3)) == 3
+    assert count_images(_messages_with_images(0)) == 0
+    assert count_images("nao e lista") == 0
 
 
 PRO_WINDOW = 65_536

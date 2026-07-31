@@ -309,16 +309,50 @@ export ANTHROPIC_MODEL="vibecoder-base"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000   # VibeCoder (janela 128k); no Pro use 50000 (janela 64k)
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=120000
 claude
 ```
 
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` não é opcional: o Claude Code assume uma janela de
 200k e não tem como descobrir a real do seu plano. Sem essa variável ele só percebe o
-limite quando a chamada é recusada; com ela, compacta a conversa antes de estourar.
-Use **100000** no VibeCoder (janela de 128k) e **50000** no Pro (janela de 64k) — os
-valores já deixam folga para a reserva de saída, então a compactação acontece antes do
-gateway recusar.
+limite quando a chamada é recusada; com ela, compacta a conversa sozinho por volta de
+80% da janela. Use **120000** — a página da sua máquina, na aba **Ferramentas**, mostra
+o valor já preenchido.
+
+Esse número é a *capacidade* que o Claude Code passa a assumir, não o ponto em que ele
+compacta: ele compacta um pouco antes de acreditar que encheu. Por isso 120000, e não
+os 104000 que seriam 80% de 131072 — declarar 80% faria a compactação acontecer bem
+antes disso, desperdiçando contexto. 120000 é o teto: o resto da janela fica reservado
+para a resposta do modelo.
+
+Esses `export` valem só para a sessão de terminal em que você os rodou. Para não
+depender disso, ponha o mesmo conteúdo em `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://llmserve-docker.up.railway.app",
+    "ANTHROPIC_AUTH_TOKEN": "<SUA_CHAVE_DE_ACESSO>",
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_MODEL": "vibecoder-base",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "vibecoder-base",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "vibecoder-base",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "vibecoder-base",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "120000"
+  }
+}
+```
+
+Dois detalhes do formato: os valores são **strings** (`"120000"`, não `120000`) e não
+há interpolação — `"$ANTHROPIC_MODEL"` não funciona em JSON, por isso o nome do modelo
+aparece repetido. Use o `~/.claude/settings.json` da sua conta, **não** o
+`.claude/settings.json` do projeto: esse costuma ir para o git e levaria a sua chave
+de acesso com ele.
+
+Se ainda assim o contexto estourar, o gateway responde com um erro explicando o que
+fazer. Nesse ponto use `/clear` e comece uma sessão nova — `/compact` reenvia a
+conversa inteira para o modelo, então é justamente o comando que não cabe mais na
+janela.
 
 ### Codex CLI
 
@@ -329,9 +363,9 @@ model_provider = "llmserve"
 model = "vibecoder-base"
 
 # Compacta o histórico antes de estourar a janela do plano. O Codex assume 200k
-# por padrão e só descobriria o limite ao ser recusado. VibeCoder (128k): 100000;
-# Pro (64k): 50000.
-model_auto_compact_token_limit = 100000
+# por padrão e só descobriria o limite ao ser recusado. Mesmo valor do Claude
+# Code: o maior input que ainda deixa espaço para a resposta na janela de 131072.
+model_auto_compact_token_limit = 120000
 
 [model_providers.llmserve]
 name = "llmserve"

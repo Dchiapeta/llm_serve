@@ -19,7 +19,18 @@ formato de "thinking blocks" da Anthropic; prompt caching (cache_control)
 """
 
 import json
+import os
 import uuid
+
+# Kill switch do input_tokens no message_delta. A API da Anthropic emite
+# input_tokens nos dois eventos (message_start e message_delta) e os SDKs
+# oficiais ATRIBUEM o valor, não somam — mas o rastreador interno do Claude
+# Code não é o SDK. Se em alguma versão ele somar, o contexto contado dobra e o
+# cliente compacta cedo demais; aí isto vira "false" e o message_delta volta a
+# mandar só output_tokens, sem precisar de deploy.
+EMIT_INPUT_TOKENS_IN_DELTA = (
+    os.environ.get("ANTHROPIC_EMIT_INPUT_TOKENS_IN_DELTA", "true").lower() != "false"
+)
 
 STOP_REASON_MAP = {
     "stop": "end_turn",
@@ -196,7 +207,9 @@ def anthropic_to_openai_request(body: dict) -> tuple[dict, str]:
     return openai_body, requested_model
 
 
-def openai_to_anthropic_response(openai_resp: dict, requested_model: str) -> dict:
+def openai_to_anthropic_response(
+    openai_resp: dict, requested_model: str, input_tokens_fallback: int = 0
+) -> dict:
     """Resposta não-streaming: chat.completion (OpenAI) -> message (Anthropic)."""
     choice = (openai_resp.get("choices") or [{}])[0]
     message = choice.get("message") or {}
@@ -231,7 +244,11 @@ def openai_to_anthropic_response(openai_resp: dict, requested_model: str) -> dic
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": usage.get("prompt_tokens", 0),
+            # input_tokens_fallback (a estimativa do orçamento de contexto) só
+            # entra se o vLLM omitiu o usage: é o número pelo qual o cliente
+            # rastreia o contexto, e devolver 0 aí faz o Claude Code achar que
+            # a sessão está vazia e nunca compactar.
+            "input_tokens": usage.get("prompt_tokens") or input_tokens_fallback,
             "output_tokens": usage.get("completion_tokens", 0),
         },
     }
@@ -245,7 +262,8 @@ THINK_CLOSE = "</think>"
 
 
 async def anthropic_sse_from_openai_stream(
-    upstream, requested_model: str, on_done=None, filter_reasoning: bool = False
+    upstream, requested_model: str, on_done=None, filter_reasoning: bool = False,
+    input_tokens_estimate: int = 0,
 ):
     """Converte o stream SSE do vLLM (chat/completions, formato OpenAI) pro
     formato de eventos da Anthropic Messages API (message_start ->
@@ -259,7 +277,15 @@ async def anthropic_sse_from_openai_stream(
     `filter_reasoning=True` (planos em REASONING_LEAK_PLANS, main.py)
     suprime o bloco de raciocínio (antes de </think>) do "content" — mesmo
     filtro que chat/completions já aplica; sem isso o Claude Code recebia
-    o raciocínio cru misturado no texto exibido nesses planos."""
+    o raciocínio cru misturado no texto exibido nesses planos.
+
+    `input_tokens_estimate` é o est_tokens do orçamento de contexto
+    (context_budget.PromptBudget), emitido como usage.input_tokens no
+    message_start. Necessário porque o vLLM só manda usage no chunk FINAL do
+    stream, mas o cliente lê o input do message_start — era 0 hardcoded aqui, e
+    com isso o rastreador de contexto do Claude Code nunca acumulava e o
+    auto-compact nunca disparava, qualquer que fosse a janela configurada. O
+    número real do vLLM corrige a estimativa no message_delta."""
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     yield _sse("message_start", {
         "type": "message_start",
@@ -271,7 +297,16 @@ async def anthropic_sse_from_openai_stream(
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            # os campos de cache vão a zero (não fazemos prompt caching — ver
+            # o cabeçalho deste módulo) mas PRESENTES: shape fiel à API real, e
+            # há cliente que soma os três pra calcular contexto usado, onde
+            # ausente (undefined) e 0 não são a mesma coisa.
+            "usage": {
+                "input_tokens": input_tokens_estimate,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0,
+            },
         },
     })
 
@@ -412,10 +447,18 @@ async def anthropic_sse_from_openai_stream(
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
 
         stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
+        delta_usage = {"output_tokens": (usage or {}).get("completion_tokens", 0)}
+        if EMIT_INPUT_TOKENS_IN_DELTA:
+            # corrige a estimativa do message_start com a contagem real do
+            # vLLM (que só chega neste ponto do stream); sem usage no stream,
+            # repete a estimativa em vez de deixar o cliente sem número
+            delta_usage["input_tokens"] = (
+                (usage or {}).get("prompt_tokens") or input_tokens_estimate
+            )
         yield _sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": (usage or {}).get("completion_tokens", 0)},
+            "usage": delta_usage,
         })
         yield _sse("message_stop", {"type": "message_stop"})
     finally:
