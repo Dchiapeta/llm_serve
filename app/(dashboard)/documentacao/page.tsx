@@ -7,6 +7,7 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion"
 import { Card, CardContent } from "@/components/ui/card"
+import { MachineAbout } from "@/components/machines/machine-about"
 
 function Lead({ children }: { children: ReactNode }) {
   return <p className="text-foreground">{children}</p>
@@ -349,6 +350,20 @@ export default function DocumentacaoPage() {
                     cliente só precisa dar retry.
                   </li>
                 </List>
+              </AccordionContent>
+            </AccordionItem>
+
+            <AccordionItem value="exemplos-request">
+              <AccordionTrigger className="text-base font-medium text-foreground">
+                Exemplos de chamada (todas as linguagens)
+              </AccordionTrigger>
+              <AccordionContent>
+                <Lead>
+                  Os mesmos exemplos disponíveis na aba "Sobre" de cada
+                  máquina, aqui com valores genéricos — troque a URL e o
+                  modelo pelos da sua máquina.
+                </Lead>
+                <MachineAbout gatewayUrl={null} modelName={null} maxModelLen={null} />
               </AccordionContent>
             </AccordionItem>
 
