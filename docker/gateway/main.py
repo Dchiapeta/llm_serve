@@ -714,6 +714,13 @@ async def collect_usage_metrics_once() -> None:
             await supa.insert_usage_metrics(rows)
         except Exception as e:
             logger.warning("coleta de métricas: falha ao gravar máquina %s (%s)", machine["id"], e)
+        try:
+            await supa.touch_keys_last_used(list(active.keys()), window_start)
+        except Exception as e:
+            logger.warning(
+                "coleta de métricas: falha ao tocar last_used_at das chaves da máquina %s (%s)",
+                machine["id"], e,
+            )
 
 
 async def metrics_collection_loop(interval_s: float = METRICS_COLLECTION_INTERVAL_S):

@@ -372,6 +372,22 @@ class SupaClient:
         r = await self._rest.post("/usage_metrics", json=rows)
         r.raise_for_status()
 
+    async def touch_keys_last_used(self, api_key_ids: list[str], ts: str) -> None:
+        """Marca last_used_at (migration 0046) das chaves com uso na janela
+        recém-coletada. Chamado por collect_usage_metrics_once com o mesmo
+        window_start de usage_metrics — todas as chaves do batch levam o
+        mesmo timestamp, então um único PATCH com filtro `in` cobre o
+        batch inteiro."""
+        if not api_key_ids:
+            return
+        ids = ",".join(dict.fromkeys(api_key_ids))
+        r = await self._rest.patch(
+            "/api_keys",
+            params={"id": f"in.({ids})"},
+            json={"last_used_at": ts},
+        )
+        r.raise_for_status()
+
     async def insert_gateway_request(self, row: dict) -> None:
         """Uma linha por requisição completada (migration 0038). Chamado
         fire-and-forget (spawn_tracked) no fechamento de cada requisição —

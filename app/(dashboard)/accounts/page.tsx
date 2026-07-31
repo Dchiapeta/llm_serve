@@ -94,13 +94,14 @@ export default async function AccountsPage() {
                 <TableHead>Chave</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Criada em</TableHead>
+                <TableHead>Último uso</TableHead>
                 <TableHead className="w-24" />
               </TableRow>
             </TableHeader>
             <TableBody>
               {keys.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center text-muted-foreground">
+                  <TableCell colSpan={7} className="text-center text-muted-foreground">
                     Nenhuma chave gerada.
                   </TableCell>
                 </TableRow>
@@ -130,6 +131,11 @@ export default async function AccountsPage() {
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {new Date(k.created_at).toLocaleDateString("pt-BR")}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {k.last_used_at
+                      ? new Date(k.last_used_at).toLocaleDateString("pt-BR")
+                      : "nunca usada"}
                   </TableCell>
                   <TableCell>
                     {k.status === "active" && (

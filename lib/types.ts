@@ -141,6 +141,10 @@ export type ApiKey = {
   // 0044), nunca exibida ao cliente, isenta dos dois.
   purpose: "customer" | "playground"
   created_at: string
+  expires_at: string | null
+  // Tocado pelo coletor periódico de usage_metrics do gateway (migration
+  // 0046) — granularidade de METRICS_COLLECTION_INTERVAL_S, não por request.
+  last_used_at: string | null
 }
 
 // Adapter LoRA de uma conta, já treinado e armazenado no Supabase Storage
