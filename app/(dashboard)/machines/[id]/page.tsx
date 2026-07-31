@@ -239,7 +239,7 @@ export default async function MachineDetailPage({
           <CardContent>
             <p className="text-xs text-muted-foreground">
               {machine.status === "running" && lastStartedAt
-                ? `No ar desde ${new Date(lastStartedAt).toLocaleString("pt-BR")}`
+                ? `No ar desde ${new Date(lastStartedAt).toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" })}`
                 : "Máquina não está rodando"}
             </p>
           </CardContent>
