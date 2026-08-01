@@ -66,10 +66,10 @@ export const config = {
     // handler): a rota de sync do agent, a de provisionamento automático e a
     // de recriação de máquina — chamadas pelo gateway com
     // X-Admin-Secret/PANEL_ADMIN_SECRET; e a de ingestão de RAG, a de config
-    // de modelo por stack e a de obtenção da chave de Playground — chamadas
-    // por sistemas externos (LP/admin de outro projeto) com
-    // X-External-Secret/EXTERNAL_INTEGRATION_SECRET. As rotas com id na URL
-    // usam segmento dinâmico ([^/]+).
-    "/((?!_next/static|_next/image|favicon.ico|api/agent|api/machines/provision|api/machines/[^/]+/recreate|api/knowledge/ingest|api/stacks/[^/]+/model-config|api/playground/key).*)",
+    // de modelo por stack, a de emissão de chave "customer" e a de obtenção
+    // da chave de Playground — chamadas por sistemas externos (LP/admin de
+    // outro projeto) com X-External-Secret/EXTERNAL_INTEGRATION_SECRET. As
+    // rotas com id na URL usam segmento dinâmico ([^/]+).
+    "/((?!_next/static|_next/image|favicon.ico|api/agent|api/machines/provision|api/machines/[^/]+/recreate|api/knowledge/ingest|api/stacks/[^/]+/model-config|api/playground/key|api/keys).*)",
   ],
 }
