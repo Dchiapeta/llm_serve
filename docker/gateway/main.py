@@ -1214,6 +1214,28 @@ def agent_starting_503() -> HTTPException:
     )
 
 
+def capacity_503(plan: str, reason: str) -> HTTPException:
+    """Sem vaga em nenhuma máquina do plano (todas cheias, ou nenhuma no ar) e
+    nada a religar/provisionar. Ao contrário de waking/provisioning/recreating,
+    aqui não há infraestrutura subindo — é volume de requests concorrentes
+    excedendo a capacidade contratada. Logamos explicitamente porque esse 503
+    nunca chega a gateway_requests (pick_machine_with_free_slot falha antes de
+    existir machine_id/flight_key pra logar) — sem esta linha, a única pista
+    fica no corpo da resposta que o cliente recebeu."""
+    logger.warning(
+        "capacidade: 503 no plano %s (%s) — provável excesso de requests "
+        "concorrentes; sem máquina livre e nada a religar/provisionar",
+        plan, reason,
+    )
+    return HTTPException(
+        status_code=503,
+        detail=f"Sem capacidade disponível no momento ({reason}). "
+        "Isso costuma acontecer quando muitas requisições chegam ao mesmo "
+        "tempo. Tente novamente em alguns segundos.",
+        headers={"Retry-After": "5"},
+    )
+
+
 async def provision_machine_for_plan(plan: str) -> dict | None:
     """POST {PANEL_URL}/api/machines/provision — pede ao painel Next.js pra
     criar uma máquina nova do plano (o gateway nunca fala com a API de
@@ -1475,8 +1497,8 @@ async def pick_machine_with_free_slot(plan: str) -> dict:
     ) or await try_provision_for_request(plan, "sem máquina com vaga nem pausada"):
         raise provisioning_503()
     if not machines:
-        raise HTTPException(status_code=503, detail="nenhuma máquina disponível")
-    raise HTTPException(status_code=503, detail="sem capacidade: todas as máquinas estão cheias")
+        raise capacity_503(plan, "nenhuma máquina disponível")
+    raise capacity_503(plan, "todas as máquinas estão cheias")
 
 
 async def do_load(stack_id: str, entry: dict, machine: dict, adapter: dict) -> None:

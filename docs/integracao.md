@@ -436,12 +436,21 @@ depois de um período parado **religa a máquina e responde `503`**, com o heade
 |---|---|---|
 | `503` | ~60s | Infraestrutura religando após pausa por inatividade |
 | `503` | ~5s | Preparo de recursos do seu plano em andamento |
+| `503` | ~5s | Sem capacidade no momento — muitas requisições concorrentes esgotaram as vagas do seu plano |
 | `429` | variável | Limite de requisições por minuto atingido |
 | `429` | 3600s | Cota diária de tokens do plano esgotada |
 
+O terceiro caso é diferente dos outros dois: não é a infraestrutura subindo, é volume —
+seu código (ou um teste de carga) mandou mais requisições simultâneas do que o plano
+comporta. É o cenário típico de processar uma fila grande (milhares de itens) sem limitar
+a concorrência. A mensagem no corpo do `503` (`detail`) diz explicitamente qual dos dois
+motivos ocorreu.
+
 Como você está chamando a API diretamente, **o retry é responsabilidade do seu código**.
-Sem ele, a primeira chamada do dia falha na cara do seu usuário. O padrão é simples:
-repetir enquanto o status for `429` ou `503`, dormindo o que o `Retry-After` mandar.
+Sem ele, a primeira chamada do dia falha na cara do seu usuário — e, no caso de excesso de
+concorrência, **cada item da fila que cair num `503` é perdido permanentemente** em vez de
+ser reprocessado. O padrão é simples: repetir enquanto o status for `429` ou `503`,
+dormindo o que o `Retry-After` mandar.
 
 ```python
 import os, time, requests
