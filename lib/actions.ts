@@ -1494,6 +1494,7 @@ export async function createKey(input: {
   accountId: string
   machineId: string
   stackId?: string | null
+  name?: string | null
   // ISO 8601; null/omitido = nunca expira. Chave de onboarding/teste deve
   // sempre passar uma data — chave "de produção" emitida manualmente pelo
   // painel para um cliente já validado pode ficar sem teto.
@@ -1571,6 +1572,7 @@ export async function createKey(input: {
     account_id: input.accountId,
     machine_id: input.machineId,
     stack_id: stackId,
+    name: input.name ?? null,
     key_hash: hashKey(plainKey),
     key_prefix: keyPrefix(plainKey),
     plain_key: plainKey,

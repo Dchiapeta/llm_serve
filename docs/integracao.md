@@ -426,6 +426,52 @@ configurado na conta, **não envie um `system`**.
 
 ---
 
+## Reasoning ("thinking"): por que a resposta pode demorar
+
+O modelo do seu plano pode ser um modelo de *reasoning*: antes de responder, ele gera um
+bloco de raciocínio interno (chain-of-thought) que não aparece pra você, mas consome
+tokens e tempo de geração como qualquer outro texto. Uma pergunta simples pode gerar
+centenas ou milhares de tokens de raciocínio antes da resposta final — é normal a mesma
+pergunta levar de poucos segundos a mais de um minuto dependendo de quanto o modelo
+"pensa".
+
+Isso importa em dois cenários:
+
+- **Latência**: se sua aplicação é sensível a tempo de resposta (ex.: classificação em
+  lote, chat em tempo real), o reasoning pode ser o maior custo de tempo da chamada —
+  maior até que a resposta em si.
+- **Requests sem streaming**: sem `"stream": true`, você só recebe a resposta depois que
+  toda a geração (raciocínio incluído) termina. Se isso passar de ~60 segundos, a chamada
+  pode ser encerrada pelo gateway antes de qualquer byte chegar (ver
+  [Retry](#retry-o-ponto-mais-importante-para-produção)). Para tarefas onde o reasoning
+  pode ser longo, use streaming — ou desligue o reasoning, abaixo.
+
+### Desligando o reasoning por request
+
+Para modelos da família Qwen3.x, dá pra desligar o thinking numa chamada específica com
+`chat_template_kwargs`:
+
+```json
+{
+  "messages": [{"role": "user", "content": "Classifique: promocional, suporte ou outro."}],
+  "chat_template_kwargs": {"enable_thinking": false}
+}
+```
+
+**O campo precisa estar aninhado dentro de `chat_template_kwargs`** — mandar
+`"enable_thinking": false` solto na raiz do corpo é ignorado silenciosamente (o vLLM não
+reconhece o campo nesse nível, e como não é um parâmetro do padrão OpenAI, nada acusa
+erro). Esse é o erro mais comum ao tentar essa configuração: a chamada continua
+"pensando" normalmente porque a flag nunca chegou a valer.
+
+Com o thinking desligado, uma classificação simples cai de potencialmente dezenas de
+segundos (milhares de tokens de raciocínio) para poucos tokens de resposta direta — mas
+a qualidade do resultado em tarefas mais abertas ou que exigem múltiplos passos de
+raciocínio tende a piorar. Vale mais a pena em tarefas fechadas e objetivas
+(classificação, extração, formatação) do que em tarefas abertas.
+
+---
+
 ## Retry: o ponto mais importante para produção
 
 A infraestrutura do seu plano pode estar pausada por inatividade. A primeira chamada
