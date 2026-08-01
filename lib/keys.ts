@@ -1,11 +1,11 @@
 import { createHash, randomBytes } from "crypto"
 
-// Gera uma chave com prefixo "stc_" + 64 caracteres HEX (256 bits).
+// Gera uma chave com prefixo "stac_" + 64 caracteres HEX (256 bits).
 // O prefixo é só cosmético (facilita reconhecer a chave em logs/DevTools);
 // a autenticação no gateway faz hash da string inteira, então chaves antigas
-// sem prefixo continuam válidas normalmente.
+// (com "stc_" ou sem prefixo algum) continuam válidas normalmente.
 export function generateHexKey(): string {
-  return `stc_${randomBytes(32).toString("hex")}`
+  return `stac_${randomBytes(32).toString("hex")}`
 }
 
 export function hashKey(key: string): string {
