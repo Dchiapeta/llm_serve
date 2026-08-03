@@ -43,10 +43,12 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+import jsonschema
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+import document_extract
 from anthropic_compat import (
     anthropic_sse_from_openai_stream,
     anthropic_to_openai_request,
@@ -120,6 +122,12 @@ MIN_RESERVED_SLOTS_SHARED_POD = int(os.environ.get("MIN_RESERVED_SLOTS_SHARED_PO
 # contra corpo absurdo/malformado, e 8 MB continua cumprindo esse papel.
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(8_000_000)))
 MAX_MESSAGES = int(os.environ.get("MAX_MESSAGES", "200"))
+
+# teto de tempo da inferência de extração de documento (/v1/documents/extract).
+# Não confundir com os 60s do proxy_client: lá o read mede o SILÊNCIO entre
+# chunks de um stream; aqui a requisição é não-streaming, então o read tem que
+# cobrir a geração inteira do JSON de uma vez.
+DOCUMENT_UPSTREAM_TIMEOUT_S = float(os.environ.get("DOCUMENT_UPSTREAM_TIMEOUT_S", "240"))
 
 # quota diária de tokens por conta (controle de custo real — rate limit e
 # concorrência limitam volume de requests, não o custo de cada uma). 0 =
@@ -242,6 +250,10 @@ store: RoutingStore
 # proxy para os agents: connect curto (máquina fora do ar → 503 rápido),
 # read longo (streams de inferência podem durar minutos)
 proxy_client: httpx.AsyncClient
+# client da extração de documento: read MUITO mais longo que o proxy_client.
+# Não é streaming (o JSON só serve completo), então o read cobre a geração
+# INTEIRA — não o gap entre chunks, que é o que os 60s do proxy_client medem.
+document_client: httpx.AsyncClient
 # client curto pra API de embeddings da OpenAI (RAG do VibeCoder)
 openai_client: httpx.AsyncClient
 # client pra chamar de volta o painel Next.js (POST /api/machines/provision)
@@ -319,7 +331,7 @@ runpod_client: RunPodClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supa, store, proxy_client, openai_client, panel_client, lifecycle_mgr, runpod_client
+    global supa, store, proxy_client, document_client, openai_client, panel_client, lifecycle_mgr, runpod_client
     supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
     # read curto (60s): o Cloudflare na frente do RunPod às vezes derruba (RST)
@@ -335,6 +347,21 @@ async def lifespan(app: FastAPI):
     # a requisição inteira falhava em ~3s com corpo vazio, sem erro visível).
     proxy_client = httpx.AsyncClient(
         timeout=httpx.Timeout(60.0, connect=5.0, write=10.0, pool=10.0),
+        limits=httpx.Limits(
+            max_connections=100, max_keepalive_connections=20, keepalive_expiry=5.0
+        ),
+        transport=httpx.AsyncHTTPTransport(retries=2),
+    )
+    # não-streaming: o read tem que cobrir a geração inteira do JSON, então o
+    # teto é a DURAÇÃO da inferência, não o silêncio entre chunks (os 60s do
+    # proxy_client). Um documento longo com schema grande pode passar de
+    # 2 minutos; abaixo disso a chamada morria com o pod ainda trabalhando.
+    document_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(DOCUMENT_UPSTREAM_TIMEOUT_S, connect=5.0, write=10.0, pool=10.0),
+        # limits explícito (mesmos valores do proxy_client) e não por default do
+        # httpx: o keepalive_expiry curto é o fix do RST do Cloudflare na frente
+        # do RunPod, e depender do default deixaria essa proteção à mercê de uma
+        # mudança de versão da lib.
         limits=httpx.Limits(
             max_connections=100, max_keepalive_connections=20, keepalive_expiry=5.0
         ),
@@ -394,6 +421,7 @@ async def lifespan(app: FastAPI):
     stale_routes_task.cancel()
     usage_class_task.cancel()
     await proxy_client.aclose()
+    await document_client.aclose()
     await openai_client.aclose()
     await panel_client.aclose()
     await store.aclose()
@@ -429,6 +457,40 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Authorization", "x-api-key", "Content-Type", "anthropic-version"],
 )
+
+
+@app.middleware("http")
+async def reject_oversized_upload(request: Request, call_next):
+    """Recusa upload absurdo pelo Content-Length, ANTES de ler o corpo.
+
+    Existe porque o /v1/documents/extract declara `file: UploadFile`, e aí o
+    Starlette parseia o multipart (spoolando em disco o que passa de 1 MB)
+    ANTES de a função do endpoint rodar — ou seja, antes do authenticate e
+    antes de qualquer teto por plano. Sem este guard, um `curl -F
+    file=@10GB.bin` SEM chave nenhuma enchia o disco do container: DoS anônimo
+    e repetível.
+
+    Middleware e não dependência do endpoint justamente por causa dessa ordem:
+    aqui roda antes do parsing; lá dentro, depois.
+
+    Sem Content-Length (chunked) não há o que checar — segue e cai no teto de
+    `file.size` depois do parse. Vale a mesma lógica do MAX_BODY_BYTES do
+    proxy: isto é defesa contra corpo absurdo, não o controle de custo fino
+    (que é rate limit + quota + tetos por plano)."""
+    if request.url.path == "/v1/documents/extract":
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit():
+            # margem sobre o teto de bytes do documento: o corpo multipart
+            # carrega também o schema (até MAX_SCHEMA_BYTES) e o overhead das
+            # boundaries, então comparar cru contra o teto do arquivo recusaria
+            # upload legítimo no limite.
+            ceiling = document_extract.max_limit_bytes() + MAX_SCHEMA_BYTES + 65536
+            if int(declared) > ceiling:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "corpo da requisição excede o limite"},
+                )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -2874,6 +2936,326 @@ def check_concurrency(flight_key: tuple[str, str], machine: dict, plan: str) -> 
             detail="máquina no limite de capacidade concorrente no momento, tente novamente",
             headers={"Retry-After": "2"},
         )
+
+
+# ---------- Extração estruturada de documento (PDF → JSON) ----------
+#
+# ATENÇÃO À ORDEM: esta rota tem que ser registrada ANTES do catch-all
+# /v1/{path:path} logo abaixo. O Starlette casa rotas na ordem de registro, e
+# o catch-all engoliria "documents/extract" — que não está em ALLOWED_V1 e
+# viraria um 404 sem explicação nenhuma.
+DOCUMENT_PATH = "documents/extract"
+# max_tokens da geração. Nada a ver com o piso MIN_MAX_TOKENS do chat: ali o
+# piso existe porque um modelo com thinking gasta milhares de tokens antes da
+# resposta; aqui o thinking é desligado (chat_template_kwargs abaixo) e a saída
+# é só o JSON do schema. Teto configurável pra schema grande (documento com
+# muitos itens), mas o default cobre com folga um formulário/nota típico.
+DOCUMENT_MAX_TOKENS = int(os.environ.get("DOCUMENT_MAX_TOKENS", "4000"))
+DOCUMENT_MAX_TOKENS_CEILING = int(os.environ.get("DOCUMENT_MAX_TOKENS_CEILING", "16000"))
+# teto do schema. Um schema é uma estrutura de metadados, não dado: 64 KB já
+# cobre documento com muitos campos aninhados com folga. O teto existe porque
+# tanto o check_schema daqui quanto a compilação da gramática no vLLM têm custo
+# proporcional ao tamanho — schema de megabytes é DoS, não caso de uso.
+MAX_SCHEMA_BYTES = int(os.environ.get("MAX_SCHEMA_BYTES", "65536"))
+
+
+def validate_extraction_output(content: str, schema: dict) -> dict:
+    """Parse + validação do JSON gerado, contra o schema do CLIENTE.
+
+    BLOQUEANTE de propósito, pra ser chamada em asyncio.to_thread — e essa é a
+    parte importante: `schema` é input não confiável, e jsonschema compila
+    `pattern` com o `re` do Python, que faz backtracking. Um schema com
+    quantificador aninhado (o clássico "(a+)+$") contra uma string que NÃO casa
+    tem custo exponencial no comprimento — medido aqui: 0,04s com 20 caracteres,
+    0,16s com 22, ~12 horas com 40.
+
+    Inline no event loop isso não seria lentidão de uma requisição, seria o
+    gateway inteiro parado pra todos os tenants. Na thread, o dano fica contido
+    na requisição que o causou (o rate limit por chave e o teto de concorrência
+    limitam quantas dessas existem ao mesmo tempo).
+
+    Risco residual assumido: a thread continua queimando um núcleo até
+    terminar, porque Python não mata thread. O que se compra aqui é o event
+    loop livre — que é a diferença entre "um cliente se prejudicou" e "o
+    serviço caiu"."""
+    data = json.loads(content)
+    jsonschema.validate(data, schema)
+    return data
+
+
+@app.post("/v1/documents/extract")
+async def extract_document(
+    request: Request,
+    file: UploadFile = File(...),
+    schema: str = Form(...),
+    max_tokens: int | None = Form(None, gt=0, le=DOCUMENT_MAX_TOKENS_CEILING),
+    authorization: str | None = Header(None),
+):
+    """Recebe um PDF e devolve o JSON aderente ao schema que o cliente mandou.
+
+    É o único endpoint do gateway que faz trabalho de CPU próprio antes de
+    chamar o pod (extração/OCR, ver document_extract.py) — todo o resto é
+    proxy. As duas consequências que o corpo abaixo respeita:
+
+      * a extração roda em asyncio.to_thread, NUNCA inline: o gateway é um
+        processo único e também atende todo o tráfego de chat, então OCR no
+        event loop travaria as requisições de todos os outros clientes;
+      * timeout próprio (document_client), porque extração + geração não
+        cabe nos 60s do proxy_client de chat.
+
+    Não passa por validate_body de propósito: aquele caminho existe pra
+    sanear corpo de CLIENTE (system prompt, RAG, clamp de parâmetros, filtro
+    de roles). Aqui o corpo é construído inteiro pelo servidor — o cliente
+    não controla mensagens, sampling nem modelo. O único dado dele que entra
+    no payload é o schema, e ele é validado antes."""
+    started = time.monotonic()
+
+    # Autenticar ANTES de validar o schema, mesmo que o schema seja mais barato
+    # de checar: validar schema é trabalho de CPU (check_schema percorre o
+    # metaschema, e schema recursivo pode ir a RecursionError), e nada disso
+    # deve estar disponível a quem não tem chave. O authenticate é barato
+    # (key_cache em memória) e o rate limit passa a valer pra este caminho.
+    entry, key_hash = await authenticate(authorization)
+    check_rate_limit(key_hash)
+    account_id = entry["account_id"]
+    _, key_plan = resolve_key_stack(entry)
+    await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+
+    if len(schema) > MAX_SCHEMA_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"schema excede o limite de {MAX_SCHEMA_BYTES // 1024} KB",
+        )
+    try:
+        parsed_schema = json.loads(schema)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"schema não é um JSON válido: {e}")
+    if not isinstance(parsed_schema, dict):
+        raise HTTPException(status_code=400, detail="schema precisa ser um objeto JSON")
+    # Schema inválido rejeitado AQUI, antes de gastar OCR e uma inferência: sem
+    # isso o erro só apareceria no validate da resposta, e o cliente receberia
+    # um 502 ("o modelo não devolveu JSON aderente") por um problema que é do
+    # schema dele. Except largo porque a família de erros não é só SchemaError:
+    # um "$ref" remoto levanta _WrappedReferencingError (Unresolvable) e um
+    # schema recursivo levanta RecursionError — nenhum dos dois herda de
+    # SchemaError/ValidationError, e escapariam como 500 opaco.
+    try:
+        jsonschema.Draft202012Validator.check_schema(parsed_schema)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"schema inválido: {str(e)[:300]}")
+
+    # Corte grosso ANTES de qualquer coisa cara: `file.size` vem do parser
+    # multipart do Starlette (que já fez spool em disco), então dá pra recusar
+    # um upload absurdo sem carregá-lo em RAM com file.read() e sem pagar o
+    # resolve_route (ida ao banco, e que pode até religar um pod). O teto exato
+    # do plano vem depois — aqui só barramos o que nenhum plano aceitaria.
+    if file.size is not None and file.size > document_extract.max_limit_bytes():
+        raise HTTPException(status_code=413, detail="documento excede o limite do serviço")
+
+    # o teto de bytes é do PLANO, e o plano confiável vem de resolve_route
+    # (key_plan acima é só o da chave, pode não ter stack resolvida)
+    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    await maybe_touch(stack_id, machine["id"])
+
+    pdf_bytes = await file.read()
+    try:
+        document_extract.check_size(len(pdf_bytes), effective_plan)
+    except document_extract.DocumentTooLarge as e:
+        raise HTTPException(status_code=413, detail=str(e))
+
+    flight_key = (stack_id, machine["id"])
+    in_flight[flight_key] += 1
+    check_concurrency(flight_key, machine, effective_plan)
+
+    log_ctx = dict(
+        account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
+        machine_id=machine["id"], path=DOCUMENT_PATH,
+        model=effective_model_name(stack_id, rewrite_model, machine),
+        user_agent=request.headers.get("user-agent"), started=started,
+    )
+
+    try:
+        try:
+            # to_thread: o OCR é síncrono e pesado — ver o cabeçalho de
+            # document_extract.py. Sem isso, uma página escaneada segura o
+            # event loop e todo chat concorrente no gateway espera com ela.
+            text, pages, ocr_used = await asyncio.to_thread(
+                document_extract.extract_text, pdf_bytes, effective_plan
+            )
+        except document_extract.DocumentTooLarge as e:
+            log_gateway_request(**log_ctx, status_code=413, stream=False)
+            raise HTTPException(status_code=413, detail=str(e))
+        except (document_extract.UnreadableDocument, document_extract.EmptyDocument) as e:
+            log_gateway_request(**log_ctx, status_code=400, stream=False)
+            raise HTTPException(status_code=400, detail=str(e))
+        except document_extract.DocumentError as e:
+            logger.warning("documents/extract: falha de extração (%s)", e)
+            log_gateway_request(**log_ctx, status_code=500, stream=False)
+            raise HTTPException(status_code=500, detail=str(e))
+
+        messages = document_extract.build_messages(text)
+        payload = {
+            "model": effective_model_name(stack_id, rewrite_model, machine),
+            "messages": messages,
+            # o Form já garante 0 < max_tokens <= CEILING; o clamp real contra a
+            # janela do modelo vem do apply_context_budget abaixo
+            "max_tokens": max_tokens or DOCUMENT_MAX_TOKENS,
+            "stream": False,
+            # temperatura 0: extração é determinística por natureza — o mesmo
+            # documento com o mesmo schema deve dar o mesmo JSON. Sampling
+            # aqui só produziria variação entre chamadas idênticas.
+            "temperature": 0.0,
+            # o que garante JSON aderente ao schema em vez de "JSON provável":
+            # exige --guided-decoding-backend no template (migration 0047).
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "document_extraction", "schema": parsed_schema},
+            },
+            # extração é tarefa fechada: o raciocínio custaria milhares de
+            # tokens e segundos sem melhorar o resultado. E, nos planos com
+            # thinking ligado, o bloco <think> disputaria com a gramática do
+            # guided decoding — desligar remove o problema na origem em vez de
+            # depender do filtro de saída (que ainda existe abaixo, por
+            # segurança).
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+
+        # O documento é a maior fatia do prompt, e um PDF no teto do plano (30
+        # páginas) passa fácil da janela do modelo. Sem isto o vLLM devolveria
+        # 400 e o cliente veria o 502 genérico de "falha no modelo" — culpando
+        # o servidor por um documento grande demais. apply_context_budget clampa
+        # o max_tokens ao que sobra e, se não sobrar espaço viável de resposta,
+        # levanta ContextWindowExceeded (400 com mensagem explicando o
+        # tamanho) — mesmo caminho e mesma mensagem do chat.
+        est_tokens = estimate_prompt_tokens(messages)
+        try:
+            apply_context_budget(payload, machine, "max_tokens", est_tokens)
+        except ContextWindowExceeded:
+            log_gateway_request(**log_ctx, status_code=400, stream=False)
+            # mensagem reescrita: a original é de chat ("comece uma sessão nova
+            # com /clear", "configure CLAUDE_CODE_AUTO_COMPACT_WINDOW") e não
+            # faz sentido nenhum pra quem subiu um PDF — aqui o que resolve é
+            # mandar menos páginas. Mesma exceção (mesmo status e mesmo shape
+            # de corpo do exception handler), só o texto muda.
+            raise ContextWindowExceeded(
+                f"o documento tem {pages} página(s) e ocupa ~"
+                f"{est_tokens} tokens, o que não deixa espaço "
+                f"para a resposta na janela de contexto deste plano "
+                f"({machine.get('max_model_len')} tokens). Envie menos páginas por "
+                "requisição (ex.: divida o documento) ou use um plano com janela maior."
+            )
+
+        try:
+            upstream = await document_client.post(
+                f"{machine['public_url']}/v1/chat/completions",
+                json=payload,
+                headers={"Authorization": authorization},
+            )
+        except httpx.HTTPError as e:
+            logger.warning("documents/extract: upstream indisponível para %s (%s)", flight_key, e)
+            log_gateway_request(**log_ctx, status_code=503, stream=False)
+            raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
+
+        if upstream.status_code != 200:
+            # o corpo do vLLM pode citar a public_url do pod: fica no log do
+            # servidor, o cliente recebe mensagem genérica (mesma disciplina
+            # do proxy)
+            logger.warning(
+                "documents/extract: vLLM respondeu %s (%s)",
+                upstream.status_code, upstream.text[:500],
+            )
+            log_gateway_request(**log_ctx, status_code=502, stream=False)
+            raise HTTPException(
+                status_code=502, detail="falha ao processar o documento no modelo"
+            )
+
+        # 200 com corpo inesperado (não-JSON, ou sem choices) acontece: um proxy
+        # no caminho devolvendo página de erro com status 200, ou o agent
+        # respondendo algo fora do shape. Sem este guard viraria
+        # ValueError/AttributeError → 500 cru e sem log nenhum.
+        try:
+            body = upstream.json()
+            usage = body.get("usage")
+            choice = (body.get("choices") or [{}])[0]
+            content = choice.get("message", {}).get("content") or ""
+            finish_reason = choice.get("finish_reason")
+        except (ValueError, AttributeError, KeyError, IndexError, TypeError) as e:
+            logger.warning(
+                "documents/extract: resposta fora do formato esperado (%s): %s",
+                e, upstream.text[:300],
+            )
+            log_gateway_request(**log_ctx, status_code=502, stream=False)
+            raise HTTPException(
+                status_code=502, detail="resposta inesperada do modelo"
+            )
+        # rede de proteção: enable_thinking=False já deveria bastar, mas se um
+        # template ignorar a flag o JSON vem depois de um </think> e o
+        # json.loads falharia com um 502 enganoso.
+        _, content = split_reasoning(content)
+
+        # Truncado por teto de tokens: o JSON está pela metade e o validate
+        # abaixo falharia com "não devolveu JSON aderente" — culpando o modelo
+        # por um problema de espaço. Acontece justamente quando o
+        # apply_context_budget clampou o max_tokens para caber num documento
+        # grande: sobra janela pro prompt, não pra resposta. Vale um erro
+        # próprio porque a ação do cliente é diferente (dividir o documento ou
+        # enxugar o schema), não "tentar de novo".
+        if finish_reason == "length":
+            logger.warning(
+                "documents/extract: resposta truncada (max_tokens=%s, est_prompt=%s)",
+                payload.get("max_tokens"), est_tokens,
+            )
+            log_gateway_request(**log_ctx, status_code=400, stream=False, usage=usage)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": (
+                        "a resposta não caberia no espaço disponível: o documento ocupa "
+                        "quase toda a janela de contexto do plano e não sobra lugar "
+                        "para o JSON completo. Envie menos páginas por requisição ou "
+                        "reduza o número de campos do schema."
+                    ),
+                    "max_tokens_disponivel": payload.get("max_tokens"),
+                    "raw_output": content[:2000],
+                },
+            )
+
+        try:
+            # to_thread: `parsed_schema` é do cliente e jsonschema compila
+            # `pattern` com backtracking — ver validate_extraction_output.
+            data = await asyncio.to_thread(
+                validate_extraction_output, content, parsed_schema
+            )
+        # except largo de propósito: além de JSONDecodeError/ValidationError,
+        # a resolução de referências levanta _WrappedReferencingError, que não
+        # herda de nenhuma das duas. Estreitar aqui reintroduz o 500 opaco.
+        except Exception as e:
+            # com guided decoding ligado isto é raro; quando acontece, o mais
+            # provável é o template do plano estar sem a flag (pod criado antes
+            # da migration 0047). Devolver o texto cru é o que torna esse
+            # diagnóstico possível do lado do cliente.
+            logger.warning("documents/extract: saída não aderente ao schema (%s)", e)
+            log_gateway_request(**log_ctx, status_code=502, stream=False, usage=usage)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "message": "o modelo não devolveu JSON aderente ao schema",
+                    "reason": str(e)[:300],
+                    "raw_output": content[:2000],
+                },
+            )
+
+        log_gateway_request(**log_ctx, status_code=200, stream=False, usage=usage)
+        return {
+            "data": data,
+            "pages": pages,
+            "ocr_used": ocr_used,
+            "usage": usage,
+        }
+    finally:
+        # nunca vazar o contador: com in_flight preso em > 0 a auto-pausa da
+        # máquina nunca mais dispararia
+        release_flight(flight_key)
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])

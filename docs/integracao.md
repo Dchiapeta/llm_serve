@@ -426,6 +426,106 @@ configurado na conta, **não envie um `system`**.
 
 ---
 
+## Extração estruturada de documento (PDF → JSON)
+
+Além dos endpoints compatíveis com OpenAI, existe um endpoint dedicado que recebe um
+**PDF** e devolve um **JSON no formato que você definir**. Você não precisa extrair o
+texto do documento: o serviço faz isso (inclusive OCR, para PDF escaneado) e garante que
+a saída obedece ao seu schema.
+
+```
+POST /v1/documents/extract
+Content-Type: multipart/form-data
+```
+
+| Campo | Obrigatório | Descrição |
+|---|---|---|
+| `file` | sim | O PDF |
+| `schema` | sim | JSON Schema (como string) descrevendo os campos a extrair |
+| `max_tokens` | não | Teto da resposta. Default 4000, máximo 16000 |
+
+```bash
+curl -X POST https://SEU-GATEWAY/v1/documents/extract \
+  -H "Authorization: Bearer $STAC_API_KEY" \
+  -F file=@nota_fiscal.pdf \
+  -F 'schema={
+        "type": "object",
+        "properties": {
+          "numero_nota":   {"type": "string"},
+          "cnpj_emitente": {"type": ["string", "null"]},
+          "valor_total":   {"type": "number"}
+        },
+        "required": ["numero_nota", "valor_total"]
+      }'
+```
+
+Resposta:
+
+```json
+{
+  "data": { "numero_nota": "12345", "cnpj_emitente": "11.222.333/0001-44", "valor_total": 1500.0 },
+  "pages": 3,
+  "ocr_used": false,
+  "usage": { "prompt_tokens": 2104, "completion_tokens": 48 }
+}
+```
+
+`data` é o seu JSON, **já validado contra o schema** — se ele voltar, adere ao formato que
+você pediu. `ocr_used` indica se alguma página precisou de OCR (PDF escaneado): quando
+`true`, vale conferir o resultado com mais atenção, porque a qualidade depende da imagem.
+
+### O ponto mais importante: declare os campos que podem faltar
+
+A saída é forçada a obedecer ao seu schema **token a token**. Isso é o que garante JSON
+válido — mas tem uma consequência que decide a qualidade do resultado:
+
+> Um campo declarado `{"type": "string"}` **não pode** voltar `null`. A gramática proíbe.
+> Se a informação não estiver no documento, o modelo é obrigado a emitir *alguma* string
+> — e vai **inventar** uma.
+
+Ou seja: o schema não é só o formato da resposta, é a definição do que é aceitável. Para
+um campo que pode legitimamente não existir no documento, declare-o anulável:
+
+```json
+"cnpj_emitente": {"type": ["string", "null"]}
+```
+
+Assim o modelo tem como dizer "não achei" — e a instrução que enviamos ao modelo pede
+exatamente isso (omitir ou usar `null` em vez de preencher com um valor plausível).
+
+Use `required` **só** para campos que o documento sempre contém. Um campo em `required`
+que falta no documento é o pior caso: o modelo não pode omitir nem anular, então
+fabrica o valor, e o resultado passa na validação sendo falso.
+
+### Limites
+
+| Limite | VibeCoder | Pro |
+|---|---|---|
+| Tamanho do arquivo | 8 MB | 15 MB |
+| Páginas por requisição | 15 | 30 |
+
+O schema em si tem teto de 64 KB. Documento muito grande é recusado com `400` explicando
+quantos tokens ele ocupou — nesse caso, divida o PDF e envie por partes.
+
+### Erros específicos
+
+| Status | Significado |
+|---|---|
+| `400` | PDF ilegível/corrompido, sem texto extraível, schema inválido, ou documento grande demais para a janela do plano |
+| `413` | Arquivo, número de páginas ou schema acima do limite |
+| `422` | `max_tokens` fora da faixa aceita (precisa ser maior que 0 e no máximo 16000) |
+| `502` | O modelo não devolveu JSON aderente ao schema (a resposta inclui `raw_output` para diagnóstico) |
+
+Um `502` com `raw_output` **truncado no meio** costuma significar que a resposta não caberia
+no espaço restante da janela: o documento é grande e sobrou pouco para o JSON. Nesse caso,
+divida o PDF ou reduza o número de campos do schema.
+
+**Sobre latência:** a extração é síncrona e inclui OCR quando necessário, então um
+documento de muitas páginas escaneadas pode levar minutos. O teto do servidor é de 240s
+para a inferência — dimensione o timeout do seu cliente acima disso.
+
+---
+
 ## Reasoning ("thinking"): por que a resposta pode demorar
 
 O modelo do seu plano pode ser um modelo de *reasoning*: antes de responder, ele gera um

@@ -2,3 +2,14 @@ fastapi>=0.115
 uvicorn[standard]>=0.32
 httpx>=0.27
 pydantic>=2
+# upload multipart do /v1/documents/extract (UploadFile/Form) — o FastAPI só
+# habilita multipart com o python-multipart instalado
+python-multipart>=0.0.9
+# extração de documento (PDF → JSON): parsing, OCR das páginas escaneadas e
+# validação do JSON contra o schema do cliente. Ver document_extract.py.
+# Só a imagem do gateway (CPU, Railway) carrega isso — os pods GPU rodam
+# outra imagem (dchiapeta/vllm-agent) e não são afetados.
+pymupdf>=1.24
+pytesseract>=0.3.10
+pillow>=10
+jsonschema>=4.21
