@@ -1085,6 +1085,48 @@ async function allocateMachineForTemplate(
   throw new Error(`Falha ao provisionar máquina: ${lastError}`)
 }
 
+// Garante que a stack tenha uma máquina vinculada, resolvendo sozinho quando
+// stacks.machine_id está null — idle reaper de modelo base liberou a vaga
+// (ver comentário em getOrCreatePlaygroundKey), ou a stack nunca foi homeada.
+// Espelha, no painel, a mesma resolução lazy que o gateway faz em runtime
+// (resolve_base_machine → place_base_stack em docker/gateway/main.py): quem
+// chama não precisa saber ou escolher onde a stack mora.
+export async function ensureStackMachine(stackId: string): Promise<string> {
+  const db = createSupabaseAdmin()
+  const { data: stack } = await db
+    .from("stacks")
+    .select("id, plan, machine_id")
+    .eq("id", stackId)
+    .single<{ id: string; plan: TemplatePlan; machine_id: string | null }>()
+  if (!stack) throw new Error("Stack não encontrada")
+  if (stack.machine_id) return stack.machine_id
+
+  // Reaproveita o histórico de uma chave "customer" já emitida — mesmo
+  // machine_id que getOrCreatePlaygroundKey usa e que nunca decide rota.
+  const { data: customerKey } = await db
+    .from("api_keys")
+    .select("machine_id")
+    .eq("stack_id", stackId)
+    .eq("purpose", "customer")
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle<{ machine_id: string }>()
+  if (customerKey?.machine_id) return customerKey.machine_id
+
+  // Stack nunca homeada e sem chave anterior: aloca de vez, com a mesma
+  // cascata de createStack (running com vaga → pausada com vaga → nova).
+  const tpl = await getDefaultTemplateForPlan(db, stack.plan)
+  if (!tpl) throw new Error(`Nenhum produto configurado para o plano ${stack.plan}`)
+  const alloc = await allocateMachineForTemplate(db, tpl)
+  const { error } = await db
+    .from("stacks")
+    .update({ machine_id: alloc.machineId })
+    .eq("id", stackId)
+  if (error) throw new Error(error.message)
+  return alloc.machineId
+}
+
 // pelo admin (machine_id do form), ou numa recém-provisionada com o
 // template selecionado (nome = llm-stack-N, GPU = primeira compatível). Em
 // ambos os casos emite a chave HEX da conta na máquina; a plainKey é
