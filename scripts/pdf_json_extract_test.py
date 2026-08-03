@@ -9,11 +9,12 @@ Não extrai texto localmente de propósito: a extração é responsabilidade do
 gateway (docker/gateway/document_extract.py). Se este script fizesse o parsing,
 não estaria testando o produto, e sim uma reimplementação dele.
 
-Pré-requisito: guided decoding ligado no template do plano
-(supabase/migrations/0047_guided_decoding_pdf_json.sql) E a máquina RECRIADA
-depois da migration — pod em execução carrega o env do momento em que foi
-criado. Sem isso o endpoint responde 502 com o texto cru do modelo, que é
-exatamente o sintoma dessa configuração faltando.
+Não há pré-requisito de configuração no template: no vLLM 0.24.0 o structured
+output já vem habilitado por default (StructuredOutputsConfig.backend="auto"),
+e response_format json_schema é convertido em restrição de gramática pelo
+próprio servidor. A migration 0047 tentou fixar o backend com
+--guided-decoding-backend, flag que NÃO existe nessa versão e quebrava o boot
+do pod; a 0048 reverteu.
 
 Uso:
   python3 scripts/pdf_json_extract_test.py \

@@ -177,7 +177,7 @@ def _ocr_page(page) -> str:
 
 
 # Instrução que acompanha o texto extraído. Explícita sobre "só o JSON" mesmo
-# com guided decoding ligado (--guided-decoding-backend, migration 0047): a
+# com guided decoding ligado (default do vLLM 0.24, ver migration 0048): a
 # gramática garante a FORMA da saída, não que o modelo tenha entendido a
 # tarefa — sem a instrução ele preenche o schema com valores plausíveis em vez
 # de extrair os reais, e o resultado passa em qualquer validação sendo falso.

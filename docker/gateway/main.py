@@ -3106,7 +3106,10 @@ async def extract_document(
             # aqui só produziria variação entre chamadas idênticas.
             "temperature": 0.0,
             # o que garante JSON aderente ao schema em vez de "JSON provável":
-            # exige --guided-decoding-backend no template (migration 0047).
+            # o vLLM converte isto em restrição de gramática. Não exige flag no
+            # template — StructuredOutputsConfig.backend já é "auto" por default
+            # na 0.24 (a tentativa de fixar o backend explicitamente quebrou o
+            # boot dos pods; ver migration 0048).
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {"name": "document_extraction", "schema": parsed_schema},
@@ -3230,9 +3233,10 @@ async def extract_document(
         # a resolução de referências levanta _WrappedReferencingError, que não
         # herda de nenhuma das duas. Estreitar aqui reintroduz o 500 opaco.
         except Exception as e:
-            # com guided decoding ligado isto é raro; quando acontece, o mais
-            # provável é o template do plano estar sem a flag (pod criado antes
-            # da migration 0047). Devolver o texto cru é o que torna esse
+            # com guided decoding ativo isto é raro (a gramática do vLLM não
+            # deixaria sair JSON malformado), então quase sempre aponta pra
+            # outra coisa: schema que o backend não suporta, ou resposta
+            # interceptada no caminho. Devolver o texto cru é o que torna esse
             # diagnóstico possível do lado do cliente.
             logger.warning("documents/extract: saída não aderente ao schema (%s)", e)
             log_gateway_request(**log_ctx, status_code=502, stream=False, usage=usage)
