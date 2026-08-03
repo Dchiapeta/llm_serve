@@ -48,7 +48,27 @@ export async function POST(req: NextRequest) {
   if (!stack) {
     return NextResponse.json({ error: "Stack não encontrada" }, { status: 400 })
   }
-  if (!stack.machine_id) {
+
+  // stack.machine_id pode estar null (idle reaper de modelo base liberou a
+  // vaga contábil — o gateway resolve a rota sozinho a cada request real via
+  // resolve_route → place_base_stack; esse campo nunca decide a rota, só
+  // satisfaz a FK NOT NULL de api_keys.machine_id). Mesmo fallback usado por
+  // getOrCreatePlaygroundKey em lib/actions.ts: reaproveita o machine_id da
+  // última chave "customer" ativa da stack antes de bloquear de vez.
+  let machineId = stack.machine_id
+  if (!machineId) {
+    const { data: customerKey } = await db
+      .from("api_keys")
+      .select("machine_id")
+      .eq("stack_id", stackId)
+      .eq("purpose", "customer")
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle<{ machine_id: string }>()
+    machineId = customerKey?.machine_id ?? null
+  }
+  if (!machineId) {
     return NextResponse.json(
       { error: "A máquina desta stack ainda não está pronta para emitir chaves." },
       { status: 400 }
@@ -58,7 +78,7 @@ export async function POST(req: NextRequest) {
   try {
     const { plainKey } = await createKey({
       accountId: stack.account_id,
-      machineId: stack.machine_id,
+      machineId,
       stackId,
       name,
       expiresAt,
