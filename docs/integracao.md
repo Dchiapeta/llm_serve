@@ -30,7 +30,7 @@ Content-Type: application/json
 Authorization: Bearer <SUA_CHAVE_DE_ACESSO>
 
 {
-  "model": "vibecoder-base",
+  "model": "go-base",
   "max_tokens": 8000,
   "messages": [{"role": "user", "content": "oi"}]
 }
@@ -60,7 +60,7 @@ curl https://llmserve-docker.up.railway.app/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -d '{
-    "model": "vibecoder-base",
+    "model": "go-base",
     "max_tokens": 8000,
     "messages": [{"role": "user", "content": "oi"}]
   }'
@@ -74,7 +74,7 @@ curl https://llmserve-docker.up.railway.app/v1/messages \
   -H "x-api-key: $STACK_API_KEY" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
-    "model": "vibecoder-base",
+    "model": "go-base",
     "max_tokens": 8000,
     "messages": [{"role": "user", "content": "oi"}]
   }'
@@ -125,7 +125,7 @@ const r = await fetch("https://llmserve-docker.up.railway.app/v1/chat/completion
     Authorization: "Bearer " + process.env.STACK_API_KEY,
   },
   body: JSON.stringify({
-    model: "vibecoder-base",
+    model: "go-base",
     max_tokens: 8000,
     messages: [{ role: "user", content: "oi" }],
   }),
@@ -153,7 +153,7 @@ curl_setopt_array($ch, [
         "Authorization: Bearer " . getenv("STACK_API_KEY"),
     ],
     CURLOPT_POSTFIELDS => json_encode([
-        "model" => "vibecoder-base",
+        "model" => "go-base",
         "max_tokens" => 8000,
         "messages" => [["role" => "user", "content" => "oi"]],
     ]),
@@ -180,7 +180,7 @@ import (
 
 func main() {
 	body, _ := json.Marshal(map[string]any{
-		"model":      "vibecoder-base",
+		"model":      "go-base",
 		"max_tokens": 8000,
 		"messages": []map[string]string{
 			{"role": "user", "content": "oi"},
@@ -219,7 +219,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 
 String body = """
-    {"model": "vibecoder-base",
+    {"model": "go-base",
      "max_tokens": 8000,
      "messages": [{"role": "user", "content": "oi"}]}
     """;
@@ -252,7 +252,7 @@ http.DefaultRequestHeaders.Add(
 var res = await http.PostAsJsonAsync(
     "https://llmserve-docker.up.railway.app/v1/chat/completions", new
 {
-    model = "vibecoder-base",
+    model = "go-base",
     max_tokens = 8000,
     messages = new[] { new { role = "user", content = "oi" } },
 });
@@ -311,7 +311,7 @@ só de configuração.
 export ANTHROPIC_BASE_URL="https://llmserve-docker.up.railway.app"
 export ANTHROPIC_AUTH_TOKEN="<SUA_CHAVE_DE_ACESSO>"
 export ANTHROPIC_API_KEY=""
-export ANTHROPIC_MODEL="vibecoder-base"
+export ANTHROPIC_MODEL="go-base"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
@@ -340,10 +340,10 @@ depender disso, ponha o mesmo conteúdo em `~/.claude/settings.json`:
     "ANTHROPIC_BASE_URL": "https://llmserve-docker.up.railway.app",
     "ANTHROPIC_AUTH_TOKEN": "<SUA_CHAVE_DE_ACESSO>",
     "ANTHROPIC_API_KEY": "",
-    "ANTHROPIC_MODEL": "vibecoder-base",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "vibecoder-base",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "vibecoder-base",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "vibecoder-base",
+    "ANTHROPIC_MODEL": "go-base",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "go-base",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "go-base",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "go-base",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "120000"
   }
 }
@@ -366,7 +366,7 @@ Em `~/.codex/config.toml`:
 
 ```toml
 model_provider = "llmserve"
-model = "vibecoder-base"
+model = "go-base"
 
 # Compacta o histórico antes de estourar a janela do plano. O Codex assume 200k
 # por padrão e só descobriria o limite ao ser recusado. Mesmo valor do Claude
@@ -568,7 +568,7 @@ risco de um campo ser preenchido com dado que não está no seu PDF.
 
 ### Limites
 
-| Limite | VibeCoder | Pro |
+| Limite | Go | Pro |
 |---|---|---|
 | Tamanho do arquivo | 8 MB | 15 MB |
 | Páginas por requisição | 15 | 30 |

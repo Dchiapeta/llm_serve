@@ -24,7 +24,7 @@ POST /v1/chat/completions
 
 ```json
 {
-  "model": "vibecoder-base",
+  "model": "go-base",
   "max_tokens": 8000,
   "messages": [
     { "role": "user", "content": "oi" }
@@ -255,7 +255,7 @@ ou pode omitir o campo em silêncio (campo fora de `required`). Detalhes em
 
 **Limites:**
 
-| Limite | VibeCoder | Pro |
+| Limite | Go | Pro |
 |---|---|---|
 | Tamanho do arquivo | 8 MB | 15 MB |
 | Páginas por requisição | 15 | 30 |

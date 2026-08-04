@@ -30,10 +30,10 @@ from context_budget import (
     usable_input_tokens,
 )
 
-VIBECODER_WINDOW = 16384
+GO_WINDOW = 16384
 
 
-def _machine(max_model_len=VIBECODER_WINDOW):
+def _machine(max_model_len=GO_WINDOW):
     return {"id": "m1", "max_model_len": max_model_len}
 
 
@@ -45,7 +45,7 @@ def test_clampa_abaixo_do_piso_quando_a_janela_exige():
     body = {"max_tokens": 16_000, "messages": [{"role": "user", "content": prompt}]}
     est = estimate_prompt_tokens(messages=body["messages"])
     apply_context_budget(body, _machine(), est_tokens=est)
-    expected_budget = VIBECODER_WINDOW - reserved_tokens_for(est)
+    expected_budget = GO_WINDOW - reserved_tokens_for(est)
     assert body["max_tokens"] <= expected_budget
     assert body["max_tokens"] < 16_000
 
@@ -161,7 +161,7 @@ def test_reserved_tokens_for_por_tipo_de_estimativa():
     )
 
 
-CLAUDE_CODE_WINDOW = 131_072  # VibeCoder e Pro, padronizados
+CLAUDE_CODE_WINDOW = 131_072  # Go e Pro, padronizados
 
 
 def test_contagem_exata_nao_rejeita_prompt_que_cabe():
@@ -199,7 +199,7 @@ def test_janela_recomendada_ao_cliente():
     assert auto_compact_window(65_536) == 56_000  # janela do Pro antes de padronizar
     # nunca acima do que o gateway aceita — recomendar mais que isso recriaria o
     # 400 de contexto que o módulo existe pra evitar
-    for window in (VIBECODER_WINDOW, 65_536, CLAUDE_CODE_WINDOW):
+    for window in (GO_WINDOW, 65_536, CLAUDE_CODE_WINDOW):
         assert auto_compact_window(window) <= usable_input_tokens(window)
 
 
@@ -217,7 +217,7 @@ def test_janela_recomendada_nao_e_80_por_cento_da_janela():
     assert 0.80 < declarado * 0.92 / CLAUDE_CODE_WINDOW < 0.90
 
 
-@pytest.mark.parametrize("window", [VIBECODER_WINDOW, 65_536, CLAUDE_CODE_WINDOW])
+@pytest.mark.parametrize("window", [GO_WINDOW, 65_536, CLAUDE_CODE_WINDOW])
 def test_janela_recomendada_deixa_a_saida_garantida(window):
     """Auto-consistência entre o valor que recomendamos ao cliente e o que o
     gateway aceita: um prompt exatamente do tamanho recomendado tem que passar

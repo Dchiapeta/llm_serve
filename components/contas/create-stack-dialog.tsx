@@ -108,7 +108,7 @@ export function CreateStackDialog({
   const [phase, setPhase] = React.useState<Phase>("form")
   const [email, setEmail] = React.useState("")
   const [name, setName] = React.useState("")
-  const [plan, setPlan] = React.useState<TemplatePlan>("VibeCoder")
+  const [plan, setPlan] = React.useState<TemplatePlan>("Go")
   const [machineId, setMachineId] = React.useState("")
   const [slug, setSlug] = React.useState(generateStackSlug)
   const [result, setResult] = React.useState<StackResult | null>(null)
@@ -134,7 +134,7 @@ export function CreateStackDialog({
     (a) => a.email?.toLowerCase() === email.trim().toLowerCase()
   )
 
-  // O produto escolhido (VibeCoder/Pro/Max/Enterprise) determina o template:
+  // O produto escolhido (Go/Pro/Max/Enterprise) determina o template:
   // o cadastrado em /templates com aquele plano.
   const template = templates.find((t) => t.plan === plan)
   const templateId = template?.id ?? ""
@@ -162,7 +162,7 @@ export function CreateStackDialog({
       setPhase("form")
       setEmail("")
       setName("")
-      setPlan("VibeCoder")
+      setPlan("Go")
       setMachineId("")
       setSlug(generateStackSlug())
       setResult(null)

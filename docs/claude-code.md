@@ -1,4 +1,4 @@
-# Claude Code nos planos VibeCoder e Pro (janela 128k)
+# Claude Code nos planos Go e Pro (janela 128k)
 
 Por que existe: o Claude Code CLI manda ~26k tokens só de system prompt +
 tool schemas antes de qualquer trabalho — numa janela de 16k ele nem abre
@@ -37,10 +37,10 @@ Regras comuns aos dois planos:
 verificação de leitura de volta nos dois lados — os templates JÁ têm a
 config abaixo; falta recriar os pods e rodar os load tests.
 
-### VibeCoder (A40 48GB, Qwen3.5-9B) — aplicado
+### Go (A40 48GB, Qwen3.5-9B) — aplicado
 
 ```
---dtype bfloat16 --max-model-len 131072 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name vibecoder-base
+--dtype bfloat16 --max-model-len 131072 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name go-base
 ```
 
 - Janela nativa do Qwen3.5-9B é **262144** (config.json conferido) —
@@ -65,7 +65,7 @@ A40"]`, `gpu_count=2` (o entrypoint deriva `--tensor-parallel-size 2` do
 --max-model-len 131072 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 16 --disable-custom-all-reduce --enable-prompt-tokens-details --served-model-name pro-base
 ```
 
-- **Janela igual à do VibeCoder: 131072.** É o que permite uma config única de
+- **Janela igual à do Go: 131072.** É o que permite uma config única de
   cliente nos dois planos (seção 5). Nativa do 27B é 262k — sem YaRN, só a flag.
 - Orçamento: 96 GB totais, pesos ~28 GB fatiados 14+14 no TP → pool de KV
   **~54 GB ≈ ~540k tokens fp8** ≈ **~4,2 sessões cheias de 128k**. Admissão:
@@ -117,10 +117,10 @@ testar até `--context-tokens 110000`, e um 400 de contexto aí é falha do test
 não comportamento previsto.
 
 ```bash
-# VibeCoder (A40, 9B: pool ~340k tokens ≈ ~2,6 sessões cheias de 128k)
+# Go (A40, 9B: pool ~340k tokens ≈ ~2,6 sessões cheias de 128k)
 python3 scripts/loadtest.py \
   --base-url https://llmserve-docker.up.railway.app \
-  --api-key <chave VibeCoder> --model <alias vibecoder> \
+  --api-key <chave Go> --model <alias go> \
   --levels 4,6,10 --context-tokens 110000 --max-tokens 16000
 
 # Pro (2× A40 TP=2, 27B: pool ~540k tokens ≈ ~4,2 sessões cheias)
@@ -257,5 +257,5 @@ Ver `docker/gateway/context_budget.py` e os testes de regressão em
 - Limiares iniciais são chutes razoáveis — calibrar com a distribuição real
   de `usage_metrics` após ~2 semanas (override sem deploy em
   `templates.usage_class_config`). Os limiares de tokens/request derivam
-  sozinhos da janela nova (fração de 128k); os diários (VibeCoder 300k/1.5M,
+  sozinhos da janela nova (fração de 128k); os diários (Go 300k/1.5M,
   Pro 600k/3M por dia) são os candidatos à calibração.

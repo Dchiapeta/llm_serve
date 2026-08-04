@@ -42,8 +42,10 @@ DEFAULT_REQ_PCT_HIGH = 0.40
 
 # fator 2: tokens por dia ativo (medium, high) — por plano. Chutes iniciais
 # razoáveis; calibrar com a distribuição real de usage_metrics após ~2
-# semanas de VibeCoder-64k (override sem deploy via usage_class_config).
+# semanas de Go-64k (override sem deploy via usage_class_config).
+# "VibeCoder" é o nome antigo de "Go" — remover quando a migration 0049 rodar.
 DEFAULT_DAILY_THRESHOLDS = {
+    "Go": (300_000, 1_500_000),
     "VibeCoder": (300_000, 1_500_000),
     "Pro": (600_000, 3_000_000),
     "Max": (1_000_000, 5_000_000),
@@ -135,7 +137,7 @@ def classify_stack(
 
     # fator 2: tokens por dia ativo, limiares do plano
     default_medium, default_high = DEFAULT_DAILY_THRESHOLDS.get(
-        row.get("plan"), DEFAULT_DAILY_THRESHOLDS["VibeCoder"]
+        row.get("plan"), DEFAULT_DAILY_THRESHOLDS["Go"]
     )
     daily = total_tokens / active_days
     factor_daily = "low"

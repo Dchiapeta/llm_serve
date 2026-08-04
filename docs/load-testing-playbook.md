@@ -1,6 +1,6 @@
 # Playbook de teste de carga por plano
 
-Como testamos um template de plano (VibeCoder, Pro, Max, Enterprise) antes de
+Como testamos um template de plano (Go, Pro, Max, Enterprise) antes de
 liberar pra produção. Objetivo: sempre sair com os mesmos números
 comparáveis entre planos — tempo de resposta por dificuldade/categoria,
 throughput sob concorrência, e taxa de erro real.
@@ -34,7 +34,7 @@ throughput sob concorrência, e taxa de erro real.
   crescer, mas mantenha a distribuição por categoria/dificuldade.
 - **`max_tokens`**: sempre generoso (8000). Budgets baixos cortam a resposta
   no meio do raciocínio antes de chegar na resposta final ("problema do
-  length", achado na validação do VibeCoder) — isso mede o teto de tokens,
+  length", achado na validação do Go) — isso mede o teto de tokens,
   não a qualidade do modelo.
 - **Sempre streaming** (`stream: true`). Requisição não-streaming através do
   gateway pode estourar o timeout de leitura (60s, é só o idle timeout do
@@ -46,7 +46,7 @@ throughput sob concorrência, e taxa de erro real.
   cada uma disparando sua própria sequência de 5 requisições. Objetivo:
   medir se a atividade de uma conta degrada a latência/throughput de outra
   conta que divide a mesma GPU — é o que valida (ou não) as razões de
-  oversubscription assumidas para cada plano (2-4x VibeCoder, 5-10x
+  oversubscription assumidas para cada plano (2-4x Go, 5-10x
   Pro/Max).
   - Rodar em dois modos pra comparação: (a) baseline — cada conta sozinha
     na máquina, sem vizinhos; (b) full — todas as N contas ativas ao mesmo
@@ -291,7 +291,7 @@ Concorrência não trava mais por chave — trava pelo agregado de
 `in_flight` na MÁQUINA vs. `machines.max_concurrent_seqs` (migration 0028;
 `NULL` cai no fallback `DEFAULT_MAX_CONCURRENT_SEQS`), com um piso
 (`MIN_RESERVED_SLOTS_SHARED_POD`, default 2) sempre reservado em planos de
-pod compartilhado (`SHARED_POD_PLANS` — VibeCoder/Pro) pra quem chegar
+pod compartilhado (`SHARED_POD_PLANS` — Go/Pro) pra quem chegar
 depois nunca ficar 100% bloqueado esperando um tenant pesado. O roteamento
 (`routing_state`) é por `account_id`, não por `stack_id` — requer então
 duas CONTAS de teste (não duas stacks da mesma conta) cujas chaves roteiem

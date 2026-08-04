@@ -17,7 +17,7 @@ Fluxo por request:
   3. Sem rota: alocação placeholder (primeira máquina running com slot livre),
      claim atômico, upsert da chave no agent, load do adapter, proxy.
   4. Injeta no body (chat completions): system prompt da conta + top-k de
-     contexto da base de conhecimento (RAG básico do VibeCoder, embeddings
+     contexto da base de conhecimento (RAG básico do Go, embeddings
      via OpenAI).
   5. Máquina fora do ar → 503 imediato, nunca pendura o request.
   6. Sem nenhuma máquina running com vaga → auto-wake: religa (startPod) um
@@ -83,7 +83,7 @@ KEY_CACHE_TTL_S = float(os.environ.get("KEY_CACHE_TTL_S", "60"))
 KEY_CACHE_NEGATIVE_TTL_S = 5.0
 LORA_LOAD_TIMEOUT_S = float(os.environ.get("LORA_LOAD_TIMEOUT_S", "120"))
 LORA_BUCKET = os.environ.get("LORA_BUCKET", "loras")
-# embeddings do RAG (VibeCoder) — mesmo modelo/dimensão usado na indexação
+# embeddings do RAG (Go) — mesmo modelo/dimensão usado na indexação
 # pelo painel (lib/actions.ts), senão a similaridade de cosseno não faz sentido
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
@@ -135,7 +135,10 @@ DOCUMENT_UPSTREAM_TIMEOUT_S = float(os.environ.get("DOCUMENT_UPSTREAM_TIMEOUT_S"
 # usage_metrics, populada pelo metrics_collection_loop abaixo; cache curto
 # evita 1 round-trip ao Supabase por request na hot path.
 DAILY_TOKEN_BUDGET = {
-    "VibeCoder": int(os.environ.get("DAILY_TOKEN_BUDGET_VIBECODER", "0")),
+    "Go": int(os.environ.get("DAILY_TOKEN_BUDGET_GO", "0")),
+    # TRANSIÇÃO: nome antigo do plano "Go", aceito até a migration 0049 rodar
+    # em produção. Remover junto com as outras entradas "VibeCoder" daqui.
+    "VibeCoder": int(os.environ.get("DAILY_TOKEN_BUDGET_GO", "0")),
     "Pro": int(os.environ.get("DAILY_TOKEN_BUDGET_PRO", "0")),
     "Max": int(os.environ.get("DAILY_TOKEN_BUDGET_MAX", "0")),
     "Enterprise": int(os.environ.get("DAILY_TOKEN_BUDGET_ENTERPRISE", "0")),
@@ -254,7 +257,7 @@ proxy_client: httpx.AsyncClient
 # Não é streaming (o JSON só serve completo), então o read cobre a geração
 # INTEIRA — não o gap entre chunks, que é o que os 60s do proxy_client medem.
 document_client: httpx.AsyncClient
-# client curto pra API de embeddings da OpenAI (RAG do VibeCoder)
+# client curto pra API de embeddings da OpenAI (RAG do Go)
 openai_client: httpx.AsyncClient
 # client pra chamar de volta o painel Next.js (POST /api/machines/provision)
 panel_client: httpx.AsyncClient
@@ -1963,7 +1966,7 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str, 
     if not adapter:
         # sem adapter registrado → serve o modelo base, stack-aware: máquina
         # da stack da chave quando running; pausada → realocação automática
-        # ou wake da própria; fallback por plano (VibeCoder nunca cai numa
+        # ou wake da própria; fallback por plano (Go nunca cai numa
         # máquina servindo o modelo do Pro/Max, e vice-versa)
         machine, effective_plan = await resolve_base_machine(account_id, entry)
         return machine, False, effective_plan, stack_id
@@ -2439,13 +2442,16 @@ THINK_CLOSE = "</think>"
 # Pro (Qwen3.6-27B) validado em 17/07/2026: 14/15 respostas fecham com
 # </think> (a exceção foi truncada por length — coberta pelo fallback do
 # filtro, que devolve o buffer acumulado no fim do stream).
-REASONING_LEAK_PLANS = {"VibeCoder", "Pro"}
+# "VibeCoder" é o nome antigo de "Go": fica aceito até a migration 0049 rodar
+# em produção, senão o plano sai do set na janela entre deploy e migration e o
+# filtro de <think> desliga sozinho. Remover depois.
+REASONING_LEAK_PLANS = {"Go", "VibeCoder", "Pro"}
 
 # planos cujo pod é COMPARTILHADO entre várias stacks/tenants (ver
 # check_concurrency) — hoje coincide em membros com REASONING_LEAK_PLANS, mas
 # são eixos diferentes (parser de reasoning vs. topologia do pod) que podem
 # divergir; não reaproveitar um pelo outro.
-SHARED_POD_PLANS = {"VibeCoder", "Pro"}
+SHARED_POD_PLANS = {"Go", "VibeCoder", "Pro"}
 
 
 def split_reasoning(text: str) -> tuple[str | None, str]:
@@ -2486,7 +2492,7 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple,
                     # fechado) — sem isso aqui, o branch abaixo repassa a
                     # linha crua e sai do loop antes de nunca ver esse chunk,
                     # deixando tokens_in/tokens_out null pra sempre nos
-                    # planos com filtro de raciocínio (VibeCoder/Pro).
+                    # planos com filtro de raciocínio (Go/Pro).
                     if usage is None and b'"usage"' in stripped and stripped.startswith(b"data:"):
                         usage_payload = stripped[len(b"data:") :].strip()
                         if usage_payload not in (b"[DONE]", b""):

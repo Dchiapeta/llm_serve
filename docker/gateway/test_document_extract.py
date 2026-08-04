@@ -100,11 +100,11 @@ def test_pdf_vazio_de_bytes():
 
 def test_teto_de_paginas_por_plano():
     pdf = _pdf(*[f"p{i}" for i in range(20)])
-    # Pro (30) aceita; VibeCoder (15) recusa o MESMO documento
+    # Pro (30) aceita; Go (15) recusa o MESMO documento
     _, pages, _ = extract_text(pdf, "Pro")
     assert pages == 20
     with pytest.raises(DocumentTooLarge):
-        extract_text(pdf, "VibeCoder")
+        extract_text(pdf, "Go")
 
 
 def test_plano_desconhecido_cai_no_default_conservador():
@@ -130,7 +130,7 @@ def test_teto_de_paginas_rejeita_antes_do_ocr(monkeypatch):
         document_extract, "_ocr_page", lambda page: chamadas.append(1) or ""
     )
     with pytest.raises(DocumentTooLarge):
-        extract_text(_pdf(*["" for _ in range(20)]), "VibeCoder")
+        extract_text(_pdf(*["" for _ in range(20)]), "Go")
     assert not chamadas, "OCR rodou antes da checagem do teto de páginas"
 
 
@@ -141,12 +141,12 @@ def test_check_size():
 
 
 def test_check_size_usa_o_teto_do_plano():
-    """8 MB passa no Pro (15 MB) e falha no VibeCoder (8 MB) — o mesmo upload,
+    """8 MB passa no Pro (15 MB) e falha no Go (8 MB) — o mesmo upload,
     dois planos, tetos diferentes."""
     nove_mb = 9 * 1024 * 1024
     check_size(nove_mb, "Pro")
     with pytest.raises(DocumentTooLarge):
-        check_size(nove_mb, "VibeCoder")
+        check_size(nove_mb, "Go")
 
 
 # ---------- prompt ----------

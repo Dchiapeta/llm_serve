@@ -77,7 +77,7 @@ export function ImportTemplateDialog({
 
           <div className="flex flex-col gap-2">
             <Label htmlFor={`plan-${runpodTemplateId}`}>Plano</Label>
-            <Select name="plan" defaultValue="VibeCoder">
+            <Select name="plan" defaultValue="Go">
               <SelectTrigger id={`plan-${runpodTemplateId}`} className="w-full">
                 <SelectValue />
               </SelectTrigger>

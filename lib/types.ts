@@ -1,7 +1,7 @@
-export type TemplatePlan = "VibeCoder" | "Pro" | "Max" | "Enterprise"
+export type TemplatePlan = "Go" | "Pro" | "Max" | "Enterprise"
 
 export const TEMPLATE_PLANS: TemplatePlan[] = [
-  "VibeCoder",
+  "Go",
   "Pro",
   "Max",
   "Enterprise",
@@ -11,7 +11,7 @@ export const TEMPLATE_PLANS: TemplatePlan[] = [
 // processo vLLM). Espelha SHARED_POD_PLANS do gateway (docker/gateway/main.py).
 // Nesses planos o prefix caching vira canal lateral de tempo entre co-tenants
 // (ver docker/entrypoint.sh), então o provisionamento força DISABLE_PREFIX_CACHING.
-export const SHARED_POD_PLANS: TemplatePlan[] = ["VibeCoder", "Pro"]
+export const SHARED_POD_PLANS: TemplatePlan[] = ["Go", "Pro"]
 
 export type Template = {
   id: string

@@ -32,7 +32,7 @@ function Field({
 
 export function ApiReference() {
   const mensagemBody = `{
-  "model": "vibecoder-base",
+  "model": "go-base",
   "max_tokens": 8000,
   "messages": [
     { "role": "user", "content": "oi" }
@@ -222,7 +222,7 @@ export function ApiReference() {
             <thead className="border-b bg-muted/50 text-foreground">
               <tr>
                 <th className="px-3 py-2 font-medium">Limite</th>
-                <th className="px-3 py-2 font-medium">VibeCoder</th>
+                <th className="px-3 py-2 font-medium">Go</th>
                 <th className="px-3 py-2 font-medium">Pro</th>
               </tr>
             </thead>

@@ -8,12 +8,7 @@ import { randomBytes } from "crypto"
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { computeCapacity, stackWeight, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
-import {
-  parseImageLimit,
-  parseMaxModelLen,
-  parseMaxNumSeqs,
-  parseServedModelName,
-} from "./machines"
+import { vllmFlagsFromTemplate } from "./machines"
 import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
 import { generateStackSlug, STACK_SLUG_RE } from "./slug"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
@@ -110,7 +105,7 @@ async function logEvent(machineId: string | null, type: string, message: string)
   await db.from("machine_events").insert({ machine_id: machineId, type, message })
 }
 
-// Plano/tier do template: VibeCoder, Pro, Max ou Enterprise.
+// Plano/tier do template: Go, Pro, Max ou Enterprise.
 function parsePlan(formData: FormData): TemplatePlan {
   const raw = String(formData.get("plan") || "").trim()
   if (!TEMPLATE_PLANS.includes(raw as TemplatePlan)) {
@@ -507,26 +502,7 @@ async function provisionMachine(input: {
       template_id: tpl.id,
       admin_secret: adminSecret,
       model_name: tpl.model_name,
-      // alias servido pelo vLLM (--served-model-name), pra o gateway fixar o
-      // "model" correto em vez do path do HF; null se o template não usa a flag
-      served_model_name:
-        parseServedModelName(tpl.env?.VLLM_EXTRA_ARGS) ??
-        parseServedModelName(tpl.start_command),
-      // janela de contexto (--max-model-len), pro gateway clampar max_tokens
-      // ao orçamento restante; null se o template não usa a flag
-      max_model_len:
-        parseMaxModelLen(tpl.env?.VLLM_EXTRA_ARGS) ??
-        parseMaxModelLen(tpl.start_command),
-      // teto de sequências concorrentes (--max-num-seqs), pro gateway aplicar
-      // o 429 no valor REAL do deploy em vez do fallback conservador dele
-      max_concurrent_seqs:
-        parseMaxNumSeqs(tpl.env?.VLLM_EXTRA_ARGS) ??
-        parseMaxNumSeqs(tpl.start_command),
-      // teto de imagens por prompt (--limit-mm-per-prompt), pro gateway
-      // recortar excedente em vez de deixar o pod devolver 400
-      max_images_per_prompt:
-        parseImageLimit(tpl.env?.VLLM_EXTRA_ARGS) ??
-        parseImageLimit(tpl.start_command),
+      ...vllmFlagsFromTemplate(tpl),
       vram_gb: totalVramGb,
       cost_per_hr: pod.costPerHr ?? null,
       public_url: podProxyUrl(pod.id, 8000),
@@ -864,6 +840,10 @@ export async function recreateMachine(
       status: "creating",
       cost_per_hr: pod.costPerHr ?? m.cost_per_hr,
       public_url: podProxyUrl(pod.id, 8000),
+      // o pod novo sobe com o template ATUAL, que pode ter mudado desde o
+      // provisionamento — re-deriva as flags do vLLM ou o gateway continua
+      // operando com os valores do pod antigo (ver vllmFlagsFromTemplate)
+      ...vllmFlagsFromTemplate(tpl),
       // reseta o relógio de ociosidade a partir da recriação (mesmo motivo do
       // startMachine): sem isso o last_activity_at fica velho e o reaper do
       // gateway auto-pausa a máquina minutos depois de ela subir, antes de
@@ -1953,7 +1933,7 @@ const KNOWLEDGE_BUCKET = "knowledge"
 const EMBEDDING_MODEL = "text-embedding-3-small"
 
 // Chunking fixo por tamanho de caractere com overlap — suficiente para o
-// RAG básico do VibeCoder; nada de chunking semântico/estrutural por ora.
+// RAG básico do Go; nada de chunking semântico/estrutural por ora.
 const CHUNK_SIZE = 1000
 const CHUNK_OVERLAP = 100
 

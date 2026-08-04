@@ -37,7 +37,7 @@ import { StackRowActions } from "@/components/contas/stack-row-actions"
 // Cor do badge por plano de produto — mantém a mesma paleta usada em
 // components/templates para o plano do template.
 export const PLAN_BADGE_VARIANT: Record<TemplatePlan, "secondary" | "info-light" | "success-light" | "warning-light"> = {
-  VibeCoder: "secondary",
+  Go: "secondary",
   Pro: "info-light",
   Max: "success-light",
   Enterprise: "warning-light",

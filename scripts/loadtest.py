@@ -133,7 +133,7 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
             # tanto o primeiro byte que nunca chega (conexão zumbi) quanto um
             # stream que congelou. Com o filtro de reasoning do gateway, o 1º
             # byte visível só sai quando o raciocínio fecha — dimensionar o
-            # default pra isso (120s cobre os ~85s observados no VibeCoder).
+            # default pra isso (120s cobre os ~85s observados no Go).
             timeout=httpx.Timeout(args.first_byte_timeout, connect=15.0),
         ) as resp:
             if resp.status_code != 200:
@@ -388,7 +388,7 @@ async def main():
         "sozinha) e depois full (todas simultâneas) e reporta o delta por "
         "conta. Ignora --levels.",
     )
-    parser.add_argument("--model", required=True, help="served-model-name do template (ex: pro-base, vibecoder-base)")
+    parser.add_argument("--model", required=True, help="served-model-name do template (ex: pro-base, go-base)")
     parser.add_argument("--levels", default="5,10,15", help="Níveis de concorrência, separados por vírgula")
     parser.add_argument("--requests-per-user", type=int, default=5)
     parser.add_argument("--max-tokens", type=int, default=8000)

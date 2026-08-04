@@ -6,7 +6,7 @@ agent (mesma disciplina de docker/gateway/context_budget.py).
 ---------------------------------------------------------------------------
 Por que o salt existe
 ---------------------------------------------------------------------------
-Nos planos de pod COMPARTILHADO (VibeCoder, Pro) várias stacks de contas
+Nos planos de pod COMPARTILHADO (Go, Pro) várias stacks de contas
 diferentes dividem o mesmo processo vLLM. Com prefix caching ligado, um
 cache hit reduz o TTFT de forma observável: um tenant mede o próprio tempo
 de resposta e infere se um prefixo já foi processado por outro. Canal

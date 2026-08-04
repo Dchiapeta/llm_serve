@@ -253,7 +253,7 @@ class SupaClient:
         Sem este filtro, uma conta sem adapter cairia em QUALQUER máquina
         running (ver list_running_machines) — inofensivo com um único
         modelo base em produção, mas quebra assim que existir mais de um
-        template/modelo simultâneo (ex: VibeCoder em Qwen3.5-9B e Pro/Max em
+        template/modelo simultâneo (ex: Go em Qwen3.5-9B e Pro/Max em
         Qwen3.6-35B). O join usa a FK machines.template_id → templates.id.
         """
         r = await self._rest.get(

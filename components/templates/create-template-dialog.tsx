@@ -65,7 +65,7 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
           </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="plan">Plano</Label>
-            <Select name="plan" defaultValue="VibeCoder">
+            <Select name="plan" defaultValue="Go">
               <SelectTrigger id="plan" className="w-full">
                 <SelectValue />
               </SelectTrigger>

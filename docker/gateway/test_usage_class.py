@@ -13,7 +13,7 @@ NOW = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
 def _row(**overrides):
     row = {
         "stack_id": "s1",
-        "plan": "VibeCoder",
+        "plan": "Go",
         "usage_class": "low",
         "usage_class_updated_at": None,
         "max_model_len": 65536,
@@ -47,14 +47,14 @@ def test_fator_request_relativo_a_janela():
     # 30k tokens/request numa janela de 64k (~46%) -> high;
     # o MESMO padrão numa janela de 200k (15%) -> nada muda (low)
     row = _row(total_tokens=3_000_000, total_requests=100, active_days=14)
-    # tokens diários = ~214k/dia, abaixo do limiar diário do VibeCoder (300k)
+    # tokens diários = ~214k/dia, abaixo do limiar diário do Go (300k)
     assert classify_stack(row, NOW) == "high"
     assert classify_stack(_row(**{**row, "max_model_len": 200_000}), NOW) is None
 
 
 def test_fator_diario_por_plano():
     # 100 requests pequenos (2k/request numa janela 64k = fator request low)
-    # mas 2M tokens/dia -> high pelo fator diário do VibeCoder
+    # mas 2M tokens/dia -> high pelo fator diário do Go
     row = _row(total_tokens=14_000_000, total_requests=7_000, active_days=7)
     assert classify_stack(row, NOW) == "high"
     # mesmo consumo diário no Max (limiar high 5M/dia) -> medium

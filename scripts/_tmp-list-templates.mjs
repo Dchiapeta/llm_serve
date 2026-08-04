@@ -7,7 +7,7 @@ const db = createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: fa
 const { data, error } = await db
   .from("templates")
   .select("id, name, plan, runpod_template_id, image, start_command, created_at")
-  .in("plan", ["Pro", "VibeCoder"])
+  .in("plan", ["Pro", "Go"])
   .order("plan", { ascending: true })
   .order("created_at", { ascending: true })
 

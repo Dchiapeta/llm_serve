@@ -35,13 +35,18 @@ import io
 #
 # Plano ausente do dict cai no default conservador: um plano novo nunca herda
 # um teto alto por esquecimento.
+#
+# "VibeCoder" é o nome antigo de "Go" — entrada mantida só até a migration 0049
+# rodar em produção; sem ela o plano cairia no default na janela de transição.
 MAX_DOCUMENT_BYTES = {
+    "Go": 8 * 1024 * 1024,
     "VibeCoder": 8 * 1024 * 1024,
     "Pro": 15 * 1024 * 1024,
     "Max": 15 * 1024 * 1024,
     "Enterprise": 15 * 1024 * 1024,
 }
 MAX_DOCUMENT_PAGES = {
+    "Go": 15,
     "VibeCoder": 15,
     "Pro": 30,
     "Max": 30,

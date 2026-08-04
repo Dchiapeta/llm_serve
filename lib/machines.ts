@@ -71,6 +71,36 @@ export function parseImageLimit(args: string | null | undefined): number | null 
   }
 }
 
+// Campos de `machines` derivados das flags do vLLM no template. O gateway lê
+// tudo da própria máquina (não busca o template a cada request), então essas
+// colunas são uma cópia denormalizada que precisa ser reescrita SEMPRE que o
+// pod sobe com um template — no provisionamento e na recriação. Sem isso, uma
+// edição do template só chegava ao gateway criando uma máquina nova: recriar
+// não bastava, e o caso do --served-model-name era o pior (o pod passa a servir
+// o alias novo enquanto o gateway continua fixando o antigo → 404 em toda
+// request). Aceita env.VLLM_EXTRA_ARGS ou start_command, nessa ordem.
+export function vllmFlagsFromTemplate(tpl: {
+  env: Record<string, string> | null
+  start_command: string | null
+}) {
+  const extra = tpl.env?.VLLM_EXTRA_ARGS
+  const cmd = tpl.start_command
+  return {
+    // alias servido pelo vLLM (--served-model-name), pra o gateway fixar o
+    // "model" correto em vez do path do HF; null se o template não usa a flag
+    served_model_name: parseServedModelName(extra) ?? parseServedModelName(cmd),
+    // janela de contexto (--max-model-len), pro gateway clampar max_tokens
+    // ao orçamento restante; null se o template não usa a flag
+    max_model_len: parseMaxModelLen(extra) ?? parseMaxModelLen(cmd),
+    // teto de sequências concorrentes (--max-num-seqs), pro gateway aplicar
+    // o 429 no valor REAL do deploy em vez do fallback conservador dele
+    max_concurrent_seqs: parseMaxNumSeqs(extra) ?? parseMaxNumSeqs(cmd),
+    // teto de imagens por prompt (--limit-mm-per-prompt), pro gateway
+    // recortar excedente em vez de deixar o pod devolver 400
+    max_images_per_prompt: parseImageLimit(extra) ?? parseImageLimit(cmd),
+  }
+}
+
 // Status exibido na UI: além dos status do banco, "starting" indica que o
 // pod está de pé mas o vLLM ainda não respondeu (baixando/carregando modelo)
 // e "failed" que o processo do vLLM morreu (ex.: OOM no boot) com o pod vivo.
