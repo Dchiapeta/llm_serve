@@ -111,6 +111,9 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
 ## Endpoints
 
 - `POST /v1/...` — proxy OpenAI-compatible (Bearer HEX do cliente)
+- `POST /v1/documents/extract` — PDF → JSON via schema (OCR quando escaneado)
+- `POST /v1/images/extract` — imagem solta → JSON via schema (sempre via OCR)
+- `POST /v1/documents/generate` — HTML → PDF (direto ou por instrução ao modelo)
 - `GET /` / `GET /health` — health checks
 - `GET /admin/routes` — in-flight e tamanho do cache (header `X-Admin-Secret`)
 - `POST /admin/flush-key-cache` — invalida o cache de chaves (revogação imediata)

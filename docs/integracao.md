@@ -45,7 +45,9 @@ descobrir nem acertar o nome. Se quiser o nome real, consulte `GET /v1/models`.
 Além de `/v1/chat/completions`, o serviço aceita `/v1/completions`, `/v1/embeddings`,
 `/v1/responses` e `GET /v1/models` (formato OpenAI), `/v1/messages` e
 `/v1/messages/count_tokens` (formato Anthropic), e os endpoints dedicados
-`/v1/documents/extract` (PDF → JSON) e `/v1/documents/generate` (HTML → PDF, ver
+`/v1/documents/extract` (PDF → JSON), `/v1/images/extract` (imagem solta → JSON, ver
+["Extração estruturada de imagem"](#extração-estruturada-de-imagem-jpegpngwebp--json))
+e `/v1/documents/generate` (HTML → PDF, ver
 ["Geração de PDF a partir de HTML"](#geração-de-pdf-a-partir-de-html)). Qualquer outro
 caminho responde `404`.
 
@@ -441,6 +443,60 @@ não são texto (imagem, por exemplo) são ignoradas para esse fim.
 
 Nada disso exige mandar nada além da chave: é ela que identifica a sua stack, e a
 configuração viaja junto automaticamente.
+
+---
+
+## OCR de imagem via chat
+
+Não é um endpoint separado: é a **mesma rota de chat**
+(`/v1/chat/completions`), enviando a imagem como uma parte `image_url` dentro
+do `content` da mensagem, junto com a instrução em texto do que fazer com ela
+(transcrever, descrever, comparar duas imagens, etc.).
+
+```bash
+IMG_B64=$(base64 -i print.png)
+curl https://llmserve-docker.up.railway.app/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $STACK_API_KEY" \
+  -d @- <<EOF
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Transcreva todo o texto visível nesta imagem."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,$IMG_B64"}}
+      ]
+    }
+  ]
+}
+EOF
+```
+
+A imagem viaja como uma [data URL](https://developer.mozilla.org/en-US/docs/Web/URI/Reference/Schemes/data)
+(`data:<mime>;base64,<dados>`) dentro do próprio corpo JSON — não há upload
+prévio nem endpoint separado para hospedar o arquivo. No formato Anthropic
+(`/v1/messages`), o bloco equivalente é
+`{"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}`,
+convertido internamente para o mesmo formato acima.
+
+Por ser a rota de chat, vale a mesma regra de `system`/RAG explicada em
+["Limites e comportamento"](#limites-e-comportamento) acima: sem mensagem
+`system`, o system prompt da sua stack (e o RAG) são aplicados; com `system`,
+o seu substitui os dois. Saída estruturada (`response_format` com JSON
+Schema) também funciona aqui — a diferença para o endpoint dedicado de
+["extração de imagem"](#extração-estruturada-de-imagem-jpegpngwebp--json) é
+que ali o texto é extraído por OCR no próprio gateway antes de chegar ao
+modelo, enquanto aqui é o modelo (multimodal) que enxerga a imagem
+diretamente.
+
+### Limites
+
+- Corpo total da request (JSON + imagem em base64) até **8 MB**.
+- Número de imagens por mensagem tem teto por plano (`max_images_per_prompt`
+  do pod); imagens excedentes são recortadas automaticamente e substituídas
+  por um aviso de texto, em vez de gerar erro — a request não falha, mas o
+  modelo é avisado de que não viu tudo.
 
 ---
 
