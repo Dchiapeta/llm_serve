@@ -7,6 +7,7 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion"
 import { Card, CardContent } from "@/components/ui/card"
+import { ApiReference } from "@/components/documentacao/api-reference"
 import { MachineAbout } from "@/components/machines/machine-about"
 
 function Lead({ children }: { children: ReactNode }) {
@@ -364,6 +365,15 @@ export default function DocumentacaoPage() {
                   modelo pelos da sua máquina.
                 </Lead>
                 <MachineAbout gatewayUrl={null} modelName={null} maxModelLen={null} />
+              </AccordionContent>
+            </AccordionItem>
+
+            <AccordionItem value="referencia-api">
+              <AccordionTrigger className="text-base font-medium text-foreground">
+                Referência da API por caso de uso
+              </AccordionTrigger>
+              <AccordionContent>
+                <ApiReference />
               </AccordionContent>
             </AccordionItem>
 

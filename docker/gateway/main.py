@@ -54,7 +54,7 @@ from anthropic_compat import (
     anthropic_to_openai_request,
     openai_to_anthropic_response,
 )
-from content_policy import clamp_media
+from content_policy import clamp_media, text_of
 from context_budget import (
     CONTEXT_IMAGE_TOKENS,
     ContextWindowExceeded,
@@ -2189,12 +2189,20 @@ async def validate_body(
     client_systems = [m for m in messages if m.get("role") == "system"]
     messages = [m for m in messages if m.get("role") != "system"]
 
-    if client_systems:
-        content = "\n\n---\n\n".join(
-            c["content"] for c in client_systems if isinstance(c.get("content"), str)
-        )
-        if content:
-            messages.insert(0, {"role": "system", "content": content})
+    # text_of e não isinstance(str): `content` em lista de partes tipadas é
+    # protocolo OpenAI válido, e antes era descartado — o system do cliente
+    # sumia E o fallback abaixo não rodava (o `if` já tinha sido tomado),
+    # deixando a request sem instrução nenhuma.
+    client_system_text = "\n\n---\n\n".join(
+        filter(None, (text_of(c.get("content")) for c in client_systems))
+    )
+
+    # A condição é o TEXTO, não a presença da mensagem: um system vazio não
+    # carrega instrução, então não deve suprimir o prompt da stack. Antes,
+    # `{"role":"system","content":""}` engolia a configuração da conta e não
+    # colocava nada no lugar.
+    if client_system_text:
+        messages.insert(0, {"role": "system", "content": client_system_text})
     else:
         system_message = await build_stack_system_message(messages, entry)
         if system_message:
@@ -2988,6 +2996,11 @@ async def extract_document(
     request: Request,
     file: UploadFile = File(...),
     schema: str = Form(...),
+    # mesmos papéis do /v1/chat/completions, só que em multipart (tem um
+    # arquivo junto, então não dá pra ser JSON). A semântica é idêntica de
+    # propósito: quem já integra com o chat não aprende regra nova.
+    system: str | None = Form(None),
+    user: str | None = Form(None),
     max_tokens: int | None = Form(None, gt=0, le=DOCUMENT_MAX_TOKENS_CEILING),
     authorization: str | None = Header(None),
 ):
@@ -3093,7 +3106,28 @@ async def extract_document(
             log_gateway_request(**log_ctx, status_code=500, stream=False)
             raise HTTPException(status_code=500, detail=str(e))
 
-        messages = document_extract.build_messages(text)
+        # `user` COMPÕE com a instrução padrão (ver build_messages): o cliente
+        # acrescenta contexto do documento sem poder remover o "não invente,
+        # use null", que é a garantia contra campo fabricado.
+        messages = document_extract.build_messages(text, user)
+
+        # `system` segue EXATAMENTE a regra do chat: com conteúdo, substitui o
+        # prompt da stack; ausente ou vazio, vale o da stack (resolvido pela
+        # chave). Vazio não substitui nada — mesmo motivo do chat: um system
+        # sem instrução não deve apagar a configuração da conta.
+        #
+        # Sem RAG, ao contrário do chat: aqui o contexto relevante é o
+        # documento que acabou de ser enviado. Trechos da base de conhecimento
+        # competiriam com ele e abririam espaço pro modelo preencher um campo
+        # com dado de OUTRO documento — o oposto do que a extração promete.
+        # Por isso não reaproveita build_stack_system_message, que traz os dois.
+        system_text = (system or "").strip()
+        if not system_text:
+            stack, _ = resolve_key_stack(entry)
+            system_text = ((stack or {}).get("system_prompt") or "").strip()
+        if system_text:
+            messages.insert(0, {"role": "system", "content": system_text})
+
         payload = {
             "model": effective_model_name(stack_id, rewrite_model, machine),
             "messages": messages,

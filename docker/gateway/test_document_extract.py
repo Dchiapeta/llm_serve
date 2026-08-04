@@ -152,6 +152,23 @@ def test_check_size_usa_o_teto_do_plano():
 # ---------- prompt ----------
 
 
+def test_build_messages_compoe_instrucao_do_cliente():
+    """`user` do multipart entra ENTRE a instrução padrão e o documento —
+    compõe, não substitui. Se substituísse, o cliente removeria sem querer o
+    "não invente", que é a garantia contra campo fabricado."""
+    content = build_messages("DOC", "Isto é um contrato de locação.")[0]["content"]
+    assert "nunca invente" in content, "garantia do servidor foi perdida"
+    assert "contrato de locação" in content
+    assert content.index("nunca invente") < content.index("contrato de locação")
+    assert content.index("contrato de locação") < content.index("DOC")
+
+
+def test_build_messages_ignora_instrucao_em_branco():
+    """String vazia/espaços não devem inserir um bloco de contexto vazio."""
+    for vazio in (None, "", "   ", "\n"):
+        assert "Contexto adicional" not in build_messages("DOC", vazio)[0]["content"]
+
+
 def test_build_messages_embute_o_documento():
     msgs = build_messages("CONTEUDO EXTRAIDO")
     assert len(msgs) == 1

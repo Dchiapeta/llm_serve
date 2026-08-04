@@ -8,7 +8,7 @@ um 400 num bloco antigo se repete indefinidamente — foi exatamente o que
 aconteceu em produção no Pro (29/07/2026).
 """
 
-from content_policy import MEDIA_DROPPED_NOTE, clamp_media, count_images
+from content_policy import MEDIA_DROPPED_NOTE, clamp_media, count_images, text_of
 
 
 def _img(n: int = 1) -> dict:
@@ -195,3 +195,37 @@ def test_note_template_tem_os_dois_placeholders():
     """Se alguém editar a mensagem e tirar um placeholder, o .format() explode
     em produção no meio de uma request."""
     assert "{n}" in MEDIA_DROPPED_NOTE and "{limit}" in MEDIA_DROPPED_NOTE
+
+
+# ---------- text_of: o system prompt que sumia ----------
+
+
+def test_text_of_string():
+    assert text_of("você é um assistente jurídico") == "você é um assistente jurídico"
+
+
+def test_text_of_lista_de_partes():
+    """content em lista é protocolo OpenAI válido. Antes era descartado, e o
+    system do cliente sumia junto com o fallback da stack."""
+    content = [{"type": "text", "text": "parte um"}, {"type": "text", "text": " e dois"}]
+    assert text_of(content) == "parte um e dois"
+
+
+def test_text_of_ignora_partes_nao_texto():
+    content = [_img(), {"type": "text", "text": "só isto"}]
+    assert text_of(content) == "só isto"
+
+
+def test_text_of_vazio_para_conteudo_sem_texto():
+    """O caso que decide o fallback: sem texto aproveitável, quem chama trata
+    como 'não veio system' e injeta o prompt da stack."""
+    assert text_of("") == ""
+    assert text_of([]) == ""
+    assert text_of([_img()]) == ""
+    assert text_of(None) == ""
+    assert text_of({"type": "text", "text": "dict solto não é lista"}) == ""
+
+
+def test_text_of_parte_malformada_nao_explode():
+    """Parte sem "text" ou não-dict vem de cliente, não pode derrubar a request."""
+    assert text_of([{"type": "text"}, "string solta", None, {"type": "text", "text": "ok"}]) == "ok"

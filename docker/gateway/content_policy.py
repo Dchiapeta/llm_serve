@@ -44,6 +44,31 @@ MEDIA_DROPPED_NOTE = (
 IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 
 
+def text_of(content) -> str:
+    """Texto de um `content` de mensagem, aceitando os DOIS formatos que o
+    protocolo OpenAI permite: string crua ou lista de partes tipadas
+    ([{"type": "text", "text": ...}, ...]).
+
+    Existe por causa de um bug de descarte silencioso no system prompt: o
+    caminho do chat só considerava `content` quando era `str`, então um
+    system em formato de lista — protocolo válido, e cada vez mais comum —
+    era jogado fora. E, como o cliente ainda assim "tinha mandado um system",
+    o fallback do prompt da stack também não rodava: a request seguia SEM
+    instrução nenhuma, nem a do cliente nem a da plataforma.
+
+    Partes não-texto (imagem, áudio) são ignoradas de propósito: quem chama
+    isto quer instrução, e uma imagem no system não vira texto."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
 def count_images(messages: list) -> int:
     """Quantas partes de imagem existem no corpo, somando todas as mensagens."""
     total = 0

@@ -424,6 +424,21 @@ Isso é intencional — ferramentas como Cursor e Claude Code embutem o próprio
 prompt e quebrariam se recebessem outro por cima. Se você depende do system prompt
 configurado na conta, **não envie um `system`**.
 
+A regra completa, incluindo o caso do `system` sem conteúdo:
+
+| O que você envia | O que vale |
+|---|---|
+| Nenhuma mensagem `system` | System prompt + RAG configurados na sua stack |
+| `system` com conteúdo | O seu conteúdo (a configuração da stack e o RAG não entram) |
+| `system` vazio, ou sem nenhuma parte de texto | System prompt + RAG da stack — um `system` sem instrução não substitui nada |
+
+O `content` do `system` pode ser string ou lista de partes
+(`[{"type": "text", "text": "..."}]`); os dois formatos são lidos igualmente. Partes que
+não são texto (imagem, por exemplo) são ignoradas para esse fim.
+
+Nada disso exige mandar nada além da chave: é ela que identifica a sua stack, e a
+configuração viaja junto automaticamente.
+
 ---
 
 ## Extração estruturada de documento (PDF → JSON)
@@ -442,6 +457,8 @@ Content-Type: multipart/form-data
 |---|---|---|
 | `file` | sim | O PDF |
 | `schema` | sim | JSON Schema (como string) descrevendo os campos a extrair |
+| `system` | não | Substitui o system prompt configurado na sua stack (mesma regra do chat) |
+| `user` | não | Contexto adicional sobre este documento — **soma** à instrução de extração |
 | `max_tokens` | não | Teto da resposta. Default 4000, máximo 16000 |
 
 ```bash
@@ -493,9 +510,61 @@ um campo que pode legitimamente não existir no documento, declare-o anulável:
 Assim o modelo tem como dizer "não achei" — e a instrução que enviamos ao modelo pede
 exatamente isso (omitir ou usar `null` em vez de preencher com um valor plausível).
 
-Use `required` **só** para campos que o documento sempre contém. Um campo em `required`
-que falta no documento é o pior caso: o modelo não pode omitir nem anular, então
-fabrica o valor, e o resultado passa na validação sendo falso.
+Só que existe uma segunda armadilha, na direção oposta:
+
+> **Campo fora de `required` é omitido em silêncio.** Pelo JSON Schema, campo não
+> obrigatório é opcional — a gramática permite não emitir a chave, e o modelo faz o
+> caminho mais barato: some com o campo em vez de procurar o dado. Você recebe `200`
+> com JSON válido e um campo a menos, sem aviso nenhum.
+
+A combinação que resolve as duas é **`required` em todos os campos** + **tipo anulável**
+naqueles que podem legitimamente faltar:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "numero_nota":   {"type": "string"},
+    "cnpj_emitente": {"type": ["string", "null"]},
+    "valor_total":   {"type": "number"}
+  },
+  "required": ["numero_nota", "cnpj_emitente", "valor_total"]
+}
+```
+
+Assim o campo **sempre** aparece na resposta e vem `null` quando realmente não está no
+documento. Deixe fora de `required` apenas o que você aceita não receber.
+
+O mesmo vale **dentro** de arrays e objetos aninhados: cada objeto de uma lista precisa do
+próprio `required`, senão os itens voltam com campos faltando pelo mesmo motivo.
+
+### `system` e `user`: a mesma regra do chat
+
+Os papéis funcionam aqui exatamente como em `/v1/chat/completions` — só viajam como campos
+do multipart, porque há um arquivo na mesma requisição.
+
+| Você envia | O que acontece |
+|---|---|
+| Nada | Vale o system prompt configurado na sua stack (resolvido pela chave) |
+| `system` com conteúdo | Substitui o system prompt da stack |
+| `system` vazio | Vale o da stack — vazio não substitui nada |
+| `user` | **Soma** à instrução de extração, não a substitui |
+
+```bash
+curl -X POST https://SEU-GATEWAY/v1/documents/extract \
+  -H "Authorization: Bearer $STAC_API_KEY" \
+  -F file=@contrato.pdf \
+  -F 'schema={...}' \
+  -F 'user=Este é um contrato de locação. A data que importa é a de vencimento.'
+```
+
+A assimetria entre os dois é proposital: `system` é **configuração** (faz sentido trocar),
+`user` é **tarefa** (soma). Se o `user` substituísse, você removeria sem querer a instrução
+que impede o modelo de inventar valores — a garantia mais importante da extração.
+
+A base de conhecimento (RAG) **não** é usada neste endpoint, de propósito: aqui o contexto
+relevante é o documento que você enviou, e trechos de outros documentos aumentariam o
+risco de um campo ser preenchido com dado que não está no seu PDF.
 
 ### Limites
 

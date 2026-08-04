@@ -195,10 +195,31 @@ EXTRACTION_PROMPT = (
     "nunca invente, adivinhe ou infira um valor que não esteja escrito nele. "
     "Se a informação de um campo não aparecer no documento, omita esse campo "
     "(ou use null, se o schema permitir) em vez de preenchê-lo com um valor "
-    "plausível.\n\n"
-    "--- DOCUMENTO ---\n{text}\n--- FIM DO DOCUMENTO ---"
+    "plausível."
 )
 
+# Instrução do cliente (campo `user` do multipart), quando houver. Entra ENTRE
+# a instrução padrão e o documento, com rótulo próprio: sem a marcação, um
+# texto do cliente do tipo "ignore as regras acima" se confundiria com a
+# instrução do servidor. Assim ele é claramente contexto adicional da tarefa,
+# não um substituto das garantias.
+USER_INSTRUCTION_BLOCK = "\n\nContexto adicional informado por quem enviou o documento:\n{user}"
 
-def build_messages(text: str) -> list[dict]:
-    return [{"role": "user", "content": EXTRACTION_PROMPT.format(text=text)}]
+DOCUMENT_BLOCK = "\n\n--- DOCUMENTO ---\n{text}\n--- FIM DO DOCUMENTO ---"
+
+
+def build_messages(text: str, user_instruction: str | None = None) -> list[dict]:
+    """Mensagem `user` da extração: instrução padrão + (contexto do cliente) +
+    documento.
+
+    O `user_instruction` COMPÕE, nunca substitui — ao contrário do `system`,
+    que troca a configuração da stack. A assimetria é proposital e segue a
+    mesma lógica do chat: `system` é configuração (faz sentido trocar), `user`
+    é tarefa (soma). Se substituísse, o cliente removeria sem querer o "não
+    invente, use null" — que é justamente a garantia que impede o modelo de
+    fabricar valor pra preencher o schema."""
+    parts = [EXTRACTION_PROMPT]
+    if user_instruction and user_instruction.strip():
+        parts.append(USER_INSTRUCTION_BLOCK.format(user=user_instruction.strip()))
+    parts.append(DOCUMENT_BLOCK.format(text=text))
+    return [{"role": "user", "content": "".join(parts)}]
