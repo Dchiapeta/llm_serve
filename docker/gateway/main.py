@@ -47,8 +47,10 @@ import jsonschema
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 import document_extract
+import document_generate
 from anthropic_compat import (
     anthropic_sse_from_openai_stream,
     anthropic_to_openai_request,
@@ -479,7 +481,16 @@ async def reject_oversized_upload(request: Request, call_next):
     Sem Content-Length (chunked) não há o que checar — segue e cai no teto de
     `file.size` depois do parse. Vale a mesma lógica do MAX_BODY_BYTES do
     proxy: isto é defesa contra corpo absurdo, não o controle de custo fino
-    (que é rate limit + quota + tetos por plano)."""
+    (que é rate limit + quota + tetos por plano).
+
+    /v1/images/extract entra no mesmo guard que /v1/documents/extract, com o
+    teto de bytes de imagem (menor, ver document_extract.py) em vez do de
+    documento.
+
+    /v1/documents/generate entra no mesmo guard: o corpo ali é JSON (sem
+    multipart, sem spool em disco), mas o FastAPI ainda lê o corpo inteiro
+    pra RAM antes do handler rodar — sem este corte, um Content-Length
+    gigante é lido por completo antes de qualquer autenticação."""
     if request.url.path == "/v1/documents/extract":
         declared = request.headers.get("content-length")
         if declared and declared.isdigit():
@@ -488,6 +499,27 @@ async def reject_oversized_upload(request: Request, call_next):
             # boundaries, então comparar cru contra o teto do arquivo recusaria
             # upload legítimo no limite.
             ceiling = document_extract.max_limit_bytes() + MAX_SCHEMA_BYTES + 65536
+            if int(declared) > ceiling:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "corpo da requisição excede o limite"},
+                )
+    elif request.url.path == "/v1/images/extract":
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit():
+            ceiling = document_extract.max_limit_image_bytes() + MAX_SCHEMA_BYTES + 65536
+            if int(declared) > ceiling:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "corpo da requisição excede o limite"},
+                )
+    elif request.url.path == "/v1/documents/generate":
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit():
+            # margem sobre o teto de bytes do HTML: o corpo JSON carrega o
+            # HTML dentro de uma chave (`{"html": "..."}`), então o overhead
+            # da própria envelope JSON também precisa de folga.
+            ceiling = document_generate.max_limit_bytes() + 4096
             if int(declared) > ceiling:
                 return JSONResponse(
                     status_code=413,
@@ -2952,13 +2984,14 @@ def check_concurrency(flight_key: tuple[str, str], machine: dict, plan: str) -> 
         )
 
 
-# ---------- Extração estruturada de documento (PDF → JSON) ----------
+# ---------- Extração estruturada de documento/imagem (PDF ou JPEG/PNG/WEBP → JSON) ----------
 #
-# ATENÇÃO À ORDEM: esta rota tem que ser registrada ANTES do catch-all
+# ATENÇÃO À ORDEM: estas rotas têm que ser registradas ANTES do catch-all
 # /v1/{path:path} logo abaixo. O Starlette casa rotas na ordem de registro, e
-# o catch-all engoliria "documents/extract" — que não está em ALLOWED_V1 e
-# viraria um 404 sem explicação nenhuma.
+# o catch-all engoliria "documents/extract"/"images/extract" — que não estão
+# em ALLOWED_V1 e virariam um 404 sem explicação nenhuma.
 DOCUMENT_PATH = "documents/extract"
+IMAGE_PATH = "images/extract"
 # max_tokens da geração. Nada a ver com o piso MIN_MAX_TOKENS do chat: ali o
 # piso existe porque um modelo com thinking gasta milhares de tokens antes da
 # resposta; aqui o thinking é desligado (chat_template_kwargs abaixo) e a saída
@@ -2997,43 +3030,17 @@ def validate_extraction_output(content: str, schema: dict) -> dict:
     return data
 
 
-@app.post("/v1/documents/extract")
-async def extract_document(
-    request: Request,
-    file: UploadFile = File(...),
-    schema: str = Form(...),
-    # mesmos papéis do /v1/chat/completions, só que em multipart (tem um
-    # arquivo junto, então não dá pra ser JSON). A semântica é idêntica de
-    # propósito: quem já integra com o chat não aprende regra nova.
-    system: str | None = Form(None),
-    user: str | None = Form(None),
-    max_tokens: int | None = Form(None, gt=0, le=DOCUMENT_MAX_TOKENS_CEILING),
-    authorization: str | None = Header(None),
-):
-    """Recebe um PDF e devolve o JSON aderente ao schema que o cliente mandou.
+async def _authenticate_for_extraction(
+    authorization: str | None, schema: str
+) -> tuple[dict, str, str, dict]:
+    """Auth + validação de schema — a parte IDÊNTICA entre /v1/documents/extract
+    e /v1/images/extract. Devolve (entry, key_hash, account_id, parsed_schema).
 
-    É o único endpoint do gateway que faz trabalho de CPU próprio antes de
-    chamar o pod (extração/OCR, ver document_extract.py) — todo o resto é
-    proxy. As duas consequências que o corpo abaixo respeita:
-
-      * a extração roda em asyncio.to_thread, NUNCA inline: o gateway é um
-        processo único e também atende todo o tráfego de chat, então OCR no
-        event loop travaria as requisições de todos os outros clientes;
-      * timeout próprio (document_client), porque extração + geração não
-        cabe nos 60s do proxy_client de chat.
-
-    Não passa por validate_body de propósito: aquele caminho existe pra
-    sanear corpo de CLIENTE (system prompt, RAG, clamp de parâmetros, filtro
-    de roles). Aqui o corpo é construído inteiro pelo servidor — o cliente
-    não controla mensagens, sampling nem modelo. O único dado dele que entra
-    no payload é o schema, e ele é validado antes."""
-    started = time.monotonic()
-
-    # Autenticar ANTES de validar o schema, mesmo que o schema seja mais barato
-    # de checar: validar schema é trabalho de CPU (check_schema percorre o
-    # metaschema, e schema recursivo pode ir a RecursionError), e nada disso
-    # deve estar disponível a quem não tem chave. O authenticate é barato
-    # (key_cache em memória) e o rate limit passa a valer pra este caminho.
+    Autenticar ANTES de validar o schema, mesmo que o schema seja mais barato
+    de checar: validar schema é trabalho de CPU (check_schema percorre o
+    metaschema, e schema recursivo pode ir a RecursionError), e nada disso
+    deve estar disponível a quem não tem chave. O authenticate é barato
+    (key_cache em memória) e o rate limit passa a valer pra este caminho."""
     entry, key_hash = await authenticate(authorization)
     check_rate_limit(key_hash)
     account_id = entry["account_id"]
@@ -3063,6 +3070,261 @@ async def extract_document(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"schema inválido: {str(e)[:300]}")
 
+    return entry, key_hash, account_id, parsed_schema
+
+
+async def _run_extraction_pipeline(
+    *,
+    text: str,
+    pages: int,
+    ocr_used: bool,
+    parsed_schema: dict,
+    user: str | None,
+    system: str | None,
+    entry: dict,
+    stack_id: str,
+    machine: dict,
+    rewrite_model: str | None,
+    max_tokens: int | None,
+    authorization: str | None,
+    flight_key: tuple[str, str],
+    log_ctx: dict,
+    path_label: str,
+) -> dict:
+    """Monta o prompt, chama o pod e valida a saída — a parte IDÊNTICA entre
+    /v1/documents/extract e /v1/images/extract, a partir do momento em que já
+    se tem (texto, páginas, ocr_used) em mãos. O que muda entre as duas rotas
+    é só COMO chegar até esses três valores (parsing do upload + extração)."""
+    # `user` COMPÕE com a instrução padrão (ver build_messages): o cliente
+    # acrescenta contexto do documento sem poder remover o "não invente,
+    # use null", que é a garantia contra campo fabricado.
+    messages = document_extract.build_messages(text, user)
+
+    # `system` segue EXATAMENTE a regra do chat: com conteúdo, substitui o
+    # prompt da stack; ausente ou vazio, vale o da stack (resolvido pela
+    # chave). Vazio não substitui nada — mesmo motivo do chat: um system
+    # sem instrução não deve apagar a configuração da conta.
+    #
+    # Sem RAG, ao contrário do chat: aqui o contexto relevante é o
+    # documento que acabou de ser enviado. Trechos da base de conhecimento
+    # competiriam com ele e abririam espaço pro modelo preencher um campo
+    # com dado de OUTRO documento — o oposto do que a extração promete.
+    # Por isso não reaproveita build_stack_system_message, que traz os dois.
+    system_text = (system or "").strip()
+    if not system_text:
+        stack, _ = resolve_key_stack(entry)
+        system_text = ((stack or {}).get("system_prompt") or "").strip()
+    if system_text:
+        messages.insert(0, {"role": "system", "content": system_text})
+
+    payload = {
+        "model": effective_model_name(stack_id, rewrite_model, machine),
+        "messages": messages,
+        # o Form já garante 0 < max_tokens <= CEILING; o clamp real contra a
+        # janela do modelo vem do apply_context_budget abaixo
+        "max_tokens": max_tokens or DOCUMENT_MAX_TOKENS,
+        "stream": False,
+        # temperatura 0: extração é determinística por natureza — o mesmo
+        # documento com o mesmo schema deve dar o mesmo JSON. Sampling
+        # aqui só produziria variação entre chamadas idênticas.
+        "temperature": 0.0,
+        # o que garante JSON aderente ao schema em vez de "JSON provável":
+        # o vLLM converte isto em restrição de gramática. Não exige flag no
+        # template — StructuredOutputsConfig.backend já é "auto" por default
+        # na 0.24 (a tentativa de fixar o backend explicitamente quebrou o
+        # boot dos pods; ver migration 0048).
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "document_extraction", "schema": parsed_schema},
+        },
+        # extração é tarefa fechada: o raciocínio custaria milhares de
+        # tokens e segundos sem melhorar o resultado. E, nos planos com
+        # thinking ligado, o bloco <think> disputaria com a gramática do
+        # guided decoding — desligar remove o problema na origem em vez de
+        # depender do filtro de saída (que ainda existe abaixo, por
+        # segurança).
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    # O conteúdo enviado é a maior fatia do prompt, e um documento/imagem no
+    # teto do plano passa fácil da janela do modelo. Sem isto o vLLM devolveria
+    # 400 e o cliente veria o 502 genérico de "falha no modelo" — culpando
+    # o servidor por um conteúdo grande demais. apply_context_budget clampa
+    # o max_tokens ao que sobra e, se não sobrar espaço viável de resposta,
+    # levanta ContextWindowExceeded (400 com mensagem explicando o
+    # tamanho) — mesmo caminho e mesma mensagem do chat.
+    est_tokens = estimate_prompt_tokens(messages)
+    try:
+        apply_context_budget(payload, machine, "max_tokens", est_tokens)
+    except ContextWindowExceeded:
+        log_gateway_request(**log_ctx, status_code=400, stream=False)
+        # mensagem reescrita: a original é de chat ("comece uma sessão nova
+        # com /clear", "configure CLAUDE_CODE_AUTO_COMPACT_WINDOW") e não
+        # faz sentido nenhum pra quem subiu um documento/imagem — aqui o que
+        # resolve é mandar menos conteúdo. Mesma exceção (mesmo status e
+        # mesmo shape de corpo do exception handler), só o texto muda.
+        # "página(s)" só entra pro caminho de PDF: imagem sempre tem pages=1
+        # fixo, e citar "1 página" nesse caso seria um detalhe sem sentido
+        # pra quem mandou uma imagem solta.
+        content_desc = (
+            f"o documento tem {pages} página(s) e ocupa"
+            if path_label == "documents/extract"
+            else "o conteúdo enviado ocupa"
+        )
+        raise ContextWindowExceeded(
+            f"{content_desc} ~{est_tokens} tokens, o que não deixa espaço "
+            f"para a resposta na janela de contexto deste plano "
+            f"({machine.get('max_model_len')} tokens). Envie menos conteúdo por "
+            "requisição (ex.: divida o documento) ou use um plano com janela maior."
+        )
+
+    try:
+        upstream = await document_client.post(
+            f"{machine['public_url']}/v1/chat/completions",
+            json=payload,
+            headers={"Authorization": authorization},
+        )
+    except httpx.HTTPError as e:
+        logger.warning("%s: upstream indisponível para %s (%s)", path_label, flight_key, e)
+        log_gateway_request(**log_ctx, status_code=503, stream=False)
+        raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
+
+    if upstream.status_code != 200:
+        # o corpo do vLLM pode citar a public_url do pod: fica no log do
+        # servidor, o cliente recebe mensagem genérica (mesma disciplina
+        # do proxy)
+        logger.warning(
+            "%s: vLLM respondeu %s (%s)",
+            path_label, upstream.status_code, upstream.text[:500],
+        )
+        log_gateway_request(**log_ctx, status_code=502, stream=False)
+        raise HTTPException(
+            status_code=502, detail="falha ao processar o documento no modelo"
+        )
+
+    # 200 com corpo inesperado (não-JSON, ou sem choices) acontece: um proxy
+    # no caminho devolvendo página de erro com status 200, ou o agent
+    # respondendo algo fora do shape. Sem este guard viraria
+    # ValueError/AttributeError → 500 cru e sem log nenhum.
+    try:
+        body = upstream.json()
+        usage = body.get("usage")
+        choice = (body.get("choices") or [{}])[0]
+        content = choice.get("message", {}).get("content") or ""
+        finish_reason = choice.get("finish_reason")
+    except (ValueError, AttributeError, KeyError, IndexError, TypeError) as e:
+        logger.warning(
+            "%s: resposta fora do formato esperado (%s): %s",
+            path_label, e, upstream.text[:300],
+        )
+        log_gateway_request(**log_ctx, status_code=502, stream=False)
+        raise HTTPException(
+            status_code=502, detail="resposta inesperada do modelo"
+        )
+    # rede de proteção: enable_thinking=False já deveria bastar, mas se um
+    # template ignorar a flag o JSON vem depois de um </think> e o
+    # json.loads falharia com um 502 enganoso.
+    _, content = split_reasoning(content)
+
+    # Truncado por teto de tokens: o JSON está pela metade e o validate
+    # abaixo falharia com "não devolveu JSON aderente" — culpando o modelo
+    # por um problema de espaço. Acontece justamente quando o
+    # apply_context_budget clampou o max_tokens para caber num conteúdo
+    # grande: sobra janela pro prompt, não pra resposta. Vale um erro
+    # próprio porque a ação do cliente é diferente (dividir o conteúdo ou
+    # enxugar o schema), não "tentar de novo".
+    if finish_reason == "length":
+        logger.warning(
+            "%s: resposta truncada (max_tokens=%s, est_prompt=%s)",
+            path_label, payload.get("max_tokens"), est_tokens,
+        )
+        log_gateway_request(**log_ctx, status_code=400, stream=False, usage=usage)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    "a resposta não caberia no espaço disponível: o conteúdo enviado "
+                    "ocupa quase toda a janela de contexto do plano e não sobra lugar "
+                    "para o JSON completo. Envie menos conteúdo por requisição ou "
+                    "reduza o número de campos do schema."
+                ),
+                "max_tokens_disponivel": payload.get("max_tokens"),
+                "raw_output": content[:2000],
+            },
+        )
+
+    try:
+        # to_thread: `parsed_schema` é do cliente e jsonschema compila
+        # `pattern` com backtracking — ver validate_extraction_output.
+        data = await asyncio.to_thread(
+            validate_extraction_output, content, parsed_schema
+        )
+    # except largo de propósito: além de JSONDecodeError/ValidationError,
+    # a resolução de referências levanta _WrappedReferencingError, que não
+    # herda de nenhuma das duas. Estreitar aqui reintroduz o 500 opaco.
+    except Exception as e:
+        # com guided decoding ativo isto é raro (a gramática do vLLM não
+        # deixaria sair JSON malformado), então quase sempre aponta pra
+        # outra coisa: schema que o backend não suporta, ou resposta
+        # interceptada no caminho. Devolver o texto cru é o que torna esse
+        # diagnóstico possível do lado do cliente.
+        logger.warning("%s: saída não aderente ao schema (%s)", path_label, e)
+        log_gateway_request(**log_ctx, status_code=502, stream=False, usage=usage)
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "o modelo não devolveu JSON aderente ao schema",
+                "reason": str(e)[:300],
+                "raw_output": content[:2000],
+            },
+        )
+
+    log_gateway_request(**log_ctx, status_code=200, stream=False, usage=usage)
+    return {
+        "data": data,
+        "pages": pages,
+        "ocr_used": ocr_used,
+        "usage": usage,
+    }
+
+
+@app.post("/v1/documents/extract")
+async def extract_document(
+    request: Request,
+    file: UploadFile = File(...),
+    schema: str = Form(...),
+    # mesmos papéis do /v1/chat/completions, só que em multipart (tem um
+    # arquivo junto, então não dá pra ser JSON). A semântica é idêntica de
+    # propósito: quem já integra com o chat não aprende regra nova.
+    system: str | None = Form(None),
+    user: str | None = Form(None),
+    max_tokens: int | None = Form(None, gt=0, le=DOCUMENT_MAX_TOKENS_CEILING),
+    authorization: str | None = Header(None),
+):
+    """Recebe um PDF e devolve o JSON aderente ao schema que o cliente mandou.
+
+    É um dos dois endpoints do gateway que fazem trabalho de CPU próprio antes
+    de chamar o pod (extração/OCR, ver document_extract.py e a rota irmã
+    /v1/images/extract) — todo o resto é proxy. As duas consequências que o
+    corpo abaixo respeita:
+
+      * a extração roda em asyncio.to_thread, NUNCA inline: o gateway é um
+        processo único e também atende todo o tráfego de chat, então OCR no
+        event loop travaria as requisições de todos os outros clientes;
+      * timeout próprio (document_client), porque extração + geração não
+        cabe nos 60s do proxy_client de chat.
+
+    Não passa por validate_body de propósito: aquele caminho existe pra
+    sanear corpo de CLIENTE (system prompt, RAG, clamp de parâmetros, filtro
+    de roles). Aqui o corpo é construído inteiro pelo servidor — o cliente
+    não controla mensagens, sampling nem modelo. O único dado dele que entra
+    no payload é o schema, e ele é validado antes."""
+    started = time.monotonic()
+
+    entry, key_hash, account_id, parsed_schema = await _authenticate_for_extraction(
+        authorization, schema
+    )
+
     # Corte grosso ANTES de qualquer coisa cara: `file.size` vem do parser
     # multipart do Starlette (que já fez spool em disco), então dá pra recusar
     # um upload absurdo sem carregá-lo em RAM com file.read() e sem pagar o
@@ -3072,7 +3334,8 @@ async def extract_document(
         raise HTTPException(status_code=413, detail="documento excede o limite do serviço")
 
     # o teto de bytes é do PLANO, e o plano confiável vem de resolve_route
-    # (key_plan acima é só o da chave, pode não ter stack resolvida)
+    # (key_plan resolvido dentro de _authenticate_for_extraction é só o da
+    # chave, pode não ter stack resolvida)
     machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
     await maybe_touch(stack_id, machine["id"])
 
@@ -3112,22 +3375,237 @@ async def extract_document(
             log_gateway_request(**log_ctx, status_code=500, stream=False)
             raise HTTPException(status_code=500, detail=str(e))
 
-        # `user` COMPÕE com a instrução padrão (ver build_messages): o cliente
-        # acrescenta contexto do documento sem poder remover o "não invente,
-        # use null", que é a garantia contra campo fabricado.
-        messages = document_extract.build_messages(text, user)
+        return await _run_extraction_pipeline(
+            text=text, pages=pages, ocr_used=ocr_used, parsed_schema=parsed_schema,
+            user=user, system=system, entry=entry, stack_id=stack_id, machine=machine,
+            rewrite_model=rewrite_model, max_tokens=max_tokens, authorization=authorization,
+            flight_key=flight_key, log_ctx=log_ctx, path_label="documents/extract",
+        )
+    finally:
+        # nunca vazar o contador: com in_flight preso em > 0 a auto-pausa da
+        # máquina nunca mais dispararia
+        release_flight(flight_key)
 
-        # `system` segue EXATAMENTE a regra do chat: com conteúdo, substitui o
-        # prompt da stack; ausente ou vazio, vale o da stack (resolvido pela
-        # chave). Vazio não substitui nada — mesmo motivo do chat: um system
-        # sem instrução não deve apagar a configuração da conta.
-        #
-        # Sem RAG, ao contrário do chat: aqui o contexto relevante é o
-        # documento que acabou de ser enviado. Trechos da base de conhecimento
-        # competiriam com ele e abririam espaço pro modelo preencher um campo
-        # com dado de OUTRO documento — o oposto do que a extração promete.
-        # Por isso não reaproveita build_stack_system_message, que traz os dois.
-        system_text = (system or "").strip()
+
+@app.post("/v1/images/extract")
+async def extract_image(
+    request: Request,
+    file: UploadFile = File(...),
+    schema: str = Form(...),
+    system: str | None = Form(None),
+    user: str | None = Form(None),
+    max_tokens: int | None = Form(None, gt=0, le=DOCUMENT_MAX_TOKENS_CEILING),
+    authorization: str | None = Header(None),
+):
+    """Recebe uma imagem (JPEG/PNG/WEBP) e devolve o JSON aderente ao schema
+    que o cliente mandou. Irmã de /v1/documents/extract: mesmo contrato de
+    resposta, mesma disciplina de OCR bloqueante em thread — ver
+    document_extract.py e _run_extraction_pipeline acima.
+
+    Ao contrário de PDF, aqui não existe "texto embutido" a extrair: a imagem
+    inteira sempre passa por OCR (pytesseract), por isso `ocr_used` é sempre
+    True e `pages` é sempre 1 na resposta. Não usa modelo vision/multimodal —
+    o OCR roda no gateway (CPU), e o pod só recebe texto, exatamente como no
+    caminho de PDF."""
+    started = time.monotonic()
+
+    entry, key_hash, account_id, parsed_schema = await _authenticate_for_extraction(
+        authorization, schema
+    )
+
+    # mesmo corte grosso do PDF, teto próprio de imagem (ver document_extract.py)
+    if file.size is not None and file.size > document_extract.max_limit_image_bytes():
+        raise HTTPException(status_code=413, detail="imagem excede o limite do serviço")
+
+    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    await maybe_touch(stack_id, machine["id"])
+
+    image_bytes = await file.read()
+    try:
+        document_extract.check_image_size(len(image_bytes), effective_plan)
+    except document_extract.DocumentTooLarge as e:
+        raise HTTPException(status_code=413, detail=str(e))
+
+    flight_key = (stack_id, machine["id"])
+    in_flight[flight_key] += 1
+    check_concurrency(flight_key, machine, effective_plan)
+
+    log_ctx = dict(
+        account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
+        machine_id=machine["id"], path=IMAGE_PATH,
+        model=effective_model_name(stack_id, rewrite_model, machine),
+        user_agent=request.headers.get("user-agent"), started=started,
+    )
+
+    try:
+        try:
+            # to_thread: mesmo motivo do PDF — OCR é síncrono e pesado, não
+            # pode travar o event loop compartilhado com o tráfego de chat.
+            text, ocr_used = await asyncio.to_thread(
+                document_extract.extract_text_from_image, image_bytes, effective_plan
+            )
+        except document_extract.DocumentTooLarge as e:
+            log_gateway_request(**log_ctx, status_code=413, stream=False)
+            raise HTTPException(status_code=413, detail=str(e))
+        except (document_extract.UnreadableDocument, document_extract.EmptyDocument) as e:
+            log_gateway_request(**log_ctx, status_code=400, stream=False)
+            raise HTTPException(status_code=400, detail=str(e))
+        except document_extract.DocumentError as e:
+            logger.warning("images/extract: falha de extração (%s)", e)
+            log_gateway_request(**log_ctx, status_code=500, stream=False)
+            raise HTTPException(status_code=500, detail=str(e))
+
+        return await _run_extraction_pipeline(
+            text=text, pages=1, ocr_used=ocr_used, parsed_schema=parsed_schema,
+            user=user, system=system, entry=entry, stack_id=stack_id, machine=machine,
+            rewrite_model=rewrite_model, max_tokens=max_tokens, authorization=authorization,
+            flight_key=flight_key, log_ctx=log_ctx, path_label="images/extract",
+        )
+    finally:
+        release_flight(flight_key)
+
+
+# ---------- Geração de PDF a partir de HTML ----------
+#
+# Mesma razão de ordenação de /v1/documents/extract acima: precisa estar
+# registrado ANTES do catch-all /v1/{path:path}, senão "documents/generate"
+# (que não está em ALLOWED_V1) viraria 404 sem explicação.
+GENERATE_PATH = "documents/generate"
+
+# Só usados no modo por prompt (quando `user` chama o modelo pra escrever o
+# HTML) — mesmo papel de DOCUMENT_MAX_TOKENS/_CEILING no endpoint de extração.
+GENERATION_MAX_TOKENS = int(os.environ.get("GENERATION_MAX_TOKENS", "8000"))
+GENERATION_MAX_TOKENS_CEILING = int(os.environ.get("GENERATION_MAX_TOKENS_CEILING", "16000"))
+
+# Sem `machine`/pod envolvido no modo direto (HTML já pronto), o
+# in_flight/check_concurrency por máquina não protege esse caminho. Este
+# semáforo é quem protege o único processo do Railway de N renders pesados
+# simultâneos — vale para os dois modos, já que o custo de CPU do render é o
+# mesmo independente de quem escreveu o HTML.
+GENERATE_MAX_CONCURRENT = int(os.environ.get("GENERATE_MAX_CONCURRENT", "4"))
+generate_semaphore = asyncio.Semaphore(GENERATE_MAX_CONCURRENT)
+
+
+class GenerateDocumentRequest(BaseModel):
+    # Exatamente um dos dois: `html` é o documento já pronto (modo direto,
+    # sem modelo); `user` é a instrução do que gerar (modo por prompt, chama
+    # o modelo). Validado no handler porque a mensagem de erro precisa
+    # explicar a exclusividade — um Field de pydantic não expressaria isso
+    # bem.
+    html: str | None = None
+    user: str | None = None
+    # Só faz sentido junto de `user` (mesma semântica de /v1/documents/extract):
+    # com conteúdo, substitui o system prompt da stack; ausente ou vazio, usa
+    # o da stack.
+    system: str | None = None
+    max_tokens: int | None = Field(None, gt=0, le=GENERATION_MAX_TOKENS_CEILING)
+
+
+async def _render_pdf_guarded(
+    html: str, plan: str | None, log_ctx: dict, *, usage: dict | None = None
+) -> bytes:
+    """Semáforo de concorrência + render + tradução de erro — a parte comum
+    aos dois modos de /v1/documents/generate. `usage` só é não-None no modo
+    por prompt (é o consumo de tokens da chamada ao modelo que já aconteceu
+    antes desta função)."""
+    if generate_semaphore.locked():
+        log_gateway_request(**log_ctx, status_code=429, stream=False, usage=usage)
+        raise HTTPException(
+            status_code=429, detail="muitas gerações de PDF simultâneas, tente novamente"
+        )
+    async with generate_semaphore:
+        try:
+            return await asyncio.to_thread(document_generate.render_pdf, html, plan)
+        except document_generate.TooManyPages as e:
+            log_gateway_request(**log_ctx, status_code=413, stream=False, usage=usage)
+            raise HTTPException(status_code=413, detail=str(e))
+        except document_generate.RenderError as e:
+            log_gateway_request(**log_ctx, status_code=400, stream=False, usage=usage)
+            raise HTTPException(status_code=400, detail=str(e))
+        except document_generate.DocumentGenerateError as e:
+            logger.warning("documents/generate: falha de geração (%s)", e)
+            log_gateway_request(**log_ctx, status_code=500, stream=False, usage=usage)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/documents/generate")
+async def generate_document(
+    request: Request,
+    body: GenerateDocumentRequest,
+    authorization: str | None = Header(None),
+):
+    """Devolve o PDF renderizado, em um de dois modos:
+
+      * `html`: documento já pronto — conversão pura, sem inferência, sem
+        pod. Funciona mesmo com a stack pausada e não gasta tokens.
+      * `user` (+ `system` opcional): instrução do que gerar — o gateway
+        chama o modelo pedindo HTML (mesma regra de composição system/user
+        de /v1/documents/extract: `system` substitui o prompt da stack,
+        `user` soma à instrução fixa de geração) e renderiza a resposta.
+
+    Os dois modos são mutuamente exclusivos: misturar `html` com `user`
+    seria ambíguo (qual documento vale?), e por isso é rejeitado explicitamente
+    em vez de um dos dois ser ignorado em silêncio."""
+    started = time.monotonic()
+
+    if body.html and body.user:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "informe `html` (documento já pronto) OU `user` (instrução para o "
+                "modelo gerar o documento), não os dois"
+            ),
+        )
+    if not body.html and not body.user:
+        raise HTTPException(status_code=400, detail="informe `html` ou `user`")
+
+    entry, key_hash = await authenticate(authorization)
+    check_rate_limit(key_hash)
+    account_id = entry["account_id"]
+
+    # ---------- modo direto: HTML já pronto, sem modelo ----------
+    if body.html:
+        stack, plan = resolve_key_stack(entry)
+        stack_id = (stack or {}).get("id")
+        log_ctx = dict(
+            account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
+            machine_id=None, path=GENERATE_PATH, model=None,
+            user_agent=request.headers.get("user-agent"), started=started,
+        )
+        try:
+            document_generate.check_size(len(body.html.encode("utf-8")), plan)
+        except document_generate.HtmlTooLarge as e:
+            log_gateway_request(**log_ctx, status_code=413, stream=False)
+            raise HTTPException(status_code=413, detail=str(e))
+
+        pdf_bytes = await _render_pdf_guarded(body.html, plan, log_ctx)
+        log_gateway_request(**log_ctx, status_code=200, stream=False)
+        return Response(content=pdf_bytes, media_type="application/pdf")
+
+    # ---------- modo por prompt: o modelo escreve o HTML ----------
+    _, key_plan = resolve_key_stack(entry)
+    await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+
+    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    await maybe_touch(stack_id, machine["id"])
+
+    flight_key = (stack_id, machine["id"])
+    in_flight[flight_key] += 1
+    check_concurrency(flight_key, machine, effective_plan)
+
+    log_ctx = dict(
+        account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
+        machine_id=machine["id"], path=GENERATE_PATH,
+        model=effective_model_name(stack_id, rewrite_model, machine),
+        user_agent=request.headers.get("user-agent"), started=started,
+    )
+
+    try:
+        messages = document_generate.build_messages(body.user)
+
+        # mesma regra do chat e de /v1/documents/extract: `system` com
+        # conteúdo substitui o prompt da stack; ausente/vazio usa o da stack.
+        system_text = (body.system or "").strip()
         if not system_text:
             stack, _ = resolve_key_stack(entry)
             system_text = ((stack or {}).get("system_prompt") or "").strip()
@@ -3137,55 +3615,24 @@ async def extract_document(
         payload = {
             "model": effective_model_name(stack_id, rewrite_model, machine),
             "messages": messages,
-            # o Form já garante 0 < max_tokens <= CEILING; o clamp real contra a
-            # janela do modelo vem do apply_context_budget abaixo
-            "max_tokens": max_tokens or DOCUMENT_MAX_TOKENS,
+            "max_tokens": body.max_tokens or GENERATION_MAX_TOKENS,
             "stream": False,
-            # temperatura 0: extração é determinística por natureza — o mesmo
-            # documento com o mesmo schema deve dar o mesmo JSON. Sampling
-            # aqui só produziria variação entre chamadas idênticas.
-            "temperature": 0.0,
-            # o que garante JSON aderente ao schema em vez de "JSON provável":
-            # o vLLM converte isto em restrição de gramática. Não exige flag no
-            # template — StructuredOutputsConfig.backend já é "auto" por default
-            # na 0.24 (a tentativa de fixar o backend explicitamente quebrou o
-            # boot dos pods; ver migration 0048).
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": "document_extraction", "schema": parsed_schema},
-            },
-            # extração é tarefa fechada: o raciocínio custaria milhares de
-            # tokens e segundos sem melhorar o resultado. E, nos planos com
-            # thinking ligado, o bloco <think> disputaria com a gramática do
-            # guided decoding — desligar remove o problema na origem em vez de
-            # depender do filtro de saída (que ainda existe abaixo, por
-            # segurança).
+            # geração de documento não precisa de raciocínio visível: o
+            # </think> só disputaria espaço com o HTML e seria descartado por
+            # split_reasoning mesmo assim — desligar na origem evita o custo.
             "chat_template_kwargs": {"enable_thinking": False},
         }
 
-        # O documento é a maior fatia do prompt, e um PDF no teto do plano (30
-        # páginas) passa fácil da janela do modelo. Sem isto o vLLM devolveria
-        # 400 e o cliente veria o 502 genérico de "falha no modelo" — culpando
-        # o servidor por um documento grande demais. apply_context_budget clampa
-        # o max_tokens ao que sobra e, se não sobrar espaço viável de resposta,
-        # levanta ContextWindowExceeded (400 com mensagem explicando o
-        # tamanho) — mesmo caminho e mesma mensagem do chat.
         est_tokens = estimate_prompt_tokens(messages)
         try:
             apply_context_budget(payload, machine, "max_tokens", est_tokens)
         except ContextWindowExceeded:
             log_gateway_request(**log_ctx, status_code=400, stream=False)
-            # mensagem reescrita: a original é de chat ("comece uma sessão nova
-            # com /clear", "configure CLAUDE_CODE_AUTO_COMPACT_WINDOW") e não
-            # faz sentido nenhum pra quem subiu um PDF — aqui o que resolve é
-            # mandar menos páginas. Mesma exceção (mesmo status e mesmo shape
-            # de corpo do exception handler), só o texto muda.
             raise ContextWindowExceeded(
-                f"o documento tem {pages} página(s) e ocupa ~"
-                f"{est_tokens} tokens, o que não deixa espaço "
+                f"a instrução ocupa ~{est_tokens} tokens, o que não deixa espaço "
                 f"para a resposta na janela de contexto deste plano "
-                f"({machine.get('max_model_len')} tokens). Envie menos páginas por "
-                "requisição (ex.: divida o documento) ou use um plano com janela maior."
+                f"({machine.get('max_model_len')} tokens). Envie uma instrução menor "
+                "ou use um plano com janela maior."
             )
 
         try:
@@ -3195,57 +3642,44 @@ async def extract_document(
                 headers={"Authorization": authorization},
             )
         except httpx.HTTPError as e:
-            logger.warning("documents/extract: upstream indisponível para %s (%s)", flight_key, e)
+            logger.warning(
+                "documents/generate: upstream indisponível para %s (%s)", flight_key, e
+            )
             log_gateway_request(**log_ctx, status_code=503, stream=False)
             raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
 
         if upstream.status_code != 200:
-            # o corpo do vLLM pode citar a public_url do pod: fica no log do
-            # servidor, o cliente recebe mensagem genérica (mesma disciplina
-            # do proxy)
             logger.warning(
-                "documents/extract: vLLM respondeu %s (%s)",
+                "documents/generate: vLLM respondeu %s (%s)",
                 upstream.status_code, upstream.text[:500],
             )
             log_gateway_request(**log_ctx, status_code=502, stream=False)
-            raise HTTPException(
-                status_code=502, detail="falha ao processar o documento no modelo"
-            )
+            raise HTTPException(status_code=502, detail="falha ao gerar o documento no modelo")
 
-        # 200 com corpo inesperado (não-JSON, ou sem choices) acontece: um proxy
-        # no caminho devolvendo página de erro com status 200, ou o agent
-        # respondendo algo fora do shape. Sem este guard viraria
-        # ValueError/AttributeError → 500 cru e sem log nenhum.
         try:
-            body = upstream.json()
-            usage = body.get("usage")
-            choice = (body.get("choices") or [{}])[0]
+            resp_body = upstream.json()
+            usage = resp_body.get("usage")
+            choice = (resp_body.get("choices") or [{}])[0]
             content = choice.get("message", {}).get("content") or ""
             finish_reason = choice.get("finish_reason")
         except (ValueError, AttributeError, KeyError, IndexError, TypeError) as e:
             logger.warning(
-                "documents/extract: resposta fora do formato esperado (%s): %s",
+                "documents/generate: resposta fora do formato esperado (%s): %s",
                 e, upstream.text[:300],
             )
             log_gateway_request(**log_ctx, status_code=502, stream=False)
-            raise HTTPException(
-                status_code=502, detail="resposta inesperada do modelo"
-            )
-        # rede de proteção: enable_thinking=False já deveria bastar, mas se um
-        # template ignorar a flag o JSON vem depois de um </think> e o
-        # json.loads falharia com um 502 enganoso.
-        _, content = split_reasoning(content)
+            raise HTTPException(status_code=502, detail="resposta inesperada do modelo")
 
-        # Truncado por teto de tokens: o JSON está pela metade e o validate
-        # abaixo falharia com "não devolveu JSON aderente" — culpando o modelo
-        # por um problema de espaço. Acontece justamente quando o
-        # apply_context_budget clampou o max_tokens para caber num documento
-        # grande: sobra janela pro prompt, não pra resposta. Vale um erro
-        # próprio porque a ação do cliente é diferente (dividir o documento ou
-        # enxugar o schema), não "tentar de novo".
+        # rede de proteção: enable_thinking=False já deveria bastar, mas se um
+        # template ignorar a flag o HTML vem depois de um </think>.
+        _, content = split_reasoning(content)
+        # rede de proteção nº 2: modelo devolveu ```html ... ``` em volta do
+        # HTML apesar da instrução — ver document_generate.strip_html_fences.
+        content = document_generate.strip_html_fences(content)
+
         if finish_reason == "length":
             logger.warning(
-                "documents/extract: resposta truncada (max_tokens=%s, est_prompt=%s)",
+                "documents/generate: resposta truncada (max_tokens=%s, est_prompt=%s)",
                 payload.get("max_tokens"), est_tokens,
             )
             log_gateway_request(**log_ctx, status_code=400, stream=False, usage=usage)
@@ -3253,49 +3687,27 @@ async def extract_document(
                 status_code=400,
                 detail={
                     "message": (
-                        "a resposta não caberia no espaço disponível: o documento ocupa "
-                        "quase toda a janela de contexto do plano e não sobra lugar "
-                        "para o JSON completo. Envie menos páginas por requisição ou "
-                        "reduza o número de campos do schema."
+                        "o HTML gerado foi cortado: a instrução ocupa quase toda a janela "
+                        "de contexto do plano e não sobrou espaço para a resposta completa. "
+                        "Envie uma instrução menor ou aumente max_tokens."
                     ),
                     "max_tokens_disponivel": payload.get("max_tokens"),
                     "raw_output": content[:2000],
                 },
             )
 
+        # o HTML devolvido pelo modelo passa pelo MESMO teto de bytes do modo
+        # direto: nada garante que o modelo respeitou a instrução de tamanho,
+        # e render_pdf ainda tem o teto de páginas como segunda linha de defesa.
         try:
-            # to_thread: `parsed_schema` é do cliente e jsonschema compila
-            # `pattern` com backtracking — ver validate_extraction_output.
-            data = await asyncio.to_thread(
-                validate_extraction_output, content, parsed_schema
-            )
-        # except largo de propósito: além de JSONDecodeError/ValidationError,
-        # a resolução de referências levanta _WrappedReferencingError, que não
-        # herda de nenhuma das duas. Estreitar aqui reintroduz o 500 opaco.
-        except Exception as e:
-            # com guided decoding ativo isto é raro (a gramática do vLLM não
-            # deixaria sair JSON malformado), então quase sempre aponta pra
-            # outra coisa: schema que o backend não suporta, ou resposta
-            # interceptada no caminho. Devolver o texto cru é o que torna esse
-            # diagnóstico possível do lado do cliente.
-            logger.warning("documents/extract: saída não aderente ao schema (%s)", e)
-            log_gateway_request(**log_ctx, status_code=502, stream=False, usage=usage)
-            raise HTTPException(
-                status_code=502,
-                detail={
-                    "message": "o modelo não devolveu JSON aderente ao schema",
-                    "reason": str(e)[:300],
-                    "raw_output": content[:2000],
-                },
-            )
+            document_generate.check_size(len(content.encode("utf-8")), effective_plan)
+        except document_generate.HtmlTooLarge as e:
+            log_gateway_request(**log_ctx, status_code=413, stream=False, usage=usage)
+            raise HTTPException(status_code=413, detail=str(e))
 
+        pdf_bytes = await _render_pdf_guarded(content, effective_plan, log_ctx, usage=usage)
         log_gateway_request(**log_ctx, status_code=200, stream=False, usage=usage)
-        return {
-            "data": data,
-            "pages": pages,
-            "ocr_used": ocr_used,
-            "usage": usage,
-        }
+        return Response(content=pdf_bytes, media_type="application/pdf")
     finally:
         # nunca vazar o contador: com in_flight preso em > 0 a auto-pausa da
         # máquina nunca mais dispararia

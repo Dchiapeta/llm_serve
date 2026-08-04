@@ -13,3 +13,8 @@ pymupdf>=1.24
 pytesseract>=0.3.10
 pillow>=10
 jsonschema>=4.21
+# geração de PDF a partir de HTML (/v1/documents/generate). Puro Python, mas
+# depende de libs de sistema (Pango/Cairo/GDK-Pixbuf) instaladas no
+# Dockerfile — ver document_generate.py. >=63 porque é a partir daí que
+# URLFetcher aceita `allowed_protocols` (bloqueio de rede externa).
+weasyprint>=63

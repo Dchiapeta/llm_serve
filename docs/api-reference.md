@@ -10,7 +10,7 @@ Em todos os casos:
 |---|---|
 | Base URL | `https://llmserve-docker.up.railway.app` |
 | Autenticação | header `Authorization: Bearer <SUA_CHAVE_DE_ACESSO>` |
-| Content-Type | `application/json`, exceto `/v1/documents/extract` (`multipart/form-data`) |
+| Content-Type | `application/json`, exceto `/v1/documents/extract` e `/v1/images/extract` (`multipart/form-data`) |
 
 ---
 
@@ -271,6 +271,175 @@ acima disso — documentos escaneados com várias páginas podem levar minutos).
 | `413` | Arquivo, número de páginas ou schema acima do limite |
 | `422` | `max_tokens` fora da faixa aceita |
 | `502` | Modelo não devolveu JSON aderente ao schema (resposta inclui `raw_output` para diagnóstico) |
+
+---
+
+## 3.5. Imagem solta — OCR / extração estruturada (JPEG/PNG/WEBP → JSON)
+
+Endpoint irmão do caso 3, para quando o que você tem é uma **imagem solta** (foto de
+celular, print de tela, scan avulso) em vez de um PDF. Mesmo contrato de resposta,
+mesmas regras de `system`/`user`/schema — só troca o `file` e o formato aceito.
+
+Diferente do caso 2 (que manda a imagem ao modelo dentro do chat), aqui a extração de
+texto é feita por **OCR no próprio gateway** (mesmo motor usado no PDF escaneado do
+caso 3) — o modelo só recebe o texto já extraído, nunca a imagem em si.
+
+```
+POST /v1/images/extract
+Content-Type: multipart/form-data
+```
+
+| Campo | Obrigatório | Descrição |
+|---|---|---|
+| `file` | sim | A imagem, em JPEG, PNG ou WEBP |
+| `schema` | sim | JSON Schema (como string) descrevendo os campos a extrair |
+| `system` | não | Substitui o system prompt configurado na sua stack |
+| `user` | não | Contexto adicional sobre esta imagem — **soma** à instrução de extração |
+| `max_tokens` | não | Teto da resposta. Default 4000, máximo 16000 |
+
+```bash
+curl -X POST https://llmserve-docker.up.railway.app/v1/images/extract \
+  -H "Authorization: Bearer $STACK_API_KEY" \
+  -F file=@nota_fiscal.jpg \
+  -F 'schema={
+        "type": "object",
+        "properties": {
+          "numero_nota":   {"type": "string"},
+          "cnpj_emitente": {"type": ["string", "null"]},
+          "valor_total":   {"type": "number"}
+        },
+        "required": ["numero_nota", "cnpj_emitente", "valor_total"]
+      }'
+```
+
+**Resposta:**
+
+```json
+{
+  "data": { "numero_nota": "12345", "cnpj_emitente": "11.222.333/0001-44", "valor_total": 1500.0 },
+  "pages": 1,
+  "ocr_used": true,
+  "usage": { "prompt_tokens": 612, "completion_tokens": 48 }
+}
+```
+
+Diferente do PDF, aqui `pages` é sempre `1` e `ocr_used` é sempre `true`: não existe
+"texto embutido" numa imagem solta, toda imagem passa por OCR. A mesma regra de schema
+(campo em `required` **e** anulável quando puder faltar) vale igual — ver
+[integracao.md](integracao.md#o-ponto-mais-importante-declare-os-campos-que-podem-faltar).
+
+**Limites:**
+
+| Limite | Go | Pro |
+|---|---|---|
+| Tamanho do arquivo | 5 MB | 10 MB |
+| Resolução | 20 megapixels | 20 megapixels |
+
+Schema até 64 KB. Timeout do servidor: 240s.
+
+**Erros específicos:**
+
+| Status | Significado |
+|---|---|
+| `400` | Imagem ilegível/corrompida, formato não suportado, nenhum texto encontrado por OCR, schema inválido, ou conteúdo grande demais para a janela do plano |
+| `413` | Arquivo, resolução ou schema acima do limite |
+| `422` | `max_tokens` fora da faixa aceita |
+| `502` | Modelo não devolveu JSON aderente ao schema (resposta inclui `raw_output` para diagnóstico) |
+
+---
+
+## 4. PDF a partir de HTML
+
+Endpoint dedicado com **dois modos**, mutuamente exclusivos:
+
+- **Modo direto** (`html`): você já tem o HTML pronto (por exemplo, de uma resposta
+  anterior do modelo) e só quer o PDF renderizado. Sem inferência, sem gastar tokens,
+  funciona mesmo com a stack pausada.
+- **Modo por instrução** (`user` [+ `system`]): você descreve o que quer, o gateway
+  chama o modelo pedindo o HTML e já devolve o PDF renderizado — um único request.
+
+```
+POST /v1/documents/generate
+Content-Type: application/json
+```
+
+| Campo | Obrigatório | Descrição |
+|---|---|---|
+| `html` | um dos dois | O HTML completo a renderizar (modo direto) |
+| `user` | um dos dois | O que o documento deve conter (modo por instrução) |
+| `system` | não | Só com `user`. Substitui o system prompt configurado na sua stack |
+| `max_tokens` | não | Só com `user`. Teto da resposta do modelo. Default 8000, máximo 16000 |
+
+`html` e `user` são exclusivos — mandar os dois (ou nenhum) responde `400`.
+
+### Modo direto
+
+```bash
+curl -X POST https://llmserve-docker.up.railway.app/v1/documents/generate \
+  -H "Authorization: Bearer $STACK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"html": "<h1>Relatório</h1><p>conteúdo já pronto</p>"}' \
+  -o relatorio.pdf
+```
+
+### Modo por instrução
+
+```bash
+curl -X POST https://llmserve-docker.up.railway.app/v1/documents/generate \
+  -H "Authorization: Bearer $STACK_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"user": "Um relatório de vendas de agosto, com uma tabela por região."}' \
+  -o relatorio.pdf
+```
+
+O gateway chama o modelo pedindo um HTML autossuficiente (ver regra abaixo) e
+renderiza a resposta direto, sem uma segunda chamada do seu lado.
+
+`system` e `user` seguem **exatamente a mesma regra** de
+[`/v1/documents/extract`](#3-documento--ocr--extração-estruturada-pdf--json):
+
+| Você envia | O que vale |
+|---|---|
+| Nada | System prompt da stack |
+| `system` com conteúdo | O seu (substitui o da stack) |
+| `system` vazio | O da stack — vazio não substitui nada |
+| `user` | Soma à instrução padrão de geração (não a substitui) |
+
+Não passa por RAG: o contexto relevante é a instrução que você deu, não a base de
+conhecimento da stack.
+
+**Resposta (os dois modos):** o PDF em bytes (`Content-Type: application/pdf`) — não
+é JSON, salve direto no arquivo (`-o` no curl, ou o equivalente no seu cliente HTTP).
+
+**O HTML precisa ser autossuficiente — nos dois modos.** O servidor **não busca
+nenhum recurso externo**, nada de `<img src="https://...">`, `@import`, fontes
+remotas ou qualquer outra URL de rede. Imagens e fontes têm que estar embutidas como
+`data:` URI:
+
+```html
+<img src="data:image/png;base64,iVBORw0KG...">
+```
+
+Um recurso externo não trava a requisição — ele é simplesmente ignorado e o PDF sai
+sem ele. No modo por instrução essa regra já vai embutida na instrução que o gateway
+manda ao modelo; no modo direto é responsabilidade de quem monta o HTML.
+
+**Limites:**
+
+| Limite | Go | Pro / Max / Enterprise |
+|---|---|---|
+| Tamanho do HTML (direto, ou gerado pelo modelo) | 2 MB | 5 MB |
+| Páginas no PDF resultante | 20 | 50 |
+
+**Erros específicos:**
+
+| Status | Significado |
+|---|---|
+| `400` | `html`+`user` combinados, nenhum dos dois enviado, HTML não pôde ser renderizado, ou (modo por instrução) resposta do modelo truncada |
+| `413` | HTML (enviado ou gerado pelo modelo) ou número de páginas do PDF resultante acima do limite |
+| `422` | `max_tokens` fora da faixa aceita |
+| `429` | Muitas gerações simultâneas — tente de novo em seguida |
+| `502` | (modo por instrução) falha ao chamar o modelo |
 
 ---
 

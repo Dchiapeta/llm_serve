@@ -55,6 +55,29 @@ MAX_DOCUMENT_PAGES = {
 DEFAULT_MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_DOCUMENT_PAGES = 15
 
+# Tetos de imagem solta (não embutida em PDF). Bytes por plano — mais baixos
+# que os de PDF porque uma imagem é sempre "1 página": não há como um upload
+# grande justificar custo maior de rede/memória do que o teto de PDF do mesmo
+# plano. Megapixels protege CPU (é o número de pixels, não os bytes, que
+# decide o custo do tesseract — um JPEG bem comprimido pode decodificar numa
+# imagem de resolução absurda e custar CPU equivalente a várias páginas de
+# PDF, mesmo pesando pouco em disco).
+MAX_IMAGE_BYTES = {
+    "Go": 5 * 1024 * 1024,
+    "VibeCoder": 5 * 1024 * 1024,
+    "Pro": 10 * 1024 * 1024,
+    "Max": 10 * 1024 * 1024,
+    "Enterprise": 10 * 1024 * 1024,
+}
+DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+# 20 MP cobre com folga qualquer foto de celular/scan de documento; acima
+# disso o custo de decode+OCR passa de "uma página" pra vários segundos de
+# CPU só pra abrir o arquivo.
+MAX_IMAGE_MEGAPIXELS = 20_000_000
+# Formatos que o Pillow/pytesseract leem sem plugin externo e que cobrem o
+# caso de uso real (foto de celular, print de tela, scan avulso).
+SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP"}
+
 # DPI do render pro OCR. 200 é o meio caminho conhecido: abaixo de ~150 o
 # tesseract erra dígitos em fonte pequena (justamente o que mais importa em
 # nota fiscal/CNPJ), e acima de ~300 o custo de CPU sobe sem ganho de
@@ -113,6 +136,27 @@ def check_size(size: int, plan: str | None) -> None:
     if size > ceiling:
         raise DocumentTooLarge(
             f"documento excede o limite deste plano "
+            f"({size // (1024 * 1024)} MB > {ceiling // (1024 * 1024)} MB)"
+        )
+
+
+def limit_image_bytes(plan: str | None) -> int:
+    return MAX_IMAGE_BYTES.get(plan or "", DEFAULT_MAX_IMAGE_BYTES)
+
+
+def max_limit_image_bytes() -> int:
+    """Equivalente a max_limit_bytes(), mas pro eixo de imagem — mesmo motivo:
+    corte grosso antes de conhecer o plano do cliente."""
+    return max([*MAX_IMAGE_BYTES.values(), DEFAULT_MAX_IMAGE_BYTES])
+
+
+def check_image_size(size: int, plan: str | None) -> None:
+    """Teto de bytes de imagem, checado antes de qualquer decode. Mesmo papel
+    de check_size, eixo separado porque os tetos por plano são diferentes."""
+    ceiling = limit_image_bytes(plan)
+    if size > ceiling:
+        raise DocumentTooLarge(
+            f"imagem excede o limite deste plano "
             f"({size // (1024 * 1024)} MB > {ceiling // (1024 * 1024)} MB)"
         )
 
@@ -179,6 +223,74 @@ def _ocr_page(page) -> str:
             return pytesseract.image_to_string(img, lang=OCR_LANGS).strip()
     except Exception:
         return ""
+
+
+def extract_text_from_image(image_bytes: bytes, plan: str | None) -> tuple[str, bool]:
+    """Devolve (texto, ocr_used=True sempre — imagem só tem o caminho de OCR).
+
+    BLOQUEANTE por design, mesma disciplina de extract_text: chamar SEMPRE
+    via asyncio.to_thread.
+
+    Ao contrário de PDF, aqui não existe "texto embutido": toda imagem passa
+    por OCR. `ocr_used` é mantido no retorno só pra manter o mesmo shape de
+    tupla que extract_text — no handler ele sempre é True."""
+    try:
+        import pytesseract
+        from PIL import Image, UnidentifiedImageError
+    except ImportError as e:  # pragma: no cover - ambiente sem a dependência
+        raise DocumentError("suporte a imagem indisponível no servidor") from e
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+    except (UnidentifiedImageError, OSError) as e:
+        raise UnreadableDocument(
+            "não foi possível ler a imagem (arquivo inválido ou corrompido)"
+        ) from e
+
+    with img:
+        if img.format not in SUPPORTED_IMAGE_FORMATS:
+            raise UnreadableDocument(
+                f"formato de imagem não suportado ({img.format}); use JPEG, PNG ou WEBP"
+            )
+
+        # ANTES do decode: Image.open só lê o cabeçalho (width/height vêm de
+        # lá, sem decodificar pixel nenhum), então dá pra rejeitar aqui sem
+        # pagar o custo de decodificação. Checar DEPOIS (ex.: depois de
+        # img.load()) não protegeria nada — um PNG de poucos KB pode
+        # descomprimir para uma imagem de centenas de MP ("decompression
+        # bomb"), e o decode já teria consumido a CPU/memória proporcionais
+        # ao tamanho descomprimido antes da checagem rodar.
+        megapixels = img.width * img.height
+        if megapixels > MAX_IMAGE_MEGAPIXELS:
+            raise DocumentTooLarge(
+                f"imagem tem {megapixels / 1_000_000:.1f} MP, "
+                f"o limite é {MAX_IMAGE_MEGAPIXELS / 1_000_000:.0f} MP"
+            )
+
+        try:
+            # força a decodificação agora, já dentro do teto de megapixels —
+            # um arquivo truncado só falharia no primeiro acesso a pixel,
+            # dentro do OCR, com uma exceção menos clara.
+            img.load()
+        except OSError as e:
+            raise UnreadableDocument(
+                "não foi possível ler a imagem (arquivo inválido ou corrompido)"
+            ) from e
+
+        try:
+            text = pytesseract.image_to_string(img, lang=OCR_LANGS).strip()
+        except Exception as e:
+            # ao contrário de _ocr_page (onde falha de OCR numa página entre
+            # várias não aborta o documento), aqui é a imagem inteira — não há
+            # texto de outras páginas pra salvar o resultado, então a falha
+            # propaga como erro explícito em vez de virar EmptyDocument muda.
+            raise DocumentError("falha ao executar OCR na imagem") from e
+
+    if not text:
+        raise EmptyDocument(
+            "nenhum texto foi encontrado na imagem (ilegível por OCR)"
+        )
+    return text, True
 
 
 # Instrução que acompanha o texto extraído. Explícita sobre "só o JSON" mesmo
