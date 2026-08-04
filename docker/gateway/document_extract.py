@@ -38,19 +38,23 @@ import io
 #
 # "VibeCoder" é o nome antigo de "Go" — entrada mantida só até a migration 0049
 # rodar em produção; sem ela o plano cairia no default na janela de transição.
+# Enterprise é negociado por contrato ("Custom" na página de preços); os
+# valores abaixo são o ponto de partida aplicado até o contrato pedir mais —
+# não há ainda um mecanismo de override por conta, então um teto maior exige
+# alterar esta constante manualmente.
 MAX_DOCUMENT_BYTES = {
     "Go": 8 * 1024 * 1024,
     "VibeCoder": 8 * 1024 * 1024,
     "Pro": 15 * 1024 * 1024,
-    "Max": 15 * 1024 * 1024,
-    "Enterprise": 15 * 1024 * 1024,
+    "Max": 25 * 1024 * 1024,
+    "Enterprise": 50 * 1024 * 1024,
 }
 MAX_DOCUMENT_PAGES = {
     "Go": 15,
     "VibeCoder": 15,
     "Pro": 30,
-    "Max": 30,
-    "Enterprise": 30,
+    "Max": 50,
+    "Enterprise": 100,
 }
 DEFAULT_MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_DOCUMENT_PAGES = 15
@@ -66,8 +70,8 @@ MAX_IMAGE_BYTES = {
     "Go": 5 * 1024 * 1024,
     "VibeCoder": 5 * 1024 * 1024,
     "Pro": 10 * 1024 * 1024,
-    "Max": 10 * 1024 * 1024,
-    "Enterprise": 10 * 1024 * 1024,
+    "Max": 15 * 1024 * 1024,
+    "Enterprise": 25 * 1024 * 1024,
 }
 DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 # 20 MP cobre com folga qualquer foto de celular/scan de documento; acima

@@ -46,19 +46,22 @@ import re
 # "VibeCoder" é o nome antigo de "Go" — entrada mantida só até a migration
 # 0049 rodar em produção; sem ela o plano cairia no default na janela de
 # transição (mesmo raciocínio de document_extract.py).
+# Enterprise é negociado por contrato ("Custom" na página de preços); os
+# valores abaixo são o ponto de partida aplicado até o contrato pedir mais —
+# ver mesma observação em document_extract.py.
 MAX_HTML_BYTES = {
     "Go": 2 * 1024 * 1024,
     "VibeCoder": 2 * 1024 * 1024,
     "Pro": 5 * 1024 * 1024,
-    "Max": 5 * 1024 * 1024,
-    "Enterprise": 5 * 1024 * 1024,
+    "Max": 8 * 1024 * 1024,
+    "Enterprise": 15 * 1024 * 1024,
 }
 MAX_PDF_PAGES = {
     "Go": 20,
     "VibeCoder": 20,
     "Pro": 50,
-    "Max": 50,
-    "Enterprise": 50,
+    "Max": 75,
+    "Enterprise": 150,
 }
 DEFAULT_MAX_HTML_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_PDF_PAGES = 20

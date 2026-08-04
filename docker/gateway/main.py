@@ -99,7 +99,22 @@ MAX_LORAS_PER_MACHINE = int(os.environ.get("MAX_LORAS_PER_MACHINE", "8"))
 # um cliente descontrolado consumia GPU sem nenhum teto. Réplica única do
 # gateway (ver docstring do módulo), então estado em memória é seguro — mesmo
 # padrão do key_cache/in_flight.
-RATE_LIMIT_RPM = float(os.environ.get("RATE_LIMIT_RPM", "60"))
+#
+# Por plano, seguindo o mesmo padrão de document_extract.MAX_DOCUMENT_BYTES:
+# Enterprise é negociado por contrato ("Custom" na página de preços) e o
+# valor abaixo é só o ponto de partida até o contrato pedir mais.
+RATE_LIMIT_RPM = {
+    "Go": 60.0,
+    "VibeCoder": 60.0,
+    "Pro": 120.0,
+    "Max": 300.0,
+    "Enterprise": 600.0,
+}
+DEFAULT_RATE_LIMIT_RPM = float(os.environ.get("RATE_LIMIT_RPM", "60"))
+
+
+def rate_limit_rpm(plan: str | None) -> float:
+    return RATE_LIMIT_RPM.get(plan or "", DEFAULT_RATE_LIMIT_RPM)
 
 # concorrência: ELÁSTICA por MÁQUINA, não um teto fixo por chave — uma stack
 # sozinha no pod pode usar quase toda a capacidade; outras dividem o mesmo
@@ -601,16 +616,17 @@ async def authenticate(authorization: str | None) -> tuple[dict, str]:
     return entry, key_hash
 
 
-def check_rate_limit(key_hash: str) -> None:
-    """Token bucket em memória por chave: RATE_LIMIT_RPM tokens/min, com
-    burst até o teto do bucket. Estourou -> 429 + Retry-After; nunca
-    enfileira, só rejeita — o cliente decide se tenta de novo."""
+def check_rate_limit(key_hash: str, plan: str | None) -> None:
+    """Token bucket em memória por chave: rpm do plano tokens/min, com burst
+    até o teto do bucket. Estourou -> 429 + Retry-After; nunca enfileira, só
+    rejeita — o cliente decide se tenta de novo."""
+    rpm = rate_limit_rpm(plan)
     now = time.time()
-    tokens, last = rate_buckets.get(key_hash, (RATE_LIMIT_RPM, now))
-    tokens = min(RATE_LIMIT_RPM, tokens + (now - last) * RATE_LIMIT_RPM / 60.0)
+    tokens, last = rate_buckets.get(key_hash, (rpm, now))
+    tokens = min(rpm, tokens + (now - last) * rpm / 60.0)
     if tokens < 1.0:
         rate_buckets[key_hash] = (tokens, now)
-        retry_after = max(1, int((1.0 - tokens) * 60.0 / RATE_LIMIT_RPM) + 1)
+        retry_after = max(1, int((1.0 - tokens) * 60.0 / rpm) + 1)
         raise HTTPException(
             status_code=429,
             detail="limite de requisições excedido, tente novamente em instantes",
@@ -2661,9 +2677,9 @@ async def anthropic_messages(
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
 
     entry, key_hash, bearer_header = await authenticate_anthropic(authorization, x_api_key)
-    check_rate_limit(key_hash)
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
+    check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
 
     machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
@@ -2833,7 +2849,8 @@ async def anthropic_count_tokens(
     Passa por rate limit (mas não por quota/concorrência): deixou de ser um
     cálculo puramente local — perto do teto faz uma chamada ao pod."""
     entry, key_hash, _bearer = await authenticate_anthropic(authorization, x_api_key)
-    check_rate_limit(key_hash)
+    _, key_plan = resolve_key_stack(entry)
+    check_rate_limit(key_hash, key_plan)
     raw_body = await request.body()
     if len(raw_body) > MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
@@ -3042,9 +3059,9 @@ async def _authenticate_for_extraction(
     deve estar disponível a quem não tem chave. O authenticate é barato
     (key_cache em memória) e o rate limit passa a valer pra este caminho."""
     entry, key_hash = await authenticate(authorization)
-    check_rate_limit(key_hash)
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
+    check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
 
     if len(schema) > MAX_SCHEMA_BYTES:
@@ -3560,12 +3577,12 @@ async def generate_document(
         raise HTTPException(status_code=400, detail="informe `html` ou `user`")
 
     entry, key_hash = await authenticate(authorization)
-    check_rate_limit(key_hash)
+    stack, plan = resolve_key_stack(entry)
+    check_rate_limit(key_hash, plan)
     account_id = entry["account_id"]
 
     # ---------- modo direto: HTML já pronto, sem modelo ----------
     if body.html:
-        stack, plan = resolve_key_stack(entry)
         stack_id = (stack or {}).get("id")
         log_ctx = dict(
             account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
@@ -3728,9 +3745,9 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
 
     entry, key_hash = await authenticate(authorization)
-    check_rate_limit(key_hash)
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
+    check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
 
     machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
