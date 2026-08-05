@@ -158,6 +158,7 @@ export function StackRowActions({
         accountId={account.id}
         stackId={stack.id}
         stackSlug={stack.slug}
+        plan={stack.plan}
         initialFiles={knowledgeFiles}
         open={knowledgeOpen}
         onOpenChange={setKnowledgeOpen}

@@ -13,6 +13,23 @@ export const TEMPLATE_PLANS: TemplatePlan[] = [
 // (ver docker/entrypoint.sh), então o provisionamento força DISABLE_PREFIX_CACHING.
 export const SHARED_POD_PLANS: TemplatePlan[] = ["Go", "Pro"]
 
+// Quantidade máxima de arquivos indexados na base de conhecimento (RAG) por
+// stack, por plano. null = sem limite. Consumido pela Server Action de upload
+// (lib/actions.ts) e pela UI (knowledge-files-dialog.tsx), que precisa do
+// mesmo valor pra mostrar contagem/estado de "cheio" sem round-trip.
+export const RAG_FILE_LIMIT_BY_PLAN: Record<TemplatePlan, number | null> = {
+  Go: 5,
+  Pro: 20,
+  Max: 50,
+  Enterprise: null,
+}
+
+// Teto de tamanho por arquivo de RAG, igual pra todos os planos. embedTexts
+// (lib/actions.ts) faz batching em lotes de 500 chunks por chamada à API de
+// embeddings — 10MB de texto puro dá ~10 mil chunks (~20 chamadas), ainda
+// tranquilo em tempo de processamento por upload.
+export const MAX_KNOWLEDGE_FILE_SIZE_BYTES = 10 * 1024 * 1024
+
 export type Template = {
   id: string
   runpod_template_id: string | null

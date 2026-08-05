@@ -5,6 +5,7 @@ import { FileText, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { deleteKnowledgeFile, listKnowledgeFiles, uploadKnowledgeFile } from "@/lib/actions"
+import { MAX_KNOWLEDGE_FILE_SIZE_BYTES, RAG_FILE_LIMIT_BY_PLAN, type TemplatePlan } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -17,10 +18,13 @@ import { Input } from "@/components/ui/input"
 
 type KnowledgeFile = { storage_path: string; chunks: number }
 
+const MAX_FILE_SIZE_MB = MAX_KNOWLEDGE_FILE_SIZE_BYTES / (1024 * 1024)
+
 export function KnowledgeFilesDialog({
   accountId,
   stackId,
   stackSlug,
+  plan,
   initialFiles,
   open,
   onOpenChange,
@@ -28,6 +32,7 @@ export function KnowledgeFilesDialog({
   accountId: string
   stackId: string
   stackSlug: string
+  plan: TemplatePlan
   initialFiles: KnowledgeFile[]
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -76,6 +81,9 @@ export function KnowledgeFilesDialog({
     })
   }
 
+  const limit = RAG_FILE_LIMIT_BY_PLAN[plan]
+  const atLimit = limit !== null && files.length >= limit
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
@@ -83,18 +91,33 @@ export function KnowledgeFilesDialog({
           <DialogTitle>Base de conhecimento — {stackSlug}</DialogTitle>
           <DialogDescription>
             Arquivos .txt/.md indexados por embedding (OpenAI), usados como
-            contexto de RAG nas respostas desta stack.
+            contexto de RAG nas respostas desta stack. Até {MAX_FILE_SIZE_MB}MB
+            por arquivo e{" "}
+            {limit === null ? "sem limite de quantidade" : `até ${limit} arquivo(s)`}
+            {" "}no plano {plan}.
           </DialogDescription>
         </DialogHeader>
 
         <div className="flex flex-col gap-4">
           <div className="flex gap-2">
-            <Input ref={inputRef} type="file" accept=".txt,.md" className="flex-1" />
-            <Button onClick={onUpload} disabled={pending}>
+            <Input
+              ref={inputRef}
+              type="file"
+              accept=".txt,.md"
+              className="flex-1"
+              disabled={atLimit}
+            />
+            <Button onClick={onUpload} disabled={pending || atLimit}>
               <Upload className="size-4" />
               Subir
             </Button>
           </div>
+          {atLimit && (
+            <p className="text-sm text-destructive">
+              Limite de {limit} arquivo(s) do plano {plan} atingido. Remova um
+              arquivo para subir outro.
+            </p>
+          )}
 
           <div className="flex flex-col gap-2">
             {files.length === 0 && (

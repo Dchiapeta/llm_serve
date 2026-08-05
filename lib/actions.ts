@@ -13,7 +13,7 @@ import { getClientLocation, listRoutesByMachine, setClientLocation } from "./rou
 import { generateStackSlug, STACK_SLUG_RE } from "./slug"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import { SHARED_POD_PLANS, TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Stack, type Template, type TemplatePlan } from "./types"
+import { MAX_KNOWLEDGE_FILE_SIZE_BYTES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Stack, type Template, type TemplatePlan } from "./types"
 
 // Janela de deduplicação do provisionamento: um retry do gateway dentro desse
 // intervalo reusa a máquina 'creating' recém-criada em vez de criar outra.
@@ -1937,6 +1937,47 @@ const EMBEDDING_MODEL = "text-embedding-3-small"
 const CHUNK_SIZE = 1000
 const CHUNK_OVERLAP = 100
 
+function assertKnowledgeFileSize(sizeBytes: number) {
+  if (sizeBytes > MAX_KNOWLEDGE_FILE_SIZE_BYTES) {
+    const maxMb = MAX_KNOWLEDGE_FILE_SIZE_BYTES / (1024 * 1024)
+    throw new Error(`Arquivo excede o tamanho máximo permitido (${maxMb}MB)`)
+  }
+}
+
+// Barra o upload de um arquivo NOVO quando a stack já está no teto de
+// arquivos do plano. Reenviar um arquivo já indexado (mesmo storage_path,
+// upsert) não conta como novo — chunkAndIndex substitui a indexação anterior.
+async function assertKnowledgeFileQuota(
+  db: ReturnType<typeof createSupabaseAdmin>,
+  stackId: string,
+  storagePath: string
+) {
+  const { data: stack, error: stackErr } = await db
+    .from("stacks")
+    .select("plan")
+    .eq("id", stackId)
+    .single<{ plan: TemplatePlan }>()
+  if (stackErr || !stack) throw new Error("Stack não encontrada")
+
+  const limit = RAG_FILE_LIMIT_BY_PLAN[stack.plan]
+  if (limit === null) return
+
+  const { data: existing, error: existingErr } = await db
+    .from("knowledge_chunks")
+    .select("storage_path")
+    .eq("stack_id", stackId)
+  if (existingErr) throw new Error(existingErr.message)
+
+  const distinctPaths = new Set((existing ?? []).map((r) => r.storage_path))
+  if (distinctPaths.has(storagePath)) return
+
+  if (distinctPaths.size >= limit) {
+    throw new Error(
+      `Limite de ${limit} arquivo(s) na base de conhecimento atingido para o plano ${stack.plan}`
+    )
+  }
+}
+
 // Supabase Storage rejeita chaves com acentos e outros caracteres fora do
 // alfabeto seguro de S3 ("Invalid key") — normaliza antes de montar o path.
 function sanitizeStorageFileName(name: string): string {
@@ -1965,10 +2006,13 @@ function chunkText(text: string): string[] {
   return chunks
 }
 
-async function embedTexts(texts: string[]): Promise<number[][]> {
-  const apiKey = process.env.OPENAI_API_KEY
-  if (!apiKey) throw new Error("OPENAI_API_KEY não configurada")
+// A OpenAI limita a 2048 itens por request de embeddings (e um teto de tokens
+// por request bem maior) — 500 chunks de ~250 tokens cada fica bem folgado
+// dos dois limites, permitindo arquivos de até MAX_KNOWLEDGE_FILE_SIZE_BYTES
+// (~10k chunks) sem estourar nenhum dos dois.
+const EMBEDDING_BATCH_SIZE = 500
 
+async function embedBatch(apiKey: string, texts: string[]): Promise<number[][]> {
   const resp = await fetch("https://api.openai.com/v1/embeddings", {
     method: "POST",
     headers: {
@@ -1982,6 +2026,18 @@ async function embedTexts(texts: string[]): Promise<number[][]> {
   }
   const data = (await resp.json()) as { data: { embedding: number[] }[] }
   return data.data.map((d) => d.embedding)
+}
+
+async function embedTexts(texts: string[]): Promise<number[][]> {
+  const apiKey = process.env.OPENAI_API_KEY
+  if (!apiKey) throw new Error("OPENAI_API_KEY não configurada")
+
+  const embeddings: number[][] = []
+  for (let i = 0; i < texts.length; i += EMBEDDING_BATCH_SIZE) {
+    const batch = texts.slice(i, i + EMBEDDING_BATCH_SIZE)
+    embeddings.push(...(await embedBatch(apiKey, batch)))
+  }
+  return embeddings
 }
 
 function assertSupportedKnowledgeExtension(name: string) {
@@ -2038,10 +2094,13 @@ export async function uploadKnowledgeFile(formData: FormData) {
   if (!stackId) throw new Error("Stack não informada")
   if (!(file instanceof File) || file.size === 0) throw new Error("Arquivo não informado")
   assertSupportedKnowledgeExtension(file.name)
+  assertKnowledgeFileSize(file.size)
 
   // prefixo por stack (não por conta): evita que duas stacks da mesma conta
   // com arquivo de mesmo nome se sobrescrevam mutuamente
   const storagePath = `${stackId}/${sanitizeStorageFileName(file.name)}`
+  await assertKnowledgeFileQuota(db, stackId, storagePath)
+
   const { error: uploadErr } = await db.storage
     .from(KNOWLEDGE_BUCKET)
     .upload(storagePath, file, { upsert: true, contentType: "text/plain" })
@@ -2068,12 +2127,15 @@ export async function ingestKnowledgeFile(input: {
   assertSupportedKnowledgeExtension(input.storagePath)
 
   const db = createSupabaseAdmin()
+  await assertKnowledgeFileQuota(db, input.stackId, input.storagePath)
+
   const { data, error: downloadErr } = await db.storage
     .from(KNOWLEDGE_BUCKET)
     .download(input.storagePath)
   if (downloadErr || !data) {
     throw new Error(`Falha ao baixar arquivo do Storage: ${downloadErr?.message ?? "não encontrado"}`)
   }
+  assertKnowledgeFileSize(data.size)
 
   return chunkAndIndex({ ...input, text: await data.text() })
 }
