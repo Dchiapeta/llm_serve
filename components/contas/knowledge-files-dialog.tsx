@@ -90,9 +90,9 @@ export function KnowledgeFilesDialog({
         <DialogHeader>
           <DialogTitle>Base de conhecimento — {stackSlug}</DialogTitle>
           <DialogDescription>
-            Arquivos .txt/.md indexados por embedding (OpenAI), usados como
-            contexto de RAG nas respostas desta stack. Até {MAX_FILE_SIZE_MB}MB
-            por arquivo e{" "}
+            Arquivos .txt/.md/.pdf (PDF só com texto embutido, sem OCR)
+            indexados por embedding (OpenAI), usados como contexto de RAG nas
+            respostas desta stack. Até {MAX_FILE_SIZE_MB}MB por arquivo e{" "}
             {limit === null ? "sem limite de quantidade" : `até ${limit} arquivo(s)`}
             {" "}no plano {plan}.
           </DialogDescription>
@@ -103,7 +103,7 @@ export function KnowledgeFilesDialog({
             <Input
               ref={inputRef}
               type="file"
-              accept=".txt,.md"
+              accept=".txt,.md,.pdf"
               className="flex-1"
               disabled={atLimit}
             />

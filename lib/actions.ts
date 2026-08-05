@@ -2041,9 +2041,26 @@ async function embedTexts(texts: string[]): Promise<number[][]> {
 }
 
 function assertSupportedKnowledgeExtension(name: string) {
-  if (!/\.(txt|md)$/i.test(name)) {
-    throw new Error("Só arquivos .txt ou .md são aceitos por enquanto")
+  if (!/\.(txt|md|pdf)$/i.test(name)) {
+    throw new Error("Só arquivos .txt, .md ou .pdf são aceitos por enquanto")
   }
+}
+
+// PDF escaneado (sem texto embutido) não é suportado — extractText do unpdf só
+// lê o texto já embutido no PDF, não faz OCR. Sinalizamos isso na mensagem de
+// erro em vez de deixar cair no genérico "Arquivo vazio" de chunkAndIndex.
+async function extractKnowledgeText(fileName: string, blob: Blob): Promise<string> {
+  if (!/\.pdf$/i.test(fileName)) return blob.text()
+
+  const { extractText, getDocumentProxy } = await import("unpdf")
+  const pdf = await getDocumentProxy(new Uint8Array(await blob.arrayBuffer()))
+  const { text } = await extractText(pdf, { mergePages: true })
+  if (!text.trim()) {
+    throw new Error(
+      "Nenhum texto encontrado no PDF — só PDFs com texto embutido são suportados, PDF escaneado (imagem) ainda não"
+    )
+  }
+  return text
 }
 
 // Chunka, gera embeddings e substitui a indexação anterior do mesmo arquivo
@@ -2083,8 +2100,9 @@ async function chunkAndIndex(input: {
   return { chunks: chunks.length }
 }
 
-// Sobe um arquivo de texto pro bucket de conhecimento, chunka e indexa os
-// embeddings — só texto puro/Markdown (sem parsing de PDF/DOCX nesta rodada).
+// Sobe um arquivo pro bucket de conhecimento, chunka e indexa os embeddings —
+// .txt/.md como texto puro, .pdf com texto embutido extraído via unpdf (PDF
+// escaneado/sem texto embutido não é suportado, ver extractKnowledgeText).
 export async function uploadKnowledgeFile(formData: FormData) {
   const db = createSupabaseAdmin()
   const accountId = String(formData.get("account_id"))
@@ -2101,12 +2119,13 @@ export async function uploadKnowledgeFile(formData: FormData) {
   const storagePath = `${stackId}/${sanitizeStorageFileName(file.name)}`
   await assertKnowledgeFileQuota(db, stackId, storagePath)
 
+  const contentType = /\.pdf$/i.test(file.name) ? "application/pdf" : "text/plain"
   const { error: uploadErr } = await db.storage
     .from(KNOWLEDGE_BUCKET)
-    .upload(storagePath, file, { upsert: true, contentType: "text/plain" })
+    .upload(storagePath, file, { upsert: true, contentType })
   if (uploadErr) throw new Error(`Falha ao subir arquivo: ${uploadErr.message}`)
 
-  await chunkAndIndex({ accountId, stackId, storagePath, text: await file.text() })
+  await chunkAndIndex({ accountId, stackId, storagePath, text: await extractKnowledgeText(file.name, file) })
 }
 
 // Dispara o processamento (chunk+embedding+index) de um arquivo que o
@@ -2137,7 +2156,7 @@ export async function ingestKnowledgeFile(input: {
   }
   assertKnowledgeFileSize(data.size)
 
-  return chunkAndIndex({ ...input, text: await data.text() })
+  return chunkAndIndex({ ...input, text: await extractKnowledgeText(input.storagePath, data) })
 }
 
 export async function listKnowledgeFiles(
