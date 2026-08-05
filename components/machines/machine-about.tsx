@@ -18,7 +18,7 @@ export function MachineAbout({
   // Fallback é a URL real de produção (Railway) — GATEWAY_URL pode não estar
   // setado no ambiente do painel, e um placeholder deixaria o snippet inútil.
   const url =
-    gatewayUrl?.replace(/\/$/, "") ?? "https://llmserve-docker.up.railway.app"
+    gatewayUrl?.replace(/\/$/, "") ?? "https://api.trystac.com"
   const model = modelName ?? "<modelo>"
 
   const curlOpenAI = `curl ${url}/v1/chat/completions \\

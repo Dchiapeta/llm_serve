@@ -8,7 +8,7 @@ produção, nunca direto no pod (mesma regra do loadtest.py).
 
 Uso (checks rápidos, sem custo de rajada):
   python3 scripts/security_check.py \
-    --base-url https://llmserve-docker.up.railway.app \
+    --base-url https://api.trystac.com \
     --api-key <chave HEX de uma conta de TESTE> \
     --model <served-model-name do template, ex: pro-base>
 

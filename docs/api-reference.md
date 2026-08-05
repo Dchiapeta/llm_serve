@@ -8,7 +8,7 @@ Em todos os casos:
 
 | | |
 |---|---|
-| Base URL | `https://llmserve-docker.up.railway.app` |
+| Base URL | `https://api.trystac.com` |
 | Autenticação | header `Authorization: Bearer <SUA_CHAVE_DE_ACESSO>` |
 | Content-Type | `application/json`, exceto `/v1/documents/extract` e `/v1/images/extract` (`multipart/form-data`) |
 
@@ -33,7 +33,7 @@ POST /v1/chat/completions
 ```
 
 ```bash
-curl https://llmserve-docker.up.railway.app/v1/chat/completions \
+curl https://api.trystac.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -d '{
@@ -85,7 +85,7 @@ POST /v1/chat/completions
 
 ```bash
 IMG_B64=$(base64 -i print.png)
-curl https://llmserve-docker.up.railway.app/v1/chat/completions \
+curl https://api.trystac.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -d @- <<EOF
@@ -154,7 +154,7 @@ Só `file` + `schema`. O system prompt configurado na sua stack é aplicado
 automaticamente, resolvido pela chave — você não envia nada a mais.
 
 ```bash
-curl -X POST https://llmserve-docker.up.railway.app/v1/documents/extract \
+curl -X POST https://api.trystac.com/v1/documents/extract \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -F file=@nota_fiscal.pdf \
   -F 'schema={
@@ -174,7 +174,7 @@ Use quando a mesma stack recebe documentos de tipos diferentes e você precisa d
 *o que é este aqui*. O texto **soma** à instrução de extração, não a substitui.
 
 ```bash
-curl -X POST https://llmserve-docker.up.railway.app/v1/documents/extract \
+curl -X POST https://api.trystac.com/v1/documents/extract \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -F file=@contrato.pdf \
   -F 'schema={
@@ -204,7 +204,7 @@ user:   <instrução padrão de extração — não invente, use null se não ac
 Use quando esta requisição precisa de regras diferentes das configuradas na plataforma.
 
 ```bash
-curl -X POST https://llmserve-docker.up.railway.app/v1/documents/extract \
+curl -X POST https://api.trystac.com/v1/documents/extract \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -F file=@nota_fiscal.pdf \
   -F 'schema={
@@ -298,7 +298,7 @@ Content-Type: multipart/form-data
 | `max_tokens` | não | Teto da resposta. Default 4000, máximo 16000 |
 
 ```bash
-curl -X POST https://llmserve-docker.up.railway.app/v1/images/extract \
+curl -X POST https://api.trystac.com/v1/images/extract \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -F file=@nota_fiscal.jpg \
   -F 'schema={
@@ -375,7 +375,7 @@ Content-Type: application/json
 ### Modo direto
 
 ```bash
-curl -X POST https://llmserve-docker.up.railway.app/v1/documents/generate \
+curl -X POST https://api.trystac.com/v1/documents/generate \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"html": "<h1>Relatório</h1><p>conteúdo já pronto</p>"}' \
@@ -385,7 +385,7 @@ curl -X POST https://llmserve-docker.up.railway.app/v1/documents/generate \
 ### Modo por instrução
 
 ```bash
-curl -X POST https://llmserve-docker.up.railway.app/v1/documents/generate \
+curl -X POST https://api.trystac.com/v1/documents/generate \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"user": "Um relatório de vendas de agosto, com uma tabela por região."}' \

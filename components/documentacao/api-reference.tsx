@@ -4,7 +4,7 @@ import type { ReactNode } from "react"
 
 import { CodeBlock } from "@/components/ui/code-block"
 
-const GATEWAY_URL = "https://llmserve-docker.up.railway.app"
+const GATEWAY_URL = "https://api.trystac.com"
 
 function Lead({ children }: { children: ReactNode }) {
   return <p className="text-foreground">{children}</p>

@@ -10,7 +10,7 @@ pro porquê).
 
 Uso:
   python3 scripts/loadtest.py \
-    --base-url https://llmserve-docker.up.railway.app \
+    --base-url https://api.trystac.com \
     --api-key <chave HEX da conta> \
     --model pro-base \
     --levels 5,10,15 \
@@ -379,7 +379,7 @@ async def run_level(client: httpx.AsyncClient, args, level: int) -> list[dict]:
 
 async def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--base-url", required=True, help="URL do gateway (ex: https://llmserve-docker.up.railway.app)")
+    parser.add_argument("--base-url", required=True, help="URL do gateway (ex: https://api.trystac.com)")
     parser.add_argument("--api-key", help="Chave HEX da conta/stack sendo testada (modo níveis de concorrência)")
     parser.add_argument(
         "--isolation-keys",

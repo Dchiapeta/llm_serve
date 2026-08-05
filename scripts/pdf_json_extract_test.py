@@ -18,7 +18,7 @@ do pod; a 0048 reverteu.
 
 Uso:
   python3 scripts/pdf_json_extract_test.py \
-    --base-url https://llmserve-docker.up.railway.app \
+    --base-url https://api.trystac.com \
     --api-key <chave HEX da stack de teste> \
     --doc nota_fiscal.pdf:schemas/nota_fiscal.json \
     --doc contrato.pdf:schemas/contrato.json \

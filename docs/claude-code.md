@@ -119,13 +119,13 @@ não comportamento previsto.
 ```bash
 # Go (A40, 9B: pool ~340k tokens ≈ ~2,6 sessões cheias de 128k)
 python3 scripts/loadtest.py \
-  --base-url https://llmserve-docker.up.railway.app \
+  --base-url https://api.trystac.com \
   --api-key <chave Go> --model <alias go> \
   --levels 4,6,10 --context-tokens 110000 --max-tokens 16000
 
 # Pro (2× A40 TP=2, 27B: pool ~540k tokens ≈ ~4,2 sessões cheias)
 python3 scripts/loadtest.py \
-  --base-url https://llmserve-docker.up.railway.app \
+  --base-url https://api.trystac.com \
   --api-key <chave Pro> --model <alias pro> \
   --levels 2,4,6 --context-tokens 110000 --max-tokens 16000
 ```
@@ -164,7 +164,7 @@ Permanente — recomendado, é o que não se esquece:
 // ~/.claude/settings.json   (o da SUA CONTA, não o do projeto: esse vai pro git)
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "https://llmserve-docker.up.railway.app",
+    "ANTHROPIC_BASE_URL": "https://api.trystac.com",
     "ANTHROPIC_AUTH_TOKEN": "<sua chave do plano>",
     "ANTHROPIC_MODEL": "<alias do modelo do plano>",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "120000"
@@ -179,7 +179,7 @@ não funciona em JSON, o alias tem que ser repetido literalmente em cada chave
 Só para a sessão do terminal atual:
 
 ```bash
-export ANTHROPIC_BASE_URL=https://llmserve-docker.up.railway.app
+export ANTHROPIC_BASE_URL=https://api.trystac.com
 export ANTHROPIC_AUTH_TOKEN=<sua chave do plano>
 export ANTHROPIC_MODEL=<alias do modelo do plano>
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW=120000

@@ -58,7 +58,7 @@ npm run dev
    gateway roteia para a máquina certa, realoca stacks e religa pods pausados:
 
 ```bash
-curl https://llmserve-docker.up.railway.app/v1/chat/completions \
+curl https://api.trystac.com/v1/chat/completions \
   -H "Authorization: Bearer <chave-hex>" \
   -H "Content-Type: application/json" \
   -d '{"model": "qualquer-valor", "max_tokens": 8000, "messages": [{"role": "user", "content": "Olá"}]}'

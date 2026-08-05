@@ -12,7 +12,7 @@ mas nada aqui depende disso.
 
 | | |
 |---|---|
-| Endpoint | `POST https://llmserve-docker.up.railway.app/v1/chat/completions` |
+| Endpoint | `POST https://api.trystac.com/v1/chat/completions` |
 | Autenticação | header `Authorization: Bearer <SUA_CHAVE_DE_ACESSO>` |
 | Corpo | JSON com `model`, `max_tokens` e `messages` |
 | Resposta | o texto vem em `choices[0].message.content` |
@@ -25,7 +25,7 @@ Nunca a coloque em código versionado nem em frontend: ela dá acesso direto ao 
 
 ```http
 POST /v1/chat/completions HTTP/1.1
-Host: llmserve-docker.up.railway.app
+Host: api.trystac.com
 Content-Type: application/json
 Authorization: Bearer <SUA_CHAVE_DE_ACESSO>
 
@@ -61,7 +61,7 @@ Todos os exemplos abaixo fazem a mesma chamada e leem a chave da variável de am
 ### curl
 
 ```bash
-curl https://llmserve-docker.up.railway.app/v1/chat/completions \
+curl https://api.trystac.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -d '{
@@ -74,7 +74,7 @@ curl https://llmserve-docker.up.railway.app/v1/chat/completions \
 No formato Anthropic, se preferir:
 
 ```bash
-curl https://llmserve-docker.up.railway.app/v1/messages \
+curl https://api.trystac.com/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: $STACK_API_KEY" \
   -H "anthropic-version: 2023-06-01" \
@@ -95,7 +95,7 @@ import requests
 message = "content here"
 
 r = requests.post(
-    "https://llmserve-docker.up.railway.app/v1/chat/completions",
+    "https://api.trystac.com/v1/chat/completions",
     headers={
         "Content-Type": "application/json",
         "Authorization": "Bearer " + os.environ["STACK_API_KEY"],
@@ -123,7 +123,7 @@ explicitamente o teto de tokens da resposta.
 
 ```js
 // fetch nativo: Node 18+, Deno, Bun, browser. Sem dependências.
-const r = await fetch("https://llmserve-docker.up.railway.app/v1/chat/completions", {
+const r = await fetch("https://api.trystac.com/v1/chat/completions", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
@@ -148,7 +148,7 @@ fica visível para quem abrir o DevTools.
 
 ```php
 <?php
-$ch = curl_init("https://llmserve-docker.up.railway.app/v1/chat/completions");
+$ch = curl_init("https://api.trystac.com/v1/chat/completions");
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => true,
     CURLOPT_POST => true,
@@ -193,7 +193,7 @@ func main() {
 	})
 
 	req, _ := http.NewRequest("POST",
-		"https://llmserve-docker.up.railway.app/v1/chat/completions",
+		"https://api.trystac.com/v1/chat/completions",
 		bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+os.Getenv("STACK_API_KEY"))
@@ -230,7 +230,7 @@ String body = """
     """;
 
 HttpRequest req = HttpRequest.newBuilder()
-    .uri(URI.create("https://llmserve-docker.up.railway.app/v1/chat/completions"))
+    .uri(URI.create("https://api.trystac.com/v1/chat/completions"))
     .header("Content-Type", "application/json")
     .header("Authorization", "Bearer " + System.getenv("STACK_API_KEY"))
     .timeout(Duration.ofSeconds(120))
@@ -255,7 +255,7 @@ http.DefaultRequestHeaders.Add(
     "Authorization", "Bearer " + Environment.GetEnvironmentVariable("STACK_API_KEY"));
 
 var res = await http.PostAsJsonAsync(
-    "https://llmserve-docker.up.railway.app/v1/chat/completions", new
+    "https://api.trystac.com/v1/chat/completions", new
 {
     model = "go-base",
     max_tokens = 8000,
@@ -282,7 +282,7 @@ import json, os, requests
 message = "content here"
 
 r = requests.post(
-    "https://llmserve-docker.up.railway.app/v1/chat/completions",
+    "https://api.trystac.com/v1/chat/completions",
     headers={"Authorization": "Bearer " + os.environ["STACK_API_KEY"]},
     json={
         "stream": True,
@@ -313,7 +313,7 @@ só de configuração.
 ### Claude Code
 
 ```bash
-export ANTHROPIC_BASE_URL="https://llmserve-docker.up.railway.app"
+export ANTHROPIC_BASE_URL="https://api.trystac.com"
 export ANTHROPIC_AUTH_TOKEN="<SUA_CHAVE_DE_ACESSO>"
 export ANTHROPIC_API_KEY=""
 export ANTHROPIC_MODEL="go-base"
@@ -342,7 +342,7 @@ depender disso, ponha o mesmo conteúdo em `~/.claude/settings.json`:
 ```json
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "https://llmserve-docker.up.railway.app",
+    "ANTHROPIC_BASE_URL": "https://api.trystac.com",
     "ANTHROPIC_AUTH_TOKEN": "<SUA_CHAVE_DE_ACESSO>",
     "ANTHROPIC_API_KEY": "",
     "ANTHROPIC_MODEL": "go-base",
@@ -380,7 +380,7 @@ model_auto_compact_token_limit = 120000
 
 [model_providers.llmserve]
 name = "llmserve"
-base_url = "https://llmserve-docker.up.railway.app/v1"
+base_url = "https://api.trystac.com/v1"
 env_key = "LLMSERVE_API_KEY"
 wire_api = "responses"
 ```
@@ -397,7 +397,7 @@ reportado em algumas builds), o fallback é `/compact` manual em sessões longas
 
 Todas têm um provider do tipo "OpenAI compatible". A configuração é sempre a mesma:
 
-- **Base URL**: `https://llmserve-docker.up.railway.app/v1`
+- **Base URL**: `https://api.trystac.com/v1`
 - **API key**: sua chave de acesso
 - **Model**: qualquer valor
 
@@ -455,7 +455,7 @@ do `content` da mensagem, junto com a instrução em texto do que fazer com ela
 
 ```bash
 IMG_B64=$(base64 -i print.png)
-curl https://llmserve-docker.up.railway.app/v1/chat/completions \
+curl https://api.trystac.com/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -d @- <<EOF
@@ -748,7 +748,7 @@ dois campos, ou nenhum, responde `400`:
 ### Modo direto
 
 ```bash
-curl -X POST https://llmserve-docker.up.railway.app/v1/documents/generate \
+curl -X POST https://api.trystac.com/v1/documents/generate \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"html": "<h1>Relatório mensal</h1><p>...</p>"}' \
@@ -758,7 +758,7 @@ curl -X POST https://llmserve-docker.up.railway.app/v1/documents/generate \
 ### Modo por instrução
 
 ```bash
-curl -X POST https://llmserve-docker.up.railway.app/v1/documents/generate \
+curl -X POST https://api.trystac.com/v1/documents/generate \
   -H "Authorization: Bearer $STACK_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"user": "Um relatório mensal de vendas, com uma tabela por região."}' \
@@ -890,7 +890,7 @@ dormindo o que o `Retry-After` mandar.
 ```python
 import os, time, requests
 
-URL = "https://llmserve-docker.up.railway.app/v1/chat/completions"
+URL = "https://api.trystac.com/v1/chat/completions"
 HEADERS = {
     "Content-Type": "application/json",
     "Authorization": "Bearer " + os.environ["STACK_API_KEY"],
@@ -907,7 +907,7 @@ def chamar(payload, tentativas=5):
 ```
 
 ```js
-const URL = "https://llmserve-docker.up.railway.app/v1/chat/completions"
+const URL = "https://api.trystac.com/v1/chat/completions"
 const HEADERS = {
   "Content-Type": "application/json",
   Authorization: "Bearer " + process.env.STACK_API_KEY,

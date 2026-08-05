@@ -16,7 +16,7 @@ throughput sob concorrência, e taxa de erro real.
    ```
 2. **A máquina precisa estar `running`.** Subir/religar é ação de quem tem
    acesso à RunPod (custo real) — nunca automatizar isso sem confirmação.
-3. **Sempre testar via o gateway** (`https://llmserve-docker.up.railway.app`),
+3. **Sempre testar via o gateway** (`https://api.trystac.com`),
    nunca direto no `public_url` do pod. Ver "Armadilhas" — bater direto no
    pod tem dois problemas: não atualiza `last_activity_at` (a máquina pode
    ser auto-pausada no meio do teste) e não exercita o roteamento/realocação
@@ -60,7 +60,7 @@ throughput sob concorrência, e taxa de erro real.
 ```bash
 pip install httpx
 python3 scripts/loadtest.py \
-  --base-url https://llmserve-docker.up.railway.app \
+  --base-url https://api.trystac.com \
   --api-key <chave HEX da stack de teste> \
   --model <served-model-name do template, ex: pro-base> \
   --levels 5,10,15 \
@@ -78,7 +78,7 @@ as mesmas tarefas nos dois modos, e imprime o "custo do vizinho" por conta:
 
 ```bash
 python3 scripts/loadtest.py \
-  --base-url https://llmserve-docker.up.railway.app \
+  --base-url https://api.trystac.com \
   --isolation-keys <chave1>,<chave2>,<chave3> \
   --model pro-base \
   --out isolamento_pro.json
@@ -190,12 +190,12 @@ consumir a quota diária de tokens da conta.
 ```bash
 # checks rápidos (sem custo de rajada)
 python3 scripts/security_check.py \
-  --base-url https://llmserve-docker.up.railway.app \
+  --base-url https://api.trystac.com \
   --api-key <chave HEX da stack de teste>
 
 # inclui rate-limit/concorrência — custo real de GPU, ver aviso no --help
 python3 scripts/security_check.py \
-  --base-url https://llmserve-docker.up.railway.app \
+  --base-url https://api.trystac.com \
   --api-key <chave HEX da stack de teste> \
   --include-burst
 ```
