@@ -146,6 +146,16 @@ MAX_MESSAGES = int(os.environ.get("MAX_MESSAGES", "200"))
 # cobrir a geração inteira do JSON de uma vez.
 DOCUMENT_UPSTREAM_TIMEOUT_S = float(os.environ.get("DOCUMENT_UPSTREAM_TIMEOUT_S", "240"))
 
+# mesmo motivo do DOCUMENT_UPSTREAM_TIMEOUT_S acima, agora pro proxy genérico
+# de /v1/messages: com "stream": false o vLLM não manda NENHUM byte até a
+# geração inteira terminar, então os 60s do proxy_client (pensados pra medir
+# silêncio ENTRE chunks de um stream) matam requests não-streaming saudáveis
+# sempre que max_tokens for alto o bastante pra passar de 60s de geração —
+# confirmado ao vivo num teste com max_tokens=8000: a máquina respondia ao
+# /health em <1s, mas o proxy estourava aos 60s e devolvia "máquina
+# indisponível" pra uma máquina saudável que só ainda estava gerando.
+MESSAGES_NONSTREAM_TIMEOUT_S = float(os.environ.get("MESSAGES_NONSTREAM_TIMEOUT_S", "600"))
+
 # quota diária de tokens por conta (controle de custo real — rate limit e
 # concorrência limitam volume de requests, não o custo de cada uma). 0 =
 # sem teto (default, por plano — só liga onde configurado). Lida de
@@ -2735,15 +2745,48 @@ async def anthropic_messages(
 
     upstream_body = json.dumps(openai_body).encode()
 
+    # streaming: mantém os 60s default do proxy_client (silêncio ENTRE
+    # chunks — se o vLLM já começou a mandar SSE e trava no meio, é falha de
+    # verdade). Não-streaming: sem chunks, o read timeout tem que cobrir a
+    # geração inteira até max_tokens — ver MESSAGES_NONSTREAM_TIMEOUT_S acima.
+    # connect/write/pool continuam os do client (5s/10s/10s): só o read muda.
+    upstream_timeout = (
+        proxy_client.timeout
+        if is_stream
+        else httpx.Timeout(
+            MESSAGES_NONSTREAM_TIMEOUT_S, connect=5.0, write=10.0, pool=10.0
+        )
+    )
+
     try:
         upstream_req = proxy_client.build_request(
             "POST",
             f"{machine['public_url']}/v1/chat/completions",
             content=upstream_body,
             headers={"Authorization": bearer_header, "Content-Type": "application/json"},
+            timeout=upstream_timeout,
         )
         upstream = await proxy_client.send(upstream_req, stream=True)
+    except httpx.ReadTimeout as e:
+        # conexão abriu normalmente, máquina pode estar saudável (ver
+        # MESSAGES_NONSTREAM_TIMEOUT_S) — só não respondeu dentro da janela.
+        # Mensagem separada da de "máquina indisponível" abaixo: aqui não dá
+        # pra saber se ela ainda vai terminar, então "tente novamente" é
+        # enganoso — o cliente deve saber que foi timeout, não indisponibilidade.
+        release_flight(flight_key)
+        logger.warning(
+            "anthropic proxy: timeout aguardando resposta de %s (%s)", flight_key, e
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "a máquina não respondeu a tempo (geração longa ou timeout "
+                "insuficiente) — considere usar stream:true para max_tokens altos"
+            ),
+        )
     except httpx.HTTPError as e:
+        # falha de conexão de verdade (recusada, DNS, pod fora do ar etc.) —
+        # aqui sim "indisponível" é a descrição correta.
         release_flight(flight_key)
         logger.warning("anthropic proxy: upstream indisponível para %s (%s)", flight_key, e)
         raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
