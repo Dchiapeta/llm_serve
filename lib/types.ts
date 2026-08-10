@@ -7,6 +7,27 @@ export const TEMPLATE_PLANS: TemplatePlan[] = [
   "Enterprise",
 ]
 
+// Estado de cobrança da stack (migration 0050). Espelha o status da
+// assinatura na Chargefy, projetado por trigger. 'suspended' e 'canceled'
+// cortam o acesso na hora; 'past_due' só corta depois de BILLING_GRACE_HOURS
+// contadas de stacks.past_due_since (docker/gateway/main.py:billing_blocked).
+export type BillingStatus =
+  | "active"
+  | "trialing"
+  | "past_due"
+  | "suspended"
+  | "canceled"
+
+// Tolerância entre a assinatura entrar em atraso e a chave parar de
+// responder. Espelha BILLING_GRACE_HOURS do gateway, que é quem de fato
+// aplica o corte — aqui serve só pra UI mostrar quanto tempo resta.
+//
+// ATENÇÃO: no gateway o valor é sobrescrevível por env var
+// (docker/gateway/main.py). Se ela for configurada em produção sem mudar este
+// número, a coluna "Cobrança" do painel passa a mentir sobre a única data que
+// o suporte usa pra decidir se cobra ou espera — mude os dois juntos.
+export const BILLING_GRACE_HOURS = 72
+
 // Planos cujo pod é COMPARTILHADO entre tenants (várias stacks/contas no mesmo
 // processo vLLM). Espelha SHARED_POD_PLANS do gateway (docker/gateway/main.py).
 // Nesses planos o prefix caching vira canal lateral de tempo entre co-tenants
@@ -125,6 +146,15 @@ export type Stack = {
   // gateway; pesa na ocupação de máquina (low=1.0, medium=1.5, high=3.0).
   usage_class: "low" | "medium" | "high"
   usage_class_updated_at: string | null
+  // Estado de cobrança (migration 0050). Escrito pelo trigger que projeta
+  // chargefy_subscriptions (repo TryStac) e pelo loop de reconciliação do
+  // gateway — nunca pela aplicação. 'past_due' ainda tem acesso: é o par com
+  // past_due_since, contra BILLING_GRACE_HOURS, que corta.
+  billing_status: BillingStatus
+  past_due_since: string | null
+  // Idempotência do provisionamento por checkout (= client_reference de
+  // chargefy_checkout_attempts). Null em stack criada pelo painel admin.
+  provisioning_ref: string | null
   created_at: string
 }
 

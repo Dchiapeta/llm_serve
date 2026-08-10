@@ -10,7 +10,7 @@ import { computeCapacity, stackWeight, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
 import { vllmFlagsFromTemplate } from "./machines"
 import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
-import { generateStackSlug, STACK_SLUG_RE } from "./slug"
+import { insertStack } from "./stacks"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
 import { MAX_KNOWLEDGE_FILE_SIZE_BYTES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Stack, type Template, type TemplatePlan } from "./types"
@@ -1129,7 +1129,6 @@ export async function createStack(formData: FormData): Promise<{
   if (!name) throw new Error("Informe o nome do cliente")
   if (!email) throw new Error("Informe o e-mail do cliente")
   if (!templateId) throw new Error("Selecione um produto")
-  if (!STACK_SLUG_RE.test(slug)) slug = generateStackSlug()
 
   const { data: tpl } = await db
     .from("templates")
@@ -1183,31 +1182,11 @@ export async function createStack(formData: FormData): Promise<{
     accountId = created.id
   }
 
-  // Insert com retry: colisão do unique de slug (Postgres 23505) regenera.
-  let stackId: string | null = null
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const { data: stack, error } = await db
-      .from("stacks")
-      .insert({
-        account_id: accountId,
-        plan,
-        slug,
-        // `name` é coluna do TryStac (supabase/SHARED_SCHEMA.md), NOT NULL
-        // sem default — sem isso o insert falha com 23502 (violação de
-        // not-null), não com 23505, e nem cai no retry de colisão de slug.
-        name: slug,
-        ...(purchaseDate ? { purchase_date: purchaseDate } : {}),
-      })
-      .select("id")
-      .single<{ id: string }>()
-    if (!error && stack) {
-      stackId = stack.id
-      break
-    }
-    if (error && error.code !== "23505") throw new Error(error.message)
-    slug = generateStackSlug()
-  }
-  if (!stackId) throw new Error("Não foi possível gerar um ID único; tente novamente")
+  // Insert (com retry de colisão de slug) compartilhado com o provisionamento
+  // por checkout — ver lib/stacks.ts.
+  const inserted = await insertStack({ db, accountId, plan, slug, purchaseDate })
+  const stackId = inserted.stackId
+  slug = inserted.slug
 
   let machineId = chosenMachineId
   let machineCreated = false

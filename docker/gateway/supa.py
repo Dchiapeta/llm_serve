@@ -71,7 +71,16 @@ class SupaClient:
 
         `purpose` (migration 0044) distingue chave "customer" de chave
         "playground" — esta última é interna (nunca exibida ao cliente,
-        gerada junto com a stack) e isenta de check_token_quota (main.py)."""
+        gerada junto com a stack) e isenta de check_token_quota (main.py).
+
+        `billing_status`/`past_due_since` (migration 0050) pegam carona no
+        mesmo select porque o corte por inadimplência é avaliado a cada
+        request, em `billing_blocked` (main.py) — uma query extra por request
+        só pra isso seria desperdício, e o key_cache já carrega o dict inteiro.
+        ATENÇÃO: `raise_for_status` abaixo transforma coluna inexistente
+        (PostgREST 400/42703) em erro não tratado no authenticate, ou seja,
+        500 em 100% do tráfego — a migration 0050 tem que estar aplicada
+        ANTES deste código subir."""
         r = await self._rest.get(
             "/api_keys",
             params={
@@ -80,7 +89,7 @@ class SupaClient:
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,purpose,"
                 "accounts(name,"
                 "stacks(id,machine_id,plan,slug,created_at,system_prompt,"
-                "default_temperature,default_top_p))",
+                "default_temperature,default_top_p,billing_status,past_due_since))",
                 "limit": "1",
             },
         )
@@ -509,6 +518,54 @@ class SupaClient:
                 "machine_id": "not.is.null",
                 "last_activity_at": f"lt.{cutoff_iso}",
                 "select": "id,machine_id,plan,usage_class",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def list_expired_grace_stacks(self, cutoff_iso: str) -> list[dict]:
+        """Stacks em atraso cuja tolerância já venceu — candidatas a virar
+        'suspended'. Usa o índice parcial stacks_past_due_idx (0050)."""
+        r = await self._rest.get(
+            "/stacks",
+            params={
+                "billing_status": "eq.past_due",
+                "past_due_since": f"lte.{cutoff_iso}",
+                "select": "id,slug,machine_id,past_due_since",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def suspend_stack(self, stack_id: str) -> bool:
+        """Materializa o corte: past_due → suspended.
+
+        Condicionado a billing_status ainda ser 'past_due'. Sem isso, um
+        pagamento processado pelo webhook entre o SELECT e este PATCH seria
+        sobrescrito — o cliente pagaria e o loop o suspenderia logo em
+        seguida. 0 linhas = alguém mudou o estado antes; ignorar é o certo."""
+        r = await self._rest.patch(
+            "/stacks",
+            params={"id": f"eq.{stack_id}", "billing_status": "eq.past_due"},
+            json={"billing_status": "suspended"},
+            headers={"Prefer": "return=representation"},
+        )
+        r.raise_for_status()
+        return len(r.json()) > 0
+
+    async def list_blocked_stacks_with_machine(self) -> list[dict]:
+        """Stacks cortadas que ainda ocupam vaga numa máquina.
+
+        Uma stack suspensa não trafega (402 no authenticate), mas continua
+        contando em machine_stack_load — ou seja, segue ocupando um slot pago
+        indefinidamente. Liberar a vaga é contábil, igual ao idle reaper: a
+        stack volta a ser homeada por place_base_stack se o cliente pagar."""
+        r = await self._rest.get(
+            "/stacks",
+            params={
+                "billing_status": "in.(suspended,canceled)",
+                "machine_id": "not.is.null",
+                "select": "id,slug,machine_id",
             },
         )
         r.raise_for_status()

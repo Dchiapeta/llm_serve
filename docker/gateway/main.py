@@ -40,7 +40,7 @@ import os
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import jsonschema
@@ -154,7 +154,16 @@ DOCUMENT_UPSTREAM_TIMEOUT_S = float(os.environ.get("DOCUMENT_UPSTREAM_TIMEOUT_S"
 # confirmado ao vivo num teste com max_tokens=8000: a máquina respondia ao
 # /health em <1s, mas o proxy estourava aos 60s e devolvia "máquina
 # indisponível" pra uma máquina saudável que só ainda estava gerando.
-MESSAGES_NONSTREAM_TIMEOUT_S = float(os.environ.get("MESSAGES_NONSTREAM_TIMEOUT_S", "600"))
+#
+# 90s, não mais — o public_url da máquina passa pelo Cloudflare do próprio
+# RunPod, que tem teto de proxy de ~100-120s (524 "A timeout occurred") e não
+# é algo que a gente controla. Subir esse valor pra perto ou acima disso
+# (tentamos 600s) só troca um erro claro nosso por um 524 em HTML do
+# Cloudflare, sem ganhar nenhum segundo real de espera — confirmado ao vivo:
+# com 600s aqui, a request morreu do mesmo jeito aos ~127s, só que com uma
+# página de erro do RunPod no lugar da nossa mensagem. 90s deixa margem de
+# segurança pra sempre sermos nós a responder primeiro.
+MESSAGES_NONSTREAM_TIMEOUT_S = float(os.environ.get("MESSAGES_NONSTREAM_TIMEOUT_S", "90"))
 
 # quota diária de tokens por conta (controle de custo real — rate limit e
 # concorrência limitam volume de requests, não o custo de cada uma). 0 =
@@ -171,6 +180,16 @@ DAILY_TOKEN_BUDGET = {
     "Enterprise": int(os.environ.get("DAILY_TOKEN_BUDGET_ENTERPRISE", "0")),
 }
 TOKEN_QUOTA_CACHE_TTL_S = float(os.environ.get("TOKEN_QUOTA_CACHE_TTL_S", "60"))
+
+# corte por inadimplência (migration 0050): tolerância entre a assinatura
+# entrar em atraso (stacks.past_due_since, gravado pelo trigger que projeta
+# chargefy_subscriptions) e a chave parar de responder. A política mora aqui
+# e não no banco de propósito — mudar o prazo é trocar esta constante, não
+# reescrever linha nenhuma.
+#
+# Vale para os dois cenários de atraso: fatura mensal vencida e valor anual
+# não pago depois do trial de 7 dias.
+BILLING_GRACE_HOURS = float(os.environ.get("BILLING_GRACE_HOURS", "72"))
 # usage_metrics antes só era populado quando um admin abria o painel
 # (collectUsageMetrics em lib/metrics.ts, chamado só no carregamento da
 # página) — inviável como base de uma quota real, já que uma conta gerava
@@ -444,12 +463,14 @@ async def lifespan(app: FastAPI):
     metrics_task = asyncio.create_task(metrics_collection_loop())
     stale_routes_task = asyncio.create_task(stale_route_reconciliation_loop())
     usage_class_task = asyncio.create_task(usage_class_loop())
+    billing_task = asyncio.create_task(billing_reconcile_loop())
     yield
     reaper_task.cancel()
     machine_task.cancel()
     metrics_task.cancel()
     stale_routes_task.cancel()
     usage_class_task.cancel()
+    billing_task.cancel()
     await proxy_client.aclose()
     await document_client.aclose()
     await openai_client.aclose()
@@ -584,6 +605,49 @@ def lora_name(stack_id: str) -> str:
 # ---------- Autenticação ----------
 
 
+def billing_blocked(stack: dict) -> str | None:
+    """Motivo do corte por inadimplência, ou None se a stack pode trafegar.
+
+    Única implementação da regra: `authenticate` a aplica por request (corte
+    exato) e `billing_reconcile_once` (lifecycle.py) a usa pra materializar o
+    corte em stacks.billing_status, pra tabela e comportamento não divergirem.
+
+    'past_due' NÃO bloqueia por si só — é o par (past_due, past_due_since)
+    contra BILLING_GRACE_HOURS que decide. Um cliente cuja fatura falhou hoje
+    continua trabalhando; quem passou das 72h para.
+    """
+    status = (stack.get("billing_status") or "active").lower()
+    if status in ("suspended", "canceled"):
+        return "assinatura suspensa por falta de pagamento — regularize em app.trystac.com"
+
+    past_due_since = stack.get("past_due_since")
+    if not past_due_since:
+        return None
+    try:
+        since = datetime.fromisoformat(str(past_due_since).replace("Z", "+00:00"))
+        if since.tzinfo is None:
+            # A coluna é timestamptz e o PostgREST sempre emite offset, mas um
+            # valor naive aqui compararia com datetime.now(timezone.utc) e
+            # levantaria TypeError DENTRO de authenticate — ou seja, 500 em
+            # todo o tráfego da chave, o oposto do fail-open pretendido.
+            raise ValueError("timestamp sem timezone")
+    except ValueError:
+        # Timestamp ilegível não é motivo pra derrubar um cliente pagante:
+        # fail-open aqui é a escolha certa (o oposto do fail-closed de
+        # stack_id, onde a ausência do dado significa configuração quebrada).
+        # O corte não se perde: billing_reconcile_once filtra past_due_since no
+        # próprio banco, sem passar por este parser.
+        logger.warning("past_due_since ilegível na stack %s: %r", stack.get("id"), past_due_since)
+        return None
+
+    if since + timedelta(hours=BILLING_GRACE_HOURS) <= datetime.now(timezone.utc):
+        return (
+            f"assinatura em atraso há mais de {int(BILLING_GRACE_HOURS)}h — "
+            "regularize o pagamento em app.trystac.com"
+        )
+    return None
+
+
 async def authenticate(authorization: str | None) -> tuple[dict, str]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="chave de acesso ausente")
@@ -622,6 +686,26 @@ async def authenticate(authorization: str | None) -> tuple[dict, str]:
     # pra qualquer chave que escape disso no futuro.
     if not entry.get("stack_id"):
         raise HTTPException(status_code=401, detail="chave sem stack associada — contate o suporte")
+
+    # Corte por inadimplência. Fica aqui, e não junto de check_rate_limit nos
+    # 4 call-sites de inferência, por dois motivos: authenticate_anthropic
+    # delega pra cá (então /v1/messages fica coberto de graça), e endpoint
+    # novo nasce protegido em vez de nascer aberto.
+    #
+    # 402 e não 401/403: o cliente não errou a credencial nem perdeu
+    # permissão — a chave está intacta e volta a funcionar sozinha assim que
+    # o pagamento entrar. Revogar a chave resolveria o corte, mas obrigaria o
+    # cliente a trocá-la em todas as integrações dele pra voltar.
+    #
+    # Playground é isento (mesmo critério de check_token_quota): é a chave
+    # interna que o admin usa pra diagnosticar a stack. Bloqueá-la tiraria
+    # justamente a ferramenta de investigar a conta suspensa.
+    if entry.get("purpose") != "playground":
+        stack, _ = resolve_key_stack(entry)
+        if stack:
+            reason = billing_blocked(stack)
+            if reason:
+                raise HTTPException(status_code=402, detail=reason)
 
     return entry, key_hash
 
@@ -1069,6 +1153,85 @@ async def usage_class_loop(interval_s: float = USAGE_CLASS_INTERVAL_S):
         except Exception as e:
             logger.warning("rebalanceamento de teto de heavy falhou: %s", e)
         await asyncio.sleep(interval_s)
+
+
+async def billing_reconcile_once() -> tuple[int, int]:
+    """Materializa o corte por inadimplência e devolve as vagas de quem foi
+    cortado. Devolve (suspensas, vagas_liberadas).
+
+    O bloqueio em si NÃO depende deste loop — `authenticate` avalia
+    billing_blocked por request, então o corte acontece na hora exata mesmo
+    que isto aqui esteja parado. O loop existe por dois motivos diferentes:
+
+      1. Sem ele, uma stack ficaria eternamente em 'past_due' com a
+         tolerância vencida: bloqueada de fato, mas descrita como "em atraso"
+         para o painel, o suporte e qualquer relatório. O estado do banco
+         mentiria sobre o comportamento do sistema.
+      2. Stack cortada continua contando em machine_stack_load — ocupando um
+         slot pago que ninguém pode usar. Liberar a vaga é contábil, mesmo
+         movimento do idle reaper de stacks base.
+    """
+    cutoff_iso = (
+        datetime.now(timezone.utc) - timedelta(hours=BILLING_GRACE_HOURS)
+    ).isoformat()
+
+    suspended = 0
+    try:
+        expired = await supa.list_expired_grace_stacks(cutoff_iso)
+    except Exception as e:
+        logger.warning("reconciliação de billing: falha ao listar em atraso (%s)", e)
+        expired = []
+
+    for stack in expired:
+        stack_id = stack["id"]
+        try:
+            if await supa.suspend_stack(stack_id):
+                suspended += 1
+                # o key_cache guarda o dict da stack inteiro (billing_status
+                # incluso): sem evictar, a entrada velha continuaria dizendo
+                # 'past_due' pelo resto do TTL
+                _evict_key_cache_for_stack(stack_id)
+                logger.info(
+                    "billing: stack %s suspensa (em atraso desde %s)",
+                    stack.get("slug") or stack_id, stack.get("past_due_since"),
+                )
+        except Exception as e:
+            logger.warning("billing: suspender stack %s falhou (%s)", stack_id, e)
+
+    released = 0
+    try:
+        blocked = await supa.list_blocked_stacks_with_machine()
+    except Exception as e:
+        logger.warning("reconciliação de billing: falha ao listar cortadas (%s)", e)
+        blocked = []
+
+    for stack in blocked:
+        stack_id, machine_id = stack["id"], stack["machine_id"]
+        # stack cortada não gera tráfego novo, mas um stream aberto ANTES do
+        # corte pode seguir em voo — mesma guarda do idle reaper
+        if in_flight.get((stack_id, machine_id), 0) > 0:
+            continue
+        try:
+            if await supa.release_base_stack(stack_id, machine_id):
+                released += 1
+                _evict_key_cache_for_stack(stack_id)
+                logger.info(
+                    "billing: vaga de %s liberada em %s (assinatura cortada)",
+                    stack.get("slug") or stack_id, machine_id,
+                )
+        except Exception as e:
+            logger.warning("billing: liberar vaga de %s falhou (%s)", stack_id, e)
+
+    return suspended, released
+
+
+async def billing_reconcile_loop(interval_s: float = 60.0):
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await billing_reconcile_once()
+        except Exception as e:
+            logger.warning("reconciliação de billing: ciclo falhou (%s)", e)
 
 
 async def reconcile_stale_routes_once() -> None:
@@ -2105,12 +2268,21 @@ async def embed_query(text: str) -> list[float] | None:
 # lá porque é ele que calcula a janela de input recomendada pro cliente
 # (usable_input_tokens/auto_compact_window) e é o único módulo importável sem as
 # env vars obrigatórias daqui. Piso de max_tokens: thinking mode (Qwen3.x) corta
-# o raciocínio no meio quando o cliente manda um teto baixo — comum em
-# ferramentas de terceiro (Cursor, Continue, Cline etc.) que fixam max_tokens
-# curto por padrão. Como o produto é BYOE (o usuário aponta a ferramenta dele
-# direto pro endpoint, sem UI de chat própria controlando esse parâmetro), o
-# gateway impõe o piso aqui pra garantir qualidade consistente independente do
+# o raciocínio no meio quando o cliente NÃO manda max_tokens algum — comum em
+# ferramentas de terceiro (Cursor, Continue, Cline etc.) que nem passam esse
+# parâmetro. Como o produto é BYOE (o usuário aponta a ferramenta dele direto
+# pro endpoint, sem UI de chat própria controlando esse parâmetro), o gateway
+# impõe o piso aqui pra garantir qualidade consistente independente do
 # cliente.
+#
+# Quando o cliente MANDA um max_tokens baixo de propósito (ex.: orçamento de
+# tempo apertado), promover pro piso silenciosamente o ignora por completo —
+# medido ao vivo: max_tokens=100 pedido, 3690 gerado, sempre com stop_reason
+# "end_turn" (o piso de 8000 dava folga de sobra pro thinking "pensar alto" e
+# ainda terminar sozinho, bem antes do teto real). Nesse caso o comportamento
+# correto é respeitar o valor pedido, mas desligar o thinking (mesmo padrão
+# de /v1/documents/extract, ver "enable_thinking" abaixo) pra esse teto baixo
+# não truncar o raciocínio no meio — ver validate_body().
 MAX_MAX_TOKENS = int(os.environ.get("MAX_MAX_TOKENS", "16000"))  # teto: sem isso um
 # cliente podia pedir max_tokens arbitrário e a GPU rodava até esgotar o contexto,
 # sem nenhum controle de custo (ver também check_concurrency/RATE_LIMIT_RPM)
@@ -2182,8 +2354,20 @@ async def validate_body(
         body_json["stream_options"] = stream_options
 
     current_max_tokens = body_json.get("max_tokens")
-    if not isinstance(current_max_tokens, int) or current_max_tokens < MIN_MAX_TOKENS:
+    if not isinstance(current_max_tokens, int):
+        # cliente não mandou nada — piso de sempre, thinking fica ligado
+        # (comportamento inalterado, ver comentário de MIN_MAX_TOKENS acima)
         body_json["max_tokens"] = MIN_MAX_TOKENS
+    elif current_max_tokens < MIN_MAX_TOKENS:
+        # cliente pediu um teto baixo de propósito — respeita o valor (não
+        # promove mais pro piso) e desliga o thinking pra esse teto não
+        # truncar o raciocínio no meio, mesmo padrão já usado em
+        # /v1/documents/extract e /v1/documents/generate
+        chat_kwargs = body_json.get("chat_template_kwargs")
+        if not isinstance(chat_kwargs, dict):
+            chat_kwargs = {}
+        chat_kwargs["enable_thinking"] = False
+        body_json["chat_template_kwargs"] = chat_kwargs
     elif current_max_tokens > MAX_MAX_TOKENS:
         body_json["max_tokens"] = MAX_MAX_TOKENS
 
@@ -2844,6 +3028,7 @@ async def anthropic_messages(
         )
 
     usage = None
+    not_json = False
     try:
         raw = await upstream.aread()
         try:
@@ -2862,11 +3047,30 @@ async def anthropic_messages(
             )
             raw = json.dumps(anthropic_resp).encode()
         except Exception:
-            pass  # resposta não é o JSON esperado -> repassa como veio
+            not_json = True  # resposta não é o JSON esperado
     finally:
         await upstream.aclose()
         release_flight(flight_key)
         log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=False, usage=usage)
+
+    if not_json and upstream.status_code >= 400:
+        # upstream não devolveu JSON — ex.: página de erro HTML do Cloudflare
+        # do RunPod, quando o timeout DELES estoura antes do vLLM terminar
+        # (524 "A timeout occurred", visto ao vivo). Sem isso, o HTML cru ia
+        # pro cliente com content-type mentindo "application/json", quebrando
+        # o parser de qualquer SDK. Mesmo tratamento do branch streaming
+        # acima (upstream.status_code >= 400): erro Anthropic-shaped.
+        message = raw.decode(errors="replace").strip() or "erro desconhecido do modelo"
+        if message.startswith("<"):
+            # corpo é HTML (página de erro de proxy) — não é uma mensagem
+            # útil pro cliente, troca por algo genérico em vez de vazar HTML
+            message = "erro do servidor upstream (resposta não-JSON)"
+        logger.warning(
+            "anthropic proxy: upstream %s retornou %s não-JSON para %s",
+            machine["id"], upstream.status_code, flight_key,
+        )
+        return JSONResponse(status_code=upstream.status_code, content=anthropic_error_body(message))
+
     return Response(content=raw, status_code=upstream.status_code, media_type="application/json")
 
 
@@ -4054,6 +4258,16 @@ async def admin_reap_idle(x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
     reaped = await lifecycle_mgr.reap_idle_once()
     return {"ok": True, "reaped": reaped}
+
+
+@app.post("/admin/billing-reconcile")
+async def admin_billing_reconcile(x_admin_secret: str | None = Header(None)):
+    """Dispara um ciclo de reconciliação de billing manualmente (útil em
+    teste: evita esperar até 60s pra ver um past_due vencido virar
+    suspended)."""
+    require_admin(x_admin_secret)
+    suspended, released = await billing_reconcile_once()
+    return {"ok": True, "suspended": suspended, "slots_released": released}
 
 
 @app.post("/admin/consolidate")

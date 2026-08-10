@@ -448,5 +448,6 @@ manda ao modelo; no modo direto é responsabilidade de quem monta o HTML.
 | Status | Causa |
 |---|---|
 | `401` | Chave ausente, inválida, revogada ou expirada |
+| `402` | Assinatura suspensa ou em atraso há mais de 72h — a chave continua válida e volta a responder sozinha assim que o pagamento entrar (até 1 min de propagação). **Não tente de novo**: repetir não resolve, e o `detail` da resposta traz o que fazer |
 | `404` | Caminho fora da lista de rotas suportadas |
 | `429` / `503` | Rate limit, cota diária ou infraestrutura religando — veja [Retry](integracao.md#retry-o-ponto-mais-importante-para-produção) |

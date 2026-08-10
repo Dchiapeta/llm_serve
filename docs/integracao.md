@@ -939,8 +939,16 @@ generoso (120s nos exemplos) e não trate a espera como erro na sua UI.
 | Status | Causa provável |
 |---|---|
 | `401` | Chave ausente, inválida, revogada ou expirada |
+| `402` | Assinatura suspensa, ou em atraso há mais de 72h |
 | `404` | Caminho fora da lista de rotas suportadas |
 | `400` | Corpo inválido, ou prompt maior que a janela disponível |
 
 Em caso de `401` numa chave que você sabe ser válida, verifique se ela não foi revogada
 no painel e se não há espaços extras ao redor do valor copiado.
+
+O `402` é o único erro desta tabela que **não** deve entrar no laço de retry: ele não
+descreve uma falha transitória, e sim uma cobrança pendente. A chave não foi revogada —
+ela volta a responder sozinha (em até 1 minuto) assim que o pagamento for regularizado,
+sem precisar gerar chave nova nem trocar nada na sua integração. Uma falha de cobrança
+não corta o acesso na hora: há 72 horas de tolerância a partir do vencimento, e o painel
+mostra quanto tempo resta antes do corte.

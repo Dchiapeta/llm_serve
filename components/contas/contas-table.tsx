@@ -5,7 +5,7 @@ import Link from "next/link"
 import { Copy, Search } from "lucide-react"
 import { toast } from "sonner"
 
-import { TEMPLATE_PLANS, type Account, type ApiKey, type Machine, type RoutingState, type Stack, type TemplatePlan } from "@/lib/types"
+import { BILLING_GRACE_HOURS, TEMPLATE_PLANS, type Account, type ApiKey, type BillingStatus, type Machine, type RoutingState, type Stack, type TemplatePlan } from "@/lib/types"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -57,6 +57,37 @@ const MACHINE_STATUS_BADGE: Record<
 }
 
 const NO_MACHINE_BADGE = { label: "Desativada", variant: "outline" } as const
+
+// Estado de cobrança (migration 0050). 'active' não ganha badge: é o caso
+// normal e poluiria a tabela inteira — a coluna só chama atenção pro que
+// exige ação.
+const BILLING_BADGE: Partial<
+  Record<
+    BillingStatus,
+    { label: string; variant: React.ComponentProps<typeof Badge>["variant"] }
+  >
+> = {
+  trialing: { label: "Trial", variant: "info-light" },
+  past_due: { label: "Em atraso", variant: "warning-light" },
+  suspended: { label: "Suspensa", variant: "destructive-light" },
+  canceled: { label: "Cancelada", variant: "outline" },
+}
+
+// Quanto falta da tolerância antes do corte. Vencido = a stack está bloqueada
+// de fato mesmo que o loop ainda não a tenha marcado como 'suspended' (janela
+// de até 60s entre uma coisa e outra).
+//
+// `ceil` e não `floor`: com 50 min restando, floor daria 0 horas e a coluna
+// diria "corte pendente" enquanto o gateway ainda libera o cliente. Arredondar
+// para cima mantém a tabela e o comportamento contando a mesma coisa.
+function graceRemaining(pastDueSince: string | null): string | null {
+  if (!pastDueSince) return null
+  const remainingMs = new Date(pastDueSince).getTime() + BILLING_GRACE_HOURS * 3600_000 - Date.now()
+  if (remainingMs <= 0) return "corte pendente"
+  const hours = Math.ceil(remainingMs / 3600_000)
+  if (hours < 24) return `corta em ${hours}h`
+  return `corta em ${Math.ceil(hours / 24)}d`
+}
 
 // Opções do filtro de status — rótulos exibidos na tabela; "terminated"
 // fica de fora porque `machines` (page.tsx) já exclui máquinas encerradas.
@@ -197,6 +228,7 @@ export function ContasTable({
             <TableHead>Cliente</TableHead>
             <TableHead>E-mail</TableHead>
             <TableHead>Produto</TableHead>
+            <TableHead>Cobrança</TableHead>
             <TableHead>Status</TableHead>
             <TableHead>Máquina</TableHead>
             <TableHead className="w-10" />
@@ -205,7 +237,7 @@ export function ContasTable({
         <TableBody>
           {filteredRows.length === 0 && (
             <TableRow>
-              <TableCell colSpan={8} className="text-center text-muted-foreground">
+              <TableCell colSpan={9} className="text-center text-muted-foreground">
                 {rows.length === 0
                   ? "Nenhuma stack ainda."
                   : "Nenhuma stack encontrada."}
@@ -217,6 +249,11 @@ export function ContasTable({
             const status = stack.machine
               ? MACHINE_STATUS_BADGE[stack.machine.status]
               : NO_MACHINE_BADGE
+            const billing = BILLING_BADGE[stack.billing_status]
+            const grace =
+              stack.billing_status === "past_due"
+                ? graceRemaining(stack.past_due_since)
+                : null
             return (
               <TableRow key={stack.id}>
                 <TableCell className="text-sm font-medium">
@@ -251,6 +288,20 @@ export function ContasTable({
                   <Badge variant={PLAN_BADGE_VARIANT[stack.plan]} size="sm">
                     {stack.plan}
                   </Badge>
+                </TableCell>
+                <TableCell>
+                  {billing ? (
+                    <div className="flex flex-col items-start gap-0.5">
+                      <Badge variant={billing.variant} size="sm">
+                        {billing.label}
+                      </Badge>
+                      {grace && (
+                        <span className="text-[11px] text-muted-foreground">{grace}</span>
+                      )}
+                    </div>
+                  ) : (
+                    <span className="text-sm text-muted-foreground">—</span>
+                  )}
                 </TableCell>
                 <TableCell>
                   <Badge variant={status.variant} size="sm">

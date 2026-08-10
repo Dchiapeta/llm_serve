@@ -23,6 +23,27 @@ não confie só no que está em `supabase/migrations/` aqui.**
 | `knowledge_chunks` | policy de SELECT por conta (`authenticated`) + view `stack_knowledge_files` (agregada por `storage_path`, `security_invoker=true`, sem a coluna `embedding`) |
 | `api_keys` | colunas `name`, `last_used_at` (uso ainda não identificado neste repo) |
 
+## Colunas deste repo escritas pelo lado do TryStac
+
+`stacks.billing_status`, `stacks.past_due_since` e `stacks.provisioning_ref`
+são criadas aqui (`0050_stacks_billing.sql`) mas **escritas do outro lado**:
+
+- `billing_status` / `past_due_since` — pelo trigger `project_subscription_to_stack`
+  (migration `0029` do TryStac), que projeta `chargefy_subscriptions` na stack.
+  Também escritas pelo `billing_reconcile_once` do gateway (`docker/gateway/main.py`),
+  que materializa `past_due` vencido → `suspended`. **Nenhuma aplicação escreve
+  estas colunas à mão** — trocar isso por um update de aplicação reintroduz o
+  problema de ordenação que o trigger resolve (a Chargefy não garante ordem
+  entre eventos).
+- `provisioning_ref` — pelo `POST /api/stacks` deste repo, com o
+  `client_reference` que o TryStac gera em `chargefy_checkout_attempts`. O
+  unique parcial é o que impede uma reentrega de webhook virar uma segunda
+  stack.
+
+Ordem obrigatória: `0050` (aqui) **antes** de `0029` (lá), e as duas antes de
+qualquer deploy do gateway que leia as colunas — `find_active_key` faz
+`raise_for_status()`, então coluna faltando vira 500 em todo o tráfego.
+
 ## Convenção usada pelo TryStac (pra não colidir nomes/policies)
 
 - Grants de UPDATE são sempre **por coluna** (`grant update (col) on table to authenticated`), nunca a tabela inteira — o resto das colunas (`plan`, `machine_id`, `account_id`, `usage_class`, etc.) continua sem grant nenhum pra `authenticated`.
