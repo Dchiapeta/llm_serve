@@ -189,7 +189,13 @@ TOKEN_QUOTA_CACHE_TTL_S = float(os.environ.get("TOKEN_QUOTA_CACHE_TTL_S", "60"))
 #
 # Vale para os dois cenários de atraso: fatura mensal vencida e valor anual
 # não pago depois do trial de 7 dias.
-BILLING_GRACE_HOURS = float(os.environ.get("BILLING_GRACE_HOURS", "72"))
+#
+# `or` em vez do default de get(): uma variável DECLARADA E VAZIA é o estado
+# natural de quem copiou o .env.example e não preencheu, e float("") levanta
+# ValueError no import — o módulo nem carrega, o gateway não sobe, e todo o
+# tráfego de inferência de todos os clientes cai. Um prazo de cobrança não
+# configurado tem que degradar para o default, nunca para outage.
+BILLING_GRACE_HOURS = float(os.environ.get("BILLING_GRACE_HOURS") or "72")
 # usage_metrics antes só era populado quando um admin abria o painel
 # (collectUsageMetrics em lib/metrics.ts, chamado só no carregamento da
 # página) — inviável como base de uma quota real, já que uma conta gerava
