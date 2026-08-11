@@ -1,0 +1,19 @@
+# Contexto de build da imagem do gateway (docker/gateway/Dockerfile), que é
+# construída da raiz do repo. Sem esta lista o contexto passa de 9 GB — .next
+# sozinho é 8 GB — para uma imagem que copia treze .py e um requirements.txt.
+#
+# Não afeta a imagem do agent (docker/Dockerfile): ela usa paths agent/..., logo
+# o contexto dela é docker/ e o .dockerignore lido seria docker/.dockerignore.
+node_modules
+.next
+.git
+test-lora-adapter
+
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+
+# Nenhum COPY referencia o .env, mas hoje ele é enviado ao daemon junto do resto
+# do contexto. Segredo não tem por que sair da máquina.
+.env
+.env.example

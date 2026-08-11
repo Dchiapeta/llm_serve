@@ -25,7 +25,15 @@ RUN apt-get update \
 COPY docker/gateway/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY docker/gateway/main.py docker/gateway/routing.py docker/gateway/supa.py docker/gateway/lifecycle.py docker/gateway/runpod_api.py docker/gateway/anthropic_compat.py docker/gateway/context_budget.py docker/gateway/usage_class.py docker/gateway/recovery.py docker/gateway/content_policy.py docker/gateway/document_extract.py docker/gateway/document_generate.py .
+# Glob de propósito: a lista arquivo-a-arquivo que existia aqui já esqueceu
+# módulo novo três vezes (anthropic_compat, recovery, e cli_policy +
+# client_identity), e cada vez o gateway subiu em crash-loop com
+# ModuleNotFoundError no import do main.py. Com o glob, módulo novo entra na
+# imagem sozinho. O rm mantém o que a lista garantia de graça: teste fora da
+# imagem. requirements.txt fica no COPY próprio acima para o pip continuar
+# cacheado — este COPY invalida a cada mudança de código.
+COPY docker/gateway/*.py .
+RUN rm -f test_*.py
 
 EXPOSE 8080
 

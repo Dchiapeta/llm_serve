@@ -115,9 +115,12 @@ SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=... GATEWAY_ADMIN_SECRET=dev \
 
 ## Build e deploy
 
+Da **raiz do repo**, não de `docker/gateway` — os `COPY` do Dockerfile usam
+paths `docker/gateway/...`, então o contexto de build tem que ser a raiz:
+
 ```bash
-cd docker/gateway
-docker buildx build --platform linux/amd64 -t SEU_USUARIO/llm-gateway:latest --push .
+docker buildx build -f docker/gateway/Dockerfile \
+  --platform linux/amd64 -t SEU_USUARIO/llm-gateway:latest --push .
 ```
 
 Rode em qualquer host com CPU (pod CPU da RunPod, VPS, etc.) — precisa
