@@ -54,6 +54,10 @@ Formato Anthropic equivalente: `POST /v1/messages` com header `x-api-key` em vez
 `Authorization` (veja [integracao.md](integracao.md#a-request)). Também existem
 `/v1/completions`, `/v1/embeddings`, `/v1/responses` e `GET /v1/models`.
 
+`/v1/messages` e `/v1/responses` são as rotas do Claude Code e do Codex, e por isso
+exigem plano **Pro ou superior** — no Go elas respondem `403`. `/v1/chat/completions`
+funciona em todos os planos.
+
 ---
 
 ## 2. Imagem — OCR / leitura de imagem

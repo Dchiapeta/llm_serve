@@ -3,16 +3,26 @@
 import { CodeBlock } from "@/components/ui/code-block"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { autoCompactWindow } from "@/lib/context-window"
+import { CLI_BLOCKED_PLANS, type TemplatePlan } from "@/lib/types"
 
 export function MachineAbout({
   gatewayUrl,
   modelName,
   maxModelLen,
+  plan,
 }: {
   gatewayUrl: string | null
   modelName: string | null
   maxModelLen: number | null
+  // Plano do template da máquina. null = máquina sem template (não dá pra
+  // saber o plano) — mostra as ferramentas, mesmo fail-open do gateway quando
+  // o plano não é resolvível.
+  plan: TemplatePlan | null
 }) {
+  // Planos sem CLI não podem ver a config de Claude Code/Codex: o gateway
+  // responde 403 nessas rotas (docker/gateway/cli_policy.py), então ensiná-la
+  // aqui seria mandar o cliente montar algo que não funciona.
+  const cliAllowed = !plan || !CLI_BLOCKED_PLANS.includes(plan)
   // Sempre o gateway, nunca o proxy do pod: o pod muda/pausa e o cliente não
   // pode saber disso — realocação e auto-wake só funcionam via gateway.
   // Fallback é a URL real de produção (Railway) — GATEWAY_URL pode não estar
@@ -263,7 +273,7 @@ wire_api = "responses"`
           <TabsTrigger value="js">JS / TS</TabsTrigger>
           <TabsTrigger value="php">PHP</TabsTrigger>
           <TabsTrigger value="outras">Outras</TabsTrigger>
-          <TabsTrigger value="tools">Ferramentas</TabsTrigger>
+          {cliAllowed && <TabsTrigger value="tools">Ferramentas</TabsTrigger>}
         </TabsList>
 
         <TabsContent value="terminal" className="mt-4 flex flex-col gap-6">
@@ -304,6 +314,7 @@ wire_api = "responses"`
           </div>
         </TabsContent>
 
+        {cliAllowed && (
         <TabsContent value="tools" className="mt-4 flex flex-col gap-6">
           <div>
             <h3 className="mb-2 text-sm font-medium">Claude Code CLI</h3>
@@ -359,7 +370,17 @@ wire_api = "responses"`
             </p>
           </div>
         </TabsContent>
+        )}
       </Tabs>
+
+      {!cliAllowed && (
+        <p className="text-xs text-muted-foreground">
+          O plano {plan} não inclui uso via CLI ou assistente de código (Claude
+          Code, Codex, Cursor, Cline) — o gateway responde{" "}
+          <code className="font-mono">403</code> nessas rotas. É do Pro para
+          cima.
+        </p>
+      )}
 
       <p className="text-xs text-muted-foreground">
         Máquina pausada responde <code className="font-mono">503</code> com{" "}

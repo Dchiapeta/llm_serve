@@ -1,12 +1,18 @@
-# Claude Code nos planos Go e Pro (janela 128k)
+# Claude Code no plano Pro (janela 128k)
+
+> **O Go saiu deste doc.** Ferramenta de código passou a ser do Pro para cima: o
+> gateway responde `403` em `/v1/messages`, `/v1/responses` e em
+> `chat/completions` com User-Agent de CLI quando o plano é Go
+> (`docker/gateway/cli_policy.py`). A config do template Go abaixo fica como
+> **registro histórico** — foi dimensionada para o Claude Code, e é justamente o
+> que a torna superdimensionada para o perfil de requests de API que sobrou.
 
 Por que existe: o Claude Code CLI manda ~26k tokens só de system prompt +
 tool schemas antes de qualquer trabalho — numa janela de 16k ele nem abre
 sessão (era o 400 cru do vLLM: "maximum context length is 16384 tokens...")
 e em 32k compacta o tempo todo. A janela subiu 16k → 32k → 64k → **131072
-(128k) nos dois planos**, hoje padronizada para que a config do cliente seja
-única. Este doc cobre a config dos templates dos DOIS planos, o gate de load
-test e o setup do usuário.
+(128k)**. Este doc cobre a config do template, o gate de load test e o setup
+do usuário.
 
 Pré-requisitos já no código (deploy antes de subir os pods novos):
 - Migration `0031_machine_max_model_len.sql` — gateway passa a conhecer a
@@ -26,7 +32,7 @@ overcommit silencioso). O inverso (DB migrado, código antigo) é seguro.
 
 ## 2. Config dos templates (painel → Templates)
 
-Regras comuns aos dois planos:
+Regras comuns:
 - **NÃO ligar prefix caching**: pods compartilhados rodam com
   `DISABLE_PREFIX_CACHING=true` de propósito (canal lateral de timing entre
   co-tenants — ver lib/types.ts SHARED_POD_PLANS). Não reverter.
@@ -37,21 +43,45 @@ Regras comuns aos dois planos:
 verificação de leitura de volta nos dois lados — os templates JÁ têm a
 config abaixo; falta recriar os pods e rodar os load tests.
 
-### Go (A40 48GB, Qwen3.5-9B) — aplicado
+### Go (A40 48GB, Qwen3.5-9B) — histórico, plano sem CLI desde 11/08/2026
+
+Mantido aqui porque explica de onde vem a config que o Go tem HOJE, e porque é
+o ponto de partida de qualquer recalibração para o perfil novo.
+
+O candidato a substituí-lo é o template **`Go_A40_Qwen3.5_64K-TEST`**
+(Supabase `6ef2312b-a9c7-4566-a763-dd24709416ab`, RunPod `frepvqwivj`):
+`--max-model-len 65536`, `--max-num-seqs 16`, `kv_reserve 1.0`, `max_users 25`,
+mesmo alias `vibecoder-base`. Promover depende de load test — o perfil a medir
+é concorrência de requests de API, não contexto grande de sessão agêntica.
 
 ```
---dtype bfloat16 --max-model-len 131072 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name go-base
+--dtype bfloat16 --max-model-len 131072 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name vibecoder-base
 ```
 
+- O alias servido é **`vibecoder-base`**, não `go-base`: a migration 0049
+  renomeou o PLANO, não o `--served-model-name` do template. Este doc já disse
+  `go-base` aqui e estava errado — quem copiar o nome errado leva 404 do pod.
 - Janela nativa do Qwen3.5-9B é **262144** (config.json conferido) —
   **sem YaRN/hf-overrides**, só a flag. Era 16384 → 65536 → **131072 (128k,
   aplicado 23/07/2026)**; admissão mantida (kv_reserve 1.5, max_users 18).
-- KV fp8 do 9B = 64KB/token (32 camadas × 4 KV heads × 256 head_dim):
-  pool ~22 GB ≈ **~340k tokens**; sessão cheia de 128k ≈ 8,4 GB ≈ **~2,6
-  sessões simultâneas** antes de preempção (era ~5 a 64k). Subir o teto não
-  consome mais VRAM — o pool é fixado pelo gpu-memory-utilization.
-- `kv_reserve_gb_per_user`: 1 → **1.5** (high = 4,5 GB ≈ uma sessão cheia;
-  orçamento (48−20)/1.5 = 18 slots ponderados).
+- KV fp8 do 9B = **16 KiB/token**. ⚠️ Este número já esteve errado aqui como
+  "64 KB/token", e o erro importa: ele fazia uma sessão cheia de 128k parecer
+  custar 8,4 GB (≈2,6 sessões no pool) quando custa **2 GB** (≈11 sessões). O
+  9B é **híbrido** — `full_attention_interval=4`, só 8 das 32 camadas têm KV que
+  cresce — e é de lá que sai o 4× de diferença (medição na migration 0037 e em
+  `modelos-hibridos-prefix-caching-off`). Consequência prática: **o KV nunca foi
+  o recurso escasso do Go**; o pool de ~22 GB serve ~1,4 M tokens e quem corta a
+  concorrência é `--max-num-seqs`.
+- Subir o teto de janela não consome mais VRAM — o pool é fixado pelo
+  `gpu-memory-utilization`, e `--max-model-len` é teto por sequência, não
+  reserva. **Baixá-lo, portanto, também não devolve VRAM**: o que ele encolhe é
+  o pior caso por sessão, e é isso que permite subir `--max-num-seqs` sem
+  preempção.
+- `kv_reserve_gb_per_user`: 1 → **1.5** (high = 4,5 GB; orçamento
+  (48−20)/1.5 = 18 slots). Note que este campo trata cada cliente
+  **contratado** como se tivesse KV reservado permanentemente — premissa
+  razoável para sessão de CLI, falsa para requests de API, onde o KV é liberado
+  no fim de cada request.
 - `--max-num-seqs 8`: ponto de partida; calibrar no load test.
 
 ### Pro (2× A40 48GB, TP=2, Qwen3.6-27B-FP8) — aplicado
@@ -102,8 +132,7 @@ A40"]`, `gpu_count=2` (o entrypoint deriva `--tensor-parallel-size 2` do
    `kv_cache_dtype=fp8`, capacidade real do pool de KV e — no Pro —
    `tensor_parallel_size=2` mais a passagem pelo NCCL (o deadlock de PCIe sem
    NVLink congela exatamente em `parallel_state.py`/`pynccl.py`).
-5. Conferir: `select name, max_model_len from machines;` → **131072** nos dois
-   planos.
+5. Conferir: `select name, max_model_len from machines;` → **131072**.
 
 ## 4. Load test (gate — a mudança só vale se passar)
 
@@ -117,12 +146,6 @@ testar até `--context-tokens 110000`, e um 400 de contexto aí é falha do test
 não comportamento previsto.
 
 ```bash
-# Go (A40, 9B: pool ~340k tokens ≈ ~2,6 sessões cheias de 128k)
-python3 scripts/loadtest.py \
-  --base-url https://api.trystac.com \
-  --api-key <chave Go> --model <alias go> \
-  --levels 4,6,10 --context-tokens 110000 --max-tokens 16000
-
 # Pro (2× A40 TP=2, 27B: pool ~540k tokens ≈ ~4,2 sessões cheias)
 python3 scripts/loadtest.py \
   --base-url https://api.trystac.com \
@@ -134,18 +157,18 @@ No Pro o número que decide não é vazão, é **TTFT**: o gargalo é o prefill 
 128k (dequant Marlin + all-reduce por camada em PCIe). Capacidade de KV lá
 sobra; latência é a incógnita.
 
-E uma rodada de regressão em cada plano com as tarefas normais (sem
-`--context-tokens`), igual à validação do template v2 (70/70).
+E uma rodada de regressão com as tarefas normais (sem `--context-tokens`), igual
+à validação do template v2 (70/70).
 
-Critérios de aprovação (por plano):
+Critérios de aprovação:
 - zero 400 de contexto e zero OOM/crash do vLLM;
 - TTFT aceitável no pico (referência: Pro ~10s em carga pesada);
 - regressão das tarefas normais sem degradação relevante.
 
-Se degradar: reduzir `--max-num-seqs`. Reduzir a janela é o último recurso e
-custa a padronização — se cair em um plano só, o `AUTO_COMPACT_WINDOW` volta a
-ser diferente por plano (a conta é por máquina, então o painel acompanha
-sozinho, mas os docs e o onboarding deixam de ter um número único).
+Se degradar: reduzir `--max-num-seqs`. Reduzir a janela é o último recurso —
+`AUTO_COMPACT_WINDOW` sai da janela real por máquina (`lib/context-window.ts`),
+então o painel acompanha sozinho, mas os docs e o onboarding perdem o número
+único.
 
 Cuidado ao testar direto no pod (bypass do gateway): o idle-reaper não vê
 atividade e pode pausar a máquina no meio do teste — preferir sempre o
@@ -153,10 +176,11 @@ gateway.
 
 ## 5. Setup do usuário (onboarding)
 
-Com a janela padronizada em 131072 nos dois planos, a config é a mesma. O
-painel gera esses dois blocos na aba **Ferramentas** da máquina, já com a URL,
+O painel gera esses dois blocos na aba **Ferramentas** da máquina, já com a URL,
 o alias do modelo e a janela preenchidos (`components/machines/machine-about.tsx`,
-conta em `lib/context-window.ts`).
+conta em `lib/context-window.ts`). A aba só aparece em máquina de plano com CLI —
+numa máquina Go ela fica oculta, pela mesma constante que o gateway aplica
+(`CLI_BLOCKED_PLANS`).
 
 Permanente — recomendado, é o que não se esquece:
 

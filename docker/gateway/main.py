@@ -56,6 +56,7 @@ from anthropic_compat import (
     anthropic_to_openai_request,
     openai_to_anthropic_response,
 )
+from cli_policy import CLI_POLICY_ENFORCE, cli_block_reason
 from client_identity import (
     CLIENT_LIMIT_ENFORCE,
     CLIENT_TOUCH_THROTTLE_S,
@@ -769,7 +770,44 @@ async def enforce_client_limit(entry: dict, stack: dict, plan: str | None, heade
     raise HTTPException(status_code=403, detail=_client_limit_detail(plan, cap))
 
 
-async def authenticate(authorization: str | None, headers) -> tuple[dict, str]:
+def enforce_cli_policy(stack: dict, plan: str | None, path: str | None, headers) -> None:
+    """Corte de CLI por plano (o Go não coda — ver cli_policy.py).
+
+    Custo no caminho quente: zero I/O. `plan` e `stack` já vieram de
+    resolve_key_stack (cache de chave em memória), e a decisão é uma função pura
+    dos três sinais.
+
+    Em observação (CLI_POLICY_ENFORCE=0) loga WARNING e deixa passar — é o que
+    permite ver quem seria cortado sem cortar, caso um cliente legítimo apareça
+    barrado pela camada de User-Agent."""
+    reason = cli_block_reason(plan, path, headers.get("user-agent"))
+    if not reason:
+        return
+
+    if not CLI_POLICY_ENFORCE:
+        logger.warning(
+            "CLI no plano %s (observação, não cortado): stack=%s path=%s ua=%r",
+            plan, stack.get("id"), path, headers.get("user-agent"),
+        )
+        return
+
+    # gateway_requests não registra rejeição pré-rota (migration 0038), então
+    # esta linha é a única trilha que o suporte tem do corte — mesmo motivo do
+    # log em enforce_client_limit.
+    logger.warning(
+        "CLI bloqueado: stack=%s plano=%s path=%s ua=%r",
+        stack.get("id"), plan, path, headers.get("user-agent"),
+    )
+    # 403 e não 402/401: a credencial está intacta e o cliente não deve nada —
+    # o plano simplesmente não inclui o recurso. Um 401 mandaria o cliente
+    # trocar a chave (não resolve) e um 402 diria que há pagamento pendente
+    # (não há); 403 é o único que descreve "sua chave, sem esse direito".
+    raise HTTPException(status_code=403, detail=reason)
+
+
+async def authenticate(
+    authorization: str | None, headers, path: str | None = None
+) -> tuple[dict, str]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="chave de acesso ausente")
     key = authorization.removeprefix("Bearer ").strip()
@@ -827,6 +865,16 @@ async def authenticate(authorization: str | None, headers) -> tuple[dict, str]:
             reason = billing_blocked(stack)
             if reason:
                 raise HTTPException(status_code=402, detail=reason)
+            # Corte de CLI por plano, aqui pelos MESMOS dois motivos do bloco de
+            # billing: /v1/messages fica coberto de graça (authenticate_anthropic
+            # delega pra cá) e endpoint novo nasce protegido. Antes do teto de
+            # ambientes de propósito — não faz sentido gastar uma vaga de
+            # ambiente com uma requisição que vai levar 403 na linha seguinte.
+            #
+            # Playground é isento pelo mesmo critério de billing_blocked: é a
+            # chave interna com que o admin diagnostica a stack, e diagnosticar
+            # inclui reproduzir o que o cliente faz.
+            enforce_cli_policy(stack, plan, path, headers)
             # Mesmo motivo do bloco acima para morar aqui, e mesma isenção de
             # playground: a chave interna do admin não é um "lugar" do cliente
             # e não pode consumir a vaga que ela existe para diagnosticar.
@@ -889,7 +937,7 @@ async def check_token_quota(account_id: str, plan: str | None, purpose: str = "c
 
 
 async def authenticate_anthropic(
-    authorization: str | None, x_api_key: str | None, headers
+    authorization: str | None, x_api_key: str | None, headers, path: str | None = None
 ) -> tuple[dict, str, str]:
     """Igual a authenticate, mas aceita a chave em Authorization: Bearer OU
     x-api-key — o Claude Code manda num dos dois (às vezes os dois, se o
@@ -904,7 +952,7 @@ async def authenticate_anthropic(
     if not key:
         raise HTTPException(status_code=401, detail="chave de acesso ausente")
     bearer_header = f"Bearer {key}"
-    entry, key_hash = await authenticate(bearer_header, headers)
+    entry, key_hash = await authenticate(bearer_header, headers, path)
     return entry, key_hash, bearer_header
 
 
@@ -2996,7 +3044,7 @@ async def anthropic_messages(
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
 
     entry, key_hash, bearer_header = await authenticate_anthropic(
-        authorization, x_api_key, request.headers
+        authorization, x_api_key, request.headers, "messages"
     )
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
@@ -3223,7 +3271,7 @@ async def anthropic_count_tokens(
     Passa por rate limit (mas não por quota/concorrência): deixou de ser um
     cálculo puramente local — perto do teto faz uma chamada ao pod."""
     entry, key_hash, _bearer = await authenticate_anthropic(
-        authorization, x_api_key, request.headers
+        authorization, x_api_key, request.headers, "messages/count_tokens"
     )
     _, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
@@ -3424,7 +3472,7 @@ def validate_extraction_output(content: str, schema: dict) -> dict:
 
 
 async def _authenticate_for_extraction(
-    authorization: str | None, schema: str, headers
+    authorization: str | None, schema: str, headers, path: str
 ) -> tuple[dict, str, str, dict]:
     """Auth + validação de schema — a parte IDÊNTICA entre /v1/documents/extract
     e /v1/images/extract. Devolve (entry, key_hash, account_id, parsed_schema).
@@ -3433,8 +3481,12 @@ async def _authenticate_for_extraction(
     de checar: validar schema é trabalho de CPU (check_schema percorre o
     metaschema, e schema recursivo pode ir a RecursionError), e nada disso
     deve estar disponível a quem não tem chave. O authenticate é barato
-    (key_cache em memória) e o rate limit passa a valer pra este caminho."""
-    entry, key_hash = await authenticate(authorization, headers)
+    (key_cache em memória) e o rate limit passa a valer pra este caminho.
+
+    `path` só alimenta a política de CLI (cli_policy.py). Extração nunca é rota
+    de CLI, então nada é bloqueado aqui — passa pra que a lista de call-sites de
+    authenticate seja uniforme e um endpoint novo não nasça sem o parâmetro."""
+    entry, key_hash = await authenticate(authorization, headers, path)
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
@@ -3715,7 +3767,7 @@ async def extract_document(
     started = time.monotonic()
 
     entry, key_hash, account_id, parsed_schema = await _authenticate_for_extraction(
-        authorization, schema, request.headers
+        authorization, schema, request.headers, DOCUMENT_PATH
     )
 
     # Corte grosso ANTES de qualquer coisa cara: `file.size` vem do parser
@@ -3803,7 +3855,7 @@ async def extract_image(
     started = time.monotonic()
 
     entry, key_hash, account_id, parsed_schema = await _authenticate_for_extraction(
-        authorization, schema, request.headers
+        authorization, schema, request.headers, IMAGE_PATH
     )
 
     # mesmo corte grosso do PDF, teto próprio de imagem (ver document_extract.py)
@@ -3952,7 +4004,7 @@ async def generate_document(
     if not body.html and not body.user:
         raise HTTPException(status_code=400, detail="informe `html` ou `user`")
 
-    entry, key_hash = await authenticate(authorization, request.headers)
+    entry, key_hash = await authenticate(authorization, request.headers, GENERATE_PATH)
     stack, plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, plan)
     account_id = entry["account_id"]
@@ -4120,7 +4172,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     if len(body) > MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
 
-    entry, key_hash = await authenticate(authorization, request.headers)
+    entry, key_hash = await authenticate(authorization, request.headers, path)
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)

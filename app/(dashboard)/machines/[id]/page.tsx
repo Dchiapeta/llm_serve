@@ -436,6 +436,9 @@ export default async function MachineDetailPage({
                   parseMaxModelLen(template?.start_command) ??
                   machine.max_model_len
                 }
+                // decide se a aba Ferramentas (Claude Code, Codex, Cursor)
+                // aparece: planos em CLI_BLOCKED_PLANS levam 403 nessas rotas
+                plan={template?.plan ?? null}
               />
             </CardContent>
           </Card>

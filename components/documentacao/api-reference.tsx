@@ -126,6 +126,15 @@ export function ApiReference() {
           header <code className="font-mono text-xs">x-api-key</code> em vez
           de <code className="font-mono text-xs">Authorization</code>.
         </p>
+        <p>
+          <code className="font-mono text-xs">/v1/messages</code> e{" "}
+          <code className="font-mono text-xs">/v1/responses</code> são as rotas
+          do Claude Code e do Codex, e exigem plano{" "}
+          <span className="font-medium text-foreground">Pro ou superior</span> —
+          no Go respondem <code className="font-mono text-xs">403</code>.{" "}
+          <code className="font-mono text-xs">/v1/chat/completions</code>{" "}
+          funciona em todos os planos.
+        </p>
       </div>
 
       {/* Imagem OCR */}

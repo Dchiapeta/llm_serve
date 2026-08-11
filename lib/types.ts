@@ -28,6 +28,13 @@ export type BillingStatus =
 // o suporte usa pra decidir se cobra ou espera — mude os dois juntos.
 export const BILLING_GRACE_HOURS = 72
 
+// Planos que NÃO podem usar a stack para codar: CLI e assistente de código
+// (Claude Code, Codex, Cursor, Cline, Roo, Continue) são do Pro para cima.
+// Espelha CLI_BLOCKED_PLANS de docker/gateway/cli_policy.py, que é quem de fato
+// corta (403). Aqui serve para o painel não ENSINAR uma config que o gateway
+// recusa — mesmo cuidado de BILLING_GRACE_HOURS e MAX_CLIENTS_BY_PLAN abaixo.
+export const CLI_BLOCKED_PLANS: TemplatePlan[] = ["Go"]
+
 // Planos cujo pod é COMPARTILHADO entre tenants (várias stacks/contas no mesmo
 // processo vLLM). Espelha SHARED_POD_PLANS do gateway (docker/gateway/main.py).
 // Nesses planos o prefix caching vira canal lateral de tempo entre co-tenants

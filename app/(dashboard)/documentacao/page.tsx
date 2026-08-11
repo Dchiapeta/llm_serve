@@ -364,7 +364,14 @@ export default function DocumentacaoPage() {
                   máquina, aqui com valores genéricos — troque a URL e o
                   modelo pelos da sua máquina.
                 </Lead>
-                <MachineAbout gatewayUrl={null} modelName={null} maxModelLen={null} />
+                {/* plan={null}: doc genérica, sem máquina — mostra também a aba
+                    Ferramentas, que numa máquina de plano sem CLI fica oculta */}
+                <MachineAbout
+                  gatewayUrl={null}
+                  modelName={null}
+                  maxModelLen={null}
+                  plan={null}
+                />
               </AccordionContent>
             </AccordionItem>
 

@@ -307,6 +307,12 @@ for linha in r.iter_lines():
 
 ## Ferramentas de código
 
+> **Disponível do plano Pro para cima.** No **Go** as ferramentas de código são
+> recusadas com `403`: ele é um plano de requests de API (chat, imagem, extração de
+> documento). Isso vale para Claude Code, Codex, Cursor, Cline, Roo e Continue, e é
+> o único `403` desta seção — repetir a chamada não muda nada, e trocar a chave
+> também não. O caminho é o upgrade em app.trystac.com.
+
 Se em vez de escrever código você quer usar uma CLI, não precisa de request nenhuma —
 só de configuração.
 
@@ -316,7 +322,7 @@ só de configuração.
 export ANTHROPIC_BASE_URL="https://api.trystac.com"
 export ANTHROPIC_AUTH_TOKEN="<SUA_CHAVE_DE_ACESSO>"
 export ANTHROPIC_API_KEY=""
-export ANTHROPIC_MODEL="go-base"
+export ANTHROPIC_MODEL="pro-base"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
@@ -345,10 +351,10 @@ depender disso, ponha o mesmo conteúdo em `~/.claude/settings.json`:
     "ANTHROPIC_BASE_URL": "https://api.trystac.com",
     "ANTHROPIC_AUTH_TOKEN": "<SUA_CHAVE_DE_ACESSO>",
     "ANTHROPIC_API_KEY": "",
-    "ANTHROPIC_MODEL": "go-base",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "go-base",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "go-base",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "go-base",
+    "ANTHROPIC_MODEL": "pro-base",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "pro-base",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "pro-base",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "pro-base",
     "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "120000"
   }
 }
@@ -371,7 +377,7 @@ Em `~/.codex/config.toml`:
 
 ```toml
 model_provider = "llmserve"
-model = "go-base"
+model = "pro-base"
 
 # Compacta o histórico antes de estourar a janela do plano. O Codex assume 200k
 # por padrão e só descobriria o limite ao ser recusado. Mesmo valor do Claude
@@ -400,6 +406,10 @@ Todas têm um provider do tipo "OpenAI compatible". A configuração é sempre a
 - **Base URL**: `https://api.trystac.com/v1`
 - **API key**: sua chave de acesso
 - **Model**: qualquer valor
+
+Estas usam a mesma rota `/v1/chat/completions` de um SDK comum, então o que as
+identifica é o `User-Agent` que a ferramenta manda. É por ele que o `403` do Go se
+aplica também aqui.
 
 ---
 
@@ -468,8 +478,9 @@ A vaga de um ambiente é liberada sozinha depois de **14 dias** sem uso, então 
 máquina não exige fazer nada. Para liberar na hora — trocou de notebook hoje e quer usar
 já — o painel lista os ambientes ativos da stack com um botão de liberar vaga.
 
-Estourar o limite devolve `403`, com o motivo no campo `detail`. É o único erro que
-**não** adianta repetir: nenhuma tentativa a mais libera uma vaga.
+Estourar o limite devolve `403`, com o motivo no campo `detail` — como o `403` de
+ferramenta de código num plano que não a inclui. Os dois são os erros que **não**
+adiantam repetir: nenhuma tentativa a mais libera uma vaga nem muda o seu plano.
 
 ---
 
