@@ -14,6 +14,17 @@ cliente → gateway (:8080) → agent do pod (:8000) → vLLM (:8001)
 - **Auth**: `Authorization: Bearer <chave-hex>` → SHA-256 → `api_keys` no
   Supabase, com cache em memória (`KEY_CACHE_TTL_S`, default 60s; cache
   negativo de 5s). O painel chama `POST /admin/flush-key-cache` ao revogar.
+- **Teto de ambientes por stack** (migration 0051): dentro do `authenticate`,
+  o gateway deriva um fingerprint do request (ferramenta pelo User-Agent ×
+  bloco de rede /24 do `CF-Connecting-IP`) e conta lugares distintos por stack
+  numa janela deslizante (`CLIENT_WINDOW_DAYS`). A decisão de admissão é da
+  RPC `touch_stack_client` — no banco, não em memória, então escalar réplicas
+  não fura o teto. Caminho quente é zero I/O (cache `client_seen`, throttle de
+  `CLIENT_TOUCH_THROTTLE_S`); falha de I/O é fail-open. Nasce em modo
+  observação (`CLIENT_LIMIT_ENFORCE=0`). O fingerprint tem a mesma força do
+  User-Agent — telemetria com dente, nunca controle de segurança: quem
+  sustenta o contrato é o teto de CHAVES por stack, aplicado na emissão pelo
+  painel (`MAX_KEYS_BY_PLAN`). Ver `client_identity.py`.
 - **Roteamento**: rota com `machine_id` e status `loaded`/`migrating` → proxy
   direto (durante migração a origem continua servindo até o flip). `loading`
   → espera curta (`LOAD_WAIT_TIMEOUT_S`, default 20s) e 503 + `Retry-After`
@@ -88,6 +99,10 @@ advisory lock.
 | `MACHINE_HEALTH_POLL_INTERVAL_S` | não  | Intervalo entre polls de `/health` na máquina recém-criada (default 10) |
 | `SETTINGS_CACHE_TTL_S`    | não         | TTL do cache em memória do interruptor liga/desliga (`system_settings.auto_provision_enabled`, default 30) |
 | `UPSERT_CACHE_TTL_S`      | não         | TTL do cache "chave já upsertada no agent X" do fluxo base (default 600; invalidado por máquina a cada religada) |
+| `CLIENT_LIMIT_ENFORCE`    | não         | `0` (default) = MODO OBSERVAÇÃO: registra os ambientes e loga WARNING acima do teto, sem bloquear. `1` = devolve 403 ao ambiente que estoura o teto do plano. Ligue só depois de calibrar com os dados reais |
+| `MAX_CLIENTS_GO` / `_PRO` / `_MAX` / `_ENTERPRISE` | não | Teto de ambientes simultâneos por stack (defaults 5/25/50/sem teto; `0` = sem teto). Espelham `MAX_CLIENTS_BY_PLAN` em `lib/types.ts`, que é o que o painel exibe — mude os dois juntos |
+| `CLIENT_WINDOW_DAYS`      | não         | Janela deslizante da vaga de ambiente (default 14): sem uso por mais que isso, a vaga é liberada sozinha |
+| `CLIENT_TOUCH_THROTTLE_S` | não         | Intervalo mínimo entre dois toques do mesmo ambiente (default 300) — é o que mantém o caminho quente em zero I/O |
 
 ## Rodar local
 

@@ -1,0 +1,12 @@
+-- api_keys.machine_id passa a ser NULL-safe também neste repo: a chave de
+-- Playground de uma stack ainda não homeada nasce sem pin, e o gateway
+-- (place_base_stack → rebind_stack_keys) preenche no primeiro request. Sem
+-- isto, getOrCreatePlaygroundKey só conseguia emitir a chave depois que
+-- alguém criasse uma chave "customer" — que é o que aloca a máquina hoje
+-- (ensureStackMachine em /api/keys) — deixando o Playground de toda stack
+-- recém-criada pelo checkout em "Playground indisponível".
+--
+-- O drop not null original veio do repo TryStac (0004_api_keys_insert_policy);
+-- repetir aqui é no-op e evita que o schema deste repo dependa de uma
+-- migration que ele não versiona.
+alter table api_keys alter column machine_id drop not null;

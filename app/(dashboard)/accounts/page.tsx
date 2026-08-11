@@ -1,7 +1,7 @@
 import Link from "next/link"
 
 import { createSupabaseAdmin } from "@/lib/supabase/server"
-import type { Account, ApiKey, LoraAdapter, Machine, Stack } from "@/lib/types"
+import { MAX_KEYS_BY_PLAN, type Account, type ApiKey, type LoraAdapter, type Machine, type Stack } from "@/lib/types"
 import { Badge } from "@/components/ui/badge"
 import {
   Card,
@@ -18,7 +18,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import { CreateKeyDialog } from "@/components/accounts/create-key-dialog"
+import { CreateKeyDialog, type KeyQuota } from "@/components/accounts/create-key-dialog"
 import { RegisterLoraDialog } from "@/components/accounts/register-lora-dialog"
 import { RevokeKeyButton } from "@/components/accounts/revoke-key-button"
 
@@ -65,6 +65,28 @@ export default async function AccountsPage() {
   const loras = (lorasData ?? []) as LoraRow[]
   const stacks = (stacksData ?? []) as StackOption[]
 
+  // Quanto do teto de chaves do plano já foi usado, por par conta+máquina —
+  // o par que o CreateKeyDialog pergunta. Espelha a resolução implícita de
+  // stack do createKey (lib/actions.ts): a stack mais recente da conta
+  // naquela máquina; `stacks` já vem ordenada por created_at desc, então a
+  // primeira que aparece para o par é a mesma que a action escolheria.
+  //
+  // É só para a UI antecipar o limite — quem de fato barra é assertKeyQuota
+  // no server, e ele reconta na hora da emissão.
+  const keyQuotas: Record<string, KeyQuota> = {}
+  for (const s of stacks) {
+    if (!s.machine_id) continue
+    const slot = `${s.account_id}:${s.machine_id}`
+    if (keyQuotas[slot]) continue
+    keyQuotas[slot] = {
+      plan: s.plan,
+      used: keys.filter(
+        (k) => k.stack_id === s.id && k.status === "active" && k.purpose === "customer"
+      ).length,
+      limit: MAX_KEYS_BY_PLAN[s.plan],
+    }
+  }
+
   return (
     <div className="flex flex-col gap-6">
       <div className="flex items-center justify-between">
@@ -76,7 +98,7 @@ export default async function AccountsPage() {
         </div>
         <div className="flex gap-2">
           <RegisterLoraDialog stacks={stacks} />
-          <CreateKeyDialog accounts={accounts} machines={machines} />
+          <CreateKeyDialog accounts={accounts} machines={machines} quotas={keyQuotas} />
         </div>
       </div>
 

@@ -291,7 +291,8 @@ export function ApiReference() {
       <p className="text-xs text-muted-foreground">
         Erros comuns aos três casos —{" "}
         <code className="font-mono">401</code> (chave ausente/inválida/
-        revogada), <code className="font-mono">404</code> (rota inexistente),{" "}
+        revogada), <code className="font-mono">403</code> (limite de ambientes
+        do plano), <code className="font-mono">404</code> (rota inexistente),{" "}
         <code className="font-mono">429</code>/<code className="font-mono">503</code>{" "}
         (rate limit, cota ou infraestrutura religando) — seguem as mesmas
         regras da aba &ldquo;Exemplos de chamada&rdquo; e de{" "}

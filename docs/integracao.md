@@ -444,6 +444,33 @@ não são texto (imagem, por exemplo) são ignoradas para esse fim.
 Nada disso exige mandar nada além da chave: é ela que identifica a sua stack, e a
 configuração viaja junto automaticamente.
 
+### Quantos lugares o seu plano conecta
+
+O plano define em quantos lugares distintos a sua stack pode ser usada, medido de duas
+formas ao mesmo tempo:
+
+| | Go | Pro | Max | Enterprise |
+|---|---|---|---|---|
+| Chaves ativas | 3 | 25 | 50 | sem limite |
+| Ambientes simultâneos | 5 | 25 | 50 | sem limite |
+
+**Chaves** você controla no painel: emitir a 4ª chave num plano Go só é possível depois
+de revogar uma das três.
+
+**Ambiente** é um lugar de onde a stack é usada — a combinação da ferramenta (Claude
+Code, Cursor, Codex, SDK…) com a rede de onde ela sai. O mesmo desenvolvedor usando
+Claude Code em casa e no escritório ocupa dois ambientes; uma equipe inteira na mesma
+rede do escritório ocupa um. Isso vale independentemente de quantas chaves você usa: as
+duas contagens existem para que uma única chave espalhada por vinte máquinas não
+substitua o plano contratado.
+
+A vaga de um ambiente é liberada sozinha depois de **14 dias** sem uso, então trocar de
+máquina não exige fazer nada. Para liberar na hora — trocou de notebook hoje e quer usar
+já — o painel lista os ambientes ativos da stack com um botão de liberar vaga.
+
+Estourar o limite devolve `403`, com o motivo no campo `detail`. É o único erro que
+**não** adianta repetir: nenhuma tentativa a mais libera uma vaga.
+
 ---
 
 ## OCR de imagem via chat
@@ -940,6 +967,7 @@ generoso (120s nos exemplos) e não trate a espera como erro na sua UI.
 |---|---|
 | `401` | Chave ausente, inválida, revogada ou expirada |
 | `402` | Assinatura suspensa, ou em atraso há mais de 72h |
+| `403` | Limite de ambientes do plano atingido — veja [Quantos lugares o seu plano conecta](#quantos-lugares-o-seu-plano-conecta) |
 | `404` | Caminho fora da lista de rotas suportadas |
 | `400` | Corpo inválido, ou prompt maior que a janela disponível |
 

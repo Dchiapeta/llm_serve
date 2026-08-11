@@ -45,6 +45,41 @@ export const RAG_FILE_LIMIT_BY_PLAN: Record<TemplatePlan, number | null> = {
   Enterprise: null,
 }
 
+// Quantos LUGARES o plano pode conectar. São duas constantes porque são duas
+// camadas com garantias diferentes:
+//
+//   MAX_KEYS_BY_PLAN    — o CONTRATO. Chaves ativas (purpose 'customer') por
+//     stack, aplicado na emissão (assertKeyQuota em lib/actions.ts). Exato e
+//     sem falso positivo: ou a chave existe, ou não.
+//   MAX_CLIENTS_BY_PLAN — o DETECTOR de quem furou o contrato usando UMA
+//     chave em todo canto. Conta ambientes distintos (ferramenta + bloco de
+//     rede) vistos nos últimos CLIENT_WINDOW_DAYS, e é APROXIMADO por
+//     construção — ver o docstring de docker/gateway/client_identity.py.
+//
+// null = sem limite, mesma convenção de RAG_FILE_LIMIT_BY_PLAN.
+export const MAX_KEYS_BY_PLAN: Record<TemplatePlan, number | null> = {
+  Go: 3,
+  Pro: 25,
+  Max: 50,
+  Enterprise: null,
+}
+
+// ATENÇÃO: espelha MAX_CLIENTS_BY_PLAN de docker/gateway/client_identity.py,
+// que é quem de fato aplica o teto e aceita override por env
+// (MAX_CLIENTS_GO/PRO/MAX). Divergir faz a UI mentir sobre o número que corta
+// o cliente — mesmo cuidado de BILLING_GRACE_HOURS acima.
+export const MAX_CLIENTS_BY_PLAN: Record<TemplatePlan, number | null> = {
+  Go: 5,
+  Pro: 25,
+  Max: 50,
+  Enterprise: null,
+}
+
+// Janela deslizante da vaga de ambiente: um lugar sem uso há mais que isso
+// libera a vaga sozinho. Espelha CLIENT_WINDOW_DAYS do gateway. É o que evita
+// que trocar de notebook vire ticket de suporte.
+export const CLIENT_WINDOW_DAYS = 14
+
 // Teto de tamanho por arquivo de RAG, igual pra todos os planos. embedTexts
 // (lib/actions.ts) faz batching em lotes de 500 chunks por chamada à API de
 // embeddings — 10MB de texto puro dá ~10 mil chunks (~20 chamadas), ainda
@@ -172,10 +207,19 @@ export type KnowledgeChunk = {
   created_at: string
 }
 
+// "customer" conta pro slot de capacidade e pra cota diária de tokens;
+// "playground" é a chave interna gerada junto com a stack (migration 0044),
+// nunca exibida ao cliente, isenta dos dois.
+export type ApiKeyPurpose = "customer" | "playground"
+
 export type ApiKey = {
   id: string
   account_id: string
-  machine_id: string
+  // Pin histórico da máquina, não rota: o gateway resolve por
+  // stacks.machine_id. Null enquanto a stack ainda não foi homeada — a chave
+  // de Playground nasce assim e o gateway preenche no primeiro request
+  // (place_base_stack → rebind_stack_keys).
+  machine_id: string | null
   stack_id: string | null
   key_hash: string
   key_prefix: string
@@ -183,15 +227,39 @@ export type ApiKey = {
   // antes da migration 0014 ficam null (só o prefixo é recuperável).
   plain_key: string | null
   status: "active" | "revoked"
-  // "customer" conta pro slot de capacidade e pra cota diária de tokens;
-  // "playground" é a chave interna gerada junto com a stack (migration
-  // 0044), nunca exibida ao cliente, isenta dos dois.
-  purpose: "customer" | "playground"
+  purpose: ApiKeyPurpose
   created_at: string
   expires_at: string | null
   // Tocado pelo coletor periódico de usage_metrics do gateway (migration
   // 0046) — granularidade de METRICS_COLLECTION_INTERVAL_S, não por request.
   last_used_at: string | null
+}
+
+// Um LUGAR de onde a stack é usada (migration 0051). Escrito pelo gateway via
+// RPC touch_stack_client, uma linha por ambiente admitido — nunca por request
+// (o gateway só fala com o banco quando vê um fingerprint novo ou vencido).
+export type StackClient = {
+  id: string
+  stack_id: string
+  account_id: string | null
+  // Última chave vista neste ambiente, não a única: o mesmo lugar pode rodar
+  // Claude Code com uma chave e um script com outra.
+  api_key_id: string | null
+  // sha256(versão|ferramenta|bloco de rede) — nunca reversível para um IP.
+  fingerprint: string
+  client_label: string | null
+  user_agent: string | null
+  // Bloco /24 (IPv4) ou /48 (IPv6). Nunca o endereço completo: o bloco basta
+  // para o dono da stack reconhecer o próprio ambiente e é bem mais
+  // defensável que guardar dado pessoal identificável.
+  ip_bucket: string | null
+  first_seen_at: string
+  last_seen_at: string
+  requests: number
+  // 'released' = a vaga foi liberada no painel. A linha fica, porque o
+  // histórico é o que distingue troca de notebook de compartilhamento.
+  status: "active" | "released"
+  released_at: string | null
 }
 
 // Adapter LoRA de uma conta, já treinado e armazenado no Supabase Storage

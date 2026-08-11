@@ -404,6 +404,45 @@ class SupaClient:
         r = await self._rest.post("/gateway_requests", json=row)
         r.raise_for_status()
 
+    async def touch_stack_client(
+        self,
+        *,
+        stack_id: str,
+        account_id: str | None,
+        api_key_id: str | None,
+        fingerprint: str,
+        label: str | None,
+        user_agent: str | None,
+        ip_bucket: str | None,
+        window_days: int,
+        cap: int | None,
+    ) -> tuple[bool, int]:
+        """Registra o ambiente e devolve (admitido, ambientes_em_uso).
+
+        A decisão mora na RPC (migration 0051) e não aqui: o advisory lock por
+        stack lá dentro é o que impede duas réplicas do gateway admitirem
+        ambientes novos além do teto ao mesmo tempo. `cap=None` = sem teto."""
+        r = await self._rest.post(
+            "/rpc/touch_stack_client",
+            json={
+                "p_stack_id": stack_id,
+                "p_account_id": account_id,
+                "p_api_key_id": api_key_id,
+                "p_fingerprint": fingerprint,
+                "p_label": label,
+                "p_user_agent": user_agent,
+                "p_ip_bucket": ip_bucket,
+                "p_window_days": window_days,
+                "p_cap": cap,
+            },
+        )
+        r.raise_for_status()
+        rows = r.json() or []
+        if not rows:
+            return True, 0
+        row = rows[0] if isinstance(rows, list) else rows
+        return bool(row.get("admitted", True)), int(row.get("used") or 0)
+
     async def stack_ids_for_keys(self, api_key_ids: list[str]) -> dict[str, str | None]:
         """Resolve api_key_id -> stack_id em lote (migration 0036), pra
         denormalizar stack_id em usage_metrics no momento do insert. Chaves

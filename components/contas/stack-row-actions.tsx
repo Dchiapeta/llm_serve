@@ -5,6 +5,7 @@ import {
   ArrowRightLeft,
   BookOpen,
   Info,
+  MonitorSmartphone,
   MoreVertical,
   Settings,
   Trash2,
@@ -32,6 +33,7 @@ import { EditAccountConfigDialog } from "@/components/contas/edit-account-config
 import { KnowledgeFilesDialog } from "@/components/contas/knowledge-files-dialog"
 import { MigrateAccountDialog } from "@/components/contas/migrate-account-dialog"
 import { MigrateStackDialog } from "@/components/contas/migrate-stack-dialog"
+import { StackClientsDialog } from "@/components/contas/stack-clients-dialog"
 import { StackInfoDialog } from "@/components/contas/stack-info-dialog"
 
 export function StackRowActions({
@@ -55,6 +57,7 @@ export function StackRowActions({
   const [contaInfoOpen, setContaInfoOpen] = React.useState(false)
   const [configOpen, setConfigOpen] = React.useState(false)
   const [knowledgeOpen, setKnowledgeOpen] = React.useState(false)
+  const [clientsOpen, setClientsOpen] = React.useState(false)
   const [migrateAccountOpen, setMigrateAccountOpen] = React.useState(false)
 
   return (
@@ -82,6 +85,10 @@ export function StackRowActions({
           <DropdownMenuItem onSelect={() => setKnowledgeOpen(true)}>
             <BookOpen className="size-4" />
             Base de conhecimento
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setClientsOpen(true)}>
+            <MonitorSmartphone className="size-4" />
+            Ambientes conectados
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setMigrateStackOpen(true)}>
             <ArrowRightLeft className="size-4" />
@@ -162,6 +169,17 @@ export function StackRowActions({
         initialFiles={knowledgeFiles}
         open={knowledgeOpen}
         onOpenChange={setKnowledgeOpen}
+      />
+
+      {/* mesmo remount por key dos outros: o dialog busca os ambientes ao
+          abrir, então a key é o que garante lista fresca a cada abertura */}
+      <StackClientsDialog
+        key={clientsOpen ? "clients-open" : "clients-closed"}
+        stackId={stack.id}
+        stackSlug={stack.slug}
+        plan={stack.plan}
+        open={clientsOpen}
+        onOpenChange={setClientsOpen}
       />
 
       <MigrateAccountDialog

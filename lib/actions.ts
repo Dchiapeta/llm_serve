@@ -13,7 +13,7 @@ import { getClientLocation, listRoutesByMachine, setClientLocation } from "./rou
 import { insertStack } from "./stacks"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import { MAX_KNOWLEDGE_FILE_SIZE_BYTES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Stack, type Template, type TemplatePlan } from "./types"
+import { CLIENT_WINDOW_DAYS, MAX_KEYS_BY_PLAN, MAX_KNOWLEDGE_FILE_SIZE_BYTES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Stack, type StackClient, type Template, type TemplatePlan } from "./types"
 
 // Janela de deduplicação do provisionamento: um retry do gateway dentro desse
 // intervalo reusa a máquina 'creating' recém-criada em vez de criar outra.
@@ -1247,13 +1247,19 @@ export async function getOrCreatePlaygroundKey(stackId: string): Promise<{ plain
     .single<{ id: string; account_id: string; machine_id: string | null }>()
   if (!stack) throw new Error("Stack não encontrada")
 
-  // stacks.machine_id pode estar null (idle reaper de modelo base liberou a
-  // vaga contábil — o gateway resolve isso sozinho a cada request real, via
-  // resolve_route → place_base_stack, que também resincroniza a chave na
-  // máquina resolvida naquele momento). O valor aqui só precisa satisfazer a
-  // FK NOT NULL de api_keys.machine_id — nunca é usado pra decidir rota.
-  // Reaproveita o pin histórico da própria chave "customer" da stack, a
-  // mesma fonte que já convive com esse estado sem problema.
+  // api_keys.machine_id é pin HISTÓRICO, nunca decide rota: o gateway roteia
+  // por stacks.machine_id (resolve_base_machine) e sincroniza a chave na
+  // máquina que resolver no momento (ensure_key_on_machine). Preencher aqui
+  // é só cortesia pro key-sync de reboot (list_active_keys_for_machine).
+  //
+  // Null é estado normal e esperado: stack recém-criada pelo checkout nasce
+  // sem máquina (insertStack, lib/stacks.ts) e o idle reaper de modelo base
+  // devolve qualquer stack ociosa a esse estado. Emitir a chave assim mesmo
+  // é o que faz o Playground funcionar na PRIMEIRA mensagem — o gateway
+  // homeia a stack nesse request (place_base_stack) e o rebind_stack_keys
+  // que vem junto preenche este campo sozinho. Alocar máquina aqui, como
+  // /api/keys faz pra chave "customer", estouraria o teto de 15s do
+  // panelFetch quando precisasse provisionar pod.
   let machineId = stack.machine_id
   if (!machineId) {
     const { data: customerKey } = await db
@@ -1266,9 +1272,6 @@ export async function getOrCreatePlaygroundKey(stackId: string): Promise<{ plain
       .limit(1)
       .maybeSingle<{ machine_id: string }>()
     machineId = customerKey?.machine_id ?? null
-  }
-  if (!machineId) {
-    throw new Error("Stack sem histórico de máquina associada — verifique manualmente")
   }
 
   try {
@@ -1489,11 +1492,56 @@ export async function updateStackSystemPrompt(formData: FormData) {
   revalidatePath("/accounts")
 }
 
+// Barra a emissão de uma chave nova quando a stack já está no teto do plano.
+//
+// Esta é a camada EXATA do limite de "quantos lugares o plano conecta": ou a
+// chave existe, ou não existe. A outra camada (ambientes distintos, tabela
+// stack_clients) é aproximada e mora no gateway — ver
+// docker/gateway/client_identity.py.
+//
+// Conta por STACK e não por conta: plano é propriedade da stack desde a
+// migration 0027. Chave de Playground é isenta, mesmo critério do backstop de
+// capacidade e de check_token_quota no gateway — é ferramenta interna do
+// admin, não um lugar do cliente.
+async function assertKeyQuota(
+  db: ReturnType<typeof createSupabaseAdmin>,
+  stackId: string
+) {
+  const { data: stack, error: stackErr } = await db
+    .from("stacks")
+    .select("plan")
+    .eq("id", stackId)
+    .single<{ plan: TemplatePlan }>()
+  if (stackErr || !stack) throw new Error("Stack não encontrada")
+
+  const limit = MAX_KEYS_BY_PLAN[stack.plan]
+  if (limit === null || limit === undefined) return
+
+  const { count, error } = await db
+    .from("api_keys")
+    .select("id", { count: "exact", head: true })
+    .eq("stack_id", stackId)
+    .eq("status", "active")
+    .eq("purpose", "customer")
+  if (error) throw new Error(error.message)
+
+  if ((count ?? 0) >= limit) {
+    throw new Error(
+      `Limite de ${limit} chave(s) do plano ${stack.plan} atingido. ` +
+        "Revogue uma chave para emitir outra."
+    )
+  }
+}
+
 // Gera uma chave HEX para uma conta numa máquina.
 // Retorna a chave em texto puro UMA única vez.
 export async function createKey(input: {
   accountId: string
-  machineId: string
+  // null só é aceito para purpose "playground": a chave nasce sem pin e o
+  // gateway a vincula à máquina no primeiro request (place_base_stack →
+  // rebind_stack_keys). Chave "customer" exige máquina resolvida antes —
+  // ver o guard logo abaixo e ensureStackMachine em /api/keys.
+  machineId: string | null
   stackId?: string | null
   name?: string | null
   // ISO 8601; null/omitido = nunca expira. Chave de onboarding/teste deve
@@ -1510,17 +1558,22 @@ export async function createKey(input: {
   const purpose = input.purpose ?? "customer"
   const db = createSupabaseAdmin()
 
-  const { data: m } = await db
-    .from("machines")
-    .select("*")
-    .eq("id", input.machineId)
-    .single<Machine>()
-  if (!m) throw new Error("Máquina não encontrada")
+  // Sem máquina o backstop de capacidade abaixo não tem como rodar, e uma
+  // chave "customer" passaria por cima dele em silêncio. Só a de playground
+  // (isenta de slot por definição, migration 0044) pode nascer sem pin.
+  if (!input.machineId && purpose !== "playground") {
+    throw new Error("Chave de cliente exige uma máquina resolvida")
+  }
+
+  const { data: m } = input.machineId
+    ? await db.from("machines").select("*").eq("id", input.machineId).single<Machine>()
+    : { data: null }
+  if (input.machineId && !m) throw new Error("Máquina não encontrada")
 
   // Chave de playground não ocupa slot de capacidade — só chave "customer"
   // entra no backstop abaixo. Check-then-insert: há corrida teórica entre
   // duas emissões simultâneas, aceitável para um painel de administração.
-  if (purpose === "customer") {
+  if (purpose === "customer" && m) {
     const { count: activeKeys } = await db
       .from("api_keys")
       .select("id", { count: "exact", head: true })
@@ -1555,7 +1608,7 @@ export async function createKey(input: {
   // uso (fail-closed da migration 0021 — conta com stacks precisa de
   // stack_id resolvido).
   let stackId = input.stackId ?? null
-  if (!stackId) {
+  if (!stackId && input.machineId) {
     const { data: matchingStack } = await db
       .from("stacks")
       .select("id")
@@ -1565,6 +1618,15 @@ export async function createKey(input: {
       .limit(1)
       .maybeSingle<{ id: string }>()
     stackId = matchingStack?.id ?? null
+  }
+
+  // Depois da resolução do stackId, porque o teto é POR STACK (o plano é dela)
+  // — e depois do backstop de capacidade acima, que é por máquina. As duas
+  // checagens são independentes: uma protege a VRAM do pod, esta protege o
+  // contrato do plano. Mesma corrida check-then-insert do backstop, aceitável
+  // pelo mesmo motivo.
+  if (purpose === "customer" && stackId) {
+    await assertKeyQuota(db, stackId)
   }
 
   const plainKey = generateHexKey()
@@ -1594,13 +1656,18 @@ export async function createKey(input: {
   // o agent do pod ainda pode não estar de pé pra receber um sync direto do
   // painel (mesma race de startMachine, ver scheduleGatewayKeySync acima).
   // Delega ao gateway, que espera o agent ficar saudável antes de reenviar.
-  after(() =>
-    scheduleGatewayKeySync(input.machineId).catch((e) =>
-      console.error("Agendamento do sync falhou (a chave foi salva, o gateway cobre):", e)
+  // Sem máquina não há pod pra sincronizar: o gateway faz o upsert lazy
+  // (ensure_key_on_machine) na máquina que resolver no primeiro request.
+  const machineId = input.machineId
+  if (machineId) {
+    after(() =>
+      scheduleGatewayKeySync(machineId).catch((e) =>
+        console.error("Agendamento do sync falhou (a chave foi salva, o gateway cobre):", e)
+      )
     )
-  )
+  }
   revalidatePath("/accounts")
-  revalidatePath(`/machines/${input.machineId}`)
+  if (machineId) revalidatePath(`/machines/${machineId}`)
   return { plainKey }
 }
 
@@ -1701,15 +1768,63 @@ export async function revokeKey(keyId: string) {
     .single<ApiKey>()
   if (key) {
     await logEvent(key.machine_id, "key_revoked", `Chave ${key.key_prefix}… revogada`)
-    await syncMachineKeys(key.machine_id).catch((e) =>
-      console.error("Sync com agent falhou (a chave foi revogada no banco):", e)
-    )
+    // Chave sem pin (stack ainda não homeada) não está em pod nenhum: não há
+    // agent pra sincronizar nem página de máquina pra revalidar. O flush do
+    // cache do gateway segue incondicional — é ele que de fato tira a chave
+    // revogada de circulação antes do TTL.
+    if (key.machine_id) {
+      await syncMachineKeys(key.machine_id).catch((e) =>
+        console.error("Sync com agent falhou (a chave foi revogada no banco):", e)
+      )
+    }
     await flushGatewayKeyCache().catch((e) =>
       console.error("Flush do cache do gateway falhou (a chave foi revogada no banco):", e)
     )
     revalidatePath("/accounts")
-    revalidatePath(`/machines/${key.machine_id}`)
+    if (key.machine_id) revalidatePath(`/machines/${key.machine_id}`)
   }
+}
+
+// ---------- Ambientes conectados (stack_clients, migration 0051) ----------
+
+// Lugares distintos que usaram a stack dentro da janela deslizante, do mais
+// recente pro mais antigo. Só ambientes ativos: 'released' já devolveu a vaga
+// e some da lista (a linha fica no banco, para o histórico).
+export async function listStackClients(stackId: string): Promise<StackClient[]> {
+  const db = createSupabaseAdmin()
+  const cutoff = new Date(Date.now() - CLIENT_WINDOW_DAYS * 86_400_000).toISOString()
+  const { data, error } = await db
+    .from("stack_clients")
+    .select("*")
+    .eq("stack_id", stackId)
+    .eq("status", "active")
+    .gt("last_seen_at", cutoff)
+    .order("last_seen_at", { ascending: false })
+  if (error) throw new Error(error.message)
+  return (data ?? []) as StackClient[]
+}
+
+// Devolve a vaga de um ambiente antes de ele expirar sozinho — o caminho de
+// "troquei de notebook e não quero esperar 14 dias".
+//
+// O flush do cache do gateway é o que faz a liberação valer NA HORA: sem ele,
+// o 403 do ambiente que tomou a vaga fica cacheado em client_seen por até
+// CLIENT_TOUCH_THROTTLE_S (5 min). Mesmo raciocínio do flush em revokeKey.
+export async function releaseStackClient(clientId: string) {
+  const db = createSupabaseAdmin()
+  const { data, error } = await db
+    .from("stack_clients")
+    .update({ status: "released", released_at: new Date().toISOString() })
+    .eq("id", clientId)
+    .select("stack_id")
+    .single<{ stack_id: string }>()
+  if (error) throw new Error(error.message)
+
+  await flushGatewayKeyCache().catch((e) =>
+    console.error("Flush do cache do gateway falhou (a vaga foi liberada no banco):", e)
+  )
+  revalidatePath("/stacks")
+  return data
 }
 
 // ---------- Adapters LoRA ----------

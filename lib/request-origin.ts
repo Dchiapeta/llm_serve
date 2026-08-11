@@ -5,7 +5,13 @@
 // separar um Claude Code fazendo turnos de 85k tokens de um script curl de
 // teste, mesmo os dois batendo na mesma stack.
 //
-// Duas fontes, nesta ordem:
+// Três fontes, nesta ordem:
+//   0. purpose da chave (api_keys.purpose, migration 0044) — a chave
+//      "playground" é interna e nunca chega ao cliente, então tudo que passa
+//      por ela é teste nosso, não uso real. Vem antes do User-Agent de
+//      propósito: o UA aqui é o de quem estiver testando (browser do painel,
+//      curl), e classificar isso como "HTTP" esconderia justamente a
+//      informação que importa — que a linha não é tráfego do cliente.
 //   1. User-Agent (gateway_requests.user_agent, migration 0041) — identifica a
 //      FERRAMENTA. É o único jeito de separar Cursor/Continue/SDK/curl, que
 //      compartilham o mesmo endpoint chat/completions.
@@ -22,6 +28,8 @@
 // O User-Agent é controlado pelo cliente e pode ser forjado à vontade: isto é
 // telemetria de conveniência, nunca base para decisão de segurança ou billing.
 
+import type { ApiKeyPurpose } from "@/lib/types"
+
 export type RequestOrigin = {
   label: string
   // Tailwind com o modificador `!` porque os estilos da ReUI
@@ -31,6 +39,11 @@ export type RequestOrigin = {
 }
 
 const NEUTRO = "bg-zinc-100! text-zinc-600! dark:bg-zinc-900! dark:text-zinc-400!"
+
+const PLAYGROUND: RequestOrigin = {
+  label: "Playground",
+  className: "bg-amber-100! text-amber-700! dark:bg-amber-950! dark:text-amber-300!",
+}
 
 // Ordem importa: o primeiro match vence. Padrões mais específicos primeiro
 // (um cliente pode mandar "cursor" E "openai-node" no mesmo UA).
@@ -104,7 +117,13 @@ const BY_PATH: Record<string, RequestOrigin> = {
 export function requestOrigin(input: {
   path: string
   userAgent?: string | null
+  // purpose da chave usada na requisição. Opcional: chamadores que não têm o
+  // dado (linhas antigas, telas que só conhecem o UA) caem na classificação
+  // por ferramenta, como antes.
+  keyPurpose?: ApiKeyPurpose | null
 }): RequestOrigin {
+  if (input.keyPurpose === "playground") return PLAYGROUND
+
   const ua = input.userAgent?.toLowerCase() ?? ""
   if (ua) {
     for (const { match, origin } of BY_USER_AGENT) {

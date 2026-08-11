@@ -56,6 +56,13 @@ from anthropic_compat import (
     anthropic_to_openai_request,
     openai_to_anthropic_response,
 )
+from client_identity import (
+    CLIENT_LIMIT_ENFORCE,
+    CLIENT_TOUCH_THROTTLE_S,
+    CLIENT_WINDOW_DAYS,
+    client_cap,
+    client_fingerprint,
+)
 from content_policy import clamp_media, text_of
 from context_budget import (
     CONTEXT_IMAGE_TOKENS,
@@ -330,6 +337,16 @@ rate_buckets: dict[str, tuple[float, float]] = {}  # key_hash -> (tokens, last_r
 
 # cache curto da quota diária de tokens: account_id -> (tokens_usados, expira_em)
 token_usage_cache: dict[str, tuple[int, float]] = {}
+
+# ambientes já admitidos por stack: stack_id -> {fingerprint: último toque}.
+# Só o CAMINHO FRIO (fingerprint novo ou toque vencido) fala com o banco, então
+# o teto de ambientes custa zero I/O nos ~99,9% de requests que vêm de um lugar
+# já conhecido — mesma disciplina de maybe_touch.
+#
+# Diferente de rate_buckets/in_flight, este cache NÃO é a fonte da verdade: a
+# decisão de admissão é da RPC touch_stack_client (migration 0051), então mais
+# de uma réplica do gateway não fura o teto — no pior caso repete um round-trip.
+client_seen: dict[str, dict[str, float]] = defaultdict(dict)
 
 # último touch por conta e por máquina (throttle)
 last_touch: dict[str, float] = {}
@@ -654,7 +671,105 @@ def billing_blocked(stack: dict) -> str | None:
     return None
 
 
-async def authenticate(authorization: str | None) -> tuple[dict, str]:
+# Teto de entradas do client_seen por stack. Ambiente ADMITIDO já é limitado
+# pelo cap do plano, mas ambiente NEGADO não é — um cliente variando o
+# User-Agent geraria uma entrada nova por request. A poda mantém o dicionário
+# do tamanho de "o que ainda está dentro do throttle".
+CLIENT_SEEN_MAX_PER_STACK = 256
+
+
+def _remember_client(seen: dict, fingerprint: str, now: float, admitted: bool) -> None:
+    if len(seen) >= CLIENT_SEEN_MAX_PER_STACK:
+        cutoff = now - CLIENT_TOUCH_THROTTLE_S
+        for stale in [fp for fp, (ts, _) in seen.items() if ts < cutoff]:
+            del seen[stale]
+    seen[fingerprint] = (now, admitted)
+
+
+def _client_limit_detail(plan: str | None, cap: int | None) -> str:
+    return (
+        f"limite de {cap} ambiente(s) simultâneos do plano {plan} atingido — "
+        "libere um ambiente em app.trystac.com ou faça upgrade do plano"
+    )
+
+
+async def enforce_client_limit(entry: dict, stack: dict, plan: str | None, headers) -> None:
+    """Teto de LUGARES distintos conectados à stack (migration 0051).
+
+    Complementa o teto de CHAVES por stack aplicado na emissão pelo painel
+    (MAX_KEYS_BY_PLAN em lib/types.ts): aquele é o contrato, este pega quem
+    usa uma única chave em toda a equipe. Ver o docstring de
+    client_identity.py para o que o fingerprint acerta e o que ele erra.
+
+    Custo no caminho quente: zero. Ambiente conhecido dentro do throttle sai
+    pelo cache em memória sem nenhum I/O — só fingerprint novo (ou toque
+    vencido) chama a RPC, que é quem de fato decide a admissão.
+
+    Falha de I/O é fail-open: registrar de onde o cliente conecta é
+    telemetria com dente, e telemetria nunca pode derrubar inferência."""
+    stack_id = stack.get("id")
+    if not stack_id:
+        return
+
+    fingerprint, label, user_agent, bucket = client_fingerprint(headers)
+    cap = client_cap(plan)
+    now = time.time()
+    seen = client_seen[stack_id]
+
+    cached = seen.get(fingerprint)
+    if cached and now - cached[0] < CLIENT_TOUCH_THROTTLE_S:
+        if cached[1]:
+            return
+        # negado e ainda dentro do throttle: repete o 403 sem bater no banco,
+        # senão um cliente bloqueado gera uma RPC por request. Liberar a vaga
+        # no painel chama /admin/flush-key-cache, que zera este cache também.
+        raise HTTPException(status_code=403, detail=_client_limit_detail(plan, cap))
+
+    try:
+        admitted, used = await supa.touch_stack_client(
+            stack_id=stack_id,
+            account_id=entry.get("account_id"),
+            api_key_id=entry.get("id"),
+            fingerprint=fingerprint,
+            label=label,
+            user_agent=user_agent[:MAX_USER_AGENT_CHARS] if user_agent else None,
+            ip_bucket=bucket,
+            window_days=CLIENT_WINDOW_DAYS,
+            # Em observação o teto NÃO vai para o banco de propósito: a RPC
+            # não grava ambiente negado, então mandar o cap aqui esconderia
+            # justamente o excesso que a fase de observação existe para medir.
+            cap=cap if CLIENT_LIMIT_ENFORCE else None,
+        )
+    except Exception as e:
+        # Marca como admitido para dar BACKOFF: sem isto, uma RPC indisponível
+        # (migration 0051 ainda não aplicada, Supabase fora do ar) custaria um
+        # round-trip perdido em TODO request, não só no primeiro de cada
+        # ambiente. Fail-open — telemetria com dente jamais derruba inferência.
+        _remember_client(seen, fingerprint, now, True)
+        logger.warning("registro de ambiente falhou (stack=%s): %s", stack_id, e)
+        return
+
+    _remember_client(seen, fingerprint, now, admitted)
+
+    if admitted:
+        if cap is not None and used > cap:
+            logger.warning(
+                "ambientes acima do teto (observação): stack=%s plano=%s %d/%d "
+                "cliente=%s rede=%s",
+                stack_id, plan, used, cap, label, bucket,
+            )
+        return
+
+    # gateway_requests não registra rejeição pré-rota (migration 0038), então
+    # esta linha é a única trilha que o suporte tem do corte.
+    logger.warning(
+        "ambiente bloqueado: stack=%s plano=%s %d/%s cliente=%s rede=%s",
+        stack_id, plan, used, cap, label, bucket,
+    )
+    raise HTTPException(status_code=403, detail=_client_limit_detail(plan, cap))
+
+
+async def authenticate(authorization: str | None, headers) -> tuple[dict, str]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="chave de acesso ausente")
     key = authorization.removeprefix("Bearer ").strip()
@@ -707,11 +822,15 @@ async def authenticate(authorization: str | None) -> tuple[dict, str]:
     # interna que o admin usa pra diagnosticar a stack. Bloqueá-la tiraria
     # justamente a ferramenta de investigar a conta suspensa.
     if entry.get("purpose") != "playground":
-        stack, _ = resolve_key_stack(entry)
+        stack, plan = resolve_key_stack(entry)
         if stack:
             reason = billing_blocked(stack)
             if reason:
                 raise HTTPException(status_code=402, detail=reason)
+            # Mesmo motivo do bloco acima para morar aqui, e mesma isenção de
+            # playground: a chave interna do admin não é um "lugar" do cliente
+            # e não pode consumir a vaga que ela existe para diagnosticar.
+            await enforce_client_limit(entry, stack, plan, headers)
 
     return entry, key_hash
 
@@ -770,7 +889,7 @@ async def check_token_quota(account_id: str, plan: str | None, purpose: str = "c
 
 
 async def authenticate_anthropic(
-    authorization: str | None, x_api_key: str | None
+    authorization: str | None, x_api_key: str | None, headers
 ) -> tuple[dict, str, str]:
     """Igual a authenticate, mas aceita a chave em Authorization: Bearer OU
     x-api-key — o Claude Code manda num dos dois (às vezes os dois, se o
@@ -785,7 +904,7 @@ async def authenticate_anthropic(
     if not key:
         raise HTTPException(status_code=401, detail="chave de acesso ausente")
     bearer_header = f"Bearer {key}"
-    entry, key_hash = await authenticate(bearer_header)
+    entry, key_hash = await authenticate(bearer_header, headers)
     return entry, key_hash, bearer_header
 
 
@@ -2876,7 +2995,9 @@ async def anthropic_messages(
     if len(raw_body) > MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
 
-    entry, key_hash, bearer_header = await authenticate_anthropic(authorization, x_api_key)
+    entry, key_hash, bearer_header = await authenticate_anthropic(
+        authorization, x_api_key, request.headers
+    )
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
@@ -3101,7 +3222,9 @@ async def anthropic_count_tokens(
 
     Passa por rate limit (mas não por quota/concorrência): deixou de ser um
     cálculo puramente local — perto do teto faz uma chamada ao pod."""
-    entry, key_hash, _bearer = await authenticate_anthropic(authorization, x_api_key)
+    entry, key_hash, _bearer = await authenticate_anthropic(
+        authorization, x_api_key, request.headers
+    )
     _, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
     raw_body = await request.body()
@@ -3301,7 +3424,7 @@ def validate_extraction_output(content: str, schema: dict) -> dict:
 
 
 async def _authenticate_for_extraction(
-    authorization: str | None, schema: str
+    authorization: str | None, schema: str, headers
 ) -> tuple[dict, str, str, dict]:
     """Auth + validação de schema — a parte IDÊNTICA entre /v1/documents/extract
     e /v1/images/extract. Devolve (entry, key_hash, account_id, parsed_schema).
@@ -3311,7 +3434,7 @@ async def _authenticate_for_extraction(
     metaschema, e schema recursivo pode ir a RecursionError), e nada disso
     deve estar disponível a quem não tem chave. O authenticate é barato
     (key_cache em memória) e o rate limit passa a valer pra este caminho."""
-    entry, key_hash = await authenticate(authorization)
+    entry, key_hash = await authenticate(authorization, headers)
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
@@ -3592,7 +3715,7 @@ async def extract_document(
     started = time.monotonic()
 
     entry, key_hash, account_id, parsed_schema = await _authenticate_for_extraction(
-        authorization, schema
+        authorization, schema, request.headers
     )
 
     # Corte grosso ANTES de qualquer coisa cara: `file.size` vem do parser
@@ -3680,7 +3803,7 @@ async def extract_image(
     started = time.monotonic()
 
     entry, key_hash, account_id, parsed_schema = await _authenticate_for_extraction(
-        authorization, schema
+        authorization, schema, request.headers
     )
 
     # mesmo corte grosso do PDF, teto próprio de imagem (ver document_extract.py)
@@ -3829,7 +3952,7 @@ async def generate_document(
     if not body.html and not body.user:
         raise HTTPException(status_code=400, detail="informe `html` ou `user`")
 
-    entry, key_hash = await authenticate(authorization)
+    entry, key_hash = await authenticate(authorization, request.headers)
     stack, plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, plan)
     account_id = entry["account_id"]
@@ -3997,7 +4120,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     if len(body) > MAX_BODY_BYTES:
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
 
-    entry, key_hash = await authenticate(authorization)
+    entry, key_hash = await authenticate(authorization, request.headers)
     account_id = entry["account_id"]
     _, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
@@ -4225,7 +4348,12 @@ async def flush_key_cache(x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
     n = len(key_cache)
     key_cache.clear()
-    return {"ok": True, "flushed": n}
+    # client_seen junto: quem libera um ambiente no painel espera reconectar
+    # na hora, e o 403 fica cacheado por CLIENT_TOUCH_THROTTLE_S (5 min) sem
+    # este clear. O painel já chama este endpoint em releaseStackClient.
+    clients = len(client_seen)
+    client_seen.clear()
+    return {"ok": True, "flushed": n, "client_stacks_flushed": clients}
 
 
 @app.post("/admin/sync-machine-keys")

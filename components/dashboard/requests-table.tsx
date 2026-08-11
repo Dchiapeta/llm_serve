@@ -3,7 +3,7 @@
 import * as React from "react"
 import { Search } from "lucide-react"
 
-import type { GatewayRequest, TemplatePlan } from "@/lib/types"
+import type { ApiKeyPurpose, GatewayRequest, TemplatePlan } from "@/lib/types"
 import { requestOrigin } from "@/lib/request-origin"
 import { Badge } from "@/components/ui/badge"
 import { PlanBadge } from "@/components/machines/plan-badge"
@@ -49,7 +49,9 @@ export type RequestRow = GatewayRequest & {
   // cliente, não da requisição. FK nullable (migration 0038) — stack apagada
   // depois deixa o histórico sem plano, e a coluna mostra "—".
   stacks: { slug: string; plan: TemplatePlan } | null
-  api_keys: { key_prefix: string } | null
+  // purpose distingue a chave interna de Playground da chave do cliente — é o
+  // que a coluna Origem usa pra marcar a linha como teste nosso.
+  api_keys: { key_prefix: string; purpose: ApiKeyPurpose } | null
   accounts: { name: string } | null
 }
 
@@ -100,9 +102,13 @@ export function RequestsTable({ rows }: { rows: RequestRow[] }) {
         (r.accounts?.name.toLowerCase().includes(normalizedQuery) ?? false) ||
         (r.api_keys?.key_prefix.toLowerCase().includes(normalizedQuery) ?? false) ||
         (r.stacks?.plan.toLowerCase().includes(normalizedQuery) ?? false) ||
-        // buscar por "claude" ou "codex" é o uso óbvio assim que a coluna
-        // Origem existe — casa o rótulo, não o User-Agent cru
-        requestOrigin({ path: r.path, userAgent: r.user_agent })
+        // buscar por "claude", "codex" ou "playground" é o uso óbvio assim que
+        // a coluna Origem existe — casa o rótulo, não o User-Agent cru
+        requestOrigin({
+          path: r.path,
+          userAgent: r.user_agent,
+          keyPurpose: r.api_keys?.purpose,
+        })
           .label.toLowerCase()
           .includes(normalizedQuery)
       : true
@@ -199,7 +205,11 @@ export function RequestsTable({ rows }: { rows: RequestRow[] }) {
                 {r.api_keys?.key_prefix ? `${r.api_keys.key_prefix}…` : "—"}
               </TableCell>
               <TableCell>
-                <RequestOriginBadge path={r.path} userAgent={r.user_agent} />
+                <RequestOriginBadge
+                  path={r.path}
+                  userAgent={r.user_agent}
+                  keyPurpose={r.api_keys?.purpose}
+                />
               </TableCell>
               <TableCell className="font-mono text-xs">{r.path}</TableCell>
               <TableCell>
