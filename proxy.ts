@@ -70,6 +70,14 @@ export const config = {
     // da chave de Playground — chamadas por sistemas externos (LP/admin de
     // outro projeto) com X-External-Secret/EXTERNAL_INTEGRATION_SECRET. As
     // rotas com id na URL usam segmento dinâmico ([^/]+).
-    "/((?!_next/static|_next/image|favicon.ico|api/agent|api/machines/provision|api/machines/[^/]+/recreate|api/knowledge/ingest|api/stacks/[^/]+/model-config|api/playground/key|api/keys).*)",
+    //
+    // `api/stacks$` é ancorado de propósito: sem o `$`, o lookahead casaria
+    // qualquer coisa sob /api/stacks/... e tiraria do middleware rotas de
+    // painel futuras que dependem de sessão. As duas rotas de cobrança
+    // (criação de stack pelo checkout e billing-sync) conferem o mesmo
+    // X-External-Secret no handler — ficar fora daqui não abre nada, e ficar
+    // DENTRO as fazia responder 307 /login ao webhook da Chargefy: o cliente
+    // pagava e a stack nunca nascia.
+    "/((?!_next/static|_next/image|favicon.ico|api/agent|api/machines/provision|api/machines/[^/]+/recreate|api/knowledge/ingest|api/stacks$|api/stacks/[^/]+/billing-sync|api/stacks/[^/]+/model-config|api/playground/key|api/keys).*)",
   ],
 }
