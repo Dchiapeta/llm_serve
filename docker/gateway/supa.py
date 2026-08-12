@@ -80,13 +80,20 @@ class SupaClient:
         ATENÇÃO: `raise_for_status` abaixo transforma coluna inexistente
         (PostgREST 400/42703) em erro não tratado no authenticate, ou seja,
         500 em 100% do tráfego — a migration 0050 tem que estar aplicada
-        ANTES deste código subir."""
+        ANTES deste código subir.
+
+        `use_custom_prompt`/`system_prompt` (migration 0053, e o mesmo ATENÇÃO
+        acima vale pra ela) são o system prompt da própria CHAVE, que ganha do
+        da stack quando o switch está ligado — ver key_prompt.py. Vêm no mesmo
+        select pelo mesmo motivo do billing: são lidos em toda request de chat
+        e o key_cache já carrega a linha inteira."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,purpose,"
+                "use_custom_prompt,system_prompt,"
                 "accounts(name,"
                 "stacks(id,machine_id,plan,slug,created_at,system_prompt,"
                 "default_temperature,default_top_p,billing_status,past_due_since))",
@@ -107,6 +114,8 @@ class SupaClient:
             "stack_id": row.get("stack_id"),
             "expires_at": row.get("expires_at"),
             "purpose": row.get("purpose", "customer"),
+            "use_custom_prompt": row.get("use_custom_prompt", False),
+            "system_prompt": row.get("system_prompt"),
             "account_name": account.get("name", "?"),
             "stacks": account.get("stacks") or [],
         }

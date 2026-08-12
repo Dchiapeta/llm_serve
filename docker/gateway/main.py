@@ -79,6 +79,7 @@ from context_budget import (
     prompt_text_for_tokenize,
 )
 from context_budget import resolve_est_tokens as _resolve_est_tokens
+from key_prompt import resolve_system_prompt
 from lifecycle import LifecycleManager, MigrationError
 from recovery import is_no_gpu_error, lock_active, spawn_tracked
 from usage_class import classify_stack
@@ -2706,8 +2707,9 @@ async def validate_body(
 
 
 async def build_stack_system_message(messages: list, entry: dict) -> dict | None:
-    """system_prompt configurado da STACK + contexto de RAG (top-k da base de
-    conhecimento da STACK), pra quando o cliente não mandou system próprio.
+    """system_prompt configurado (da CHAVE ou da STACK) + contexto de RAG
+    (top-k da base de conhecimento da STACK), pra quando o cliente não mandou
+    system próprio.
 
     Reaproveita resolve_key_stack (mesmo helper do roteamento de máquina,
     commit 7e64aa4) para saber qual stack da conta está servindo o request —
@@ -2716,9 +2718,12 @@ async def build_stack_system_message(messages: list, entry: dict) -> dict | None
     stack, _ = resolve_key_stack(entry)
 
     system_parts = []
-    # system_prompt é propriedade da stack (migration 0020); accounts.system_prompt
-    # foi removida na 0027 — sem stack resolvida, não há prompt nenhum pra injetar.
-    system_prompt = (stack or {}).get("system_prompt")
+    # A instrução é da stack (migration 0020) a não ser que a chave tenha a
+    # própria (migration 0053) — ver key_prompt.py para a precedência. O RAG
+    # abaixo NÃO acompanha essa escolha: a base de conhecimento é da stack e
+    # continua valendo, porque a chave troca o "como responder", não o "sobre
+    # o quê".
+    system_prompt = resolve_system_prompt(entry, stack)
     if system_prompt:
         system_parts.append(system_prompt)
 
@@ -2752,7 +2757,7 @@ async def build_stack_instructions(entry: dict, last_user_text: str | None) -> s
     stack, _ = resolve_key_stack(entry)
 
     system_parts = []
-    system_prompt = (stack or {}).get("system_prompt")
+    system_prompt = resolve_system_prompt(entry, stack)
     if system_prompt:
         system_parts.append(system_prompt)
 
@@ -3630,9 +3635,9 @@ async def _run_extraction_pipeline(
     messages = document_extract.build_messages(text, user)
 
     # `system` segue EXATAMENTE a regra do chat: com conteúdo, substitui o
-    # prompt da stack; ausente ou vazio, vale o da stack (resolvido pela
-    # chave). Vazio não substitui nada — mesmo motivo do chat: um system
-    # sem instrução não deve apagar a configuração da conta.
+    # prompt configurado; ausente ou vazio, vale o da chave (migration 0053)
+    # ou, na falta dele, o da stack. Vazio não substitui nada — mesmo motivo
+    # do chat: um system sem instrução não deve apagar a configuração da conta.
     #
     # Sem RAG, ao contrário do chat: aqui o contexto relevante é o
     # documento que acabou de ser enviado. Trechos da base de conhecimento
@@ -3642,7 +3647,7 @@ async def _run_extraction_pipeline(
     system_text = (system or "").strip()
     if not system_text:
         stack, _ = resolve_key_stack(entry)
-        system_text = ((stack or {}).get("system_prompt") or "").strip()
+        system_text = resolve_system_prompt(entry, stack) or ""
     if system_text:
         messages.insert(0, {"role": "system", "content": system_text})
 
@@ -4133,11 +4138,12 @@ async def generate_document(
         messages = document_generate.build_messages(body.user)
 
         # mesma regra do chat e de /v1/documents/extract: `system` com
-        # conteúdo substitui o prompt da stack; ausente/vazio usa o da stack.
+        # conteúdo substitui o prompt configurado; ausente/vazio usa o da
+        # chave (migration 0053) ou, na falta dele, o da stack.
         system_text = (body.system or "").strip()
         if not system_text:
             stack, _ = resolve_key_stack(entry)
-            system_text = ((stack or {}).get("system_prompt") or "").strip()
+            system_text = resolve_system_prompt(entry, stack) or ""
         if system_text:
             messages.insert(0, {"role": "system", "content": system_text})
 

@@ -58,6 +58,15 @@ Formato Anthropic equivalente: `POST /v1/messages` com header `x-api-key` em vez
 exigem plano **Pro ou superior** — no Go elas respondem `403`. `/v1/chat/completions`
 funciona em todos os planos.
 
+**System prompt: da chave ou da stack.** Sem mensagem `system` na request, o serviço
+injeta a instrução configurada — a **da própria chave**, se você ligou "Prompt" no
+painel para ela, ou a da stack (Comportamento) caso contrário. É o que permite usar a
+mesma stack para coisas diferentes sem mudar o código: cada integração fica com a sua
+chave, e a request continua sendo só `model` + `messages`. Mandar `system` na request
+sobrescreve os dois — é por isso que Claude Code, Codex e Cursor, que embutem o próprio
+system prompt, não são afetados. A base de conhecimento (RAG) é sempre a da stack,
+independente da opção escolhida na chave.
+
 ---
 
 ## 2. Imagem — OCR / leitura de imagem
@@ -116,7 +125,8 @@ EOF
 **Resposta:** mesma forma do chat comum — texto em `choices[0].message.content`.
 
 **System prompt:** como é a rota de chat, vale a regra padrão — sem mensagem `system`, o
-system prompt da sua stack (e o RAG) são aplicados; com `system`, o seu substitui os dois.
+system prompt configurado (o da chave ou o da stack) e o RAG são aplicados; com `system`,
+o seu substitui os dois.
 
 **Saída estruturada:** funciona aqui também. Adicione `response_format` com um JSON Schema
 e a resposta vem como JSON validado, igual ao caso 3 — a diferença é que a entrada é uma
@@ -148,14 +158,15 @@ Content-Type: multipart/form-data
 |---|---|---|
 | `file` | sim | O PDF |
 | `schema` | sim | JSON Schema (como string) descrevendo os campos a extrair |
-| `system` | não | Substitui o system prompt configurado na sua stack |
+| `system` | não | Substitui o system prompt configurado (o da chave ou o da stack) |
 | `user` | não | Contexto adicional sobre este documento — **soma** à instrução de extração |
 | `max_tokens` | não | Teto da resposta. Default 4000, máximo 16000 |
 
 ### Request mínima
 
-Só `file` + `schema`. O system prompt configurado na sua stack é aplicado
-automaticamente, resolvido pela chave — você não envia nada a mais.
+Só `file` + `schema`. O system prompt configurado é aplicado automaticamente,
+resolvido pela chave (o dela, se tiver; o da stack, caso contrário) — você não
+envia nada a mais.
 
 ```bash
 curl -X POST https://api.trystac.com/v1/documents/extract \
@@ -196,14 +207,14 @@ curl -X POST https://api.trystac.com/v1/documents/extract \
 O modelo recebe:
 
 ```
-system: <system prompt da sua stack>
+system: <system prompt configurado — o da chave ou o da stack>
 user:   <instrução padrão de extração — não invente, use null se não achar>
         Contexto adicional informado por quem enviou o documento:
         Este é um contrato de locação. A data que importa é...
         --- DOCUMENTO --- <texto do PDF> --- FIM DO DOCUMENTO ---
 ```
 
-### Com `system` — substituindo a configuração da stack
+### Com `system` — substituindo a configuração da plataforma
 
 Use quando esta requisição precisa de regras diferentes das configuradas na plataforma.
 
@@ -223,9 +234,9 @@ Os dois campos são combináveis. A regra é a mesma do chat:
 
 | Você envia | O que vale |
 |---|---|
-| Nada | System prompt da stack |
-| `system` com conteúdo | O seu (substitui o da stack) |
-| `system` vazio | O da stack — vazio não substitui nada |
+| Nada | System prompt configurado — o da chave, se ela tiver; senão o da stack |
+| `system` com conteúdo | O seu (substitui o configurado) |
+| `system` vazio | O configurado — vazio não substitui nada |
 | `user` | Soma à instrução de extração |
 
 A assimetria é proposital: `system` é **configuração** (faz sentido trocar), `user` é
@@ -297,7 +308,7 @@ Content-Type: multipart/form-data
 |---|---|---|
 | `file` | sim | A imagem, em JPEG, PNG ou WEBP |
 | `schema` | sim | JSON Schema (como string) descrevendo os campos a extrair |
-| `system` | não | Substitui o system prompt configurado na sua stack |
+| `system` | não | Substitui o system prompt configurado (o da chave ou o da stack) |
 | `user` | não | Contexto adicional sobre esta imagem — **soma** à instrução de extração |
 | `max_tokens` | não | Teto da resposta. Default 4000, máximo 16000 |
 
@@ -371,7 +382,7 @@ Content-Type: application/json
 |---|---|---|
 | `html` | um dos dois | O HTML completo a renderizar (modo direto) |
 | `user` | um dos dois | O que o documento deve conter (modo por instrução) |
-| `system` | não | Só com `user`. Substitui o system prompt configurado na sua stack |
+| `system` | não | Só com `user`. Substitui o system prompt configurado (o da chave ou o da stack) |
 | `max_tokens` | não | Só com `user`. Teto da resposta do modelo. Default 8000, máximo 16000 |
 
 `html` e `user` são exclusivos — mandar os dois (ou nenhum) responde `400`.
@@ -404,9 +415,9 @@ renderiza a resposta direto, sem uma segunda chamada do seu lado.
 
 | Você envia | O que vale |
 |---|---|
-| Nada | System prompt da stack |
-| `system` com conteúdo | O seu (substitui o da stack) |
-| `system` vazio | O da stack — vazio não substitui nada |
+| Nada | System prompt configurado — o da chave, se ela tiver; senão o da stack |
+| `system` com conteúdo | O seu (substitui o configurado) |
+| `system` vazio | O configurado — vazio não substitui nada |
 | `user` | Soma à instrução padrão de geração (não a substitui) |
 
 Não passa por RAG: o contexto relevante é a instrução que você deu, não a base de

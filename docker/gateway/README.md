@@ -50,11 +50,16 @@ cliente → gateway (:8080) → agent do pod (:8000) → vLLM (:8001)
   está ativo e repassa a Bearer original — o agent continua validando e
   contando uso por chave. Máquina fora do ar → 503 imediato (connect 5s).
 - **System prompt + RAG**: em chat completions, injeta o `system_prompt`
-  configurado da conta como primeira mensagem e, se a conta tiver arquivos
+  configurado como primeira mensagem e, se a conta tiver arquivos
   indexados na base de conhecimento, embeda a última mensagem do usuário
   (OpenAI `text-embedding-3-small`) e injeta o top-k mais similar
   (`match_knowledge_chunks`) como contexto antes da mensagem do usuário.
-  Best-effort: falha na API de embeddings não derruba o request.
+  Best-effort: falha na API de embeddings não derruba o request. O prompt sai
+  da CHAVE quando ela tem `use_custom_prompt` ligado (migration 0053) e da
+  STACK caso contrário — ver `key_prompt.py`. Nos dois casos vale só quando a
+  request não traz `system` próprio: CLI e assistentes de código mandam o
+  deles e continuam intocados. O RAG não acompanha essa escolha (a base de
+  conhecimento é da stack e vale sempre).
 
 ## Limitação aceita: réplica única
 
