@@ -11,7 +11,6 @@ Agent que roda dentro do pod, na frente do vLLM.
 import asyncio
 import hashlib
 import hmac
-import json
 import os
 import shutil
 import time
@@ -31,6 +30,7 @@ from proxy_policy import (
     merge_key_entry,
     prepare_proxy_body,
 )
+from usage_norm import SseUsageScanner, usage_from_event
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
 ADMIN_SECRET = os.environ.get("AGENT_ADMIN_SECRET", "")
@@ -473,6 +473,9 @@ def cached_tokens_of(usage: dict | None) -> int:
 
 
 def track_usage(api_key_id: str | None, usage: dict | None):
+    """`usage` já normalizado pra forma chat pelos chamadores (usage_norm.py) —
+    o protocolo Responses nomeia as contagens de outro jeito e chegar aqui
+    cru significa somar zero em silêncio."""
     if not api_key_id:
         return  # chave sem id sincronizado (sync antigo) — nada seguro pra agregar
     m = metrics_per_key.setdefault(
@@ -548,24 +551,21 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
             upstream = await client.send(upstream_req, stream=True)
 
             async def stream_and_close():
-                usage = None
-                buffer = b""
+                # Scanner linha a linha, e não a janela dos últimos 16 KiB do
+                # stream que existia aqui: no protocolo Responses o usage viaja
+                # no evento final "response.completed", que carrega o snapshot
+                # INTEIRO da resposta (todo o texto gerado). Numa resposta longa
+                # esse evento passa de 16 KiB sozinho, a janela cortava o JSON
+                # no meio e o parse falhava — usage_metrics ficava zerado mesmo
+                # depois de acertar o caminho do campo.
+                scanner = SseUsageScanner()
                 try:
                     async for chunk in upstream.aiter_bytes():
                         yield chunk
-                        # o chunk com usage é o último; basta guardar o final
-                        buffer = (buffer + chunk)[-16384:]
+                        scanner.feed(chunk)
                 finally:
                     await upstream.aclose()
-                    for line in buffer.split(b"\n"):
-                        line = line.strip()
-                        if line.startswith(b"data:") and b'"usage"' in line:
-                            try:
-                                payload = json.loads(line[5:])
-                                if payload.get("usage"):
-                                    usage = payload["usage"]
-                            except Exception:
-                                pass
+                    usage = scanner.finish()
                     global concurrent_now
                     concurrent_now -= 1
                     track_usage(api_key_id, usage)
@@ -600,7 +600,10 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
             except Exception:
                 parsed = None
 
-        usage = parsed.get("usage") if isinstance(parsed, dict) else None
+        # usage_from_event e não parsed.get("usage"): em /v1/responses o dict
+        # chega com input_tokens/output_tokens, que o track_usage abaixo não
+        # sabe ler (contava request e zero token)
+        usage = usage_from_event(parsed)
         track_usage(api_key_id, usage)
         log_line(
             api_key_id, prefix, account,

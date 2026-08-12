@@ -82,6 +82,7 @@ from context_budget import resolve_est_tokens as _resolve_est_tokens
 from lifecycle import LifecycleManager, MigrationError
 from recovery import is_no_gpu_error, lock_active, spawn_tracked
 from usage_class import classify_stack
+from usage_norm import SseUsageScanner, normalize_usage, usage_from_event
 from routing import RoutingStore
 from runpod_api import RunPodClient
 from supa import SupaClient
@@ -3344,7 +3345,11 @@ def log_gateway_request(
     instrumentação temporária pra medir o erro de CONTEXT_EXACT_SAFETY_FACTOR
     (1.02) contra o prompt_tokens real do vLLM antes de mexer nele de novo —
     não vale uma migration."""
-    usage = usage or {}
+    # normaliza no ponto que grava, não em cada chamador: `usage` chega no
+    # formato do protocolo que atendeu a requisição (chat ou Responses) e os
+    # dois nomeiam as contagens de forma diferente — ver usage_norm.py. É
+    # idempotente, então quem já manda o formato chat não é afetado.
+    usage = normalize_usage(usage) or {}
     _log_estimate_drift(budget, usage, path)
     row = {
         "account_id": account_id,
@@ -4309,7 +4314,10 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # extrair "usage" no fim sem mudar o mecanismo de resposta.
         collect_full = not is_stream_request
         full = b"" if collect_full else None
-        pending = b""
+        # streaming de verdade: o scanner só faz json.loads na linha rara que
+        # carrega "usage" (o chunk final do chat, o evento response.completed
+        # do Responses) — os deltas de conteúdo nunca chegam a ser parseados.
+        scanner = SseUsageScanner()
         usage = None
         try:
             async for chunk in upstream.aiter_bytes():
@@ -4317,33 +4325,15 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                 if collect_full:
                     full += chunk
                     continue
-                # streaming de verdade: só vale a pena fazer json.loads na
-                # linha rara que carrega "usage" (chunk final do SSE, quando
-                # o vLLM manda) — as demais linhas (deltas de conteúdo) nunca
-                # chegam a ser parseadas aqui.
-                pending += chunk
-                while b"\n" in pending:
-                    line, pending = pending.split(b"\n", 1)
-                    if b'"usage"' not in line:
-                        continue
-                    stripped = line.strip()
-                    if not stripped.startswith(b"data:"):
-                        continue
-                    data = stripped[len(b"data:") :].strip()
-                    if data in (b"[DONE]", b""):
-                        continue
-                    try:
-                        parsed = json.loads(data)
-                    except Exception:
-                        continue
-                    if isinstance(parsed, dict) and parsed.get("usage"):
-                        usage = parsed["usage"]
+                scanner.feed(chunk)
         finally:
-            if collect_full and full:
+            if collect_full:
                 try:
-                    usage = json.loads(full).get("usage")
+                    usage = usage_from_event(json.loads(full)) if full else None
                 except Exception:
-                    pass
+                    usage = None
+            else:
+                usage = scanner.finish()
             await upstream.aclose()
             release_flight(flight_key)
             log_gateway_request(
