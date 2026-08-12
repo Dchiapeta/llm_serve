@@ -25,12 +25,27 @@ export const TEMPLATE_OVERHEAD = 200
  * o chat template renderizado.
  */
 export const EXACT_SAFETY_FACTOR = 1.02
+/**
+ * Orçamento para o transbordo de UM turno. O cliente decide compactar olhando o
+ * contexto do turno anterior; entre a decisão e a request seguinte cabe um
+ * tool_result inteiro (um Read de 60 KB são ~18k tokens). Sem esta margem
+ * sobravam 17654 tokens entre o topo da banda de compactação e o teto de
+ * admissão do gateway — menos que um arquivo grande.
+ */
+export const OVERSHOOT_MARGIN = 16000
+/**
+ * Teto da margem acima como fração do espaço útil. Numa janela pequena a margem
+ * fixa comeria a sessão inteira (em 16384 o espaço útil é ~8k, e reservar 16k
+ * devolveria zero — pior que não recomendar nada).
+ */
+export const OVERSHOOT_MAX_FRACTION = 0.25
 
 /** Fallback quando a janela é desconhecida (template sem --max-model-len, pod
  * anterior à migration 0031): assume o piso conservador da escada de planos
  * (64k), não a janela atual — errar pra baixo só compacta cedo, errar pra cima
- * faz o gateway rejeitar. */
-const UNKNOWN_WINDOW_FALLBACK = 56000
+ * faz o gateway rejeitar. É o que autoCompactWindow(65536) devolve, já
+ * descontada a margem de transbordo. */
+const UNKNOWN_WINDOW_FALLBACK = 42000
 
 /** Maior prompt que ainda deixa a saída garantida dentro da janela. */
 export function usableInputTokens(maxModelLen: number): number {
@@ -47,14 +62,14 @@ export function usableInputTokens(maxModelLen: number): number {
  * auto-compact dispara numa fração INTERNA dele — entre ~80% e ~92%, varia por
  * versão do Claude Code e não é configurável.
  *
- * Por isso o valor é o MAIOR admissível, não 80% da janela: em 131072 → 120000,
- * e a compactação cai entre ~96k e ~110k (73%-84% da janela). Declarar 80%
- * (104000) faria compactar em 63%-73%, deixando ~15% de contexto na mesa.
- *
- * O teto é usableInputTokens porque acima dele o gateway rejeita — não sobraria
- * espaço para a resposta.
+ * Dois tetos, não um: o de ESPAÇO (usableInputTokens, acima dele o gateway
+ * rejeita) e o de TRANSBORDO (OVERSHOOT_MARGIN, porque o cliente decide olhando
+ * o turno anterior e um tool_result grande cabe entre a decisão e a request).
+ * Em 131072 → 104000, com a compactação caindo em 83k-96k.
  */
 export function autoCompactWindow(maxModelLen: number | null | undefined): number {
   if (!maxModelLen || maxModelLen <= 0) return UNKNOWN_WINDOW_FALLBACK
-  return Math.floor(usableInputTokens(maxModelLen) / 1000) * 1000
+  const usable = usableInputTokens(maxModelLen)
+  const margin = Math.min(OVERSHOOT_MARGIN, Math.floor(usable * OVERSHOOT_MAX_FRACTION))
+  return Math.max(0, Math.floor((usable - margin) / 1000)) * 1000
 }

@@ -18,9 +18,29 @@ formato de "thinking blocks" da Anthropic; prompt caching (cache_control)
 é ignorado, sem efeito no vLLM.
 """
 
+import asyncio
 import json
+import logging
 import os
+import time
 import uuid
+
+import httpx
+
+logger = logging.getLogger("gateway.anthropic")
+
+# Kill switch do evento `error` no SSE. Quando o upstream morre ANTES de gerar
+# qualquer conteúdo, este módulo passou a emitir `event: error` (evento oficial
+# da Messages API, que o SDK trata como terminal) em vez de fechar a mensagem
+# como se tivesse dado certo. O comportamento antigo — message_delta com
+# stop_reason "end_turn" e zero conteúdo — devolvia ao cliente um turno vazio
+# que AFIRMAVA sucesso: era isso que fazia o /compact do Claude Code "travar
+# sem retornar nada" e o auto-compact falhar em silêncio (ele compactava, a
+# request morria vazia, e a conversa seguia crescendo até estourar).
+#
+# "false" volta ao encerramento gracioso, sem deploy, caso algum cliente lide
+# pior com o evento de erro do que com a resposta vazia.
+EMIT_ERROR_EVENT = os.environ.get("ANTHROPIC_SSE_ERROR_EVENT", "true").lower() != "false"
 
 # Kill switch do input_tokens no message_delta. A API da Anthropic emite
 # input_tokens nos dois eventos (message_start e message_delta) e os SDKs
@@ -250,6 +270,13 @@ def openai_to_anthropic_response(
             # a sessão está vazia e nunca compactar.
             "input_tokens": usage.get("prompt_tokens") or input_tokens_fallback,
             "output_tokens": usage.get("completion_tokens", 0),
+            # zerados mas PRESENTES, mesma razão do message_start (ver
+            # anthropic_sse_from_openai_stream): há cliente que soma os três pra
+            # calcular contexto usado, e em JS `undefined` propaga NaN — toda
+            # comparação com NaN é falsa, então o gatilho de auto-compact nunca
+            # dispararia. Ausente e 0 não são a mesma coisa.
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
         },
     }
 
@@ -260,10 +287,25 @@ def _sse(event: str, data: dict) -> bytes:
 
 THINK_CLOSE = "</think>"
 
+# Heartbeat da Messages API. Os SDKs ignoram, mas ele mantém a conexão viva
+# (Cloudflare tanto na frente do gateway quanto na frente do pod do RunPod)
+# durante um prefill longo, quando não há nada de útil a mandar ainda.
+PING = _sse("ping", {"type": "ping"})
+
+
+async def _next_chunk(iterator):
+    """`__anext__` embrulhado com sentinela em vez de StopAsyncIteration: a
+    exceção não sobrevive bem a ser guardada numa Task e reinspecionada."""
+    try:
+        return await iterator.__anext__()
+    except StopAsyncIteration:
+        return None
+
 
 async def anthropic_sse_from_openai_stream(
     upstream, requested_model: str, on_done=None, filter_reasoning: bool = False,
-    input_tokens_estimate: int = 0,
+    input_tokens_estimate: int = 0, ttft_timeout_s: float = 0.0,
+    idle_timeout_s: float = 0.0, ping_interval_s: float = 0.0, log_label: str = "",
 ):
     """Converte o stream SSE do vLLM (chat/completions, formato OpenAI) pro
     formato de eventos da Anthropic Messages API (message_start ->
@@ -285,7 +327,26 @@ async def anthropic_sse_from_openai_stream(
     stream, mas o cliente lê o input do message_start — era 0 hardcoded aqui, e
     com isso o rastreador de contexto do Claude Code nunca acumulava e o
     auto-compact nunca disparava, qualquer que fosse a janela configurada. O
-    número real do vLLM corrige a estimativa no message_delta."""
+    número real do vLLM corrige a estimativa no message_delta.
+
+    `ttft_timeout_s` / `idle_timeout_s` são DUAS janelas distintas, porque medem
+    coisas diferentes que o read timeout único do httpx confundia:
+
+    - TTFT: tempo até o PRIMEIRO chunk, que é o prefill do vLLM. Num prompt de
+      ~100k tokens isso passa de 60s com folga (2× A40 TP=2 em PCIe, dequant
+      Marlin, prefix caching desligado nos modelos híbridos) — e o read de 60s
+      do proxy_client matava exatamente a request de prompt máximo, que é a
+      compactação.
+    - idle: silêncio DEPOIS que o vLLM já começou a mandar SSE. Aí sim é falha
+      de verdade (pod travado, conexão zumbi) e a janela curta continua valendo.
+
+    Zero em qualquer uma desliga aquele watchdog (default: comportamento antigo,
+    quem controla o prazo é o read timeout do httpx).
+
+    `ping_interval_s` emite `event: ping` enquanto se espera — evento oficial da
+    Messages API. Serve pra manter a conexão viva através do Cloudflare durante
+    um prefill longo, e pra não deixar o cliente no escuro quando o filtro de
+    raciocínio represa a saída até fechar </think>."""
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     yield _sse("message_start", {
         "type": "message_start",
@@ -320,9 +381,61 @@ async def anthropic_sse_from_openai_stream(
     in_reasoning = filter_reasoning
     reasoning_buffer = ""
 
+    aborted_reason = None
+    # fora do try pra que o finally alcance: se o CLIENTE desconectar no meio
+    # (GeneratorExit num yield), a task de leitura tem que ser cancelada, senão
+    # fica rodando órfã segurando a conexão upstream
+    chunk_task = None
     try:
         try:
-            async for raw in upstream.aiter_bytes():
+            # Pump manual em vez de `async for`: é o que permite separar o
+            # prazo do PRIMEIRO chunk (prefill) do prazo de silêncio no meio do
+            # stream, e emitir ping enquanto se espera. O httpx tem um read
+            # timeout só, que confunde as duas coisas.
+            #
+            # NÃO trocar por asyncio.wait_for: ele CANCELA o __anext__ no
+            # timeout, o que injeta CancelledError dentro do gerador do httpx e
+            # deixa a conexão inutilizável — o chunk seguinte quebra. Aqui a
+            # task é deixada pendente de propósito e só é cancelada quando já
+            # estamos abandonando o stream.
+            iterator = upstream.aiter_bytes().__aiter__()
+            first_chunk_seen = False
+            waiting_since = time.monotonic()
+            while True:
+                if chunk_task is None:
+                    chunk_task = asyncio.ensure_future(_next_chunk(iterator))
+                budget = idle_timeout_s if first_chunk_seen else ttft_timeout_s
+                waits = [t for t in (ping_interval_s, budget) if t > 0]
+                done, _ = await asyncio.wait(
+                    {chunk_task}, timeout=min(waits) if waits else None
+                )
+                if not done:
+                    waited = time.monotonic() - waiting_since
+                    if budget and waited > budget:
+                        chunk_task.cancel()
+                        aborted_reason = (
+                            "prefill" if not first_chunk_seen else "silêncio"
+                        )
+                        logger.warning(
+                            "anthropic stream: %s sem chunk do upstream por %.0fs "
+                            "(teto %.0fs) em %s",
+                            aborted_reason, waited, budget, log_label or "?",
+                        )
+                        break
+                    if ping_interval_s > 0:
+                        yield PING
+                    continue
+                raw = chunk_task.result()
+                chunk_task = None
+                if raw is None:
+                    break
+                if not first_chunk_seen:
+                    first_chunk_seen = True
+                    logger.info(
+                        "anthropic stream: TTFT %.1fs em %s",
+                        time.monotonic() - waiting_since, log_label or "?",
+                    )
+                waiting_since = time.monotonic()
                 pending += raw
                 while b"\n" in pending:
                     line, pending = pending.split(b"\n", 1)
@@ -419,10 +532,43 @@ async def anthropic_sse_from_openai_stream(
                                 "type": "content_block_delta", "index": tool_blocks[oi],
                                 "delta": {"type": "input_json_delta", "partial_json": args_fragment},
                             })
-        except (Exception,):
+        except (httpx.HTTPError, ConnectionError, OSError) as e:
             # conexão upstream caiu no meio do stream — fecha os blocks
-            # abertos com o que já foi gerado, em vez de sumir sem nada
-            pass
+            # abertos com o que já foi gerado, em vez de sumir sem nada.
+            #
+            # Específico em vez de `except Exception` nu por dois motivos: um
+            # CancelledError de cliente que desconectou não é falha de API (e
+            # nem é Exception), e engolir tudo em silêncio foi o que escondeu
+            # este bug — sem esta linha de log, um stream que morre no prefill
+            # some sem deixar rastro em lugar nenhum.
+            aborted_reason = aborted_reason or "upstream"
+            logger.warning(
+                "anthropic stream: upstream caiu em %s (%s: %s)",
+                log_label or "?", type(e).__name__, e,
+            )
+
+        if aborted_reason and not text_block_open and not tool_blocks and not reasoning_buffer:
+            # Morreu sem gerar UMA palavra. Fechar a mensagem normalmente aqui
+            # produzia um turno vazio com stop_reason "end_turn" e HTTP 200 —
+            # uma resposta que AFIRMA sucesso. Era o que fazia o /compact do
+            # Claude Code "travar sem retornar nada": ele recebia um resumo
+            # vazio e válido, e a conversa seguia crescendo até estourar.
+            #
+            # `error` é evento oficial da Messages API e o SDK o trata como
+            # terminal, então a falha aparece pro usuário como falha.
+            if EMIT_ERROR_EVENT:
+                yield _sse("error", {
+                    "type": "error",
+                    "error": {
+                        "type": "overloaded_error",
+                        "message": (
+                            "a máquina não começou a responder a tempo — prompt "
+                            "muito grande para o prefill ou pod sob carga. Tente "
+                            "de novo; se persistir, reduza o contexto da sessão."
+                        ),
+                    },
+                })
+                return
 
         if in_reasoning and reasoning_buffer:
             # bateu o fim do stream sem nunca fechar </think> — devolve o
@@ -446,8 +592,21 @@ async def anthropic_sse_from_openai_stream(
         for idx in tool_blocks.values():
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
 
-        stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
-        delta_usage = {"output_tokens": (usage or {}).get("completion_tokens", 0)}
+        # Chegou aqui com aborted_reason = havia conteúdo parcial (o caso sem
+        # nada nenhum já retornou acima). "end_turn" seria mentira: a resposta
+        # foi cortada, não concluída.
+        if aborted_reason and finish_reason is None:
+            stop_reason = "max_tokens"
+        else:
+            stop_reason = STOP_REASON_MAP.get(finish_reason, "end_turn")
+        delta_usage = {
+            "output_tokens": (usage or {}).get("completion_tokens", 0),
+            # presentes e zerados pelo mesmo motivo do message_start: cliente
+            # que soma os três recebe NaN se algum vier undefined, e NaN nunca
+            # ultrapassa o limiar de compactação
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
         if EMIT_INPUT_TOKENS_IN_DELTA:
             # corrige a estimativa do message_start com a contagem real do
             # vLLM (que só chega neste ponto do stream); sem usage no stream,
@@ -462,5 +621,17 @@ async def anthropic_sse_from_openai_stream(
         })
         yield _sse("message_stop", {"type": "message_stop"})
     finally:
+        # ordem importa: cancelar a leitura ANTES de fechar o upstream, senão o
+        # aclose disputa com um __anext__ ainda em voo
+        if chunk_task is not None:
+            chunk_task.cancel()
+        # o httpx só devolve a conexão ao pool quando o stream é consumido até
+        # o fim; abandonar no meio (timeout, cliente desconectou) sem fechar
+        # queima um slot de max_connections pra sempre. O caminho OpenAI
+        # (main.py:filtered_reasoning_stream) sempre fechou, este não fechava.
+        try:
+            await upstream.aclose()
+        except Exception:
+            pass
         if on_done:
             on_done(usage)

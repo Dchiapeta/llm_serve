@@ -9,18 +9,40 @@ cópias do mesmo filtro, uma por protocolo, e o Claude Code passa SÓ por esta.
 import asyncio
 import json
 
-from anthropic_compat import anthropic_sse_from_openai_stream
+import httpx
+
+from anthropic_compat import anthropic_sse_from_openai_stream, openai_to_anthropic_response
 
 
 class FakeUpstream:
-    """Mínimo que o conversor consome do httpx.Response em modo stream."""
+    """Mínimo que o conversor consome do httpx.Response em modo stream.
 
-    def __init__(self, chunks: list[bytes]):
+    `stall_after` faz o stream PARAR de produzir depois de N chunks, sem
+    fechar — é assim que um pod em prefill longo (ou travado) se comporta, e o
+    caso que o watchdog de TTFT/idle existe pra pegar. `raise_after` simula a
+    conexão caindo de verdade."""
+
+    def __init__(self, chunks: list[bytes], stall_after: int | None = None,
+                 raise_after: int | None = None):
         self._chunks = chunks
+        self._stall_after = stall_after
+        self._raise_after = raise_after
+        self.closed = False
 
     async def aiter_bytes(self):
-        for c in self._chunks:
+        for i, c in enumerate(self._chunks):
+            if self._stall_after is not None and i >= self._stall_after:
+                await asyncio.Event().wait()  # nunca resolve
+            if self._raise_after is not None and i >= self._raise_after:
+                raise httpx.ReadError("conexão morreu")
             yield c
+        if self._stall_after == len(self._chunks):
+            await asyncio.Event().wait()
+        if self._raise_after == len(self._chunks):
+            raise httpx.ReadError("conexão morreu")
+
+    async def aclose(self):
+        self.closed = True
 
 
 def _chunk(**delta) -> bytes:
@@ -39,15 +61,17 @@ def _usage_chunk(prompt_tokens: int, completion_tokens: int) -> bytes:
 
 
 def _collect(
-    chunks: list[bytes], *, filter_reasoning: bool, input_tokens_estimate: int = 0
+    chunks: list[bytes], *, filter_reasoning: bool, input_tokens_estimate: int = 0,
+    upstream=None, **kwargs
 ) -> list[dict]:
     """Roda o conversor e devolve os eventos SSE já decodificados."""
 
     async def run():
         out = []
         gen = anthropic_sse_from_openai_stream(
-            FakeUpstream(chunks), "claude-x", filter_reasoning=filter_reasoning,
-            input_tokens_estimate=input_tokens_estimate,
+            upstream if upstream is not None else FakeUpstream(chunks),
+            "claude-x", filter_reasoning=filter_reasoning,
+            input_tokens_estimate=input_tokens_estimate, **kwargs,
         )
         async for raw in gen:
             for line in raw.decode().split("\n"):
@@ -172,6 +196,143 @@ def test_sem_estimativa_o_input_tokens_fica_zero():
     """Regressão dos chamadores que não passam o parâmetro (proxy genérico)."""
     events = _collect([_chunk(content="oi")], filter_reasoning=False)
     assert _only(events, "message_start")["message"]["usage"]["input_tokens"] == 0
+
+
+def test_message_delta_leva_os_quatro_campos_de_usage():
+    """Mesma razão do message_start: cliente que soma input + cache_* recebe
+    NaN quando um campo vem undefined, e NaN nunca ultrapassa o limiar de
+    compactação — o auto-compact simplesmente nunca dispara."""
+    usage = _only(_collect([_chunk(content="oi")], filter_reasoning=False), "message_delta")["usage"]
+    assert set(usage) == {
+        "input_tokens", "output_tokens",
+        "cache_creation_input_tokens", "cache_read_input_tokens",
+    }
+
+
+def test_resposta_nao_streaming_leva_os_quatro_campos_de_usage():
+    usage = openai_to_anthropic_response(
+        {"choices": [{"message": {"content": "oi"}, "finish_reason": "stop"}],
+         "usage": {"prompt_tokens": 10, "completion_tokens": 2}},
+        "claude-x",
+    )["usage"]
+    assert usage["input_tokens"] == 10
+    assert usage["cache_creation_input_tokens"] == 0
+    assert usage["cache_read_input_tokens"] == 0
+
+
+# ---------- stream que morre: nunca fingir sucesso ----------
+
+
+def _types(events: list[dict]) -> list[str]:
+    return [e.get("type") for e in events]
+
+
+def test_prefill_estourado_emite_error_e_nao_mensagem_vazia():
+    """A REGRESSÃO CENTRAL. Um upstream que nunca manda o primeiro chunk (pod
+    em prefill de ~120k tokens) fazia o gerador emitir message_delta com
+    stop_reason "end_turn" e message_stop, sob HTTP 200 — um turno vazio que
+    AFIRMA sucesso. Era isso que fazia o /compact do Claude Code "travar sem
+    retornar nada": ele recebia um resumo vazio e válido, e a conversa seguia
+    crescendo até estourar a janela."""
+    events = _collect(
+        [], filter_reasoning=False, upstream=FakeUpstream([], stall_after=0),
+        ttft_timeout_s=0.05, ping_interval_s=0.01,
+    )
+    assert "error" in [e.get("type") for e in events]
+    assert "message_stop" not in _types(events)
+    assert "message_delta" not in _types(events)
+
+
+def test_ping_mantem_a_conexao_viva_durante_o_prefill():
+    """Enquanto o vLLM faz prefill não há nada de útil a mandar, mas a conexão
+    precisa continuar viva (Cloudflare nos dois lados do caminho)."""
+    events = _collect(
+        [], filter_reasoning=False, upstream=FakeUpstream([], stall_after=0),
+        ttft_timeout_s=0.2, ping_interval_s=0.01,
+    )
+    assert _types(events).count("ping") >= 2
+    # o ping vem DEPOIS do message_start e ANTES de qualquer conteúdo
+    assert _types(events)[0] == "message_start"
+
+
+def test_silencio_no_meio_usa_a_janela_curta_e_entrega_o_parcial():
+    """Depois do primeiro chunk o prazo é o de silêncio (curto), não o de
+    prefill — se a janela grande vazasse para esta fase, um pod travado
+    seguraria a conexão por minutos. E o texto já gerado tem que chegar."""
+    events = _collect(
+        [], filter_reasoning=False,
+        upstream=FakeUpstream([_chunk(content="parcial")], stall_after=1),
+        ttft_timeout_s=30.0, idle_timeout_s=0.05, ping_interval_s=0.01,
+    )
+    assert _texts(events) == ["parcial"]
+    # houve conteúdo: fecha a mensagem em vez de emitir error, mas sem chamar
+    # de "end_turn" uma resposta que foi cortada
+    assert _only(events, "message_delta")["delta"]["stop_reason"] == "max_tokens"
+    assert "message_stop" in _types(events)
+
+
+def test_upstream_e_sempre_fechado():
+    """O httpx só devolve a conexão ao pool quando o stream é consumido até o
+    fim; abandonar no meio sem fechar queima um slot de max_connections."""
+    for kwargs in (
+        {"chunks": []},                                    # fim normal
+        {"chunks": [], "stall_after": 0},                  # timeout de prefill
+        {"chunks": [_chunk(content="x")], "raise_after": 1},  # conexão caiu
+    ):
+        upstream = FakeUpstream(**kwargs)
+        _collect(
+            [], filter_reasoning=False, upstream=upstream,
+            ttft_timeout_s=0.05, idle_timeout_s=0.05, ping_interval_s=0.01,
+        )
+        assert upstream.closed, kwargs
+
+
+def test_cliente_que_desconecta_no_prefill_nao_deixa_task_orfa():
+    """GeneratorExit no meio da espera: a task que lê o upstream tem que morrer
+    junto, senão fica rodando sozinha segurando a conexão."""
+
+    async def run():
+        upstream = FakeUpstream([], stall_after=0)
+        gen = anthropic_sse_from_openai_stream(
+            upstream, "claude-x", ttft_timeout_s=30.0, ping_interval_s=0.01,
+        )
+        await gen.__anext__()  # message_start
+        await gen.__anext__()  # primeiro ping, já dentro da espera
+        await gen.aclose()     # cliente foi embora
+        assert upstream.closed
+        # nenhuma task de leitura sobrevive à saída do gerador (o cancel só é
+        # efetivado no ciclo seguinte do loop, daí o sleep(0))
+        await asyncio.sleep(0)
+        vivas = [
+            t for t in asyncio.all_tasks()
+            if t is not asyncio.current_task() and not t.done()
+        ]
+        assert vivas == []
+
+    asyncio.run(run())
+
+
+def test_conexao_que_cai_sem_nada_gerado_tambem_vira_error():
+    events = _collect(
+        [], filter_reasoning=False, upstream=FakeUpstream([], raise_after=0),
+        ttft_timeout_s=30.0, ping_interval_s=0.01,
+    )
+    assert "error" in _types(events)
+    assert "message_stop" not in _types(events)
+
+
+def test_stream_normal_nao_regride_com_os_watchdogs_ligados():
+    """Chunks que chegam dentro dos prazos seguem exatamente como antes."""
+    events = _collect(
+        [_chunk(content="Ola"), _chunk(content=" mundo"),
+         _usage_chunk(prompt_tokens=10, completion_tokens=2)],
+        filter_reasoning=False, ttft_timeout_s=30.0, idle_timeout_s=30.0,
+        ping_interval_s=5.0,
+    )
+    assert _texts(events) == ["Ola", " mundo"]
+    assert _only(events, "message_delta")["delta"]["stop_reason"] == "end_turn"
+    assert "message_stop" in _types(events)
+    assert "error" not in _types(events)
 
 
 def test_tool_call_depois_de_reasoning_content_abre_o_bloco_certo():

@@ -190,10 +190,11 @@ var json = await res.Content.ReadFromJsonAsync<JsonElement>();
 Console.WriteLine(json.GetProperty("choices")[0]
     .GetProperty("message").GetProperty("content").GetString());`
 
-  // AUTO_COMPACT_WINDOW: 80% da janela real do plano — é o que faz o Claude
-  // Code compactar antes de estourar. Sem isso ele assume 200k (não há como
-  // anunciar a janela real pela API: ele ignora /v1/models e só tem o env var)
-  // e só descobre o limite quando o gateway recusa. Conta centralizada em
+  // AUTO_COMPACT_WINDOW: a janela real do plano menos a saída garantida e uma
+  // margem para o transbordo de um turno — é o que faz o Claude Code compactar
+  // antes de estourar. Sem isso ele assume 200k (não há como anunciar a janela
+  // real pela API: ele ignora /v1/models e só tem o env var) e só descobre o
+  // limite quando o gateway recusa. Conta centralizada em
   // lib/context-window.ts, espelho de docker/gateway/context_budget.py.
   const compactWindow = autoCompactWindow(maxModelLen)
 
@@ -324,13 +325,14 @@ wire_api = "responses"`
               <code className="font-mono">
                 CLAUDE_CODE_AUTO_COMPACT_WINDOW
               </code>{" "}
-              é o que faz o Claude Code compactar a conversa sozinho, por volta
-              de 80% da janela do plano
+              é o que faz o Claude Code compactar a conversa sozinho, antes de
+              encher a janela do plano
               {maxModelLen ? ` (${maxModelLen.toLocaleString("pt-BR")} tokens)` : ""}
               . Sem ele o Claude Code assume 200 mil tokens e a sessão trava com
               erro de contexto antes de compactar. O valor é a capacidade que ele
               passa a assumir, não o ponto exato da compactação — ele compacta um
-              pouco antes; o resto da janela fica reservado para a resposta.
+              pouco antes; o resto da janela fica reservado para a resposta e para
+              absorver um anexo grande no turno seguinte.
             </p>
           </div>
           <div>

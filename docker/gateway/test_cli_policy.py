@@ -100,6 +100,9 @@ def test_rotas_de_extracao_nunca_sao_cli():
 def test_mensagem_nomeia_o_plano_e_diz_o_que_fazer():
     reason = cli_block_reason("Go", "messages", None)
     assert "Go" in reason and "upgrade" in reason and "app.trystac.com" in reason
+    # os dois destinos possíveis, não só o mais barato: quem lê isso no terminal
+    # não tem a tabela de planos à mão
+    assert "Pro" in reason and "Max" in reason
 
 
 # ---------- contrato com client_identity ----------

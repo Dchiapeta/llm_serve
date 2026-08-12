@@ -191,7 +191,7 @@ Permanente — recomendado, é o que não se esquece:
     "ANTHROPIC_BASE_URL": "https://api.trystac.com",
     "ANTHROPIC_AUTH_TOKEN": "<sua chave do plano>",
     "ANTHROPIC_MODEL": "<alias do modelo do plano>",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "120000"
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "104000"
   }
 }
 ```
@@ -206,30 +206,38 @@ Só para a sessão do terminal atual:
 export ANTHROPIC_BASE_URL=https://api.trystac.com
 export ANTHROPIC_AUTH_TOKEN=<sua chave do plano>
 export ANTHROPIC_MODEL=<alias do modelo do plano>
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=120000
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=104000
 ```
 
-**Por que 120000 e não 104000 (=80% de 131072).** A variável não é o gatilho:
-ela declara a **capacidade** que o Claude Code passa a assumir, e ele compacta
-numa fração *interna* dela — entre ~80% e ~92%, que varia por versão e não é
-configurável. Então:
+**Por que 104000.** A variável não é o gatilho: ela declara a **capacidade** que
+o Claude Code passa a assumir, e ele compacta numa fração *interna* dela — entre
+~80% e ~92%, que varia por versão e não é configurável. O valor sai de **dois**
+tetos:
 
-| Declarado | Compacta em | Da janela real |
+1. **Espaço** — `usable_input_tokens`: 131072 − 8000 de saída − 200 de template,
+   com 2% de margem = **120462**. Acima disso o gateway rejeita.
+2. **Transbordo** — `CONTEXT_OVERSHOOT_MARGIN` (16000): o cliente decide olhando
+   o contexto do turno *anterior*, e entre a decisão e a request seguinte cabe um
+   `tool_result` inteiro. Um `Read` de arquivo de 60 KB são ~18k tokens.
+
+| Declarado | Compacta em | Sobra até o teto de admissão (128054) |
 |---|---|---|
-| 104000 (80% da janela) | 83k–96k | 63%–73% |
-| **120000** | **96k–110k** | **73%–84%** |
+| 120000 (só o teto 1) | 96k–110k | **17654** — menos que um arquivo grande |
+| **104000** | **83k–96k** | **32374** — absorve um turno grande inteiro |
 
-Ou seja, quem entrega "auto-compact em 80%" é o valor **máximo admissível**,
-não 80% da janela. 120000 é teto: acima disso não sobraria espaço para a
-resposta (131072 − 8000 de saída − 200 de template, com 2% de margem = 120462)
-e o próprio gateway rejeitaria — exatamente o bug que a seção seguinte descreve.
+Até 11/08/2026 o valor era 120000, com o argumento de que declarar menos deixaria
+~15% de contexto na mesa. O argumento não estava errado, estava **incompleto**:
+otimizava aproveitamento de janela e ignorava o orçamento de transbordo. Foi o que
+produziu o incidente de **128465 tokens** — estouro de 411 tokens (0,3%) sobre o
+teto, com a sessão morta, porque `/compact` reenvia a transcrição e é justamente o
+pedido que estoura. Contexto na mesa custa 15% de uma sessão; estourar custa a
+sessão inteira.
 
-Fórmula única em `context_budget.auto_compact_window()`, com o valor fixado
-pelos testes `test_janela_recomendada_ao_cliente` e
-`test_janela_recomendada_nao_e_80_por_cento_da_janela` (este último existe para
-que ninguém "corrija" a conta para `0.8 * janela` sem entender o efeito). Se a
-janela de um plano mudar, é de lá que o número novo sai — e
-`lib/context-window.ts` tem que acompanhar.
+Fórmula única em `context_budget.auto_compact_window()`, com o valor fixado pelos
+testes `test_janela_recomendada_ao_cliente`,
+`test_janela_recomendada_reserva_o_transbordo_de_um_turno` e
+`test_teto_de_admissao_e_a_fronteira_exata_do_400`. Se a janela de um plano mudar,
+é de lá que o número novo sai — e `lib/context-window.ts` tem que acompanhar.
 
 Notas para o usuário:
 - Não existe config oficial de "tamanho de janela" no Claude Code para
@@ -241,15 +249,17 @@ Notas para o usuário:
   inteira, então é justamente o pedido que dispara o erro. Mandar usar
   `/compact` ali era um beco sem saída (a sessão travava sem saída nenhuma).
 - Codex CLI: o equivalente é `model_auto_compact_token_limit` no
-  `~/.codex/config.toml` (mesmo 120000). NÃO usar `model_context_window`
+  `~/.codex/config.toml` (mesmo 104000). NÃO usar `model_context_window`
   (bug openai/codex#16068 quebra a compaction).
 - Boas práticas: CLAUDE.md do projeto enxuto, usar subagents para pesquisa
   longa (contexto zerado), `/compact` manual em sessões longas — bem antes do
   limite, não em cima dele.
 
-### Histórico: os dois bugs que faziam isso não funcionar (corrigidos)
+### Histórico: os bugs que faziam isso não funcionar (corrigidos)
 
-Até 31/07/2026, configurar a janela acima não bastava:
+Até 11/08/2026, configurar a janela acima não bastava. Foram **três** rodadas —
+as duas primeiras (31/07) estavam certas mas não fechavam o problema, porque a
+causa que realmente derrubava a compactação só apareceu na terceira:
 
 1. **O auto-compact nunca disparava.** O gateway emitia
    `message_start.usage.input_tokens = 0` em toda resposta streaming
@@ -266,8 +276,39 @@ Até 31/07/2026, configurar a janela acima não bastava:
    (`EstimateKind`): 1.02 para contagem exata, 1.1 quando a contagem falhou,
    1.2 para heurística. Isso também devolveu ~18% de input útil por sessão.
 
-Ver `docker/gateway/context_budget.py` e os testes de regressão em
-`test_context_budget.py` / `test_resolve_est_tokens.py`.
+3. **A compactação morria em silêncio, e o gateway chamava isso de sucesso.**
+   Esta era a causa de verdade. O read timeout do streaming (60s, herdado do
+   `proxy_client`) cobria também o **TTFT** — o tempo até o primeiro chunk, que
+   é o prefill. Como a compactação reenvia a transcrição inteira, ela é a
+   requisição de maior prefill que existe: no Pro, ~85k tokens já custam ~72s
+   só de prefill. Estourado o prazo, o `ReadTimeout` caía num
+   `except (Exception,): pass` mudo e o gerador seguia direto para
+   `message_delta` com `stop_reason: "end_turn"` e `message_stop`, sob HTTP 200
+   — **um turno vazio que afirmava sucesso**.
+
+   O efeito: o auto-compact disparava, a request morria vazia, o Claude Code
+   recebia um "resumo" em branco e a conversa continuava crescendo até estourar
+   a janela. O `/compact` manual fazia o mesmo — daí o sintoma "trava e não
+   retorna nada". E nada disso aparecia em lugar nenhum: o `pass` era mudo, o
+   `anthropic_compat.py` não tinha logger, e o 400 de contexto em `/v1/messages`
+   nunca chamava `log_gateway_request` (não existia em `gateway_requests`).
+
+   Hoje: watchdog de duas fases (`MESSAGES_STREAM_TTFT_TIMEOUT_S` para o
+   prefill, `MESSAGES_STREAM_IDLE_TIMEOUT_S` para o silêncio entre chunks),
+   `event: ping` a cada 15s enquanto se espera, e stream que morre sem gerar
+   nada vira `event: error` em vez de mensagem vazia. Junto: `upstream.aclose()`
+   no `finally` (cada stream abandonado queimava um slot do pool de conexões) e
+   os quatro campos de `usage` em todos os pontos de emissão — faltavam
+   `cache_*` no `message_delta` e no não-streaming, e num cliente JS
+   `undefined` propaga `NaN`, que nunca ultrapassa limiar nenhum.
+
+Ver `docker/gateway/context_budget.py`, `docker/gateway/anthropic_compat.py` e
+os testes de regressão em `test_context_budget.py` /
+`test_anthropic_compat.py` / `test_resolve_est_tokens.py`.
+
+**Assinatura do bug 3 no banco**, se ele voltar: `gateway_requests` com
+`path='messages'`, `stream=true`, `status_code=200`, `tokens_out` nulo e
+`duration_ms ≈ 60000`.
 
 ## 6. O que protege os outros usuários
 

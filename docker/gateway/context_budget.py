@@ -56,6 +56,23 @@ CONTEXT_TEMPLATE_OVERHEAD = int(os.environ.get("CONTEXT_TEMPLATE_OVERHEAD", "200
 # Abaixo disso não há resposta útil possível — melhor rejeitar com instrução
 # de compactar do que devolver meia dúzia de tokens truncados.
 MIN_VIABLE_COMPLETION_TOKENS = int(os.environ.get("MIN_VIABLE_COMPLETION_TOKENS", "256"))
+# Orçamento reservado para o TRANSBORDO DE UM TURNO ao recomendar a janela ao
+# cliente (ver auto_compact_window). O cliente decide compactar olhando o
+# contexto do turno ANTERIOR; entre essa decisão e a request seguinte cabe um
+# tool_result inteiro, e um Read de arquivo de ~60 KB são ~18k tokens.
+#
+# Sem esta margem, a distância entre o topo da banda de compactação e o teto de
+# admissão era de 17654 tokens numa janela de 131072 — ou seja, UM único
+# arquivo grande atravessava a banda inteira e a sessão morria no 400, sem
+# nenhum bug de contagem envolvido. Foi exatamente o incidente de 128465
+# tokens: transbordo de 411 tokens (0,3%) sobre o teto.
+CONTEXT_OVERSHOOT_MARGIN = int(os.environ.get("CONTEXT_OVERSHOOT_MARGIN", "16000"))
+# Teto da margem acima como fração do espaço útil. Numa janela pequena a margem
+# fixa comeria a sessão inteira (em 16384 o espaço útil é ~8k, e reservar 16k
+# devolveria ZERO — pior que não recomendar nada). Absorver um turno grande é
+# fisicamente impossível numa janela dessas; o que dá pra fazer é degradar
+# proporcionalmente em vez de zerar.
+CONTEXT_OVERSHOOT_MAX_FRACTION = float(os.environ.get("CONTEXT_OVERSHOOT_MAX_FRACTION", "0.25"))
 # Fração da janela a partir da qual a estimativa heurística (que já embute
 # CONTEXT_SAFETY_FACTOR) é considerada "perto o suficiente" do limite pra
 # valer a pena pagar uma chamada de rede extra (gateway -> agent -> vLLM
@@ -98,11 +115,17 @@ class ContextWindowExceeded(HTTPException):
     Subclasse de HTTPException de propósito: os `except HTTPException` dos
     call sites (release_flight) continuam funcionando, e o exception handler
     registrado no main.py (resolvido por MRO, vence o default do FastAPI)
-    formata o corpo no shape do cliente — Anthropic em /v1/messages*, OpenAI
-    no resto."""
+    formata o corpo no shape do cliente.
 
-    def __init__(self, message: str):
+    `shape` carrega o protocolo do cliente na própria exceção. Antes o handler
+    adivinhava pela URL (`path.startswith("/v1/messages")`), o que é um proxy
+    frágil: quem sabe qual protocolo está atendendo é o handler que levantou o
+    erro, não o formatador. O default "openai" preserva o comportamento de
+    todos os call sites que não passam nada."""
+
+    def __init__(self, message: str, shape: str = "openai"):
         super().__init__(status_code=400, detail=message)
+        self.shape = shape
 
 
 def anthropic_error_body(message: str) -> dict:
@@ -122,6 +145,16 @@ def openai_error_body(message: str) -> dict:
             "code": "context_length_exceeded",
         }
     }
+
+
+_ERROR_BODIES = {"anthropic": anthropic_error_body, "openai": openai_error_body}
+
+
+def error_body_for(shape: str, message: str) -> dict:
+    """Corpo do erro no protocolo do cliente. Shape desconhecido cai em OpenAI,
+    que é o formato do catch-all /v1/{path} — errar pro lado de quem tem mais
+    call sites."""
+    return _ERROR_BODIES.get(shape, openai_error_body)(message)
 
 
 def _strip_images(messages: list) -> tuple[list, int]:
@@ -265,6 +298,26 @@ def usable_input_tokens(max_model_len: int, reserved_output: int | None = None) 
     return max(0, int(room / CONTEXT_EXACT_SAFETY_FACTOR))
 
 
+def admission_ceiling(
+    max_model_len: int, kind: EstimateKind = EstimateKind.EXACT
+) -> int:
+    """Maior prompt que o gateway ainda ADMITE — acima disso, apply_context_budget
+    levanta ContextWindowExceeded.
+
+    É o inverso de reserved_tokens_for: o maior est_tokens tal que
+    `max_model_len - reserved_tokens_for(est, kind) >= MIN_VIABLE_COMPLETION_TOKENS`.
+    Não confundir com usable_input_tokens, que é mais restritivo por reservar os
+    8000 de saída GARANTIDA em vez do mínimo viável de 256 — entre os dois há
+    uma faixa onde a request passa mas a resposta sai clampada abaixo do piso.
+
+    Existe como função porque a conta estava só implícita na desigualdade de
+    apply_context_budget, e é dela que sai o orçamento de transbordo do
+    auto_compact_window (o teste que fixa os dois é a única coisa que impede a
+    margem de virar negativa sem ninguém perceber)."""
+    room = max_model_len - MIN_VIABLE_COMPLETION_TOKENS - CONTEXT_TEMPLATE_OVERHEAD
+    return max(0, math.floor(room / _SAFETY_FACTORS[kind]))
+
+
 def auto_compact_window(max_model_len: int) -> int:
     """Valor de CLAUDE_CODE_AUTO_COMPACT_WINDOW, arredondado pra baixo em 1k.
 
@@ -274,16 +327,32 @@ def auto_compact_window(max_model_len: int) -> int:
     O auto-compact dispara numa fração INTERNA dele — algo entre ~80% e ~92%,
     varia por versão do Claude Code e não é configurável.
 
-    Daí a conta: pra compactação cair por volta de 80% da janela real, este
-    número tem que ser o MAIOR admissível, não 80% da janela. Em 131072 →
-    120000, e a compactação cai entre ~96k e ~110k, ou seja 73%-84% da janela.
-    Declarar 80% (104000) faria compactar em 63%-73% — cedo demais, deixando
-    ~15% de contexto na mesa por sessão.
+    DOIS tetos, não um:
 
-    O teto é usable_input_tokens porque acima dele o próprio gateway rejeita
-    (não sobraria espaço pra resposta) — recomendar mais que isso recriaria o
-    bug que este módulo existe pra evitar. É por máquina, não por plano."""
-    return (usable_input_tokens(max_model_len) // 1000) * 1000
+    1. ESPAÇO — usable_input_tokens: acima dele o gateway rejeita, porque não
+       sobraria janela pra resposta.
+    2. TRANSBORDO — CONTEXT_OVERSHOOT_MARGIN: o cliente decide compactar
+       olhando o contexto do turno ANTERIOR, e entre a decisão e a request
+       seguinte cabe um tool_result inteiro. Declarar o máximo do teto 1
+       deixava só 17654 tokens entre o topo da banda de compactação e o teto de
+       admissão — menos que um Read de arquivo de 60 KB.
+
+    Em 131072: 120462 de espaço útil − 16000 de transbordo → 104000. A banda de
+    compactação fica em 83k-96k e sobram ~32k até o teto de admissão, o que
+    absorve um turno grande inteiro.
+
+    Nota histórica pra quem for "otimizar" isto de volta: até 11/08/2026 o
+    valor era o máximo do teto 1 (120000), com o argumento de que 80% da janela
+    deixaria ~15% de contexto na mesa. O argumento não estava errado, estava
+    incompleto — ele otimiza aproveitamento de janela e ignora o orçamento de
+    transbordo, e foi o que produziu o incidente dos 128465 tokens. Contexto na
+    mesa custa 15% de uma sessão; estourar custa a sessão inteira, porque
+    /compact reenvia a transcrição e é justamente o pedido que morre.
+
+    É por máquina, não por plano."""
+    usable = usable_input_tokens(max_model_len)
+    margin = min(CONTEXT_OVERSHOOT_MARGIN, int(usable * CONTEXT_OVERSHOOT_MAX_FRACTION))
+    return max(0, (usable - margin) // 1000) * 1000
 
 
 def context_exceeded_message(est_tokens: int, max_model_len: int, kind: EstimateKind) -> str:
@@ -296,6 +365,12 @@ def context_exceeded_message(est_tokens: int, max_model_len: int, kind: Estimate
     chegar aqui."""
     origem = "contagem do tokenizer" if kind is EstimateKind.EXACT else "estimado"
     return (
+        # A frase em inglês vem PRIMEIRO e é literal de propósito: é o texto que
+        # o detector de estouro de contexto do Claude Code procura pra reagir
+        # sozinho (tentar compactar em vez de só exibir "API Error: 400"). Uma
+        # mensagem só em português não casa com nada e a sessão morre sem
+        # chance de recuperação. A explicação útil vem logo atrás.
+        f"prompt is too long: {est_tokens} tokens > {max_model_len} maximum — "
         f"o prompt ocupa ~{est_tokens} tokens ({origem}) e a janela de contexto do "
         f"seu plano é de {max_model_len} tokens — não sobra espaço para a resposta. "
         "Comece uma sessão nova (/clear no Claude Code) ou remova arquivos anexados. "

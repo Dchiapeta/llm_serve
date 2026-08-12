@@ -326,21 +326,21 @@ export ANTHROPIC_MODEL="pro-base"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=120000
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=104000
 claude
 ```
 
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` não é opcional: o Claude Code assume uma janela de
 200k e não tem como descobrir a real do seu plano. Sem essa variável ele só percebe o
-limite quando a chamada é recusada; com ela, compacta a conversa sozinho por volta de
-80% da janela. Use **120000** — a página da sua máquina, na aba **Ferramentas**, mostra
-o valor já preenchido.
+limite quando a chamada é recusada; com ela, compacta a conversa sozinho antes disso.
+Use **104000** — a página da sua máquina, na aba **Ferramentas**, mostra o valor já
+preenchido.
 
 Esse número é a *capacidade* que o Claude Code passa a assumir, não o ponto em que ele
-compacta: ele compacta um pouco antes de acreditar que encheu. Por isso 120000, e não
-os 104000 que seriam 80% de 131072 — declarar 80% faria a compactação acontecer bem
-antes disso, desperdiçando contexto. 120000 é o teto: o resto da janela fica reservado
-para a resposta do modelo.
+compacta: ele compacta um pouco antes de acreditar que encheu. O resto da janela fica
+reservado para duas coisas — a resposta do modelo e uma folga para o turno seguinte,
+porque entre a decisão de compactar e a próxima mensagem cabe um arquivo grande
+inteiro (um `Read` de 60 KB são ~18 mil tokens).
 
 Esses `export` valem só para a sessão de terminal em que você os rodou. Para não
 depender disso, ponha o mesmo conteúdo em `~/.claude/settings.json`:
@@ -355,12 +355,12 @@ depender disso, ponha o mesmo conteúdo em `~/.claude/settings.json`:
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "pro-base",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "pro-base",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "pro-base",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "120000"
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "104000"
   }
 }
 ```
 
-Dois detalhes do formato: os valores são **strings** (`"120000"`, não `120000`) e não
+Dois detalhes do formato: os valores são **strings** (`"104000"`, não `104000`) e não
 há interpolação — `"$ANTHROPIC_MODEL"` não funciona em JSON, por isso o nome do modelo
 aparece repetido. Use o `~/.claude/settings.json` da sua conta, **não** o
 `.claude/settings.json` do projeto: esse costuma ir para o git e levaria a sua chave
@@ -382,7 +382,7 @@ model = "pro-base"
 # Compacta o histórico antes de estourar a janela do plano. O Codex assume 200k
 # por padrão e só descobriria o limite ao ser recusado. Mesmo valor do Claude
 # Code: o maior input que ainda deixa espaço para a resposta na janela de 131072.
-model_auto_compact_token_limit = 120000
+model_auto_compact_token_limit = 104000
 
 [model_providers.llmserve]
 name = "llmserve"

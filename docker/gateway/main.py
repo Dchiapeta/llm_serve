@@ -74,8 +74,8 @@ from context_budget import (
     anthropic_error_body,
     apply_context_budget,
     count_images,
+    error_body_for,
     estimate_prompt_tokens,
-    openai_error_body,
     prompt_text_for_tokenize,
 )
 from context_budget import resolve_est_tokens as _resolve_est_tokens
@@ -173,6 +173,42 @@ DOCUMENT_UPSTREAM_TIMEOUT_S = float(os.environ.get("DOCUMENT_UPSTREAM_TIMEOUT_S"
 # página de erro do RunPod no lugar da nossa mensagem. 90s deixa margem de
 # segurança pra sempre sermos nós a responder primeiro.
 MESSAGES_NONSTREAM_TIMEOUT_S = float(os.environ.get("MESSAGES_NONSTREAM_TIMEOUT_S", "90"))
+
+# /v1/messages com "stream": true — DUAS janelas, porque medem coisas distintas
+# que o read timeout único do httpx confundia (e o comentário antigo do
+# upstream_timeout afirmava, errado, que os 60s do proxy_client mediam só
+# silêncio entre chunks).
+#
+# TTFT = tempo até o PRIMEIRO chunk, que é o prefill. Ele cresce com o tamanho
+# do prompt, então a request de prompt máximo — a compactação do Claude Code,
+# que reenvia a transcrição inteira — é justamente a que mais demora. No Pro
+# (2× A40 TP=2, 27B, dequant Marlin, PCIe sem NVLink) um turno de ~85k tokens
+# custa ~72s só de prefill, e prefix caching está desligado nos modelos
+# híbridos (Qwen3.5/3.6), então esse custo é pago inteiro toda vez. Com 60s o
+# gateway matava a compactação e devolvia um stream vazio "bem-sucedido".
+# O loadtest já registrava ~85s de primeiro byte no Go, o template LEVE
+# (scripts/loadtest.py).
+#
+# 90s, mesma disciplina do MESSAGES_NONSTREAM_TIMEOUT_S: o public_url do pod
+# passa pelo Cloudflare do RunPod, que corta em ~100-127s e devolve 524 em HTML,
+# e é melhor sermos NÓS a responder primeiro, com uma mensagem que explica o que
+# houve. Subir acima do teto deles só troca um erro nosso por um erro deles (já
+# testado ao vivo — ver o comentário de MESSAGES_NONSTREAM_TIMEOUT_S acima).
+#
+# Ou seja: 90s é o teto prático, não uma folga escolhida. Se o prefill não cabe
+# aí, nenhum timeout resolve — o que encolhe o prefill é compactar antes, e é
+# por isso que context_budget.auto_compact_window reserva margem. Calibrar com o
+# TTFT p95 real (scripts/loadtest.py --context-tokens 96000) antes de mexer.
+MESSAGES_STREAM_TTFT_TIMEOUT_S = float(os.environ.get("MESSAGES_STREAM_TTFT_TIMEOUT_S", "90"))
+# silêncio ENTRE chunks depois que o vLLM já começou a mandar SSE: aí sim é
+# falha de verdade (pod travado, conexão zumbi), e o prazo curto do fix
+# ca23611 continua valendo.
+MESSAGES_STREAM_IDLE_TIMEOUT_S = float(os.environ.get("MESSAGES_STREAM_IDLE_TIMEOUT_S", "60"))
+# heartbeat SSE (evento "ping" da Messages API) enquanto se espera o upstream.
+# Mantém a conexão viva através do Cloudflare durante um prefill longo e evita
+# deixar o cliente no escuro quando o filtro de <think> represa a saída.
+# 0 desliga.
+ANTHROPIC_SSE_PING_INTERVAL_S = float(os.environ.get("ANTHROPIC_SSE_PING_INTERVAL_S", "15"))
 
 # quota diária de tokens por conta (controle de custo real — rate limit e
 # concorrência limitam volume de requests, não o custo de cada uma). 0 =
@@ -514,10 +550,15 @@ async def context_window_exceeded_handler(request: Request, exc: ContextWindowEx
     """Formata o estouro de contexto no shape do cliente. Handler dedicado à
     SUBCLASSE (o Starlette resolve por MRO, então vence o default de
     HTTPException) — os demais HTTPException seguem no {"detail": ...} padrão,
-    que painel/scripts já parseiam."""
-    if request.url.path.startswith("/v1/messages"):
-        return JSONResponse(status_code=exc.status_code, content=anthropic_error_body(exc.detail))
-    return JSONResponse(status_code=exc.status_code, content=openai_error_body(exc.detail))
+    que painel/scripts já parseiam.
+
+    O shape vem da EXCEÇÃO, não da URL: quem sabe qual protocolo está sendo
+    atendido é o handler que levantou o erro. O fallback por path continua pros
+    call sites que não passam shape (documents/*, images/*, catch-all)."""
+    shape = getattr(exc, "shape", None)
+    if not shape:
+        shape = "anthropic" if request.url.path.startswith("/v1/messages") else "openai"
+    return JSONResponse(status_code=exc.status_code, content=error_body_for(shape, exc.detail))
 
 
 # O gateway é uma API pra clientes programáticos (SDK OpenAI/Anthropic,
@@ -3089,6 +3130,24 @@ async def anthropic_messages(
         openai_body = await validate_body(
             openai_body, entry, rewrite_model, machine, stack_id, budget_out=budget_out
         )
+    except ContextWindowExceeded as exc:
+        release_flight(flight_key)
+        # O estouro de contexto é o evento mais importante deste endpoint (mata
+        # a sessão do usuário) e até aqui não deixava rastro NENHUM: nem em
+        # gateway_requests, nem no log de aplicação — só a linha de access log
+        # do uvicorn. Foi o que tornou o incidente indiagnosticável.
+        budget = budget_out.get("budget")
+        logger.warning(
+            "contexto estourado em messages: est=%s (%s) janela=%s ua=%s stack=%s",
+            getattr(budget, "est_tokens", "?"),
+            getattr(getattr(budget, "kind", None), "value", "?"),
+            machine.get("max_model_len"), request.headers.get("user-agent"), stack_id,
+        )
+        log_gateway_request(**log_ctx, status_code=400, stream=is_stream, usage=None)
+        # o shape vai na exceção: o cliente aqui é sempre Anthropic, e deixar o
+        # handler adivinhar pela URL é frágil (ver context_window_exceeded_handler)
+        exc.shape = "anthropic"
+        raise
     except HTTPException:
         release_flight(flight_key)
         raise
@@ -3105,17 +3164,17 @@ async def anthropic_messages(
 
     upstream_body = json.dumps(openai_body).encode()
 
-    # streaming: mantém os 60s default do proxy_client (silêncio ENTRE
-    # chunks — se o vLLM já começou a mandar SSE e trava no meio, é falha de
-    # verdade). Não-streaming: sem chunks, o read timeout tem que cobrir a
-    # geração inteira até max_tokens — ver MESSAGES_NONSTREAM_TIMEOUT_S acima.
+    # Streaming: o read do httpx aqui é só a rede de segurança EXTERNA — quem
+    # controla o prazo é o watchdog de duas fases dentro do gerador
+    # (anthropic_compat), que sabe distinguir prefill de silêncio no meio do
+    # stream. A folga de 15s garante que seja sempre o watchdog a responder
+    # primeiro, com mensagem útil, em vez do httpx com um ReadTimeout cru.
+    # Não-streaming: sem chunks, o read tem que cobrir a geração inteira até
+    # max_tokens — ver MESSAGES_NONSTREAM_TIMEOUT_S acima.
     # connect/write/pool continuam os do client (5s/10s/10s): só o read muda.
-    upstream_timeout = (
-        proxy_client.timeout
-        if is_stream
-        else httpx.Timeout(
-            MESSAGES_NONSTREAM_TIMEOUT_S, connect=5.0, write=10.0, pool=10.0
-        )
+    upstream_timeout = httpx.Timeout(
+        (MESSAGES_STREAM_TTFT_TIMEOUT_S + 15.0) if is_stream else MESSAGES_NONSTREAM_TIMEOUT_S,
+        connect=5.0, write=10.0, pool=10.0,
     )
 
     try:
@@ -3198,9 +3257,17 @@ async def anthropic_messages(
                 on_done=_on_stream_done,
                 filter_reasoning=filter_reasoning,
                 input_tokens_estimate=input_tokens_estimate,
+                ttft_timeout_s=MESSAGES_STREAM_TTFT_TIMEOUT_S,
+                idle_timeout_s=MESSAGES_STREAM_IDLE_TIMEOUT_S,
+                ping_interval_s=ANTHROPIC_SSE_PING_INTERVAL_S,
+                log_label=f"{stack_id}/{machine['id']}",
             ),
             status_code=upstream.status_code,
             media_type="text/event-stream",
+            # SSE não deve ser bufferizado por proxy nenhum no caminho — sem
+            # isso um intermediário pode segurar os chunks e devolver tudo no
+            # fim, o que anula o streaming e o heartbeat de ping junto.
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     usage = None
@@ -3294,12 +3361,24 @@ async def anthropic_count_tokens(
     # acordar pod num endpoint de metadado
     machine = await resolve_machine_readonly(entry)
     if machine is None:
+        # sem máquina o número sai da heurística PURA, sem nem o gate de
+        # proximidade do teto — vale logar, porque é o caminho em que o cliente
+        # é pior informado e até aqui este endpoint não deixava rastro nenhum
+        logger.info(
+            "count_tokens: %d tokens (heuristica, sem maquina viva) ua=%s",
+            heuristic_est, request.headers.get("user-agent"),
+        )
         return {"input_tokens": heuristic_est}
-    est_tokens, _kind = await resolve_est_tokens(
+    est_tokens, kind = await resolve_est_tokens(
         machine,
         heuristic_est,
         prompt_text_for_tokenize(messages=messages, tools=tools),
         image_tokens=count_images(messages) * CONTEXT_IMAGE_TOKENS,
+    )
+    logger.info(
+        "count_tokens: %d tokens (%s) janela=%s ua=%s",
+        est_tokens, kind.value, machine.get("max_model_len"),
+        request.headers.get("user-agent"),
     )
     return {"input_tokens": est_tokens}
 

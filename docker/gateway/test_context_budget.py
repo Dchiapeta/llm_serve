@@ -12,14 +12,17 @@ from context_budget import (
     CONTEXT_EXACT_SAFETY_FACTOR,
     CONTEXT_FALLBACK_SAFETY_FACTOR,
     CONTEXT_IMAGE_TOKENS,
+    CONTEXT_OVERSHOOT_MARGIN,
     CONTEXT_SAFETY_FACTOR,
     CONTEXT_TEMPLATE_OVERHEAD,
     RESERVED_OUTPUT_TOKENS,
     ContextWindowExceeded,
     EstimateKind,
+    admission_ceiling,
     anthropic_error_body,
     apply_context_budget,
     auto_compact_window,
+    error_body_for,
     context_exceeded_message,
     count_images,
     estimate_prompt_tokens,
@@ -195,26 +198,68 @@ def test_janela_recomendada_ao_cliente():
     """Contrato replicado em lib/context-window.ts (o painel gera o
     CLAUDE_CODE_AUTO_COMPACT_WINDOW do snippet a partir da mesma conta).
     Mudou aqui? Atualize lá."""
-    assert auto_compact_window(CLAUDE_CODE_WINDOW) == 120_000
-    assert auto_compact_window(65_536) == 56_000  # janela do Pro antes de padronizar
+    assert auto_compact_window(CLAUDE_CODE_WINDOW) == 104_000
+    assert auto_compact_window(65_536) == 42_000  # janela do Pro antes de padronizar
     # nunca acima do que o gateway aceita — recomendar mais que isso recriaria o
     # 400 de contexto que o módulo existe pra evitar
     for window in (GO_WINDOW, 65_536, CLAUDE_CODE_WINDOW):
         assert auto_compact_window(window) <= usable_input_tokens(window)
 
 
-def test_janela_recomendada_nao_e_80_por_cento_da_janela():
-    """Documenta a escolha que confunde: CLAUDE_CODE_AUTO_COMPACT_WINDOW é a
-    CAPACIDADE que o cliente assume, não o gatilho — ele compacta numa fração
-    interna (~80%-92%) dela. Declarar 80% da janela (104000 em 131072) faria
-    compactar em 63%-73%; o valor máximo admissível faz cair em 73%-84%, que é
-    o que se pediu ("auto-compact em 80%"). Se alguém "corrigir" isto pra
-    0.8 * janela, este teste explica por que não."""
+def test_janela_pequena_nao_zera_a_recomendacao():
+    """A margem de transbordo é fixa (16k) mas o espaço útil de uma janela de
+    16384 é ~8k — subtrair direto devolvia ZERO, e declarar
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW=0 é pior que não declarar nada. Nessas
+    janelas a margem degrada proporcionalmente
+    (CONTEXT_OVERSHOOT_MAX_FRACTION)."""
+    for window in (GO_WINDOW, 32_768, 65_536, CLAUDE_CODE_WINDOW):
+        declarado = auto_compact_window(window)
+        assert declarado > 0, window
+        # e continua sobrando margem de verdade até o teto de admissão
+        assert admission_ceiling(window) - declarado * 0.92 > 0, window
+
+
+def test_janela_recomendada_reserva_o_transbordo_de_um_turno():
+    """O motivo de NÃO declarar o máximo admissível (que seria 120000 em
+    131072). O cliente decide compactar olhando o contexto do turno ANTERIOR;
+    entre a decisão e a request seguinte cabe um tool_result inteiro, e um Read
+    de arquivo de 60 KB são ~18k tokens.
+
+    Declarando 120000, do topo da banda de compactação (0.92 * 120000 = 110400)
+    até o teto de admissão (128054) sobravam 17654 tokens — menos que um único
+    arquivo grande. Foi o incidente de 128465 tokens: transbordo de 411 tokens
+    sobre o teto, com a sessão morta porque /compact reenvia tudo e é justamente
+    o pedido que estoura.
+
+    Este teste substitui test_janela_recomendada_nao_e_80_por_cento_da_janela,
+    que fixava o comportamento antigo. O argumento de lá (declarar 80% deixa
+    ~15% de contexto na mesa) não estava errado, estava incompleto: otimizava
+    aproveitamento de janela e ignorava o orçamento de transbordo."""
     declarado = auto_compact_window(CLAUDE_CODE_WINDOW)
-    assert declarado > int(CLAUDE_CODE_WINDOW * 0.8)
-    # onde a compactação realmente cai, nos dois extremos da fração interna
-    assert 0.70 < declarado * 0.80 / CLAUDE_CODE_WINDOW < 0.80
-    assert 0.80 < declarado * 0.92 / CLAUDE_CODE_WINDOW < 0.90
+    topo_da_banda = declarado * 0.92  # extremo tardio da fração interna do cliente
+    assert admission_ceiling(CLAUDE_CODE_WINDOW) - topo_da_banda >= CONTEXT_OVERSHOOT_MARGIN
+    # e a compactação passa a cair em 63%-73% da janela real, por escolha
+    assert 0.60 < declarado * 0.80 / CLAUDE_CODE_WINDOW < 0.70
+    assert 0.70 < declarado * 0.92 / CLAUDE_CODE_WINDOW < 0.80
+
+
+def test_teto_de_admissao_e_a_fronteira_exata_do_400():
+    """Fixa a fronteira que o incidente cruzou por 411 tokens (0,3%), pra que
+    qualquer mexida em CONTEXT_EXACT_SAFETY_FACTOR / CONTEXT_TEMPLATE_OVERHEAD /
+    MIN_VIABLE_COMPLETION_TOKENS apareça aqui e não em produção."""
+    teto = admission_ceiling(CLAUDE_CODE_WINDOW)
+    assert teto == 128_054
+    apply_context_budget(
+        {"max_tokens": 8_000}, _machine(CLAUDE_CODE_WINDOW),
+        est_tokens=teto, kind=EstimateKind.EXACT,
+    )
+    with pytest.raises(ContextWindowExceeded):
+        apply_context_budget(
+            {"max_tokens": 8_000}, _machine(CLAUDE_CODE_WINDOW),
+            est_tokens=teto + 1, kind=EstimateKind.EXACT,
+        )
+    # o prompt do incidente, que motivou tudo isto
+    assert 128_465 > teto
 
 
 @pytest.mark.parametrize("window", [GO_WINDOW, 65_536, CLAUDE_CODE_WINDOW])
@@ -283,3 +328,23 @@ def test_shapes_de_erro():
     assert a["type"] == "error" and a["error"]["type"] == "invalid_request_error"
     o = openai_error_body("msg")
     assert o["error"]["code"] == "context_length_exceeded"
+
+
+def test_shape_do_erro_vem_da_excecao_nao_da_url():
+    """O 400 do incidente chegou ao Claude Code no shape OpenAI. O handler
+    decidia pela URL, que é um proxy frágil do protocolo — quem sabe o que
+    está atendendo é quem levanta o erro."""
+    assert error_body_for("anthropic", "x")["type"] == "error"
+    assert error_body_for("openai", "x")["error"]["code"] == "context_length_exceeded"
+    # shape desconhecido cai no default do catch-all, não explode
+    assert error_body_for("nao-existe", "x")["error"]["code"] == "context_length_exceeded"
+    assert ContextWindowExceeded("x", shape="anthropic").shape == "anthropic"
+    assert ContextWindowExceeded("x").shape == "openai"  # default preservado
+
+
+def test_mensagem_de_erro_e_reconhecivel_pelo_cliente():
+    """O Claude Code procura a frase canônica de estouro de contexto pra reagir
+    sozinho. Uma mensagem só em português não casa com nada e a sessão morre
+    sem chance de recuperação."""
+    msg = context_exceeded_message(200_000, CLAUDE_CODE_WINDOW, EstimateKind.EXACT)
+    assert msg.startswith("prompt is too long: 200000 tokens > 131072 maximum")

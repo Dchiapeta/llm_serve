@@ -90,6 +90,6 @@ def _detail(plan: str | None) -> str:
     """Mensagem ao cliente. Mesmo tom de _client_limit_detail (main.py): diz o
     que aconteceu e o que fazer a respeito, sem culpar a credencial."""
     return (
-        f"o plano {plan} não inclui uso via CLI ou assistente de código — "
-        "faça upgrade para o Pro em app.trystac.com"
+        f"o plano {plan} não tem acesso à CLI nem a assistentes de código — "
+        "para liberar o acesso, faça upgrade para o Pro ou o Max em app.trystac.com"
     )
