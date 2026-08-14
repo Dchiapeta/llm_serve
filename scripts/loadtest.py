@@ -122,8 +122,14 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
     finish_reason = None
     usage = None
     error = None
+    upstream_failed = False
     first_byte = False
-    ttft = None  # time-to-first-token: o que o usuário sente como "travou"
+    # DOIS relógios, e confundi-los mente sobre a latência: o gateway emite
+    # linhas em branco como keepalive enquanto o modelo raciocina, então o
+    # primeiro BYTE chega cedo e o primeiro TOKEN VISÍVEL pode demorar minutos.
+    # `first_visible_s` é o que o usuário sente como "travou".
+    first_byte_s = None
+    first_visible_s = None
     try:
         async with client.stream(
             "POST", "/v1/chat/completions",
@@ -141,9 +147,12 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
                 error = f"HTTP {resp.status_code}: {body[:300]!r}"
             else:
                 async for line in resp.aiter_lines():
-                    if not first_byte:
-                        ttft = time.monotonic() - t0
+                    if first_byte_s is None:
+                        first_byte_s = time.monotonic() - t0
                     first_byte = True
+                    # linha em branco = keepalive do gateway durante o
+                    # raciocínio. NÃO conta como token: contar aqui era o que
+                    # fazia o TTFT parecer ótimo enquanto a tela ficava parada.
                     if not line or not line.startswith("data:"):
                         continue
                     data = line[len("data:"):].strip()
@@ -153,10 +162,30 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    # o gateway sinaliza falha DENTRO do corpo do SSE: o 200 já
+                    # foi junto com o cabeçalho, muito antes de o stream morrer,
+                    # então não sobra status HTTP pra mudar. Sem ler isso aqui,
+                    # um timeout de upstream chega como chunk sem "choices", o
+                    # [DONE] seguinte fecha o laço sem exceção nenhuma e a
+                    # request entra no relatório como sucesso vazio — o mesmo
+                    # ponto cego que escondeu 18 de 36 falhas no gateway.
+                    if isinstance(chunk, dict) and chunk.get("error"):
+                        detail = chunk["error"] if isinstance(chunk["error"], dict) else {}
+                        error = "upstream {}: {}".format(
+                            detail.get("code") or detail.get("type") or "erro",
+                            detail.get("message") or chunk["error"],
+                        )
+                        upstream_failed = True
+                        continue
                     choices = chunk.get("choices") or []
                     if choices:
                         delta = choices[0].get("delta") or {}
-                        full_text += delta.get("content") or ""
+                        texto = delta.get("content") or ""
+                        # só AQUI o usuário vê alguma coisa. tool_calls conta
+                        # junto: é resposta legítima sem texto.
+                        if (texto or delta.get("tool_calls")) and first_visible_s is None:
+                            first_visible_s = time.monotonic() - t0
+                        full_text += texto
                         if choices[0].get("finish_reason"):
                             finish_reason = choices[0]["finish_reason"]
                     if chunk.get("usage"):
@@ -173,7 +202,14 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
         # TTFT é a métrica que o prefix caching move: sem cache o prefill do
         # prompt inteiro acontece ANTES do primeiro token. total_s inclui a
         # geração e dilui o efeito.
-        "ttft_s": round(ttft, 2) if ttft is not None else None,
+        #
+        # `ttft_s` == primeiro token VISÍVEL, de propósito: é o número que
+        # corresponde à experiência. `first_byte_s` fica ao lado pra dar a
+        # diferença — quando os dois divergem muito, o que está no meio é
+        # keepalive, ou seja, tela parada.
+        "ttft_s": round(first_visible_s, 2) if first_visible_s is not None else None,
+        "first_byte_s": round(first_byte_s, 2) if first_byte_s is not None else None,
+        "first_visible_s": round(first_visible_s, 2) if first_visible_s is not None else None,
         "chars": len(full_text),
         "completion_tokens": (usage or {}).get("completion_tokens"),
         "prompt_tokens": (usage or {}).get("prompt_tokens"),
@@ -182,20 +218,29 @@ async def attempt_one(client: httpx.AsyncClient, args, task: dict, api_key: str,
         "cached_tokens": ((usage or {}).get("prompt_tokens_details") or {}).get("cached_tokens"),
         "finish_reason": finish_reason,
         "error": error,
-        "error_phase": None if not error else ("mid_stream" if first_byte else "pre_byte"),
+        # upstream = falha REAL do sistema sob teste (o gateway desistiu do pod
+        # e disse isso no corpo). Separada das duas de transporte de propósito:
+        # não é flakiness do cliente de teste e não pode ser retentada, senão o
+        # relatório apaga justamente o que ele existe pra medir.
+        "error_phase": None if not error else (
+            "upstream" if upstream_failed else ("mid_stream" if first_byte else "pre_byte")
+        ),
     }
 
 
 async def run_one(client: httpx.AsyncClient, args, task: dict, api_key: str, tags: dict, context_prefix: str = "") -> dict:
     """Roda a task com retry pra falha pre_byte (nenhum byte recebido —
-    nada foi consumido, retentar é seguro). mid_stream NUNCA retenta: um
-    stream cortado é perda real que o relatório precisa contar. `tags`
-    identifica o registro no resultado (nível/usuário ou modo/conta)."""
+    nada foi consumido, retentar é seguro). mid_stream e upstream NUNCA
+    retentam: stream cortado e desistência do gateway são perda real que o
+    relatório precisa contar. `tags` identifica o registro no resultado
+    (nível/usuário ou modo/conta)."""
     result = None
     for attempt in range(1 + args.retries):
         result = await attempt_one(client, args, task, api_key, context_prefix)
         result.update({**tags, "retries_used": attempt})
-        if not result["error"] or result["error_phase"] == "mid_stream":
+        # condição por pre_byte e não por lista de fases: fase nova que apareça
+        # depois entra como perda real por default, que é o lado seguro
+        if not result["error"] or result["error_phase"] != "pre_byte":
             break
         if attempt < args.retries:
             await asyncio.sleep(2.0 * (attempt + 1))
@@ -336,9 +381,16 @@ def print_cache_summary(label: str, results: list[dict]) -> None:
     resultado "0% de cache" é indistinguível de "a feature não ligou", e o
     teste deixa de ser falseável."""
     ok = [r for r in results if not r["error"]]
-    ttfts = [r["ttft_s"] for r in ok if r.get("ttft_s") is not None]
+    ttfts = [r["first_visible_s"] for r in ok if r.get("first_visible_s") is not None]
+    bytes_s = [r["first_byte_s"] for r in ok if r.get("first_byte_s") is not None]
     with_cache = [r for r in ok if isinstance(r.get("cached_tokens"), int) and r.get("prompt_tokens")]
-    line = f"--- {label}: TTFT p50={_pct(ttfts, 0.5):.1f}s p95={_pct(ttfts, 0.95):.1f}s"
+    line = (
+        f"--- {label}: TTFT(visivel) p50={_pct(ttfts, 0.5):.1f}s "
+        f"p95={_pct(ttfts, 0.95):.1f}s"
+    )
+    if bytes_s:
+        # a distância entre os dois É o represamento: byte cedo, token tarde
+        line += f" · 1o byte p50={_pct(bytes_s, 0.5):.1f}s"
     if with_cache:
         cached = sum(r["cached_tokens"] for r in with_cache)
         prompt = sum(r["prompt_tokens"] for r in with_cache)
@@ -365,12 +417,17 @@ async def run_level(client: httpx.AsyncClient, args, level: int) -> list[dict]:
     flat = [r for sub in results for r in sub]
     errors = [r for r in flat if r["error"]]
     pre = sum(1 for r in errors if r["error_phase"] == "pre_byte")
-    mid = len(errors) - pre
+    upstream = sum(1 for r in errors if r["error_phase"] == "upstream")
+    mid = len(errors) - pre - upstream
     retried_ok = sum(1 for r in flat if not r["error"] and r.get("retries_used"))
+    # o critério de aceite do fix de prefill é este, e não a contagem de erro:
+    # request que não entrega UM token é falha total pro usuário, tenha ela
+    # vindo com erro declarado ou como stream vazio educado
+    vazias = sum(1 for r in flat if not r["chars"])
     print(
         f"--- nivel {level} concluido em {elapsed:.1f}s, {len(flat)} reqs, "
-        f"{len(errors)} erros ({pre} pre_byte, {mid} mid_stream), "
-        f"{retried_ok} recuperadas por retry ---",
+        f"{len(errors)} erros ({pre} pre_byte, {mid} mid_stream, {upstream} upstream), "
+        f"{vazias} sem nenhum token, {retried_ok} recuperadas por retry ---",
         flush=True,
     )
     print_cache_summary(f"nivel {level}", flat)

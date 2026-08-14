@@ -27,6 +27,12 @@ import uuid
 
 import httpx
 
+from reasoning_filter import (
+    EMPTY_RESPONSE_MESSAGE,
+    clean_completion_payload,
+    reasoning_text,
+)
+
 logger = logging.getLogger("gateway.anthropic")
 
 # Kill switch do evento `error` no SSE. Quando o upstream morre ANTES de gerar
@@ -58,6 +64,17 @@ STOP_REASON_MAP = {
     "tool_calls": "tool_use",
     "content_filter": "end_turn",
 }
+
+
+def anthropic_error_body(message: str) -> dict:
+    """Shape de erro da Anthropic Messages API (o que o Claude Code exibe).
+
+    Vive aqui, no módulo do protocolo, e não no context_budget (que o importa):
+    o erro de orçamento de contexto é só UM dos que saem neste formato."""
+    return {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": message},
+    }
 
 
 def _anthropic_content_to_text(content) -> str:
@@ -281,6 +298,97 @@ def openai_to_anthropic_response(
     }
 
 
+def upstream_error_message(raw: bytes) -> str:
+    """Mensagem legível de um corpo de ERRO do upstream (vLLM/FastAPI/proxy).
+
+    Três formatos no caminho: o do vLLM ("message" no topo ou dentro de
+    "error"), o do FastAPI ("detail"), e corpo que não é JSON nenhum — a página
+    de erro HTML do Cloudflare do RunPod, quando o timeout DELES estoura antes
+    de o vLLM terminar (524 "A timeout occurred", visto ao vivo). HTML não vira
+    mensagem: repassá-lo não explica nada ao usuário e ainda vaza a cara da
+    infra."""
+    try:
+        detail = json.loads(raw)
+    except Exception:
+        detail = None
+
+    message = ""
+    if isinstance(detail, dict):
+        erro = detail.get("error")
+        candidatos = (
+            detail.get("message"),
+            erro.get("message") if isinstance(erro, dict) else erro,
+            detail.get("detail"),
+        )
+        message = next((c for c in candidatos if isinstance(c, str) and c), "")
+
+    if not message:
+        message = raw.decode(errors="replace").strip()
+    if message.startswith("<"):
+        message = "erro do servidor upstream (resposta não-JSON)"
+    return message or "erro desconhecido do modelo"
+
+
+def anthropic_nonstreaming_body(
+    raw: bytes,
+    *,
+    status_code: int,
+    requested_model: str,
+    filter_reasoning: bool = False,
+    thinking_esperado: bool = True,
+    input_tokens_estimate: int = 0,
+) -> tuple[int, bytes, dict | None]:
+    """Corpo da resposta NÃO-streamed do /v1/messages: (status, corpo, usage).
+
+    O status devolvido é o LÓGICO — é o que vai pro cliente E pro
+    gateway_requests, que aqui coincidem (diferente do streaming, onde o 200 do
+    cabeçalho já partiu antes de o corpo morrer).
+
+    A guarda de erro é a razão de a função existir: um corpo 4xx/5xx do upstream
+    NÃO tem "choices", então passá-lo por openai_to_anthropic_response produzia
+    uma message Anthropic perfeitamente válida e VAZIA (content: [], stop_reason
+    "end_turn") com o 4xx por cima — o Claude Code mostrava "API Error: 400" sem
+    uma palavra da causa, e a mensagem do vLLM (que costuma dizer exatamente o
+    que está errado no prompt) morria aqui. Mesmo tratamento que o branch
+    streaming já dava.
+
+    Vive neste módulo, e não no main.py, pelo motivo de sempre: main.py não
+    importa sem fastapi e as env vars de runtime, então nada que more lá tem
+    teste."""
+    if status_code >= 400:
+        return status_code, _json(anthropic_error_body(upstream_error_message(raw))), None
+
+    try:
+        openai_resp = json.loads(raw)
+    except Exception:
+        openai_resp = None
+    if not isinstance(openai_resp, dict):
+        # 2xx com corpo que não é o JSON esperado: repassado como sempre foi.
+        # Sem status de erro não há o que traduzir nem o que afirmar sobre a
+        # causa — inventar um 502 aqui esconderia um upstream que talvez esteja
+        # certo e a gente é que não reconhece o formato.
+        return status_code, raw, None
+
+    usage = openai_resp.get("usage")
+    if filter_reasoning:
+        openai_resp, resposta_vazia = clean_completion_payload(
+            openai_resp, status_code=status_code, thinking_esperado=thinking_esperado
+        )
+        if resposta_vazia:
+            # mesmo desfecho do streaming: erro explícito e 502, nunca um turno
+            # vazio de sucesso
+            return 502, _json(anthropic_error_body(EMPTY_RESPONSE_MESSAGE)), usage
+
+    anthropic_resp = openai_to_anthropic_response(
+        openai_resp, requested_model, input_tokens_fallback=input_tokens_estimate
+    )
+    return status_code, _json(anthropic_resp), usage
+
+
+def _json(body: dict) -> bytes:
+    return json.dumps(body).encode()
+
+
 def _sse(event: str, data: dict) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
@@ -306,6 +414,7 @@ async def anthropic_sse_from_openai_stream(
     upstream, requested_model: str, on_done=None, filter_reasoning: bool = False,
     input_tokens_estimate: int = 0, ttft_timeout_s: float = 0.0,
     idle_timeout_s: float = 0.0, ping_interval_s: float = 0.0, log_label: str = "",
+    thinking_esperado: bool = True,
 ):
     """Converte o stream SSE do vLLM (chat/completions, formato OpenAI) pro
     formato de eventos da Anthropic Messages API (message_start ->
@@ -379,8 +488,17 @@ async def anthropic_sse_from_openai_stream(
     finish_reason = None
     usage = None
     pending = b""
-    in_reasoning = filter_reasoning
+    # `thinking_esperado` entra AQUI, no estado inicial, e não só no destino do
+    # buffer no fim do stream: com thinking desligado não há raciocínio a
+    # esperar, então represar o primeiro chunk atrasava a resposta INTEIRA até
+    # o fim (o texto saía de uma vez só no fallback abaixo, sem streaming
+    # nenhum). Sem thinking o conteúdo é resposta desde o primeiro byte.
+    in_reasoning = filter_reasoning and thinking_esperado
     reasoning_buffer = ""
+    # entregou algo que conta como resposta (texto OU tool call). É o que decide
+    # entre fechar o turno normalmente e emitir erro terminal — e o status que
+    # vai pro gateway_requests no on_done.
+    entregou_visivel = False
 
     aborted_reason = None
     # fora do try pra que o finally alcance: se o CLIENTE desconectar no meio
@@ -463,16 +581,22 @@ async def anthropic_sse_from_openai_stream(
                         finish_reason = choice0["finish_reason"]
 
                     # vLLM com --reasoning-parser (ENABLE_REASONING_PARSER, ver
-                    # docker/entrypoint.sh) já separa o raciocínio em
-                    # "reasoning_content" — nesse caso "content" NUNCA traz um
-                    # </think> pra fechar o buffer abaixo, e a resposta inteira
-                    # sairia de uma vez só no fallback de fim de stream (o
-                    # Claude Code perde streaming incremental por completo).
-                    # Detectar aqui e desligar o filtro nesta resposta.
-                    # PAR a manter sincronizado: o mesmo branch em
-                    # main.py:filtered_reasoning_stream (REASONING_LEAK_PLANS) —
-                    # são duas cópias do mesmo filtro, uma por protocolo.
-                    if "reasoning_content" in delta:
+                    # docker/entrypoint.sh) já separa o raciocínio num campo
+                    # próprio — nesse caso "content" NUNCA traz um </think> pra
+                    # fechar o buffer abaixo, e a resposta inteira sairia de uma
+                    # vez só no fallback de fim de stream (o Claude Code perde
+                    # streaming incremental por completo). Detectar aqui e
+                    # desligar o filtro nesta resposta.
+                    #
+                    # DOIS nomes: a 0.24 renomeou "reasoning_content" pra
+                    # "reasoning". Testar só o antigo é o bug que fez esta
+                    # guarda parar de disparar em produção — e o comentário
+                    # acima virou a descrição exata do sintoma. Aceitar os dois
+                    # porque imagem antiga ainda manda o velho.
+                    # PAR a manter sincronizado: reasoning_filter.py, usado pelo
+                    # filtro do chat/completions — são duas cópias do mesmo
+                    # filtro, uma por protocolo.
+                    if reasoning_text(delta) is not None:
                         in_reasoning = False
                         # o buffer pode já ter texto se o vLLM mandou "content"
                         # antes do primeiro chunk de raciocínio; descartá-lo
@@ -495,6 +619,7 @@ async def anthropic_sse_from_openai_stream(
                         else:
                             text = None  # ainda represado, nada a emitir agora
                     if text:
+                        entregou_visivel = True
                         if not text_block_open:
                             text_block_index = next_block_index
                             next_block_index += 1
@@ -509,6 +634,10 @@ async def anthropic_sse_from_openai_stream(
                         })
 
                     for tc in delta.get("tool_calls") or []:
+                        # tool call é entrega válida: resposta que só chama
+                        # ferramenta não tem texto nenhum, e o caminho do Claude
+                        # Code é quase todo assim
+                        entregou_visivel = True
                         oi = tc.get("index", 0)
                         if oi not in tool_blocks:
                             if text_block_open:
@@ -548,45 +677,58 @@ async def anthropic_sse_from_openai_stream(
                 log_label or "?", type(e).__name__, e,
             )
 
-        if aborted_reason and not text_block_open and not tool_blocks and not reasoning_buffer:
-            # Morreu sem gerar UMA palavra. Fechar a mensagem normalmente aqui
-            # produzia um turno vazio com stop_reason "end_turn" e HTTP 200 —
-            # uma resposta que AFIRMA sucesso. Era o que fazia o /compact do
-            # Claude Code "travar sem retornar nada": ele recebia um resumo
-            # vazio e válido, e a conversa seguia crescendo até estourar.
+        if in_reasoning and reasoning_buffer:
+            # Fim do stream sem nunca fechar </think>: o buffer é DESCARTADO.
+            #
+            # Só se chega aqui com `in_reasoning` quando a request pediu
+            # raciocínio (ver o estado inicial acima), e aí tudo que veio antes
+            # do </think> é o que o filtro existe pra esconder. A versão
+            # anterior entregava ("melhor resposta estranha que resposta
+            # nenhuma"), o que trocava resposta vazia por VAZAMENTO — não dá pra
+            # decidir pelo conteúdo, porque o modelo não emite a tag de ABERTURA
+            # (o chat template já a injeta no prompt).
+            #
+            # Com thinking desligado não existe buffer a descarregar: o texto já
+            # saiu incrementalmente.
+            logger.warning(
+                "anthropic stream: descartado buffer de %d chars sem </think> "
+                "(raciocínio privado) em %s",
+                len(reasoning_buffer), log_label or "?",
+            )
+            reasoning_buffer = ""
+
+        if not entregou_visivel:
+            # Nenhum bloco de conteúdo, por qualquer causa. Fechar a mensagem
+            # normalmente aqui produzia um turno vazio com stop_reason
+            # "end_turn"/"max_tokens" e HTTP 200 — uma resposta que AFIRMA
+            # sucesso. Era o que fazia o /compact do Claude Code "travar sem
+            # retornar nada": ele recebia um resumo vazio e válido, e a conversa
+            # seguia crescendo até estourar.
+            #
+            # DUAS causas distintas, e a mensagem precisa dizer qual:
+            # - aborted_reason: o stream morreu (timeout/queda) antes do 1º token;
+            # - sem aborted_reason: o stream terminou BEM, mas o modelo gastou o
+            #   teto de tokens raciocinando e nunca emitiu content. Este segundo
+            #   caso não era coberto e saía como turno vazio de sucesso.
             #
             # `error` é evento oficial da Messages API e o SDK o trata como
             # terminal, então a falha aparece pro usuário como falha.
             if EMIT_ERROR_EVENT:
+                if aborted_reason:
+                    tipo = "overloaded_error"
+                    mensagem = (
+                        "a máquina não começou a responder a tempo — prompt "
+                        "muito grande para o prefill ou pod sob carga. Tente "
+                        "de novo; se persistir, reduza o contexto da sessão."
+                    )
+                else:
+                    tipo = "api_error"
+                    mensagem = EMPTY_RESPONSE_MESSAGE
                 yield _sse("error", {
                     "type": "error",
-                    "error": {
-                        "type": "overloaded_error",
-                        "message": (
-                            "a máquina não começou a responder a tempo — prompt "
-                            "muito grande para o prefill ou pod sob carga. Tente "
-                            "de novo; se persistir, reduza o contexto da sessão."
-                        ),
-                    },
+                    "error": {"type": tipo, "message": mensagem},
                 })
                 return
-
-        if in_reasoning and reasoning_buffer:
-            # bateu o fim do stream sem nunca fechar </think> — devolve o
-            # que foi acumulado em vez de descartar a resposta inteira
-            # (mesmo fallback de filtered_reasoning_stream em main.py)
-            if not text_block_open:
-                text_block_index = next_block_index
-                next_block_index += 1
-                yield _sse("content_block_start", {
-                    "type": "content_block_start", "index": text_block_index,
-                    "content_block": {"type": "text", "text": ""},
-                })
-                text_block_open = True
-            yield _sse("content_block_delta", {
-                "type": "content_block_delta", "index": text_block_index,
-                "delta": {"type": "text_delta", "text": reasoning_buffer},
-            })
 
         if text_block_open:
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
@@ -635,4 +777,16 @@ async def anthropic_sse_from_openai_stream(
         except Exception:
             pass
         if on_done:
-            on_done(usage)
+            # status LÓGICO, não o do cabeçalho: o 200 já foi pro cliente junto
+            # com o header, muito antes de o corpo morrer. Gravar 200 pra stream
+            # que abortou (ou que não entregou nada) é o que mantinha essas
+            # falhas invisíveis em gateway_requests.
+            #   504 = watchdog cortou (prefill/silêncio além do teto)
+            #   502 = conexão caiu, ou terminou sem UM bloco de conteúdo
+            if aborted_reason in ("prefill", "silêncio"):
+                status_logico = 504
+            elif aborted_reason or not entregou_visivel:
+                status_logico = 502
+            else:
+                status_logico = getattr(upstream, "status_code", 200)
+            on_done(usage, status_logico)

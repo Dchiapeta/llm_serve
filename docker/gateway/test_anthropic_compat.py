@@ -10,8 +10,13 @@ import asyncio
 import json
 
 import httpx
+import pytest
 
-from anthropic_compat import anthropic_sse_from_openai_stream, openai_to_anthropic_response
+from anthropic_compat import (
+    anthropic_nonstreaming_body,
+    anthropic_sse_from_openai_stream,
+    openai_to_anthropic_response,
+)
 
 
 class FakeUpstream:
@@ -130,6 +135,73 @@ def test_content_antes_do_primeiro_reasoning_content_nao_e_descartado():
     assert "".join(_texts(events)) == "inicio fim"
 
 
+def test_campo_reasoning_novo_desliga_o_filtro_igual_ao_antigo():
+    """A 0.24 renomeou "reasoning_content" pra "reasoning". Os testes acima
+    cobriam SÓ o nome antigo — ficaram verdes enquanto a produção represava a
+    resposta inteira e devolvia turno vazio. Este é o par que faltava."""
+    events = _collect(
+        [
+            _chunk(reasoning="pensando..."),
+            _chunk(reasoning=" mais um pouco"),
+            _chunk(content="Ola"),
+            _chunk(content=" mundo"),
+        ],
+        filter_reasoning=True,
+    )
+    assert _texts(events) == ["Ola", " mundo"]
+
+
+def test_raciocinio_nao_vaza_no_campo_reasoning_novo():
+    events = _collect(
+        [_chunk(reasoning="segredo do raciocinio"), _chunk(content="resposta")],
+        filter_reasoning=True,
+    )
+    juntos = "".join(_texts(events))
+    assert juntos == "resposta"
+    assert "segredo" not in json.dumps(events)
+
+
+def test_so_reasoning_sem_content_vira_erro_e_nao_turno_vazio():
+    """O modelo gastou o teto de tokens pensando: nenhum content jamais veio, e
+    o stream terminou BEM (sem timeout, sem queda).
+
+    Sem esta cobertura o turno saía vazio com HTTP 200 e stop_reason
+    "max_tokens" — o cliente lê como resposta legítima. Nem vazar o raciocínio
+    (é privado) nem afirmar sucesso."""
+    events = _collect(
+        [
+            _chunk(reasoning="pensando muito"),
+            _chunk(reasoning=" e mais um pouco"),
+            b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+            b"data: [DONE]\n\n",
+        ],
+        filter_reasoning=True,
+    )
+    bruto = json.dumps(events)
+    assert "pensando muito" not in bruto, "vazou raciocínio privado"
+    assert _texts(events) == []
+    erros = [e for e in events if e.get("type") == "error"]
+    assert len(erros) == 1, "turno vazio saiu como sucesso"
+    assert "sem texto visível" in erros[0]["error"]["message"]
+
+
+def test_tool_call_sem_texto_nao_vira_erro_de_resposta_vazia():
+    """Resposta só de tool_calls não tem texto — e é resposta legítima. O
+    caminho do Claude Code é quase todo tool call; tratar como vazia encheria
+    de erro espúrio."""
+    tool = {"index": 0, "id": "call_1", "type": "function",
+            "function": {"name": "ler", "arguments": "{}"}}
+    events = _collect(
+        [
+            _chunk(reasoning="vou chamar a ferramenta"),
+            _chunk(tool_calls=[tool]),
+            b"data: [DONE]\n\n",
+        ],
+        filter_reasoning=True,
+    )
+    assert [e for e in events if e.get("type") == "error"] == []
+
+
 def test_sem_parser_o_filtro_de_think_continua_valendo():
     """Template sem ENABLE_REASONING_PARSER: o raciocínio vem cru no "content"
     e só o que vem depois de </think> pode chegar ao cliente."""
@@ -140,11 +212,64 @@ def test_sem_parser_o_filtro_de_think_continua_valendo():
     assert "".join(_texts(events)) == "resposta final"
 
 
-def test_sem_think_e_sem_parser_devolve_o_buffer_no_fim():
-    """Fallback: bateu o fim do stream sem nunca fechar </think> — melhor
-    entregar o acumulado do que sumir com a resposta."""
-    events = _collect([_chunk(content="texto sem tag")], filter_reasoning=True)
-    assert "".join(_texts(events)) == "texto sem tag"
+def test_buffer_sem_think_close_e_descartado_e_nao_entregue():
+    """MUDANÇA DE CONTRATO. Antes, o fim de stream sem </think> entregava o
+    buffer acumulado ("melhor resposta estranha que resposta nenhuma").
+
+    Só que com filter_reasoning ligado tudo que vem ANTES do </think> é
+    exatamente o raciocínio que o filtro existe pra esconder — o fallback antigo
+    trocava resposta vazia por VAZAMENTO. Agora descarta e emite erro terminal.
+    """
+    events = _collect([_chunk(content="raciocinio privado sem tag")], filter_reasoning=True)
+    assert _texts(events) == []
+    assert "raciocinio privado" not in json.dumps(events)
+    erros = [e for e in events if e.get("type") == "error"]
+    assert len(erros) == 1
+
+
+def test_thinking_desligado_entrega_texto_sem_tags():
+    """Com enable_thinking=False (o gateway força quando max_tokens <
+    MIN_MAX_TOKENS) não existe raciocínio nenhum: o texto sem </think> é a
+    resposta legítima e tem que chegar inteiro.
+
+    É o espelho do teste acima, e a razão de `thinking_esperado` existir —
+    descartar aqui comeria toda resposta curta do plano."""
+    events = _collect(
+        [_chunk(content="resposta curta sem tag")],
+        filter_reasoning=True,
+        thinking_esperado=False,
+    )
+    assert "".join(_texts(events)) == "resposta curta sem tag"
+    assert [e for e in events if e.get("type") == "error"] == []
+
+
+def test_thinking_desligado_com_stream_cortado_ainda_entrega():
+    """Mesma regra quando o stream cai: sem thinking o texto é resposta."""
+    events = _collect(
+        [_chunk(content="parcial")],
+        filter_reasoning=True,
+        thinking_esperado=False,
+        upstream=FakeUpstream([_chunk(content="parcial")], raise_after=1),
+    )
+    assert "".join(_texts(events)) == "parcial"
+
+
+def test_thinking_desligado_entrega_incremental_desde_o_primeiro_chunk():
+    """Dois chunks, DOIS deltas — não um só no fim.
+
+    Par exato do teste do protocolo OpenAI (test_reasoning_filter.py). Com
+    thinking desligado não há </think> a esperar, e o estado inicial de
+    raciocínio (`in_reasoning = filter_reasoning`, sem olhar o thinking)
+    segurava o texto inteiro até o fim do stream: a resposta chegava de uma vez
+    só, e nos planos filtrados isso valia pra TODA resposta curta — que é
+    justamente quando o gateway desliga o thinking (max_tokens <
+    MIN_MAX_TOKENS)."""
+    events = _collect(
+        [_chunk(content="Ola"), _chunk(content=" mundo")],
+        filter_reasoning=True,
+        thinking_esperado=False,
+    )
+    assert _texts(events) == ["Ola", " mundo"], "conteúdo saiu represado"
 
 
 def test_filtro_desligado_repassa_tudo():
@@ -333,6 +458,95 @@ def test_stream_normal_nao_regride_com_os_watchdogs_ligados():
     assert _only(events, "message_delta")["delta"]["stop_reason"] == "end_turn"
     assert "message_stop" in _types(events)
     assert "error" not in _types(events)
+
+
+# ---------- não-streaming: o erro do upstream não pode virar turno vazio ----------
+
+
+def _corpo(raw: bytes, status: int, **kwargs) -> tuple[int, dict, dict | None]:
+    status_logico, corpo, usage = anthropic_nonstreaming_body(
+        raw, status_code=status, requested_model="claude-x", **kwargs
+    )
+    return status_logico, json.loads(corpo), usage
+
+
+@pytest.mark.parametrize("status", [400, 429, 500, 502])
+def test_erro_do_upstream_preserva_status_e_mensagem(status):
+    """A REGRESSÃO: um corpo de erro do upstream não tem "choices", então a
+    tradução devolvia uma message Anthropic válida e VAZIA (content: [],
+    stop_reason "end_turn") com o 4xx/5xx por cima. O Claude Code mostrava
+    "API Error: 400" e nada mais — a mensagem do vLLM, que costuma dizer
+    exatamente o que está errado no prompt, morria aqui."""
+    raw = json.dumps(
+        {"error": {"message": "prompt is too long: 200000 tokens",
+                   "type": "invalid_request_error"}}
+    ).encode()
+    status_logico, corpo, usage = _corpo(raw, status)
+
+    assert status_logico == status, "status do upstream foi trocado"
+    assert corpo["type"] == "error"
+    assert corpo["error"]["message"] == "prompt is too long: 200000 tokens"
+    assert "content" not in corpo, "corpo de erro passou pela tradução de message"
+    assert usage is None
+
+
+@pytest.mark.parametrize("raw, esperado", [
+    (b'{"message":"model not found"}', "model not found"),          # vLLM
+    (b'{"detail":"Not Found"}', "Not Found"),                        # FastAPI
+    (b'{"error":"sem chave"}', "sem chave"),                         # error string
+    (b"upstream indisponivel", "upstream indisponivel"),             # texto puro
+])
+def test_mensagem_do_erro_sobrevive_a_cada_formato_de_corpo(raw, esperado):
+    """Cada camada do caminho erra com um shape diferente; nenhuma pode acabar
+    em "erro desconhecido"."""
+    _, corpo, _ = _corpo(raw, 400)
+    assert corpo["error"]["message"] == esperado
+
+
+def test_erro_em_html_nao_vaza_para_o_cliente():
+    """Página de erro do Cloudflare do RunPod (524). HTML cru não explica nada
+    ao usuário e ainda mostra a cara da infra."""
+    _, corpo, _ = _corpo(b"<html><title>524 A timeout occurred</title></html>", 524)
+    assert corpo["error"]["message"] == "erro do servidor upstream (resposta não-JSON)"
+
+
+def test_erro_com_corpo_vazio_ainda_diz_alguma_coisa():
+    _, corpo, _ = _corpo(b"", 500)
+    assert corpo["error"]["message"] == "erro desconhecido do modelo"
+
+
+def test_resposta_200_normal_continua_traduzida():
+    """Espelho: a guarda de erro não pode pegar o caminho feliz junto. Com o
+    parser do vLLM ligado, o raciocínio vem em campo próprio e é suprimido; o
+    content já vem limpo e vira o bloco de texto."""
+    raw = json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": "oi", "reasoning": "pensei"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+    }).encode()
+    status, corpo, usage = _corpo(raw, 200, filter_reasoning=True)
+    assert status == 200
+    assert corpo["content"] == [{"type": "text", "text": "oi"}]
+    assert corpo["stop_reason"] == "end_turn"
+    assert "pensei" not in json.dumps(corpo)
+    assert usage == {"prompt_tokens": 10, "completion_tokens": 2}
+
+
+def test_resposta_200_so_de_raciocinio_vira_erro_502():
+    """Mesmo desfecho do streaming: nunca um turno vazio de sucesso."""
+    raw = json.dumps({
+        "choices": [{"message": {"role": "assistant", "content": None,
+                                 "reasoning": "pensei muito"},
+                     "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 900},
+    }).encode()
+    status, corpo, usage = _corpo(raw, 200, filter_reasoning=True)
+    assert status == 502
+    assert corpo["type"] == "error"
+    assert "sem texto visível" in corpo["error"]["message"]
+    assert "pensei muito" not in json.dumps(corpo)
+    # o usage sobrevive: a request gastou tokens de verdade e precisa ser cobrada
+    assert usage == {"prompt_tokens": 10, "completion_tokens": 900}
 
 
 def test_tool_call_depois_de_reasoning_content_abre_o_bloco_certo():

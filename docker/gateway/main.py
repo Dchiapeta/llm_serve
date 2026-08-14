@@ -53,9 +53,11 @@ import demo
 import document_extract
 import document_generate
 from anthropic_compat import (
+    anthropic_error_body,
+    anthropic_nonstreaming_body,
     anthropic_sse_from_openai_stream,
     anthropic_to_openai_request,
-    openai_to_anthropic_response,
+    upstream_error_message,
 )
 from cli_policy import CLI_POLICY_ENFORCE, cli_block_reason
 from client_identity import (
@@ -74,7 +76,6 @@ from context_budget import (
     EstimateKind,
     PromptBudget,
     RESERVED_OUTPUT_TOKENS as MIN_MAX_TOKENS,
-    anthropic_error_body,
     apply_context_budget,
     count_images,
     error_body_for,
@@ -89,6 +90,12 @@ from usage_class import classify_stack
 from usage_norm import SseUsageScanner, normalize_usage, usage_from_event
 from routing import RoutingStore
 from runpod_api import RunPodClient
+from reasoning_filter import (
+    clean_completion_payload,
+    empty_response_error,
+    filtered_reasoning_stream,
+    split_reasoning,
+)
 from stream_watchdog import UpstreamStreamTimeout, aiter_bytes_watchdog
 from supa import SupaClient
 
@@ -2996,17 +3003,16 @@ async def validate_responses_body(
     return body_json
 
 
-THINK_CLOSE = "</think>"
-
 # planos cujo modelo padrão roda com "thinking" ligado — sem
 # ENABLE_REASONING_PARSER=true no template (ver docker/entrypoint.sh), o vLLM
 # sobe sem --reasoning-parser e o raciocínio inteiro vaza pro campo "content"
 # que o cliente exibe. Filtrado aqui porque o produto é BYOE: nenhuma
 # ferramenta cliente (Cursor, Continue etc.) sabe separar isso sozinha.
 # Quando o template liga ENABLE_REASONING_PARSER, o vLLM já separa o
-# raciocínio em "reasoning_content" e este filtro se desliga sozinho pra
-# essa resposta (ver o branch "reasoning_content" em
-# filtered_reasoning_stream) — streaming deixa de ficar represado.
+# raciocínio num campo próprio ("reasoning" na 0.24; "reasoning_content" nas
+# imagens antigas) e o filtro se desliga sozinho pra essa resposta, apenas
+# SUPRIMINDO o campo — ver reasoning_filter.ChatReasoningFilter, onde os dois
+# nomes são aceitos. Streaming deixa de ficar represado.
 # Pro (Qwen3.6-27B) validado em 17/07/2026: 14/15 respostas fecham com
 # </think> (a exceção foi truncada por length — coberta pelo fallback do
 # filtro, que devolve o buffer acumulado no fim do stream).
@@ -3015,204 +3021,30 @@ THINK_CLOSE = "</think>"
 # filtro de <think> desliga sozinho. Remover depois.
 REASONING_LEAK_PLANS = {"Go", "VibeCoder", "Pro"}
 
+def thinking_esperado_de(body_json) -> bool:
+    """A request pediu raciocínio?
+
+    Só é False quando alguém desligou explicitamente: o gateway, em
+    validate_body, quando max_tokens < MIN_MAX_TOKENS; ou o próprio cliente.
+    O default do chat template dos modelos do Pro/Go é thinking LIGADO, então
+    a ausência da flag significa ligado.
+
+    Usado pelo filtro pra decidir o destino do buffer que nunca viu </think>:
+    com thinking ligado é raciocínio privado (descarta), desligado é a
+    resposta (entrega)."""
+    if not isinstance(body_json, dict):
+        return True
+    kwargs = body_json.get("chat_template_kwargs")
+    if isinstance(kwargs, dict) and kwargs.get("enable_thinking") is False:
+        return False
+    return True
+
+
 # planos cujo pod é COMPARTILHADO entre várias stacks/tenants (ver
 # check_concurrency) — hoje coincide em membros com REASONING_LEAK_PLANS, mas
 # são eixos diferentes (parser de reasoning vs. topologia do pod) que podem
 # divergir; não reaproveitar um pelo outro.
 SHARED_POD_PLANS = {"Go", "VibeCoder", "Pro"}
-
-
-def split_reasoning(text: str) -> tuple[str | None, str]:
-    """Separa o bloco de raciocínio da resposta final. Modelos com thinking
-    ligado não emitem a tag de abertura no texto gerado (o chat template já
-    injeta "<think>\\n" no prompt) — só a de fechamento. Sem </think> na
-    string, devolve (None, texto original): não há nada pra filtrar."""
-    idx = text.find(THINK_CLOSE)
-    if idx == -1:
-        return None, text
-    return text[:idx], text[idx + len(THINK_CLOSE) :].lstrip("\n")
-
-
-async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple, log_ctx: dict):
-    """Envolve o stream SSE bruto do vLLM suprimindo os chunks de raciocínio
-    (antes de </think>) e só repassando ao cliente o que vem depois. Se o
-    teto de tokens for atingido sem nunca fechar </think> (raro, ~0-5% mesmo
-    com o piso de max_tokens), devolve o raciocínio acumulado no chunk final
-    em vez de descartar a resposta em silêncio.
-
-    `log_ctx` alimenta o registro fire-and-forget em gateway_requests
-    (migration 0038) no finally — `usage` é capturado de graça aqui porque
-    todo chunk já passa por json.loads pra filtrar o raciocínio. O status
-    gravado é o do UPSTREAM no caso normal, mas vira 504 quando o watchdog
-    aborta: sem isso um stream morto por timeout ficava registrado como 200 e
-    era invisível pra qualquer investigação depois."""
-    buffer_text = ""
-    in_reasoning = True
-    pending = b""
-    usage = None
-    status_code = upstream.status_code
-    timed_out = None
-    try:
-        try:
-            async for raw in aiter_bytes_watchdog(
-                upstream,
-                ttft_s=CHAT_STREAM_TTFT_TIMEOUT_S,
-                idle_s=CHAT_STREAM_IDLE_TIMEOUT_S,
-                log_label=str(flight_key),
-            ):
-                pending += raw
-                while b"\n" in pending:
-                    line, pending = pending.split(b"\n", 1)
-                    stripped = line.strip()
-
-                    # o chunk final de usage (choices: [], só "usage") chega
-                    # DEPOIS que in_reasoning já virou False (raciocínio já
-                    # fechado) — sem isso aqui, o branch abaixo repassa a
-                    # linha crua e sai do loop antes de nunca ver esse chunk,
-                    # deixando tokens_in/tokens_out null pra sempre nos
-                    # planos com filtro de raciocínio (Go/Pro).
-                    if usage is None and b'"usage"' in stripped and stripped.startswith(b"data:"):
-                        usage_payload = stripped[len(b"data:") :].strip()
-                        if usage_payload not in (b"[DONE]", b""):
-                            try:
-                                maybe_chunk = json.loads(usage_payload)
-                            except Exception:
-                                maybe_chunk = None
-                            if isinstance(maybe_chunk, dict) and maybe_chunk.get("usage"):
-                                usage = maybe_chunk["usage"]
-
-                    if not in_reasoning or not stripped.startswith(b"data:") or stripped in (
-                        b"data: [DONE]",
-                        b"data:[DONE]",
-                    ):
-                        yield line + b"\n"
-                        continue
-
-                    payload = stripped[len(b"data:") :].strip()
-                    try:
-                        chunk = json.loads(payload)
-                    except Exception:
-                        yield line + b"\n"
-                        continue
-
-                    if isinstance(chunk, dict) and chunk.get("usage"):
-                        usage = chunk["usage"]
-
-                    choices = chunk.get("choices") or []
-                    choice0 = choices[0] if choices and isinstance(choices[0], dict) else None
-                    if choice0 is None:
-                        yield line + b"\n"
-                        continue
-
-                    delta = choice0.get("delta") or {}
-
-                    # vLLM com --reasoning-parser (ENABLE_REASONING_PARSER, ver
-                    # entrypoint.sh) já separa o raciocínio em
-                    # "reasoning_content" — nesse caso "content" nunca vem
-                    # com <think>, e o buffer abaixo nunca veria um </think>
-                    # pra fechar, represando a resposta INTEIRA até o fim do
-                    # stream (todo o texto sairia de uma vez só no fallback,
-                    # quebrando streaming incremental). Detectar isso aqui e
-                    # desligar o filtro nesta resposta evita esse represamento.
-                    if "reasoning_content" in delta:
-                        in_reasoning = False
-                        if buffer_text:
-                            flushed_delta = dict(delta)
-                            flushed_delta["content"] = buffer_text
-                            flushed_choice = dict(choice0)
-                            flushed_choice["delta"] = flushed_delta
-                            flushed_chunk = dict(chunk)
-                            flushed_chunk["choices"] = [flushed_choice]
-                            yield b"data: " + json.dumps(flushed_chunk).encode() + b"\n"
-                            buffer_text = ""
-                        yield line + b"\n"
-                        continue
-
-                    content = delta.get("content")
-                    finish_reason = choice0.get("finish_reason")
-                    if content:
-                        buffer_text += content
-
-                    if THINK_CLOSE in buffer_text:
-                        _, visible = split_reasoning(buffer_text)
-                        in_reasoning = False
-                        buffer_text = ""
-                        if visible or finish_reason:
-                            delta = dict(delta)
-                            delta["content"] = visible
-                            delta.setdefault("role", "assistant")
-                            choice0["delta"] = delta
-                            yield b"data: " + json.dumps(chunk).encode() + b"\n"
-                        continue
-
-                    if finish_reason:
-                        # bateu finish_reason sem nunca ver </think> — devolve o
-                        # que foi acumulado em vez de sumir com a resposta inteira
-                        delta = dict(delta)
-                        delta["content"] = buffer_text
-                        delta.setdefault("role", "assistant")
-                        choice0["delta"] = delta
-                        buffer_text = ""
-                        in_reasoning = False
-                        yield b"data: " + json.dumps(chunk).encode() + b"\n"
-                        continue
-
-                    continue  # ainda dentro do raciocínio, sem finish_reason -> suprime
-            if pending:
-                yield pending
-        except UpstreamStreamTimeout as e:
-            # o upstream estourou o teto sem mandar byte. NÃO é fim de stream:
-            # o cliente precisa saber que falhou, senão recebe um [DONE] limpo
-            # e trata como resposta completa — foi assim que 18 de 36 requests
-            # de um load test "passaram" com 200 tendo entregado nada.
-            timed_out = e
-            status_code = 504
-        except (httpx.HTTPError, ConnectionError, OSError):
-            # a conexão com o upstream (agent/vLLM) morreu no meio do stream —
-            # visto sob concorrência pesada (conexão do pool resetada pelo
-            # Cloudflare enquanto ociosa). Não deixa a exceção estourar em
-            # silêncio: cai no fallback abaixo, que devolve o que já foi
-            # acumulado em vez de fechar a resposta sem nada.
-            status_code = 502
-        fechou_stream = False
-        if in_reasoning and buffer_text:
-            # a conexão upstream acabou sem nunca fechar </think> nem mandar um
-            # finish_reason (visto sob concorrência pesada — provável preempção/
-            # aborto do vLLM, não um bug de framing) — melhor devolver o que foi
-            # acumulado do que deixar o cliente sem nenhuma resposta
-            fallback = {
-                "object": "chat.completion.chunk",
-                "choices": [
-                    {"index": 0, "delta": {"role": "assistant", "content": buffer_text}, "finish_reason": "stop"}
-                ],
-            }
-            yield b"data: " + json.dumps(fallback).encode() + b"\n\n"
-            fechou_stream = True
-        if timed_out is not None:
-            # erro no corpo do SSE porque o 200 já foi pro cliente junto com o
-            # cabeçalho, muito antes de o corpo morrer — não dá mais pra mudar
-            # o status HTTP. O formato é o de erro da OpenAI, que é o que os
-            # clientes desse endpoint sabem ler.
-            yield b"data: " + json.dumps({
-                "error": {
-                    "message": (
-                        "a máquina não entregou resposta a tempo "
-                        f"({timed_out.phase}, {timed_out.waited:.0f}s) — "
-                        "tente novamente ou reduza o tamanho do prompt"
-                    ),
-                    "type": "upstream_timeout",
-                    "code": "upstream_timeout",
-                },
-            }).encode() + b"\n\n"
-            fechou_stream = True
-        if fechou_stream:
-            # só quando FOMOS nós a fechar. No caminho normal o [DONE] vem do
-            # próprio upstream e já foi repassado — emitir outro duplicaria.
-            yield b"data: [DONE]\n\n"
-    finally:
-        await upstream.aclose()
-        release_flight(flight_key)
-        log_gateway_request(**log_ctx, status_code=status_code, stream=True, usage=usage)
 
 
 # ---------- Claude Code (Anthropic Messages API) ----------
@@ -3381,25 +3213,17 @@ async def anthropic_messages(
                 "anthropic proxy: upstream %s retornou %s para %s: %s",
                 machine["id"], upstream.status_code, flight_key, error_raw[:500],
             )
-            try:
-                error_detail = json.loads(error_raw)
-                message = (
-                    error_detail.get("message")
-                    or (error_detail.get("error") or {}).get("message")
-                    or error_detail.get("detail")
-                    or error_raw.decode(errors="replace")
-                )
-            except Exception:
-                message = error_raw.decode(errors="replace") or "erro desconhecido do modelo"
             log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=True, usage=None)
             return JSONResponse(
                 status_code=upstream.status_code,
-                content=anthropic_error_body(message),
+                content=anthropic_error_body(upstream_error_message(error_raw)),
             )
 
-        def _on_stream_done(usage: dict | None) -> None:
+        def _on_stream_done(usage: dict | None, status_code: int) -> None:
+            # status LÓGICO vindo do conversor (504 timeout / 502 queda ou turno
+            # sem conteúdo), não o 200 do cabeçalho que já foi pro cliente
             release_flight(flight_key)
-            log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=True, usage=usage)
+            log_gateway_request(**log_ctx, status_code=status_code, stream=True, usage=usage)
 
         return StreamingResponse(
             anthropic_sse_from_openai_stream(
@@ -3411,6 +3235,9 @@ async def anthropic_messages(
                 idle_timeout_s=MESSAGES_STREAM_IDLE_TIMEOUT_S,
                 ping_interval_s=ANTHROPIC_SSE_PING_INTERVAL_S,
                 log_label=f"{stack_id}/{machine['id']}",
+                # do body JÁ processado por validate_body — é lá que o gateway
+                # força enable_thinking=False quando max_tokens < MIN_MAX_TOKENS
+                thinking_esperado=thinking_esperado_de(openai_body),
             ),
             status_code=upstream.status_code,
             media_type="text/event-stream",
@@ -3420,51 +3247,34 @@ async def anthropic_messages(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    corpo = b""
     usage = None
-    not_json = False
+    status_logico = upstream.status_code
     try:
         raw = await upstream.aread()
-        try:
-            openai_resp = json.loads(raw)
-            usage = openai_resp.get("usage")
-            if filter_reasoning:
-                for choice in openai_resp.get("choices", []):
-                    message = choice.get("message")
-                    if isinstance(message, dict) and isinstance(message.get("content"), str):
-                        reasoning, visible = split_reasoning(message["content"])
-                        if reasoning is not None:
-                            message["content"] = visible
-            anthropic_resp = openai_to_anthropic_response(
-                openai_resp, requested_model,
-                input_tokens_fallback=input_tokens_estimate,
+        if upstream.status_code >= 400:
+            logger.warning(
+                "anthropic proxy: upstream %s retornou %s para %s: %s",
+                machine["id"], upstream.status_code, flight_key, raw[:500],
             )
-            raw = json.dumps(anthropic_resp).encode()
-        except Exception:
-            not_json = True  # resposta não é o JSON esperado
+        # a tradução, a guarda de erro do upstream e o desfecho de resposta
+        # vazia vivem em anthropic_compat (testável sem as deps de runtime)
+        status_logico, corpo, usage = anthropic_nonstreaming_body(
+            raw,
+            status_code=upstream.status_code,
+            requested_model=requested_model,
+            filter_reasoning=filter_reasoning,
+            # do body JÁ processado por validate_body — é lá que o gateway força
+            # enable_thinking=False quando max_tokens < MIN_MAX_TOKENS
+            thinking_esperado=thinking_esperado_de(openai_body),
+            input_tokens_estimate=input_tokens_estimate,
+        )
     finally:
         await upstream.aclose()
         release_flight(flight_key)
-        log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=False, usage=usage)
+        log_gateway_request(**log_ctx, status_code=status_logico, stream=False, usage=usage)
 
-    if not_json and upstream.status_code >= 400:
-        # upstream não devolveu JSON — ex.: página de erro HTML do Cloudflare
-        # do RunPod, quando o timeout DELES estoura antes do vLLM terminar
-        # (524 "A timeout occurred", visto ao vivo). Sem isso, o HTML cru ia
-        # pro cliente com content-type mentindo "application/json", quebrando
-        # o parser de qualquer SDK. Mesmo tratamento do branch streaming
-        # acima (upstream.status_code >= 400): erro Anthropic-shaped.
-        message = raw.decode(errors="replace").strip() or "erro desconhecido do modelo"
-        if message.startswith("<"):
-            # corpo é HTML (página de erro de proxy) — não é uma mensagem
-            # útil pro cliente, troca por algo genérico em vez de vazar HTML
-            message = "erro do servidor upstream (resposta não-JSON)"
-        logger.warning(
-            "anthropic proxy: upstream %s retornou %s não-JSON para %s",
-            machine["id"], upstream.status_code, flight_key,
-        )
-        return JSONResponse(status_code=upstream.status_code, content=anthropic_error_body(message))
-
-    return Response(content=raw, status_code=upstream.status_code, media_type="application/json")
+    return Response(content=corpo, status_code=status_logico, media_type="application/json")
 
 
 @app.post("/v1/messages/count_tokens")
@@ -4535,24 +4345,31 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
 
     if filter_reasoning and not is_stream_request:
         usage = None
+        resposta_vazia = False
+        status_logico = upstream.status_code
         try:
             raw = await upstream.aread()
             try:
                 payload = json.loads(raw)
                 usage = payload.get("usage")
-                for choice in payload.get("choices", []):
-                    message = choice.get("message")
-                    if isinstance(message, dict) and isinstance(message.get("content"), str):
-                        reasoning, visible = split_reasoning(message["content"])
-                        if reasoning is not None:
-                            message["content"] = visible
+                payload, resposta_vazia = clean_completion_payload(
+                    payload,
+                    status_code=upstream.status_code,
+                    thinking_esperado=thinking_esperado_de(body_json),
+                )
+                if resposta_vazia:
+                    status_logico = 502
                 raw = json.dumps(payload).encode()
             except Exception:
                 pass  # resposta não é o JSON de chat completion esperado -> repassa como veio
         finally:
             await upstream.aclose()
             release_flight(flight_key)
-            log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=False, usage=usage)
+            log_gateway_request(**log_ctx, status_code=status_logico, stream=False, usage=usage)
+        if resposta_vazia:
+            # mesmo desfecho do streaming e do /v1/messages: erro explícito no
+            # lugar de um 200 com choices vazias, que o cliente lê como sucesso
+            return JSONResponse(status_code=502, content=empty_response_error())
         return Response(
             content=raw,
             status_code=upstream.status_code,
@@ -4560,8 +4377,23 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         )
 
     if filter_reasoning:
+        def _fechou_filtro(status_code: int, usage: dict | None) -> None:
+            release_flight(flight_key)
+            log_gateway_request(**log_ctx, status_code=status_code, stream=True, usage=usage)
+
         return StreamingResponse(
-            filtered_reasoning_stream(upstream, flight_key, log_ctx),
+            filtered_reasoning_stream(
+                upstream,
+                ttft_s=CHAT_STREAM_TTFT_TIMEOUT_S,
+                idle_s=CHAT_STREAM_IDLE_TIMEOUT_S,
+                log_label=str(flight_key),
+                # o que distingue "buffer é raciocínio privado" de "buffer é a
+                # resposta" quando o </think> nunca chega. O gateway força
+                # enable_thinking=False quando max_tokens < MIN_MAX_TOKENS (ver
+                # validate_body) e o cliente também pode mandar a flag.
+                thinking_esperado=thinking_esperado_de(body_json),
+                on_close=_fechou_filtro,
+            ),
             status_code=upstream.status_code,
             media_type=upstream.headers.get("content-type", "text/event-stream"),
         )
@@ -4613,6 +4445,28 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                     },
                 }).encode() + b"\n\n"
                 yield b"data: [DONE]\n\n"
+        except (httpx.HTTPError, ConnectionError, OSError):
+            # sem este ramo a exceção escapava do gerador e o finally gravava
+            # upstream.status_code — 200 — pra um stream que morreu no meio,
+            # que é o bug original de "stream morto virando sucesso" ainda
+            # vivo neste caminho (o filtered_reasoning_stream já tratava).
+            status_code = 502
+            if is_stream_request:
+                yield b"data: " + json.dumps({
+                    "error": {
+                        "message": (
+                            "a conexão com a máquina caiu antes de a resposta "
+                            "terminar — tente novamente"
+                        ),
+                        "type": "upstream_disconnect",
+                        "code": "upstream_disconnect",
+                    },
+                }).encode() + b"\n\n"
+                yield b"data: [DONE]\n\n"
+            # não-streamed não leva frame de SSE: o corpo é JSON puro e um
+            # "data:" no meio dele corromperia o parse. Lá o corte já é
+            # visível — o JSON truncado falha no cliente — e o que faltava
+            # era só o status honesto no log.
         finally:
             if collect_full:
                 try:

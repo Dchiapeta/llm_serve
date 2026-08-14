@@ -22,6 +22,10 @@ from enum import Enum
 
 from fastapi import HTTPException
 
+# o shape do erro Anthropic mora no módulo do protocolo; aqui ele é só um dos
+# formatos em que o erro de contexto pode sair (ver error_body_for)
+from anthropic_compat import anthropic_error_body
+
 # Margem sobre a estimativa de prompt: a heurística ~4 chars/token subestima
 # texto denso (código tokeniza mais "caro"); o json.dumps já infla um pouco
 # (aspas/escapes), mas não o bastante pra dispensar folga.
@@ -126,14 +130,6 @@ class ContextWindowExceeded(HTTPException):
     def __init__(self, message: str, shape: str = "openai"):
         super().__init__(status_code=400, detail=message)
         self.shape = shape
-
-
-def anthropic_error_body(message: str) -> dict:
-    """Shape de erro da Anthropic Messages API (o que o Claude Code exibe)."""
-    return {
-        "type": "error",
-        "error": {"type": "invalid_request_error", "message": message},
-    }
 
 
 def openai_error_body(message: str) -> dict:
