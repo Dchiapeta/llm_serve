@@ -1,5 +1,5 @@
 -- Log de requisições individuais feitas ao gateway (chat/completions,
--- completions, embeddings, responses, /v1/messages). Antes desta migration
+-- completions, embeddings, responses, models, /v1/messages). Antes desta migration
 -- não existia nenhum registro por-requisição — usage_metrics é agregado por
 -- janela de ~2min (window_start), então não dá pra responder "quais
 -- requisições foram feitas, quando, por qual stack/chave, com qual status".
@@ -20,7 +20,7 @@ create table if not exists gateway_requests (
   stack_id uuid references stacks(id) on delete set null,
   api_key_id uuid references api_keys(id) on delete set null,
   machine_id uuid references machines(id) on delete set null,
-  path text not null, -- "chat/completions" | "completions" | "embeddings" | "responses" | "messages"
+  path text not null, -- "chat/completions" | "completions" | "embeddings" | "responses" | "models" | "messages"
   model text,          -- model efetivo servido (rewrite_model / requested_model)
   status_code integer not null,
   stream boolean not null default false,

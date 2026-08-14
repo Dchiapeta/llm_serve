@@ -334,9 +334,10 @@ async def anthropic_sse_from_openai_stream(
 
     - TTFT: tempo até o PRIMEIRO chunk, que é o prefill do vLLM. Num prompt de
       ~100k tokens isso passa de 60s com folga (2× A40 TP=2 em PCIe, dequant
-      Marlin, prefix caching desligado nos modelos híbridos) — e o read de 60s
-      do proxy_client matava exatamente a request de prompt máximo, que é a
-      compactação.
+      Marlin) — e o read de 60s do proxy_client matava exatamente a request de
+      prompt máximo, que é a compactação. O prefix caching amortiza isso, mas
+      não no caso que importa: a compactação reescreve o início do contexto e
+      invalida o cache inteiro.
     - idle: silêncio DEPOIS que o vLLM já começou a mandar SSE. Aí sim é falha
       de verdade (pod travado, conexão zumbi) e a janela curta continua valendo.
 

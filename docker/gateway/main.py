@@ -49,6 +49,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+import demo
 import document_extract
 import document_generate
 from anthropic_compat import (
@@ -63,6 +64,8 @@ from client_identity import (
     CLIENT_WINDOW_DAYS,
     client_cap,
     client_fingerprint,
+    client_ip,
+    network_bucket,
 )
 from content_policy import clamp_media, text_of
 from context_budget import (
@@ -86,6 +89,7 @@ from usage_class import classify_stack
 from usage_norm import SseUsageScanner, normalize_usage, usage_from_event
 from routing import RoutingStore
 from runpod_api import RunPodClient
+from stream_watchdog import UpstreamStreamTimeout, aiter_bytes_watchdog
 from supa import SupaClient
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
@@ -184,11 +188,21 @@ MESSAGES_NONSTREAM_TIMEOUT_S = float(os.environ.get("MESSAGES_NONSTREAM_TIMEOUT_
 # do prompt, então a request de prompt máximo — a compactação do Claude Code,
 # que reenvia a transcrição inteira — é justamente a que mais demora. No Pro
 # (2× A40 TP=2, 27B, dequant Marlin, PCIe sem NVLink) um turno de ~85k tokens
-# custa ~72s só de prefill, e prefix caching está desligado nos modelos
-# híbridos (Qwen3.5/3.6), então esse custo é pago inteiro toda vez. Com 60s o
-# gateway matava a compactação e devolvia um stream vazio "bem-sucedido".
-# O loadtest já registrava ~85s de primeiro byte no Go, o template LEVE
-# (scripts/loadtest.py).
+# custa ~72s só de prefill. Com 60s o gateway matava a compactação e devolvia
+# um stream vazio "bem-sucedido". O loadtest já registrava ~85s de primeiro
+# byte no Go, o template LEVE (scripts/loadtest.py).
+#
+# O prefix caching AMORTIZA esse custo (medido em 14/08/2026: prefill real de
+# ~1.100-1.500 tok/s, e TTFT de 36s num prompt de 94k com cache parcial contra
+# 63s sem cache nenhum) — o que ele NÃO faz é eliminar o pior caso, que é
+# justamente a compactação: ela reescreve o início do contexto e invalida o
+# cache inteiro. Ou seja, a request que mais precisa do teto alto continua
+# sendo a que menos se beneficia do cache.
+#
+# (Um comentário anterior aqui dizia que o prefix caching estava desligado nos
+# modelos híbridos. O vLLM desliga por DEFAULT neles, mas os templates ligam
+# explicitamente via PREFIX_CACHE_ISOLATION=cache_salt, que o entrypoint.sh
+# traduz em --enable-prefix-caching. Está ligado.)
 #
 # 90s, mesma disciplina do MESSAGES_NONSTREAM_TIMEOUT_S: o public_url do pod
 # passa pelo Cloudflare do RunPod, que corta em ~100-127s e devolve 524 em HTML,
@@ -210,6 +224,31 @@ MESSAGES_STREAM_IDLE_TIMEOUT_S = float(os.environ.get("MESSAGES_STREAM_IDLE_TIME
 # deixar o cliente no escuro quando o filtro de <think> represa a saída.
 # 0 desliga.
 ANTHROPIC_SSE_PING_INTERVAL_S = float(os.environ.get("ANTHROPIC_SSE_PING_INTERVAL_S", "15"))
+
+# /v1/chat/completions (e o resto do proxy genérico /v1/{path}) com stream:true
+# — as MESMAS duas janelas do MESSAGES_STREAM_* acima, pelo mesmo motivo e com
+# os mesmos valores. O proxy genérico nunca passou `timeout` no build_request e
+# herdava o read de 60s do proxy_client; como durante o prefill não flui byte
+# nenhum, esse read media o PREFILL INTEIRO em vez de silêncio entre chunks.
+#
+# Load test de 14/08/2026 no Pro (2× A40, ~43k tokens de prompt por request):
+# 18 de 36 requests morreram sem entregar um único token, todas entre 61,3s e
+# 62,6s — e todas registradas como 200, porque o cabeçalho chega muito antes de
+# o corpo morrer. A taxa acompanha a concorrência (25% em 4, 50% em 6, 62% em
+# 8): sozinho o prefill de 43k leva ~25s, mas com requests disputando a GPU ele
+# atravessa os 60s. O caminho /v1/messages não sofria disso porque já tinha
+# ganhado as duas janelas — este bug era o mesmo, só que na porta ao lado.
+#
+# Os 90s são o mesmo teto prático do MESSAGES_STREAM_TTFT_TIMEOUT_S e pela mesma
+# razão: o public_url do pod passa pelo Cloudflare do RunPod, que corta em
+# ~100-127s com um 524 em HTML. Subir além disso só troca um erro nosso por um
+# deles. Calibrar com o TTFT p95 real (scripts/loadtest.py) antes de mexer — e
+# lendo o p95 com cuidado, porque enquanto o corte existir ele vem censurado
+# (tudo acima do teto some da amostra em vez de virar número alto).
+CHAT_STREAM_TTFT_TIMEOUT_S = float(os.environ.get("CHAT_STREAM_TTFT_TIMEOUT_S", "90"))
+# silêncio ENTRE chunks depois que o upstream já começou a mandar: aí sim é
+# falha de verdade (pod travado, conexão zumbi) e a janela curta continua valendo.
+CHAT_STREAM_IDLE_TIMEOUT_S = float(os.environ.get("CHAT_STREAM_IDLE_TIMEOUT_S", "60"))
 
 # quota diária de tokens por conta (controle de custo real — rate limit e
 # concorrência limitam volume de requests, não o custo de cada uma). 0 =
@@ -344,6 +383,44 @@ SETTINGS_CACHE_TTL_S = float(os.environ.get("SETTINGS_CACHE_TTL_S", "30"))
 # upsert lazy antes do proxy; o cache evita 1 round-trip ao agent por request
 UPSERT_CACHE_TTL_S = float(os.environ.get("UPSERT_CACHE_TTL_S", "600"))
 
+# ---------- demo pública da landing page (POST /demo) ----------
+# O terminal da hero do trystac.com roda inferência de verdade, sem conta e sem
+# chave. A política (input, rate limit, system prompt, leitura do stream) mora
+# em demo.py — módulo puro; aqui ficam só a configuração e o I/O.
+#
+# Pod DEDICADO, nunca a alocação de um cliente: o tráfego é anônimo e
+# imprevisível, e uma rajada de curiosos na landing page não pode comer as vagas
+# de sequência (check_concurrency) de quem paga. A URL vazia desliga a rota
+# (404) — é o estado correto de qualquer deploy que não tenha o pod de demo, e
+# não há fallback pro pool por construção: o caminho do /demo não passa por
+# resolve_route.
+DEMO_UPSTREAM_URL = os.environ.get("DEMO_UPSTREAM_URL", "").rstrip("/")
+# chave do agent do pod de demo. Server-side, nunca sai daqui: o browser fala
+# com /demo sem credencial nenhuma, e é este gateway que autentica no pod.
+DEMO_UPSTREAM_KEY = os.environ.get("DEMO_UPSTREAM_KEY", "")
+# served_model_name do pod de demo (o alias de --served-model-name). Explícito
+# em vez de descoberto via /v1/models pra não pagar um round-trip por request
+# e pra o deploy falhar cedo, no boot, se estiver errado.
+DEMO_MODEL = os.environ.get("DEMO_MODEL", "")
+# origens de browser autorizadas (CSV). Vazio = nenhum browser (fail-closed);
+# ver a discussão de o que CORS resolve e o que não em demo.py.
+DEMO_ALLOWED_ORIGINS = demo.parse_origins(os.environ.get("DEMO_ALLOWED_ORIGINS"))
+# 5 por hora por IP: o suficiente pra experimentar a hero (a pessoa faz 1-3
+# perguntas), longe do necessário pra usar a demo como API grátis.
+DEMO_LIMIT_PER_IP = int(os.environ.get("DEMO_LIMIT_PER_IP", "5"))
+DEMO_LIMIT_WINDOW_S = float(os.environ.get("DEMO_LIMIT_WINDOW_S", "3600"))
+# Teto GLOBAL da rota, na mesma janela. O limite por IP é falsificável na
+# prática — X-Forwarded-For é um header, e sem Cloudflare na frente qualquer um
+# escreve o que quiser nele (ver client_identity.client_ip) — então ele sozinho
+# não protege a GPU. Este teto é o que garante que o custo máximo da demo é
+# conhecido e pequeno, independente de quantos IPs alguém invente.
+DEMO_LIMIT_GLOBAL = int(os.environ.get("DEMO_LIMIT_GLOBAL", "300"))
+# 20s de read cobre TTFT + 80 tokens num pod dedicado e quente com folga. Curto
+# de propósito: o terminal da hero desiste em 5s e volta pra animação, então
+# segurar a conexão além disso só ocupa recurso por uma resposta que ninguém
+# mais vai ver.
+DEMO_UPSTREAM_TIMEOUT_S = float(os.environ.get("DEMO_UPSTREAM_TIMEOUT_S", "20"))
+
 STARTED_AT = time.time()
 
 supa: SupaClient
@@ -359,6 +436,9 @@ document_client: httpx.AsyncClient
 openai_client: httpx.AsyncClient
 # client pra chamar de volta o painel Next.js (POST /api/machines/provision)
 panel_client: httpx.AsyncClient
+# client do pod de demo (POST /demo) — pool e timeout próprios, isolados do
+# proxy_client de propósito (ver lifespan)
+demo_client: httpx.AsyncClient
 
 # cache de chaves: key_hash -> (entry | None, expira_em)
 key_cache: dict[str, tuple[dict | None, float]] = {}
@@ -376,6 +456,15 @@ rate_buckets: dict[str, tuple[float, float]] = {}  # key_hash -> (tokens, last_r
 
 # cache curto da quota diária de tokens: account_id -> (tokens_usados, expira_em)
 token_usage_cache: dict[str, tuple[int, float]] = {}
+
+# rate limit da demo pública: por IP e um teto global na mesma janela (ver
+# DEMO_LIMIT_GLOBAL). Janela deslizante, não token bucket — o motivo está no
+# docstring de demo.SlidingWindowLimiter.
+demo_ip_limiter = demo.SlidingWindowLimiter(DEMO_LIMIT_PER_IP, DEMO_LIMIT_WINDOW_S)
+demo_global_limiter = demo.SlidingWindowLimiter(DEMO_LIMIT_GLOBAL, DEMO_LIMIT_WINDOW_S)
+# desligado quando falta configuração OU quando a URL configurada é a de uma
+# máquina do pool (assert_demo_pod_is_dedicated, no boot)
+demo_enabled = bool(DEMO_UPSTREAM_URL and DEMO_UPSTREAM_KEY and DEMO_MODEL)
 
 # ambientes já admitidos por stack: stack_id -> {fingerprint: último toque}.
 # Só o CAMINHO FRIO (fingerprint novo ou toque vencido) fala com o banco, então
@@ -442,7 +531,7 @@ runpod_client: RunPodClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supa, store, proxy_client, document_client, openai_client, panel_client, lifecycle_mgr, runpod_client
+    global supa, store, proxy_client, document_client, openai_client, panel_client, demo_client, lifecycle_mgr, runpod_client
     supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
     # read curto (60s): o Cloudflare na frente do RunPod às vezes derruba (RST)
@@ -486,6 +575,22 @@ async def lifespan(app: FastAPI):
     panel_client = httpx.AsyncClient(
         timeout=httpx.Timeout(PANEL_PROVISION_TIMEOUT_S, connect=5.0)
     )
+    # client próprio da demo pública, e não o proxy_client, por duas razões:
+    # o read é curto (DEMO_UPSTREAM_TIMEOUT_S, ver o comentário lá) e o pool de
+    # conexões é separado — uma rajada de tráfego anônimo na landing page não
+    # pode disputar conexão com as requests de cliente pagante.
+    demo_client = httpx.AsyncClient(
+        headers={
+            "Authorization": f"Bearer {DEMO_UPSTREAM_KEY}",
+            "Content-Type": "application/json",
+        },
+        timeout=httpx.Timeout(DEMO_UPSTREAM_TIMEOUT_S, connect=5.0, write=10.0, pool=5.0),
+        limits=httpx.Limits(
+            max_connections=20, max_keepalive_connections=5, keepalive_expiry=5.0
+        ),
+        transport=httpx.AsyncHTTPTransport(retries=2),
+    )
+    await assert_demo_pod_is_dedicated()
     if RUNPOD_API_KEY:
         runpod_client = RunPodClient(RUNPOD_API_KEY)
     else:
@@ -537,6 +642,7 @@ async def lifespan(app: FastAPI):
     await document_client.aclose()
     await openai_client.aclose()
     await panel_client.aclose()
+    await demo_client.aclose()
     await store.aclose()
     await supa.aclose()
     if runpod_client:
@@ -2936,14 +3042,24 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple,
 
     `log_ctx` alimenta o registro fire-and-forget em gateway_requests
     (migration 0038) no finally — `usage` é capturado de graça aqui porque
-    todo chunk já passa por json.loads pra filtrar o raciocínio."""
+    todo chunk já passa por json.loads pra filtrar o raciocínio. O status
+    gravado é o do UPSTREAM no caso normal, mas vira 504 quando o watchdog
+    aborta: sem isso um stream morto por timeout ficava registrado como 200 e
+    era invisível pra qualquer investigação depois."""
     buffer_text = ""
     in_reasoning = True
     pending = b""
     usage = None
+    status_code = upstream.status_code
+    timed_out = None
     try:
         try:
-            async for raw in upstream.aiter_bytes():
+            async for raw in aiter_bytes_watchdog(
+                upstream,
+                ttft_s=CHAT_STREAM_TTFT_TIMEOUT_S,
+                idle_s=CHAT_STREAM_IDLE_TIMEOUT_S,
+                log_label=str(flight_key),
+            ):
                 pending += raw
                 while b"\n" in pending:
                     line, pending = pending.split(b"\n", 1)
@@ -3044,13 +3160,21 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple,
                     continue  # ainda dentro do raciocínio, sem finish_reason -> suprime
             if pending:
                 yield pending
+        except UpstreamStreamTimeout as e:
+            # o upstream estourou o teto sem mandar byte. NÃO é fim de stream:
+            # o cliente precisa saber que falhou, senão recebe um [DONE] limpo
+            # e trata como resposta completa — foi assim que 18 de 36 requests
+            # de um load test "passaram" com 200 tendo entregado nada.
+            timed_out = e
+            status_code = 504
         except (httpx.HTTPError, ConnectionError, OSError):
             # a conexão com o upstream (agent/vLLM) morreu no meio do stream —
             # visto sob concorrência pesada (conexão do pool resetada pelo
             # Cloudflare enquanto ociosa). Não deixa a exceção estourar em
             # silêncio: cai no fallback abaixo, que devolve o que já foi
             # acumulado em vez de fechar a resposta sem nada.
-            pass
+            status_code = 502
+        fechou_stream = False
         if in_reasoning and buffer_text:
             # a conexão upstream acabou sem nunca fechar </think> nem mandar um
             # finish_reason (visto sob concorrência pesada — provável preempção/
@@ -3063,11 +3187,32 @@ async def filtered_reasoning_stream(upstream: httpx.Response, flight_key: tuple,
                 ],
             }
             yield b"data: " + json.dumps(fallback).encode() + b"\n\n"
+            fechou_stream = True
+        if timed_out is not None:
+            # erro no corpo do SSE porque o 200 já foi pro cliente junto com o
+            # cabeçalho, muito antes de o corpo morrer — não dá mais pra mudar
+            # o status HTTP. O formato é o de erro da OpenAI, que é o que os
+            # clientes desse endpoint sabem ler.
+            yield b"data: " + json.dumps({
+                "error": {
+                    "message": (
+                        "a máquina não entregou resposta a tempo "
+                        f"({timed_out.phase}, {timed_out.waited:.0f}s) — "
+                        "tente novamente ou reduza o tamanho do prompt"
+                    ),
+                    "type": "upstream_timeout",
+                    "code": "upstream_timeout",
+                },
+            }).encode() + b"\n\n"
+            fechou_stream = True
+        if fechou_stream:
+            # só quando FOMOS nós a fechar. No caminho normal o [DONE] vem do
+            # próprio upstream e já foi repassado — emitir outro duplicaria.
             yield b"data: [DONE]\n\n"
     finally:
         await upstream.aclose()
         release_flight(flight_key)
-        log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=True, usage=usage)
+        log_gateway_request(**log_ctx, status_code=status_code, stream=True, usage=usage)
 
 
 # ---------- Claude Code (Anthropic Messages API) ----------
@@ -4308,6 +4453,17 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
             except Exception:
                 pass  # body não-JSON segue como está
 
+        # O read do httpx aqui é só a rede de segurança EXTERNA: quem controla o
+        # prazo é o watchdog de duas fases em aiter_bytes_watchdog, que sabe
+        # separar prefill de silêncio no meio do stream. A folga de 15s garante
+        # que seja sempre o watchdog a responder primeiro, com mensagem útil e
+        # com o 504 no log, em vez do httpx com um ReadTimeout cru.
+        #
+        # Sem `timeout` aqui esta request herdava os 60s do proxy_client, que
+        # durante o prefill (zero byte fluindo) matavam justamente a request de
+        # prompt grande — ver CHAT_STREAM_TTFT_TIMEOUT_S.
+        # connect/write/pool continuam os do client (5s/10s/10s): só o read muda.
+        is_stream_request = isinstance(body_json, dict) and body_json.get("stream") is True
         upstream_req = proxy_client.build_request(
             request.method,
             f"{machine['public_url']}/v1/{path}",
@@ -4317,6 +4473,15 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                 "Authorization": authorization,
                 "Content-Type": request.headers.get("content-type", "application/json"),
             },
+            timeout=httpx.Timeout(
+                (CHAT_STREAM_TTFT_TIMEOUT_S + 15.0)
+                if is_stream_request
+                # sem stream o vLLM não manda byte nenhum até a geração inteira
+                # fechar, então o read tem que cobrir a geração — mesmo motivo
+                # (e mesmo teto) do MESSAGES_NONSTREAM_TIMEOUT_S.
+                else MESSAGES_NONSTREAM_TIMEOUT_S,
+                connect=5.0, write=10.0, pool=10.0,
+            ),
         )
         upstream = await proxy_client.send(upstream_req, stream=True)
     except httpx.HTTPError as e:
@@ -4335,7 +4500,10 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     if path == "models":
         # lista também os adapters LoRA carregados na máquina ("acct-<uuid>")
         # — sem filtrar, qualquer tenant autenticado enumerava os account_id
-        # de TODOS os outros tenants que dividem o mesmo pod
+        # de TODOS os outros tenants que dividem o mesmo pod. O agent conta
+        # esta chamada em usage_metrics como qualquer request autenticada;
+        # registra-la também em gateway_requests mantém o total da página da
+        # máquina coerente com o histórico de Requisições.
         try:
             raw = await upstream.aread()
             try:
@@ -4350,6 +4518,10 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         finally:
             await upstream.aclose()
             release_flight(flight_key)
+            log_gateway_request(
+                **log_ctx, status_code=upstream.status_code,
+                stream=False, usage=None,
+            )
         return Response(
             content=raw,
             status_code=upstream.status_code,
@@ -4357,7 +4529,9 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         )
 
     filter_reasoning = path == "chat/completions" and effective_plan in REASONING_LEAK_PLANS
-    is_stream_request = isinstance(body_json, dict) and body_json.get("stream") is True
+    # is_stream_request já foi calculado antes do build_request — é ele que
+    # decide o read timeout do upstream (streaming mede prefill, não-streaming
+    # mede a geração inteira).
 
     if filter_reasoning and not is_stream_request:
         usage = None
@@ -4404,13 +4578,41 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # do Responses) — os deltas de conteúdo nunca chegam a ser parseados.
         scanner = SseUsageScanner()
         usage = None
+        status_code = upstream.status_code
         try:
-            async for chunk in upstream.aiter_bytes():
+            # watchdog só no streaming de verdade. Numa request NÃO-streamed o
+            # "primeiro chunk" só chega quando a geração inteira fecha, então um
+            # teto de TTFT aqui mataria geração longa e legítima — lá quem manda
+            # é o read do httpx (MESSAGES_NONSTREAM_TIMEOUT_S, ver build_request).
+            async for chunk in aiter_bytes_watchdog(
+                upstream,
+                ttft_s=CHAT_STREAM_TTFT_TIMEOUT_S if is_stream_request else 0,
+                idle_s=CHAT_STREAM_IDLE_TIMEOUT_S if is_stream_request else 0,
+                log_label=str(flight_key),
+            ):
                 yield chunk
                 if collect_full:
                     full += chunk
                     continue
                 scanner.feed(chunk)
+        except UpstreamStreamTimeout as e:
+            # mesmo raciocínio do filtered_reasoning_stream: o 200 já foi junto
+            # com o cabeçalho, então o erro só cabe no corpo — e o log tem que
+            # registrar 504, senão a falha some do gateway_requests.
+            status_code = 504
+            if is_stream_request:
+                yield b"data: " + json.dumps({
+                    "error": {
+                        "message": (
+                            "a máquina não entregou resposta a tempo "
+                            f"({e.phase}, {e.waited:.0f}s) — tente novamente ou "
+                            "reduza o tamanho do prompt"
+                        ),
+                        "type": "upstream_timeout",
+                        "code": "upstream_timeout",
+                    },
+                }).encode() + b"\n\n"
+                yield b"data: [DONE]\n\n"
         finally:
             if collect_full:
                 try:
@@ -4422,7 +4624,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
             await upstream.aclose()
             release_flight(flight_key)
             log_gateway_request(
-                **log_ctx, status_code=upstream.status_code,
+                **log_ctx, status_code=status_code,
                 stream=is_stream_request, usage=usage,
             )
 
@@ -4430,6 +4632,245 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         stream_and_release(),
         status_code=upstream.status_code,
         media_type=upstream.headers.get("content-type", "application/json"),
+    )
+
+
+# ---------- Demo pública da landing page ----------
+#
+# A única rota do gateway sem autenticação e a única chamada de um browser. Ela
+# atende o terminal da hero do trystac.com, que prova que a inferência é real
+# em vez de animar uma resposta gravada.
+#
+# O que a mantém segura NÃO é uma credencial (não há) e nem CORS (contornável
+# com curl), e sim o formato do endpoint: um único campo de entrada, 200
+# caracteres, 80 tokens de saída, system prompt fixo, pod dedicado, 5 requests
+# por hora por IP e um teto global por hora. A política toda vive em demo.py,
+# testada em test_demo.py; aqui fica o I/O.
+
+
+async def assert_demo_pod_is_dedicated() -> None:
+    """Desliga a demo se DEMO_UPSTREAM_URL for a URL de uma máquina do pool.
+
+    O requisito "pod dedicado" é arquitetural — o caminho do /demo não passa por
+    resolve_route, então ele nunca ESCOLHE uma máquina de cliente. O que sobra é
+    o erro de configuração: alguém colar no DEMO_UPSTREAM_URL a public_url de um
+    pod que já serve stacks. Aí o tráfego anônimo passaria a disputar as vagas
+    de sequência de quem paga, sem aparecer em check_concurrency (que conta por
+    stack/máquina, e a demo não tem stack).
+
+    Checagem no boot e não por request: a lista de máquinas muda em minutos, a
+    env var só muda em deploy. Falha de leitura do Supabase não desliga a demo —
+    ficar sem a vitrine por um blip de rede seria pior que o risco que a
+    checagem cobre, e o log fica com o aviso.
+    """
+    global demo_enabled
+    if not demo_enabled:
+        missing = [
+            name
+            for name, value in (
+                ("DEMO_UPSTREAM_URL", DEMO_UPSTREAM_URL),
+                ("DEMO_UPSTREAM_KEY", DEMO_UPSTREAM_KEY),
+                ("DEMO_MODEL", DEMO_MODEL),
+            )
+            if not value
+        ]
+        logger.info("demo pública desligada — faltando %s", ", ".join(missing))
+        return
+    if not DEMO_ALLOWED_ORIGINS:
+        logger.warning(
+            "demo pública ligada sem DEMO_ALLOWED_ORIGINS — nenhum browser vai "
+            "conseguir chamar /demo (fail-closed de CORS)"
+        )
+    try:
+        machines = await supa.list_machines_with_pod()
+    except Exception as e:
+        logger.warning("demo pública: não deu pra conferir o pod dedicado (%s)", e)
+        return
+    for machine in machines:
+        url = (machine.get("public_url") or "").rstrip("/")
+        if url and url == DEMO_UPSTREAM_URL:
+            demo_enabled = False
+            logger.error(
+                "demo pública DESLIGADA: DEMO_UPSTREAM_URL aponta para a máquina "
+                "%s, que atende stacks de cliente. A demo exige um pod dedicado.",
+                machine.get("id"),
+            )
+            return
+    logger.info("demo pública ligada — pod dedicado, modelo %s", DEMO_MODEL)
+
+
+def demo_cors_or_403(request: Request, *, preflight: bool = False) -> dict[str, str]:
+    headers = demo.cors_headers(
+        request.headers.get("origin"), DEMO_ALLOWED_ORIGINS, preflight=preflight
+    )
+    if headers is None:
+        raise HTTPException(status_code=403, detail="origem não autorizada")
+    return headers
+
+
+def demo_error(
+    status_code: int, detail: str, cors: dict[str, str], **headers: str
+) -> JSONResponse:
+    """Erro do /demo COM os headers de CORS.
+
+    Necessário porque o CORSMiddleware global está fechado (allow_origins=[]) e
+    quem emite os headers desta rota é ela mesma. Sem eles na resposta de erro, o
+    browser bloqueia a leitura e o `fetch` do terminal rejeita com um erro de
+    CORS no console em vez de receber o 400/429 — o resultado visível na hero é o
+    mesmo (volta pra animação), mas o motivo real fica invisível pra quem for
+    depurar."""
+    return JSONResponse(
+        status_code=status_code, content={"detail": detail}, headers={**cors, **headers}
+    )
+
+
+def demo_rate_limited(request: Request, cors: dict[str, str]) -> JSONResponse | None:
+    """Rate limit por IP + teto global. Devolve o 429 (com Retry-After) ou None.
+
+    O IP entra hasheado: o dict vive até 1h em memória e não há razão pra
+    guardar endereço em claro pra contar 5 requests. Sem IP identificável
+    (nenhum dos headers de proxy, sem client) todos caem no MESMO bucket — o
+    lado seguro do fail-closed, porque a alternativa (liberar) transformaria
+    "esconder o IP" na forma de furar o limite.
+    """
+    raw_ip = client_ip(request.headers) or (
+        request.client.host if request.client else None
+    )
+    key = (
+        hashlib.sha256(raw_ip.encode()).hexdigest()[:32] if raw_ip else "sem-ip"
+    )
+    # sequencial e não os dois de uma vez: `take` CONSOME a vaga, então avaliar
+    # os dois juntos gastaria uma vaga do teto global numa request que o limite
+    # por IP já recusou
+    for limiter, bucket in ((demo_ip_limiter, key), (demo_global_limiter, "global")):
+        retry_after = limiter.take(bucket)
+        if retry_after is not None:
+            return demo_error(
+                429,
+                "limite da demo excedido, tente novamente mais tarde",
+                cors,
+                **{"Retry-After": str(int(retry_after))},
+            )
+    return None
+
+
+@app.options("/demo")
+async def demo_preflight(request: Request):
+    if not demo_enabled:
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(status_code=204, headers=demo_cors_or_403(request, preflight=True))
+
+
+@app.post("/demo")
+async def demo_infer(request: Request):
+    if not demo_enabled:
+        # 404 e não 503: a rota simplesmente não existe neste deploy, e anunciar
+        # "existe mas está fora" só convida a insistir.
+        raise HTTPException(status_code=404, detail="not found")
+
+    cors = demo_cors_or_403(request)
+
+    # corte pelo Content-Length ANTES de ler o corpo: o corpo legítimo tem ~250
+    # bytes (200 caracteres + envelope JSON), e sem isso um Content-Length
+    # gigante seria lido inteiro pra RAM antes de qualquer validação — mesma
+    # lógica do middleware reject_oversized_upload, aqui inline porque é uma
+    # rota só.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > 4096:
+        return demo_error(400, "corpo da requisição excede o limite", cors)
+
+    body = await request.body()
+    if len(body) > 4096:
+        return demo_error(400, "corpo da requisição excede o limite", cors)
+    try:
+        payload_in = json.loads(body)
+    except Exception:
+        return demo_error(400, "corpo não é JSON válido", cors)
+    if not isinstance(payload_in, dict):
+        return demo_error(400, "corpo não é um objeto JSON", cors)
+
+    # Validação ANTES do rate limit, de propósito: um prompt de 201 caracteres
+    # não pode queimar uma das 5 tentativas da pessoa. Request inválida custa
+    # parsing de 250 bytes e nada de GPU, então não precisa da proteção.
+    try:
+        prompt = demo.validate_prompt(payload_in.get("prompt"))
+    except demo.InvalidPrompt as e:
+        return demo_error(400, str(e), cors)
+
+    limited = demo_rate_limited(request, cors)
+    if limited is not None:
+        return limited
+
+    # `demo.build_payload` monta o corpo do zero: nada de payload_in além do
+    # texto chega ao pod. max_tokens, model, temperature e system não são
+    # sequer lidos do que o cliente mandou.
+    try:
+        upstream = await demo_client.send(
+            demo_client.build_request(
+                "POST",
+                f"{DEMO_UPSTREAM_URL}/v1/chat/completions",
+                json=demo.build_payload(prompt, DEMO_MODEL),
+            ),
+            stream=True,
+        )
+    except httpx.HTTPError as e:
+        logger.warning("demo: pod indisponível (%s)", e)
+        return demo_error(503, "demo indisponível", cors)
+
+    # o status é conferido ANTES de devolver o StreamingResponse: depois do
+    # primeiro byte não há mais como mudar de status, e o terminal da hero
+    # depende de receber um erro HTTP pra voltar pra animação em silêncio.
+    if upstream.status_code != 200:
+        detail = (await upstream.aread())[:500]
+        await upstream.aclose()
+        logger.warning(
+            "demo: pod respondeu %s (%s)", upstream.status_code, detail.decode(errors="replace")
+        )
+        # 502 genérico: o corpo do erro do pod pode carregar a URL interna dele e
+        # o nome do modelo — vai pro log, nunca pro browser
+        return demo_error(502, "demo indisponível", cors)
+
+    logger.info(
+        "demo: %s caracteres · rede %s",
+        len(prompt),
+        # bloco /24, nunca o endereço completo — a mesma disciplina de privacidade
+        # de client_identity.network_bucket no resto do gateway
+        network_bucket(request.headers) or "?",
+    )
+
+    async def stream():
+        visible = demo.VisibleText()
+        try:
+            async for chunk in upstream.aiter_bytes():
+                for text in visible.feed(chunk):
+                    yield demo.sse_delta(text)
+            for text in visible.finish():
+                yield demo.sse_delta(text)
+            yield demo.SSE_DONE
+        except httpx.HTTPError:
+            # o pod cortou no meio: não há o que dizer ao cliente (o stream já
+            # começou com status 200) e não há contador pra liberar — a demo
+            # nunca toca in_flight. O terminal da hero trata resposta truncada
+            # como fim de stream.
+            #
+            # CancelledError (visitante fechou a aba) NÃO é capturada de
+            # propósito: engolir cancelamento deixa a task pendurada. O finally
+            # abaixo fecha o upstream nos dois caminhos.
+            pass
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            **cors,
+            "Cache-Control": "no-store",
+            # o buffer do proxy reverso engoliria o streaming e a resposta
+            # apareceria de uma vez no fim — o efeito de "token a token" na
+            # hero morre aí
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

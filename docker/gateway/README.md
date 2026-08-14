@@ -108,6 +108,14 @@ advisory lock.
 | `MAX_CLIENTS_GO` / `_PRO` / `_MAX` / `_ENTERPRISE` | não | Teto de ambientes simultâneos por stack (defaults 5/25/50/sem teto; `0` = sem teto). Espelham `MAX_CLIENTS_BY_PLAN` em `lib/types.ts`, que é o que o painel exibe — mude os dois juntos |
 | `CLIENT_WINDOW_DAYS`      | não         | Janela deslizante da vaga de ambiente (default 14): sem uso por mais que isso, a vaga é liberada sozinha |
 | `CLIENT_TOUCH_THROTTLE_S` | não         | Intervalo mínimo entre dois toques do mesmo ambiente (default 300) — é o que mantém o caminho quente em zero I/O |
+| `DEMO_UPSTREAM_URL`       | não*        | `public_url` do pod **dedicado** da demo pública (`POST /demo`). As três `DEMO_*` obrigatórias juntas ligam a rota; faltando qualquer uma, `/demo` responde 404 |
+| `DEMO_UPSTREAM_KEY`       | não*        | Chave do agent do pod de demo — server-side, nunca chega ao browser |
+| `DEMO_MODEL`              | não*        | `served_model_name` do pod de demo |
+| `DEMO_ALLOWED_ORIGINS`    | não         | Origens de browser autorizadas em `/demo` (CSV). Vazio = nenhum browser (fail-closed); só passa chamada sem `Origin` |
+| `DEMO_LIMIT_PER_IP`       | não         | Requests por IP por janela em `/demo` (default 5) |
+| `DEMO_LIMIT_GLOBAL`       | não         | Teto da rota inteira por janela (default 300) — é este, não o por IP, que garante o custo máximo da demo |
+| `DEMO_LIMIT_WINDOW_S`     | não         | Janela deslizante dos dois limites acima, em segundos (default 3600) |
+| `DEMO_UPSTREAM_TIMEOUT_S` | não         | Teto de tempo da inferência da demo (default 20 — o terminal da hero desiste em 5s) |
 
 ## Rodar local
 
@@ -137,6 +145,12 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
 - `POST /v1/documents/extract` — PDF → JSON via schema (OCR quando escaneado)
 - `POST /v1/images/extract` — imagem solta → JSON via schema (sempre via OCR)
 - `POST /v1/documents/generate` — HTML → PDF (direto ou por instrução ao modelo)
+- `POST /demo` — demo pública da landing page: `{"prompt": "..."}` → SSE
+  (`data: {"delta": "..."}`). **Sem autenticação** e a única rota chamada de um
+  browser. Pod dedicado por env var, 200 caracteres de entrada, 80 tokens de
+  saída travados no servidor, system prompt fixo, 5 req/h por IP + teto global.
+  Nada do corpo além de `prompt` é lido. Política em `demo.py`, testes em
+  `test_demo.py`
 - `GET /` / `GET /health` — health checks
 - `GET /admin/routes` — in-flight e tamanho do cache (header `X-Admin-Secret`)
 - `POST /admin/flush-key-cache` — invalida o cache de chaves (revogação imediata)
