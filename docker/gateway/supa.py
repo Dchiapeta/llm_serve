@@ -246,7 +246,11 @@ class SupaClient:
     async def get_machine(self, machine_id: str) -> dict | None:
         r = await self._rest.get(
             "/machines",
-            params={"id": f"eq.{machine_id}", "select": "*", "limit": "1"},
+            params={
+                "id": f"eq.{machine_id}",
+                "select": "*,templates(is_enabled,is_test)",
+                "limit": "1",
+            },
         )
         r.raise_for_status()
         rows = r.json()
@@ -259,6 +263,27 @@ class SupaClient:
                 "status": "eq.running",
                 "public_url": "not.is.null",
                 "select": "*",
+                "order": "created_at.asc",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def list_routable_running_machines(self) -> list[dict]:
+        """Máquinas running elegíveis para receber uma NOVA alocação.
+
+        Máquinas de template desabilitado/teste continuam acessíveis por
+        get_machine para não interromper stacks já vinculadas, mas nunca
+        aparecem nos picks e consolidações automáticas.
+        """
+        r = await self._rest.get(
+            "/machines",
+            params={
+                "status": "eq.running",
+                "public_url": "not.is.null",
+                "select": "*,templates!inner(is_enabled,is_test)",
+                "templates.is_enabled": "eq.true",
+                "templates.is_test": "eq.false",
                 "order": "created_at.asc",
             },
         )
@@ -279,8 +304,10 @@ class SupaClient:
             params={
                 "status": "eq.running",
                 "public_url": "not.is.null",
-                "select": "*,templates!inner(plan)",
+                "select": "*,templates!inner(plan,is_enabled,is_test)",
                 "templates.plan": f"eq.{plan}",
+                "templates.is_enabled": "eq.true",
+                "templates.is_test": "eq.false",
                 "order": "created_at.asc",
             },
         )
@@ -297,8 +324,10 @@ class SupaClient:
                 "status": "eq.stopped",
                 "public_url": "not.is.null",
                 "runpod_pod_id": "not.is.null",
-                "select": "*,templates!inner(plan)",
+                "select": "*,templates!inner(plan,is_enabled,is_test)",
                 "templates.plan": f"eq.{plan}",
+                "templates.is_enabled": "eq.true",
+                "templates.is_test": "eq.false",
                 "order": "created_at.asc",
             },
         )
@@ -752,7 +781,14 @@ class SupaClient:
         reposição proativa (ensure_capacity_once), que roda por plano.
         PostgREST não tem DISTINCT para coluna arbitrária sem RPC; a tabela é
         pequena, então dedup em memória é barato mesmo a cada tick de 300s."""
-        r = await self._rest.get("/templates", params={"select": "plan"})
+        r = await self._rest.get(
+            "/templates",
+            params={
+                "select": "plan",
+                "is_enabled": "eq.true",
+                "is_test": "eq.false",
+            },
+        )
         r.raise_for_status()
         return sorted({row["plan"] for row in r.json()})
 

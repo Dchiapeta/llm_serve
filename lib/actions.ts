@@ -114,6 +114,31 @@ function parsePlan(formData: FormData): TemplatePlan {
   return raw as TemplatePlan
 }
 
+type TemplateAvailability = Pick<Template, "is_enabled" | "is_test">
+
+function machineCreationBlockedReason(
+  tpl: TemplateAvailability,
+  automatic: boolean
+): string | null {
+  if (tpl.is_enabled === false) {
+    return "Produto desabilitado — habilite-o antes de criar uma máquina"
+  }
+  if (automatic && tpl.is_test === true) {
+    return "Produto em modo de teste — o provisionamento automático está bloqueado"
+  }
+  return null
+}
+
+function userAllocationBlockedReason(tpl: TemplateAvailability): string | null {
+  if (tpl.is_enabled === false) {
+    return "Produto desabilitado — novas alocações de usuários estão bloqueadas"
+  }
+  if (tpl.is_test === true) {
+    return "Produto em modo de teste — novas alocações de usuários estão bloqueadas"
+  }
+  return null
+}
+
 // Quantidade de GPUs por máquina do template; padrão 1.
 function parseGpuCount(formData: FormData): number {
   const raw = String(formData.get("gpu_count") ?? "").trim()
@@ -298,6 +323,10 @@ export async function updateTemplate(formData: FormData) {
   const image = String(formData.get("image"))
   const modelName = String(formData.get("model_name"))
   const plan = parsePlan(formData)
+  // Ausente preserva o comportamento legado (habilitado). Evita que um
+  // submit de uma UI antiga, durante rolling deploy, desative o produto.
+  const isEnabled = String(formData.get("is_enabled") ?? "true") === "true"
+  const isTest = String(formData.get("is_test")) === "true"
   const diskGb = Number(formData.get("disk_gb") || 40)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
@@ -346,6 +375,8 @@ export async function updateTemplate(formData: FormData) {
     .from("templates")
     .update({
       name,
+      is_enabled: isEnabled,
+      is_test: isTest,
       image,
       model_name: modelName,
       plan,
@@ -439,6 +470,9 @@ async function provisionMachine(input: {
   templateId: string
   gpuTypeId: string
   maxUsers?: number | null // null/undefined = usar o padrão do template
+  // Só o botão administrativo de nova máquina aceita template de teste.
+  // Todos os caminhos autônomos passam true e são barrados.
+  automatic?: boolean
 }): Promise<{ machineId: string } | { error: string }> {
   const db = createSupabaseAdmin()
   const { name, templateId, gpuTypeId } = input
@@ -449,6 +483,9 @@ async function provisionMachine(input: {
     .eq("id", templateId)
     .single<Template>()
   if (tplErr || !tpl) return { error: "Produto não encontrado" }
+
+  const blocked = machineCreationBlockedReason(tpl, input.automatic === true)
+  if (blocked) return { error: blocked }
 
   // teto manual: valor informado, com fallback para o padrão do template
   const maxUsers = input.maxUsers ?? tpl.max_users
@@ -572,6 +609,8 @@ export async function provisionMachineForPlan(input: {
   if (input.templateId && tpl.plan !== input.plan) {
     return { error: "O template informado não pertence ao plano informado" }
   }
+  const blocked = machineCreationBlockedReason(tpl, true)
+  if (blocked) return { error: blocked }
 
   // Idempotência por janela: o gateway pode reintentar esta chamada se a
   // resposta HTTP se perder por timeout DEPOIS do pod já ter sido criado (a
@@ -615,7 +654,12 @@ export async function provisionMachineForPlan(input: {
       console.error("provisionMachineForPlan: falha ao gerar nome de máquina:", message)
       return { error: message }
     }
-    const prov = await provisionMachine({ name, templateId: tpl.id, gpuTypeId })
+    const prov = await provisionMachine({
+      name,
+      templateId: tpl.id,
+      gpuTypeId,
+      automatic: true,
+    })
     if (!("error" in prov)) {
       const { data: m } = await db
         .from("machines")
@@ -746,7 +790,8 @@ export async function startMachine(
 // mesma máquina e são reenviadas pelo sync quando o pod novo fica pronto.
 // Caminho de recuperação para quando o host do pod pausado ficou sem GPU.
 export async function recreateMachine(
-  machineId: string
+  machineId: string,
+  automatic = false
 ): Promise<{ error: string } | void> {
   const db = createSupabaseAdmin()
   const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
@@ -763,6 +808,8 @@ export async function recreateMachine(
   if (!tpl) {
     return { error: "O template desta máquina não existe mais — crie uma máquina nova" }
   }
+  const blocked = machineCreationBlockedReason(tpl, automatic)
+  if (blocked) return { error: blocked }
 
   // machines.gpu_type guarda o displayName (com sufixo "×N" em multi-GPU)
   const gpuName = m.gpu_type.replace(/\s*×\d+$/, "")
@@ -985,6 +1032,8 @@ async function getDefaultTemplateForPlan(
     .from("templates")
     .select("*")
     .eq("plan", plan)
+    .eq("is_enabled", true)
+    .eq("is_test", false)
     .order("created_at", { ascending: true })
     .limit(1)
     .maybeSingle<Template>()
@@ -1005,13 +1054,16 @@ async function allocateMachineForTemplate(
   db: ReturnType<typeof createSupabaseAdmin>,
   tpl: Pick<
     Template,
-    "id" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
+    "id" | "is_enabled" | "is_test" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
   >,
   excludeMachineId?: string,
   // peso da stack que vai ocupar a vaga (0032): 1 = low (default de stack
   // nova); migrateStack passa o peso real da classe da stack migrada
   requiredWeight = 1
 ): Promise<{ machineId: string; created: boolean }> {
+  const blocked = userAllocationBlockedReason(tpl)
+  if (blocked) throw new Error(blocked)
+
   let runningQuery = db
     .from("machines")
     .select("id")
@@ -1058,6 +1110,7 @@ async function allocateMachineForTemplate(
       name: await nextStackMachineName(db),
       templateId: tpl.id,
       gpuTypeId,
+      automatic: true,
     })
     if (!("error" in prov)) return { machineId: prov.machineId, created: true }
     lastError = prov.error
@@ -1092,7 +1145,26 @@ export async function ensureStackMachine(stackId: string): Promise<string> {
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle<{ machine_id: string }>()
-  if (customerKey?.machine_id) return customerKey.machine_id
+  if (customerKey?.machine_id) {
+    const { data: historicalMachine } = await db
+      .from("machines")
+      .select("template_id")
+      .eq("id", customerKey.machine_id)
+      .maybeSingle<Pick<Machine, "template_id">>()
+    const { data: historicalTemplate } = historicalMachine?.template_id
+      ? await db
+          .from("templates")
+          .select("is_enabled, is_test")
+          .eq("id", historicalMachine.template_id)
+          .maybeSingle<TemplateAvailability>()
+      : { data: null }
+    // Sem template é máquina legada e mantém o comportamento antigo. Com
+    // template indisponível, o pin histórico não pode virar uma NOVA casa:
+    // segue para a alocação num produto de produção.
+    if (!historicalTemplate || !userAllocationBlockedReason(historicalTemplate)) {
+      return customerKey.machine_id
+    }
+  }
 
   // Stack nunca homeada e sem chave anterior: aloca de vez, com a mesma
   // cascata de createStack (running com vaga → pausada com vaga → nova).
@@ -1132,15 +1204,17 @@ export async function createStack(formData: FormData): Promise<{
 
   const { data: tpl } = await db
     .from("templates")
-    .select("id, plan, gpu_types, gpu_count, max_users, model_footprint_gb, kv_reserve_gb_per_user")
+    .select("id, plan, is_enabled, is_test, gpu_types, gpu_count, max_users, model_footprint_gb, kv_reserve_gb_per_user")
     .eq("id", templateId)
     .single<
       Pick<
         Template,
-        "id" | "plan" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
+        "id" | "plan" | "is_enabled" | "is_test" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
       >
     >()
   if (!tpl) throw new Error("Produto não encontrado")
+  const allocationBlocked = userAllocationBlockedReason(tpl)
+  if (allocationBlocked) throw new Error(allocationBlocked)
 
   // Máquina escolhida pelo admin: precisa estar rodando, ser do mesmo
   // template e ter slot livre (1 stack = 1 slot).
@@ -1351,6 +1425,20 @@ export async function migrateStack(input: {
   }
   if (!templateId) throw new Error(`Nenhum produto ${stack.plan} cadastrado`)
 
+  const { data: targetTemplate } = await db
+    .from("templates")
+    .select("id, is_enabled, is_test, gpu_types, gpu_count, max_users, model_footprint_gb, kv_reserve_gb_per_user")
+    .eq("id", templateId)
+    .single<
+      Pick<
+        Template,
+        "id" | "is_enabled" | "is_test" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
+      >
+    >()
+  if (!targetTemplate) throw new Error("Produto não encontrado")
+  const allocationBlocked = userAllocationBlockedReason(targetTemplate)
+  if (allocationBlocked) throw new Error(allocationBlocked)
+
   let machineCreated = false
   let targetMachineId = input.targetMachineId
   if (targetMachineId) {
@@ -1375,20 +1463,9 @@ export async function migrateStack(input: {
       )
     }
   } else {
-    const { data: tpl } = await db
-      .from("templates")
-      .select("id, gpu_types, gpu_count, max_users, model_footprint_gb, kv_reserve_gb_per_user")
-      .eq("id", templateId)
-      .single<
-        Pick<
-          Template,
-          "id" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
-        >
-      >()
-    if (!tpl) throw new Error("Produto não encontrado")
     try {
       const alloc = await allocateMachineForTemplate(
-        db, tpl, fromMachineId ?? undefined, requiredWeight
+        db, targetTemplate, fromMachineId ?? undefined, requiredWeight
       )
       targetMachineId = alloc.machineId
       machineCreated = alloc.created
@@ -1569,6 +1646,7 @@ export async function createKey(input: {
     ? await db.from("machines").select("*").eq("id", input.machineId).single<Machine>()
     : { data: null }
   if (input.machineId && !m) throw new Error("Máquina não encontrada")
+  let machineAllocationBlocked: string | null = null
 
   // Chave de playground não ocupa slot de capacidade — só chave "customer"
   // entra no backstop abaixo. Check-then-insert: há corrida teórica entre
@@ -1584,6 +1662,8 @@ export async function createKey(input: {
     const { data: tpl } = m.template_id
       ? await db.from("templates").select("*").eq("id", m.template_id).single<Template>()
       : { data: null }
+
+    if (tpl) machineAllocationBlocked = userAllocationBlockedReason(tpl)
 
     const cap = computeCapacity({
       vramGb: m.vram_gb,
@@ -1618,6 +1698,22 @@ export async function createKey(input: {
       .limit(1)
       .maybeSingle<{ id: string }>()
     stackId = matchingStack?.id ?? null
+  }
+
+  if (purpose === "customer" && machineAllocationBlocked) {
+    const { data: assignedStack } = stackId
+      ? await db
+          .from("stacks")
+          .select("machine_id")
+          .eq("id", stackId)
+          .maybeSingle<Pick<Stack, "machine_id">>()
+      : { data: null }
+    // Regenerar uma chave para uma stack que JÁ mora na máquina não é nova
+    // alocação e continua permitido. Qualquer outro caso tentaria colocar um
+    // usuário novo no template indisponível e é bloqueado.
+    if (assignedStack?.machine_id !== input.machineId) {
+      throw new Error(machineAllocationBlocked)
+    }
   }
 
   // Depois da resolução do stackId, porque o teto é POR STACK (o plano é dela)
@@ -2440,4 +2536,3 @@ export async function getMachineInfoDetails(
     lastStartedAt,
   }
 }
-

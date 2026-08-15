@@ -7,6 +7,12 @@ import type { Template } from "@/lib/types"
 // criar) e o corpo da tabela precisam dela, mas cada um vive no seu <Suspense>.
 export const getTemplates = cache(async (): Promise<Template[]> => {
   const db = createSupabaseAdmin()
-  const { data } = await db.from("templates").select("*").order("name")
+  // Desabilitados não podem criar máquina. Templates de teste continuam
+  // visíveis aqui porque a criação MANUAL pelo admin é justamente permitida.
+  const { data } = await db
+    .from("templates")
+    .select("*")
+    .eq("is_enabled", true)
+    .order("name")
   return (data ?? []) as Template[]
 })

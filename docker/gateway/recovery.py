@@ -73,3 +73,18 @@ def is_no_gpu_error(exc: object) -> bool:
     caixa e cobre variações de wording da RunPod (ver _NO_GPU_ERROR_PATTERNS)."""
     msg = str(exc).lower()
     return any(p in msg for p in _NO_GPU_ERROR_PATTERNS)
+
+
+def template_allows_automatic_creation(machine: dict) -> bool:
+    """A máquina pode ser recriada automaticamente pelo gateway?
+
+    `templates` é o relacionamento embutido por SupaClient.get_machine. Sem
+    template/flags (máquina legada), preserva o comportamento anterior. Um
+    template desabilitado ou de teste só pode ser tratado manualmente.
+    """
+    template = machine.get("templates")
+    if not isinstance(template, dict):
+        return True
+    return template.get("is_enabled", True) is not False and not template.get(
+        "is_test", False
+    )

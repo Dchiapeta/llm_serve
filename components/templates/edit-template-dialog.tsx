@@ -24,6 +24,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
+import { Switch } from "@/components/ui/switch"
 import { CollapsibleSection } from "@/components/templates/collapsible-section"
 import { TEMPLATE_PLANS } from "@/lib/types"
 
@@ -39,6 +40,8 @@ export function EditTemplateDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const [pending, startTransition] = React.useTransition()
+  const [isEnabled, setIsEnabled] = React.useState(template.is_enabled)
+  const [isTest, setIsTest] = React.useState(template.is_test)
   const selectedGpus = new Set(template.gpu_types ?? [])
 
   function onSubmit(formData: FormData) {
@@ -53,8 +56,17 @@ export function EditTemplateDialog({
     })
   }
 
+  function handleOpenChange(next: boolean) {
+    if (!next) {
+      // Fechar sem salvar não deve manter switches editados na próxima vez.
+      setIsEnabled(template.is_enabled)
+      setIsTest(template.is_test)
+    }
+    onOpenChange(next)
+  }
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-h-[90vh] grid-rows-[auto_1fr] overflow-hidden sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Editar produto</DialogTitle>
@@ -64,6 +76,40 @@ export function EditTemplateDialog({
         </DialogHeader>
         <form action={onSubmit} className="flex min-h-0 flex-col gap-4 overflow-y-auto pr-1">
           <input type="hidden" name="id" value={template.id} />
+          <input type="hidden" name="is_enabled" value={String(isEnabled)} />
+          <input type="hidden" name="is_test" value={String(isTest)} />
+          <div className="rounded-lg border p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="edit-is-enabled">Produto habilitado</Label>
+                <p className="text-xs text-muted-foreground">
+                  Desligado bloqueia novas máquinas e novas alocações, sem
+                  interromper as máquinas e usuários existentes.
+                </p>
+              </div>
+              <Switch
+                id="edit-is-enabled"
+                checked={isEnabled}
+                disabled={pending}
+                onCheckedChange={setIsEnabled}
+              />
+            </div>
+            <div className="mt-4 flex items-center justify-between gap-4 border-t pt-4">
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="edit-is-test">Modo de teste</Label>
+                <p className="text-xs text-muted-foreground">
+                  Permite criar máquinas manualmente, mas bloqueia criação
+                  automática e o envio de novos usuários para elas.
+                </p>
+              </div>
+              <Switch
+                id="edit-is-test"
+                checked={isTest}
+                disabled={pending}
+                onCheckedChange={setIsTest}
+              />
+            </div>
+          </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="edit-name">Nome</Label>
             <Input

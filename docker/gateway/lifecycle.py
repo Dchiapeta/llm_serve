@@ -341,7 +341,7 @@ class LifecycleManager:
         """
         if self.machine_free_slots is None:
             return []
-        machines = await self.supa.list_running_machines()
+        machines = await self.supa.list_routable_running_machines()
 
         by_template: dict[str, list[dict]] = {}
         for m in machines:

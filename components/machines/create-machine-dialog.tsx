@@ -134,7 +134,7 @@ export function CreateMachineDialog({
               </NativeSelectOption>
               {templates.map((t) => (
                 <NativeSelectOption key={t.id} value={t.id}>
-                  {t.name} — {t.model_name}
+                  {t.name} — {t.model_name}{t.is_test ? " — TESTE" : ""}
                 </NativeSelectOption>
               ))}
             </NativeSelect>

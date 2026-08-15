@@ -30,7 +30,10 @@ export async function POST(
   const { id } = await params
   let result: Awaited<ReturnType<typeof recreateMachine>>
   try {
-    result = await recreateMachine(id)
+    // Rota exclusiva do gateway: em template de teste esta recriação é uma
+    // criação automática e deve ser bloqueada; o botão do painel chama a
+    // Server Action sem este segundo argumento e continua permitido.
+    result = await recreateMachine(id, true)
   } catch (e) {
     // recreateMachine (RunPod/Supabase) pode lançar fora dos caminhos de erro
     // já tratados — nunca deixa o gateway receber o 500 HTML padrão do Next

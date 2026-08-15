@@ -85,7 +85,12 @@ from context_budget import (
 from context_budget import resolve_est_tokens as _resolve_est_tokens
 from key_prompt import resolve_system_prompt
 from lifecycle import LifecycleManager, MigrationError
-from recovery import is_no_gpu_error, lock_active, spawn_tracked
+from recovery import (
+    is_no_gpu_error,
+    lock_active,
+    spawn_tracked,
+    template_allows_automatic_creation,
+)
 from usage_class import classify_stack
 from usage_norm import SseUsageScanner, normalize_usage, usage_from_event
 from routing import RoutingStore
@@ -1211,6 +1216,8 @@ async def collect_usage_metrics_once() -> None:
     impossível, e usar o prefixo como chave de agregação atribuiria o uso
     de uma conta à outra na eventualidade de colisão — sensível o bastante
     (alimenta a quota diária de custo) pra merecer o identificador estável."""
+    # Métricas também precisam ser coletadas de templates de teste/desabilitados:
+    # eles podem continuar servindo stacks já vinculadas.
     machines = await supa.list_running_machines()
     for machine in machines:
         if not machine.get("public_url"):
@@ -1931,6 +1938,13 @@ async def try_recreate_machine(machine: dict, reason: str) -> bool:
     o processo cair antes de concluir), o lifecycle loop retenta. A entrada só
     sai da fila quando uma recriação conclui com sucesso."""
     machine_id = machine["id"]
+    if not template_allows_automatic_creation(machine):
+        pending_recreates.discard(machine_id)
+        logger.info(
+            "recriação automática de %s ignorada: template desabilitado ou de teste",
+            machine_id,
+        )
+        return False
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
         return False
     pending_recreates.add(machine_id)

@@ -6,7 +6,12 @@ docker/gateway/:
 
 import time
 
-from recovery import _NO_GPU_ERROR_PATTERNS, is_no_gpu_error, lock_active
+from recovery import (
+    _NO_GPU_ERROR_PATTERNS,
+    is_no_gpu_error,
+    lock_active,
+    template_allows_automatic_creation,
+)
 
 
 # ---------- is_no_gpu_error ----------
@@ -54,6 +59,26 @@ def test_aceita_qualquer_objeto_via_str():
 def test_padroes_todos_minusculos():
     # a normalização é lower() na entrada; os padrões precisam estar em minúsculas
     assert all(p == p.lower() for p in _NO_GPU_ERROR_PATTERNS)
+
+
+# ---------- disponibilidade do template ----------
+
+
+def test_recriacao_automatica_so_em_template_de_producao():
+    assert template_allows_automatic_creation(
+        {"templates": {"is_enabled": True, "is_test": False}}
+    )
+    assert not template_allows_automatic_creation(
+        {"templates": {"is_enabled": False, "is_test": False}}
+    )
+    assert not template_allows_automatic_creation(
+        {"templates": {"is_enabled": True, "is_test": True}}
+    )
+
+
+def test_maquina_legada_sem_relacionamento_preserva_comportamento():
+    assert template_allows_automatic_creation({})
+    assert template_allows_automatic_creation({"templates": None})
 
 
 # ---------- lock_active (trava com TTL) ----------

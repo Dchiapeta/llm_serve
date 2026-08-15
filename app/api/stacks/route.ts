@@ -81,6 +81,8 @@ export async function POST(req: NextRequest) {
       .from("templates")
       .select("id")
       .eq("plan", plan)
+      .eq("is_enabled", true)
+      .eq("is_test", false)
       .limit(1)
       .maybeSingle<{ id: string }>()
     if (!targetTpl) {
@@ -151,6 +153,8 @@ export async function POST(req: NextRequest) {
     .from("templates")
     .select("id")
     .eq("plan", plan)
+    .eq("is_enabled", true)
+    .eq("is_test", false)
     .limit(1)
     .maybeSingle<{ id: string }>()
   if (!tpl) {

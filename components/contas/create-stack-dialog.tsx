@@ -54,7 +54,7 @@ import {
 
 export type StackTemplate = Pick<
   Template,
-  "id" | "name" | "plan" | "model_name" | "model_footprint_gb" | "kv_reserve_gb_per_user" | "gpu_types"
+  "id" | "name" | "plan" | "is_enabled" | "is_test" | "model_name" | "model_footprint_gb" | "kv_reserve_gb_per_user" | "gpu_types"
 >
 
 export type StackMachine = {

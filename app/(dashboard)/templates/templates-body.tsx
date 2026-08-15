@@ -86,6 +86,7 @@ export async function TemplatesBody() {
               <TableRow>
                 <TableHead>Nome</TableHead>
                 <TableHead>Plano</TableHead>
+                <TableHead>Status</TableHead>
                 <TableHead>Modelo</TableHead>
                 <TableHead>Imagem</TableHead>
                 <TableHead>Disco</TableHead>
@@ -98,7 +99,7 @@ export async function TemplatesBody() {
             <TableBody>
               {templates.length === 0 && notImported.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={9} className="text-center text-muted-foreground">
+                  <TableCell colSpan={10} className="text-center text-muted-foreground">
                     Nenhum produto ainda. Crie o primeiro.
                   </TableCell>
                 </TableRow>
@@ -109,6 +110,15 @@ export async function TemplatesBody() {
                   <TableCell className="font-medium">{t.name}</TableCell>
                   <TableCell>
                     <Badge variant="outline">{t.plan}</Badge>
+                  </TableCell>
+                  <TableCell>
+                    {!t.is_enabled ? (
+                      <Badge variant="destructive">desabilitado</Badge>
+                    ) : t.is_test ? (
+                      <Badge variant="secondary">teste</Badge>
+                    ) : (
+                      <Badge>produção</Badge>
+                    )}
                   </TableCell>
                   <TableCell className="font-mono text-xs">{t.model_name}</TableCell>
                   <TableCell className="font-mono text-xs">{t.image}</TableCell>
@@ -144,6 +154,7 @@ export async function TemplatesBody() {
               {notImported.map((t) => (
                 <TableRow key={t.id} className="text-muted-foreground">
                   <TableCell className="font-medium">{t.name}</TableCell>
+                  <TableCell className="text-xs">—</TableCell>
                   <TableCell className="text-xs">—</TableCell>
                   <TableCell className="text-xs">—</TableCell>
                   <TableCell className="font-mono text-xs">{t.imageName}</TableCell>

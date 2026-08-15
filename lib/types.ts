@@ -97,6 +97,10 @@ export type Template = {
   id: string
   runpod_template_id: string | null
   name: string
+  // Disponibilidade operacional (migration 0054). Desabilitado não cria
+  // máquinas; teste permite máquina manual, mas nunca recebe usuário novo.
+  is_enabled: boolean
+  is_test: boolean
   image: string
   model_name: string
   plan: TemplatePlan
