@@ -5,7 +5,8 @@ import Link from "next/link"
 import { Copy, Search } from "lucide-react"
 import { toast } from "sonner"
 
-import { BILLING_GRACE_HOURS, TEMPLATE_PLANS, type Account, type ApiKey, type BillingStatus, type Machine, type RoutingState, type Stack, type TemplatePlan } from "@/lib/types"
+import { TEMPLATE_PLANS, type Account, type ApiKey, type Machine, type RoutingState, type Stack, type TemplatePlan } from "@/lib/types"
+import { BILLING_BADGE, graceRemaining } from "@/lib/billing-status"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -58,36 +59,8 @@ const MACHINE_STATUS_BADGE: Record<
 
 const NO_MACHINE_BADGE = { label: "Desativada", variant: "outline" } as const
 
-// Estado de cobrança (migration 0050). 'active' não ganha badge: é o caso
-// normal e poluiria a tabela inteira — a coluna só chama atenção pro que
-// exige ação.
-const BILLING_BADGE: Partial<
-  Record<
-    BillingStatus,
-    { label: string; variant: React.ComponentProps<typeof Badge>["variant"] }
-  >
-> = {
-  trialing: { label: "Trial", variant: "info-light" },
-  past_due: { label: "Em atraso", variant: "warning-light" },
-  suspended: { label: "Suspensa", variant: "destructive-light" },
-  canceled: { label: "Cancelada", variant: "outline" },
-}
-
-// Quanto falta da tolerância antes do corte. Vencido = a stack está bloqueada
-// de fato mesmo que o loop ainda não a tenha marcado como 'suspended' (janela
-// de até 60s entre uma coisa e outra).
-//
-// `ceil` e não `floor`: com 50 min restando, floor daria 0 horas e a coluna
-// diria "corte pendente" enquanto o gateway ainda libera o cliente. Arredondar
-// para cima mantém a tabela e o comportamento contando a mesma coisa.
-function graceRemaining(pastDueSince: string | null): string | null {
-  if (!pastDueSince) return null
-  const remainingMs = new Date(pastDueSince).getTime() + BILLING_GRACE_HOURS * 3600_000 - Date.now()
-  if (remainingMs <= 0) return "corte pendente"
-  const hours = Math.ceil(remainingMs / 3600_000)
-  if (hours < 24) return `corta em ${hours}h`
-  return `corta em ${Math.ceil(hours / 24)}d`
-}
+// BILLING_BADGE e graceRemaining vivem em lib/billing-status.ts: o CRM mostra
+// a mesma informação, e duas cópias da regra de corte divergiriam em silêncio.
 
 // Opções do filtro de status — rótulos exibidos na tabela; "terminated"
 // fica de fora porque `machines` (page.tsx) já exclui máquinas encerradas.
@@ -250,10 +223,10 @@ export function ContasTable({
               ? MACHINE_STATUS_BADGE[stack.machine.status]
               : NO_MACHINE_BADGE
             const billing = BILLING_BADGE[stack.billing_status]
-            const grace =
-              stack.billing_status === "past_due"
-                ? graceRemaining(stack.past_due_since)
-                : null
+            const grace = graceRemaining(
+              stack.billing_status,
+              stack.past_due_since
+            )
             return (
               <TableRow key={stack.id}>
                 <TableCell className="text-sm font-medium">

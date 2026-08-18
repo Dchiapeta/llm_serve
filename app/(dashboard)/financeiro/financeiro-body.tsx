@@ -61,7 +61,12 @@ export async function FinanceiroBody({
   searchParamsPromise: Promise<{ period?: string; bucket?: string }>
 }) {
   const { period: rawPeriod, bucket: rawBucket } = await searchParamsPromise
-  const period = rawPeriod && rawPeriod in PERIOD_MS ? rawPeriod : "24h"
+  // Object.hasOwn e não `in`: `in` alcança o protótipo, então ?period=constructor
+  // passava na validação, fazia periodMs virar uma função e a janela virar NaN —
+  // e como NaN falha toda comparação (inclusive os guardas `<= 0` de
+  // overlapHours), o gráfico e a tabela inteiros renderizavam NaN.
+  const period =
+    rawPeriod && Object.hasOwn(PERIOD_MS, rawPeriod) ? rawPeriod : "24h"
   const hourAllowed = HOUR_ALLOWED.has(period)
   const granularity: Granularity =
     hourAllowed && rawBucket !== "day" ? "hour" : "day"

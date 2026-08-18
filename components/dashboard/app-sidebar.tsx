@@ -9,6 +9,7 @@ import {
   Boxes,
   ChevronsUpDown,
   Cpu,
+  Handshake,
   KeyRound,
   Layers,
   LayoutDashboard,
@@ -56,6 +57,9 @@ import {
 const topItems = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard, exact: true },
   { href: "/financeiro", label: "Financeiro", icon: Wallet, exact: false },
+  // Visão comercial transversal, como o Financeiro — por isso fica aqui e não
+  // no grupo "Contas", que é a listagem técnica de e-mails e chaves.
+  { href: "/crm", label: "CRM", icon: Handshake, exact: false },
 ]
 
 const navGroups = [

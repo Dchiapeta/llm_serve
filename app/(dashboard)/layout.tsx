@@ -1,6 +1,6 @@
 import { cookies } from "next/headers"
 
-import { createSupabaseServerClient } from "@/lib/supabase/server"
+import { requireAdminSession } from "@/lib/auth-admin-server"
 import { AppSidebar } from "@/components/dashboard/app-sidebar"
 import { ThemeToggle } from "@/components/dashboard/theme-toggle"
 import {
@@ -14,12 +14,11 @@ export default async function DashboardLayout({
 }: {
   children: React.ReactNode
 }) {
-  const supabase = await createSupabaseServerClient()
-  // Só precisamos do email para exibir; getClaims lê do JWT (sem round-trip
-  // quando há signing keys assimétricas). A proteção da rota já é feita no
-  // middleware (proxy.ts).
-  const { data: claims } = await supabase.auth.getClaims()
-  const email = (claims?.claims?.email as string | undefined) ?? "Conta"
+  // Autoriza E devolve o e-mail para exibir — a mesma leitura de claims que já
+  // acontecia aqui. O proxy.ts faz o corte otimista, mas esta é a camada que de
+  // fato garante: cobre todas as rotas do grupo mesmo se o matcher do proxy
+  // mudar, como a doc do Next 16 recomenda.
+  const email = await requireAdminSession()
 
   const cookieStore = await cookies()
   const defaultOpen = cookieStore.get("sidebar_state")?.value !== "false"

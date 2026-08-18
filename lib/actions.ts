@@ -6,6 +6,7 @@ import { after } from "next/server"
 import { randomBytes } from "crypto"
 
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
+import { allowedDomainsLabel, isAllowedAdminEmail } from "./auth-admin"
 import { computeCapacity, stackWeight, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
 import { vllmFlagsFromTemplate } from "./machines"
@@ -35,6 +36,18 @@ export async function signup(formData: FormData) {
   const email = String(formData.get("email"))
   const password = String(formData.get("password"))
   const confirm = String(formData.get("confirm"))
+
+  // Antes do signUp de propósito: barrar depois criaria o usuário no Auth E a
+  // linha em accounts (ensureAccountForUser), poluindo o CRM com contas que
+  // nunca poderão entrar. Até aqui esta rota era aberta — qualquer um que
+  // chegasse no /signup virava administrador do painel.
+  if (!isAllowedAdminEmail(email)) {
+    redirect(
+      `/signup?error=${encodeURIComponent(
+        `Cadastro restrito a e-mails ${allowedDomainsLabel()}`
+      )}`
+    )
+  }
 
   if (password !== confirm) {
     redirect(`/signup?error=${encodeURIComponent("As senhas não coincidem")}`)

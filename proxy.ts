@@ -1,6 +1,8 @@
 import { createServerClient } from "@supabase/ssr"
 import { NextResponse, type NextRequest } from "next/server"
 
+import { isAllowedAdminClaims } from "@/lib/auth-admin"
+
 export async function proxy(request: NextRequest) {
   let response = NextResponse.next({ request })
 
@@ -41,16 +43,35 @@ export async function proxy(request: NextRequest) {
   const user = claims?.claims ?? null
 
   const { pathname } = request.nextUrl
+  const isDenied = pathname.startsWith("/sem-acesso")
   const isAuthPage =
     pathname.startsWith("/login") || pathname.startsWith("/signup")
+  // /sem-acesso é pública no sentido do gate: é justamente onde o barrado cai,
+  // e mandá-lo de volta pra ela criaria um laço de redirect.
+  const isPublic = isAuthPage || isDenied
 
-  if (!user && !isAuthPage) {
+  if (!user && !isPublic) {
     const url = request.nextUrl.clone()
     url.pathname = "/login"
     return NextResponse.redirect(url)
   }
 
-  if (user && isAuthPage) {
+  // Ter sessão não basta: este painel divide o Supabase Auth com o app do
+  // cliente final, então um cliente logado lá chega aqui autenticado. Só
+  // e-mail de domínio permitido entra. Este é o corte otimista (evita a
+  // navegação); quem de fato garante é o layout do dashboard — a doc do Next
+  // 16 avisa que proxy "should not be used as a full ... authorization
+  // solution" (01-app/01-getting-started/16-proxy.md).
+  const allowed = isAllowedAdminClaims(user)
+
+  if (user && !allowed && !isDenied) {
+    const url = request.nextUrl.clone()
+    url.pathname = "/sem-acesso"
+    url.search = ""
+    return NextResponse.redirect(url)
+  }
+
+  if (user && allowed && isPublic) {
     const url = request.nextUrl.clone()
     url.pathname = "/"
     return NextResponse.redirect(url)
