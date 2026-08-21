@@ -21,7 +21,7 @@ não confie só no que está em `supabase/migrations/` aqui.**
 | `stacks` | coluna `name`; `stacks_update_own` (RLS update) + grants **coluna-a-coluna** (`name`, `system_prompt`) para `authenticated` |
 | `usage_metrics` | `usage_metrics_select_own_stack` (RLS select, join `usage_metrics → api_keys → stacks → accounts`) |
 | `knowledge_chunks` | policy de SELECT por conta (`authenticated`) + view `stack_knowledge_files` (agregada por `storage_path`, `security_invoker=true`, sem a coluna `embedding`) |
-| `api_keys` | colunas `name`, `last_used_at` (uso ainda não identificado neste repo); grants **coluna-a-coluna** de update (`name`, `status`, e — desde a `0053` daqui — `use_custom_prompt`/`system_prompt`) para `authenticated` |
+| `api_keys` | colunas `name`, `last_used_at` (uso ainda não identificado neste repo); grants **coluna-a-coluna** de update (`name`, `status`, e — desde a `0053` daqui — `use_custom_prompt`/`system_prompt`, e desde a `0055` daqui — `default_temperature`/`default_top_p`/`default_max_tokens`/`default_presence_penalty`) para `authenticated` |
 
 ## Colunas deste repo escritas pelo lado do TryStac
 

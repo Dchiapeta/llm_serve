@@ -2193,6 +2193,38 @@ def apply_stack_sampling_defaults(body_json: dict, entry: dict) -> None:
         body_json["top_p"] = stack["default_top_p"]
 
 
+def apply_key_sampling_defaults(
+    body_json: dict, entry: dict, max_tokens_field: str = "max_tokens"
+) -> None:
+    """Aplica os overrides de sampling da própria CHAVE (migration 0055)
+    quando o cliente não mandou o parâmetro — mesma mecânica de
+    apply_stack_sampling_defaults, um nível acima dela: chamada ANTES, tanto
+    dessa função quanto do piso/teto de max_tokens em validate_body (que
+    ainda não rodou o dele quando esta função é chamada). Um valor de chave
+    já preenchido aqui passa a ocupar a posição de "o cliente mandou" pro
+    resto do fluxo: ganha do default da stack (porque "not in body_json"
+    deixa de ser verdade) e, no caso de max_tokens, ainda passa pela mesma
+    lógica de piso/teto/desligar-thinking que um valor vindo do cliente
+    passaria — não há tratamento especial pra esse parâmetro aqui.
+
+    presence_penalty só é preenchido pro chat completions (max_tokens_field
+    default "max_tokens") — a Responses API (validate_responses_body) nunca
+    clampou esse parâmetro, então não injetamos ele lá pra não mandar um
+    campo que aquele fluxo não trata."""
+    if "temperature" not in body_json and entry.get("default_temperature") is not None:
+        body_json["temperature"] = entry["default_temperature"]
+    if "top_p" not in body_json and entry.get("default_top_p") is not None:
+        body_json["top_p"] = entry["default_top_p"]
+    if max_tokens_field not in body_json and entry.get("default_max_tokens") is not None:
+        body_json[max_tokens_field] = entry["default_max_tokens"]
+    if (
+        max_tokens_field == "max_tokens"
+        and "presence_penalty" not in body_json
+        and entry.get("default_presence_penalty") is not None
+    ):
+        body_json["presence_penalty"] = entry["default_presence_penalty"]
+
+
 async def machine_admits(machine_id: str, usage_class: str = "low") -> bool:
     """A máquina aceita mais uma stack da classe dada? Duas restrições
     INDEPENDENTES (migration 0037):
@@ -2682,6 +2714,12 @@ async def validate_body(
     pop esquecido mandaria campo desconhecido pro vLLM."""
     pin_model(body_json, stack_id, rewrite_model, machine)
 
+    # Overrides de sampling da CHAVE (migration 0055) — chamado antes de
+    # qualquer outra coisa neste corpo pra que um valor de chave já esteja
+    # em body_json quando o piso/teto de max_tokens e o default de STACK
+    # (apply_stack_sampling_defaults, abaixo) rodarem: ganha dos dois.
+    apply_key_sampling_defaults(body_json, entry)
+
     # vLLM só manda "usage" no chunk final do SSE quando o pedido inclui
     # stream_options.include_usage (spec OpenAI) — sem isso, tokens_in/
     # tokens_out ficam null em gateway_requests pra QUALQUER requisição
@@ -2934,6 +2972,13 @@ async def validate_responses_body(
     "input" no lugar de "messages", "instructions" no lugar de um system
     message, "max_output_tokens" no lugar de "max_tokens"."""
     pin_model(body_json, stack_id, rewrite_model, machine)
+
+    # Overrides de sampling da CHAVE (migration 0055) — mesma posição e
+    # motivo do validate_body: precisa rodar antes do piso/teto de
+    # max_output_tokens e do default de STACK abaixo. Nome do campo trocado
+    # (max_output_tokens, não max_tokens); presence_penalty nunca é
+    # preenchido aqui — ver apply_key_sampling_defaults.
+    apply_key_sampling_defaults(body_json, entry, max_tokens_field="max_output_tokens")
 
     # nunca persistir a resposta recuperável por outro tenant via
     # GET /v1/responses/{id} — esse subpath nem está na allowlist, mas

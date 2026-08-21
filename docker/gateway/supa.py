@@ -86,7 +86,14 @@ class SupaClient:
         acima vale pra ela) são o system prompt da própria CHAVE, que ganha do
         da stack quando o switch está ligado — ver key_prompt.py. Vêm no mesmo
         select pelo mesmo motivo do billing: são lidos em toda request de chat
-        e o key_cache já carrega a linha inteira."""
+        e o key_cache já carrega a linha inteira.
+
+        `default_temperature`/`default_top_p`/`default_max_tokens`/
+        `default_presence_penalty` (migration 0055, mesmo ATENÇÃO) são os
+        overrides de sampling da própria CHAVE — aplicados em
+        apply_key_sampling_defaults (main.py) antes do default de STACK
+        (default_temperature/default_top_p, dentro de `stacks` abaixo) e do
+        clamp de segurança global."""
         r = await self._rest.get(
             "/api_keys",
             params={
@@ -94,6 +101,7 @@ class SupaClient:
                 "status": "eq.active",
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,purpose,"
                 "use_custom_prompt,system_prompt,"
+                "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
                 "accounts(name,"
                 "stacks(id,machine_id,plan,slug,created_at,system_prompt,"
                 "default_temperature,default_top_p,billing_status,past_due_since))",
@@ -116,6 +124,10 @@ class SupaClient:
             "purpose": row.get("purpose", "customer"),
             "use_custom_prompt": row.get("use_custom_prompt", False),
             "system_prompt": row.get("system_prompt"),
+            "default_temperature": row.get("default_temperature"),
+            "default_top_p": row.get("default_top_p"),
+            "default_max_tokens": row.get("default_max_tokens"),
+            "default_presence_penalty": row.get("default_presence_penalty"),
             "account_name": account.get("name", "?"),
             "stacks": account.get("stacks") or [],
         }
