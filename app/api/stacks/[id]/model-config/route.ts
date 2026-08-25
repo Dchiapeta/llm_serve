@@ -32,10 +32,22 @@ function parseBoundedNumberOrNull(value: unknown, lo: number, hi: number): numbe
   return INVALID
 }
 
-// Configura defaults de sampling (temperature/top_p) aplicados pelo gateway
-// quando o cliente final não manda o parâmetro na requisição (migration
-// 0035). Pensada para um sistema externo (ex.: LP/admin de outro projeto)
-// configurar isso por stack sem precisar de sessão do painel.
+// Mesma forma de parseBoundedNumberOrNull, mas pra max_tokens: inteiro > min,
+// sem teto no banco (a coluna só exige `> 0` — migration 0056; o teto real é
+// o clamp de runtime do gateway, MAX_MAX_TOKENS). Espelha
+// validateOptionalMaxTokens do TryStac (api-keys/actions.ts).
+function parseIntegerOrNull(value: unknown, min: number): number | null | typeof INVALID {
+  if (value === null) return null
+  if (typeof value === "number" && Number.isInteger(value) && value > min) return value
+  return INVALID
+}
+
+// Configura defaults de sampling (temperature/top_p/max_tokens/
+// presence_penalty) aplicados pelo gateway quando o cliente final não manda o
+// parâmetro na requisição (temperature/top_p: migration 0035; max_tokens/
+// presence_penalty: migration 0056). Pensada para um sistema externo (ex.:
+// LP/admin de outro projeto) configurar isso por stack sem precisar de sessão
+// do painel.
 export async function PATCH(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -70,9 +82,32 @@ export async function PATCH(
     }
     update.default_top_p = v
   }
+  if ("default_max_tokens" in body) {
+    const v = parseIntegerOrNull(body.default_max_tokens, 0)
+    if (v === INVALID) {
+      return NextResponse.json(
+        { error: "default_max_tokens deve ser um inteiro > 0, ou null" },
+        { status: 400 }
+      )
+    }
+    update.default_max_tokens = v
+  }
+  if ("default_presence_penalty" in body) {
+    const v = parseBoundedNumberOrNull(body.default_presence_penalty, -2, 2)
+    if (v === INVALID) {
+      return NextResponse.json(
+        { error: "default_presence_penalty deve ser number entre -2 e 2, ou null" },
+        { status: 400 }
+      )
+    }
+    update.default_presence_penalty = v
+  }
   if (Object.keys(update).length === 0) {
     return NextResponse.json(
-      { error: "informe default_temperature e/ou default_top_p" },
+      {
+        error:
+          "informe default_temperature, default_top_p, default_max_tokens e/ou default_presence_penalty",
+      },
       { status: 400 }
     )
   }

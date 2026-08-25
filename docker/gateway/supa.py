@@ -92,8 +92,10 @@ class SupaClient:
         `default_presence_penalty` (migration 0055, mesmo ATENÇÃO) são os
         overrides de sampling da própria CHAVE — aplicados em
         apply_key_sampling_defaults (main.py) antes do default de STACK
-        (default_temperature/default_top_p, dentro de `stacks` abaixo) e do
-        clamp de segurança global."""
+        (default_temperature/default_top_p/default_max_tokens/
+        default_presence_penalty, dentro de `stacks` abaixo — os dois últimos
+        desde a migration 0056, mesmo ATENÇÃO) e do clamp de segurança
+        global."""
         r = await self._rest.get(
             "/api_keys",
             params={
@@ -104,7 +106,8 @@ class SupaClient:
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
                 "accounts(name,"
                 "stacks(id,machine_id,plan,slug,created_at,system_prompt,"
-                "default_temperature,default_top_p,billing_status,past_due_since))",
+                "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
+                "billing_status,past_due_since))",
                 "limit": "1",
             },
         )

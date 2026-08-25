@@ -184,10 +184,13 @@ export type Stack = {
   // Override de system prompt da stack; null = sem override.
   system_prompt: string | null
   // Defaults de sampling aplicados pelo gateway quando o cliente não manda o
-  // parâmetro na requisição (migration 0035). Null = passthrough puro, sem
-  // default — comportamento de antes da migration.
+  // parâmetro na requisição (temperature/top_p: migration 0035;
+  // max_tokens/presence_penalty: migration 0056). Null = passthrough puro,
+  // sem default.
   default_temperature: number | null
   default_top_p: number | null
+  default_max_tokens: number | null
+  default_presence_penalty: number | null
   // Classe de consumo (migration 0032), derivada do uso real pelo loop do
   // gateway; pesa na ocupação de máquina (low=1.0, medium=1.5, high=3.0).
   usage_class: "low" | "medium" | "high"

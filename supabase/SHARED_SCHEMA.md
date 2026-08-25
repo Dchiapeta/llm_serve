@@ -18,7 +18,7 @@ não confie só no que está em `supabase/migrations/` aqui.**
 | Tabela | O que o TryStac adicionou (fora deste repo) |
 |---|---|
 | `accounts` | `accounts_select_own` (RLS select, `user_id = auth.uid()`) + `grant select ... to authenticated` |
-| `stacks` | coluna `name`; `stacks_update_own` (RLS update) + grants **coluna-a-coluna** (`name`, `system_prompt`) para `authenticated` |
+| `stacks` | coluna `name`; `stacks_update_own` (RLS update) + grants **coluna-a-coluna** (`name`, `system_prompt`) para `authenticated`. **Diferente das demais colunas desta linha:** `default_temperature`/`default_top_p` (`0035` daqui) e `default_max_tokens`/`default_presence_penalty` (`0056` daqui) **não têm grant de update pro TryStac** — a leitura vem do `grant select` de tabela inteira que o TryStac já concedeu (fora deste repo), e a escrita é feita por **este repositório**, via `PATCH /api/stacks/[id]/model-config` (service role, sem RLS) — o painel do TryStac chama essa rota em vez de escrever direto no Supabase. Não "corrigir" isso adicionando um grant coluna-a-coluna achando que falta um — é intencional. |
 | `usage_metrics` | `usage_metrics_select_own_stack` (RLS select, join `usage_metrics → api_keys → stacks → accounts`) |
 | `knowledge_chunks` | policy de SELECT por conta (`authenticated`) + view `stack_knowledge_files` (agregada por `storage_path`, `security_invoker=true`, sem a coluna `embedding`) |
 | `api_keys` | colunas `name`, `last_used_at` (uso ainda não identificado neste repo); grants **coluna-a-coluna** de update (`name`, `status`, e — desde a `0053` daqui — `use_custom_prompt`/`system_prompt`, e desde a `0055` daqui — `default_temperature`/`default_top_p`/`default_max_tokens`/`default_presence_penalty`) para `authenticated` |

@@ -2179,11 +2179,31 @@ def resolve_key_stack(entry: dict) -> tuple[dict | None, str | None]:
     return None, None
 
 
-def apply_stack_sampling_defaults(body_json: dict, entry: dict) -> None:
-    """Aplica default_temperature/default_top_p da stack (migration 0035)
-    quando o cliente não mandou o parâmetro. Roda ANTES do clamp de
-    segurança em validate_body/validate_responses_body, que cobre tanto o
-    valor do cliente quanto o default recém-aplicado."""
+def apply_stack_sampling_defaults(
+    body_json: dict, entry: dict, max_tokens_field: str = "max_tokens"
+) -> None:
+    """Aplica default_temperature/default_top_p/default_max_tokens/
+    default_presence_penalty da stack (migrations 0035 e 0056) quando o
+    cliente não mandou o parâmetro — mesma mecânica de
+    apply_key_sampling_defaults, um nível abaixo dela na precedência (ver
+    call sites em validate_body/validate_responses_body: chamada logo após a
+    de chave, ANTES do piso/teto de max_tokens — não depois, senão o piso já
+    preencheria body_json[max_tokens_field] e o guard abaixo nunca veria o
+    campo ausente). Roda ANTES do clamp de segurança em validate_body/
+    validate_responses_body, que cobre tanto o valor do cliente/chave quanto
+    o default de stack recém-aplicado.
+
+    Assimetria conhecida (documentada, não é bug): um default_max_tokens de
+    stack abaixo do piso (MIN_MAX_TOKENS) é RESPEITADO em chat completions
+    (mesma lógica de "cliente mandou baixo de propósito", desliga thinking —
+    ver bloco logo abaixo desta chamada em validate_body) mas é PROMOVIDO de
+    volta pro piso em Responses API/Codex CLI (validate_responses_body não
+    tem esse branch — ver o bloco de piso/teto de max_output_tokens ali).
+    Mesma assimetria já existe hoje pros overrides por chave.
+
+    presence_penalty só é preenchido pro chat completions (max_tokens_field
+    default "max_tokens") — mesma restrição de apply_key_sampling_defaults,
+    pelo mesmo motivo: a Responses API nunca clampou esse parâmetro."""
     stack, _ = resolve_key_stack(entry)
     if not stack:
         return
@@ -2191,6 +2211,14 @@ def apply_stack_sampling_defaults(body_json: dict, entry: dict) -> None:
         body_json["temperature"] = stack["default_temperature"]
     if "top_p" not in body_json and stack.get("default_top_p") is not None:
         body_json["top_p"] = stack["default_top_p"]
+    if max_tokens_field not in body_json and stack.get("default_max_tokens") is not None:
+        body_json[max_tokens_field] = stack["default_max_tokens"]
+    if (
+        max_tokens_field == "max_tokens"
+        and "presence_penalty" not in body_json
+        and stack.get("default_presence_penalty") is not None
+    ):
+        body_json["presence_penalty"] = stack["default_presence_penalty"]
 
 
 def apply_key_sampling_defaults(
@@ -2717,8 +2745,19 @@ async def validate_body(
     # Overrides de sampling da CHAVE (migration 0055) — chamado antes de
     # qualquer outra coisa neste corpo pra que um valor de chave já esteja
     # em body_json quando o piso/teto de max_tokens e o default de STACK
-    # (apply_stack_sampling_defaults, abaixo) rodarem: ganha dos dois.
+    # (apply_stack_sampling_defaults, logo abaixo) rodarem: ganha dos dois.
     apply_key_sampling_defaults(body_json, entry)
+
+    # Default de sampling da STACK (migrations 0035/0056) — chamado logo
+    # depois do de chave (que ganha dele) e ANTES do piso/teto de max_tokens
+    # abaixo: se essa chamada ficasse depois do piso/teto (como já esteve),
+    # o piso já teria preenchido body_json["max_tokens"] sempre que nem
+    # cliente nem chave mandaram nada, e o guard "not in body_json" desta
+    # função nunca veria o campo ausente — o default de max_tokens da stack
+    # nasceria morto. 0.0 é um valor explícito válido pra temperature/top_p/
+    # presence_penalty, por isso os checks são "not in body_json", não
+    # isinstance/truthy.
+    apply_stack_sampling_defaults(body_json, entry)
 
     # vLLM só manda "usage" no chunk final do SSE quando o pedido inclui
     # stream_options.include_usage (spec OpenAI) — sem isso, tokens_in/
@@ -2757,11 +2796,6 @@ async def validate_body(
     # de abuso trivial (n=100 = 100x o custo de uma request só)
     if isinstance(body_json.get("n"), int):
         body_json["n"] = 1
-
-    # Default de sampling da stack (migration 0035) — só entra quando o
-    # cliente NÃO mandou o parâmetro; 0.0 é um valor explícito válido, por
-    # isso o check é "not in body_json", não um isinstance/truthy check.
-    apply_stack_sampling_defaults(body_json, entry)
 
     for param, lo, hi in (
         ("temperature", 0.0, 2.0),
@@ -2980,6 +3014,21 @@ async def validate_responses_body(
     # preenchido aqui — ver apply_key_sampling_defaults.
     apply_key_sampling_defaults(body_json, entry, max_tokens_field="max_output_tokens")
 
+    # Default de sampling da STACK (migrations 0035/0056) — mesma posição e
+    # motivo do validate_body: tem que rodar ANTES do piso/teto de
+    # max_output_tokens abaixo, senão o piso já preencheria o campo e o
+    # default de max_tokens da stack nunca seria aplicado (ver comentário
+    # equivalente em validate_body). Nome do campo trocado pelo mesmo motivo
+    # da chamada de chave acima — sem isso a função tentaria ler/gravar
+    # "max_tokens", chave que este fluxo não lê.
+    #
+    # Assimetria conhecida: um default_max_tokens de stack abaixo do piso é
+    # PROMOVIDO de volta pro piso aqui (bloco logo abaixo não tem o branch de
+    # "respeitar e desligar thinking" que validate_body tem) — ao contrário
+    # de chat completions, onde é respeitado como está. Mesmo comportamento
+    # que já existia pra overrides por chave.
+    apply_stack_sampling_defaults(body_json, entry, max_tokens_field="max_output_tokens")
+
     # nunca persistir a resposta recuperável por outro tenant via
     # GET /v1/responses/{id} — esse subpath nem está na allowlist, mas
     # store=false garante que não sobra nada pra recuperar de qualquer jeito
@@ -2990,8 +3039,6 @@ async def validate_responses_body(
         body_json["max_output_tokens"] = MIN_MAX_TOKENS
     elif max_output_tokens > MAX_MAX_TOKENS:
         body_json["max_output_tokens"] = MAX_MAX_TOKENS
-
-    apply_stack_sampling_defaults(body_json, entry)
 
     for param, lo, hi in (("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)):
         value = body_json.get(param)
