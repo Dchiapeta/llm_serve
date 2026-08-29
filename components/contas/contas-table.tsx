@@ -204,13 +204,14 @@ export function ContasTable({
             <TableHead>Cobrança</TableHead>
             <TableHead>Status</TableHead>
             <TableHead>Máquina</TableHead>
+            <TableHead>Criada em</TableHead>
             <TableHead className="w-10" />
           </TableRow>
         </TableHeader>
         <TableBody>
           {filteredRows.length === 0 && (
             <TableRow>
-              <TableCell colSpan={9} className="text-center text-muted-foreground">
+              <TableCell colSpan={10} className="text-center text-muted-foreground">
                 {rows.length === 0
                   ? "Nenhuma stack ainda."
                   : "Nenhuma stack encontrada."}
@@ -292,6 +293,12 @@ export function ContasTable({
                   ) : (
                     <span className="text-sm text-muted-foreground">—</span>
                   )}
+                </TableCell>
+                <TableCell
+                  className="text-sm whitespace-nowrap text-muted-foreground"
+                  title={new Date(stack.created_at).toLocaleString("pt-BR")}
+                >
+                  {new Date(stack.created_at).toLocaleDateString("pt-BR")}
                 </TableCell>
                 <TableCell>
                   <StackRowActions
