@@ -63,6 +63,9 @@ def test_sdk_e_http_sao_o_uso_que_o_go_mantem():
         "curl/8.4.0",
         "python-requests/2.32",
         "PostmanRuntime/7.37",
+        # ferramenta com rótulo próprio, mas de automação: ganhar um slug em
+        # TOOL_PATTERNS não pode virar corte de CLI para quem está no Go
+        "n8n",
     ):
         assert cli_block_reason("Go", "chat/completions", ua) is None, ua
 

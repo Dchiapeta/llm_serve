@@ -30,6 +30,7 @@ def test_reconhece_as_ferramentas_da_tabela():
         "Cline/3.1": "cline",
         "Roo-Code/1.0": "roo",
         "Continue/0.9": "continue",
+        "n8n": "n8n",
         "openai-python/1.40.0": "sdk",
         "curl/8.4.0": "http",
     }
@@ -40,6 +41,8 @@ def test_reconhece_as_ferramentas_da_tabela():
 def test_primeiro_match_vence():
     # UA com dois padrões: "cursor" é mais específico e vem antes de "openai-node"
     assert normalize_tool("Cursor/1.2 (openai-node/4.0)")[0] == "cursor"
+    # o n8n usa axios por baixo; se voltar a citá-lo, o rótulo específico vence
+    assert normalize_tool("n8n (axios/1.7.9)")[0] == "n8n"
 
 
 def test_ua_desconhecido_e_ausente_sao_buckets_distintos():

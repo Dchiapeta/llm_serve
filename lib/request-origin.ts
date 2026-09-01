@@ -45,25 +45,25 @@ const PLAYGROUND: RequestOrigin = {
   className: "bg-amber-100! text-amber-700! dark:bg-amber-950! dark:text-amber-300!",
 }
 
+// Nomeadas porque o fallback por protocolo (BY_PATH) também as usa: a lista
+// abaixo cresce a cada ferramenta nova, e apontar para a posição no array
+// quebraria o fallback no dia em que um padrão entrasse antes destes dois.
+const CLAUDE_CODE: RequestOrigin = {
+  label: "Claude Code",
+  className: "bg-orange-100! text-orange-700! dark:bg-orange-950! dark:text-orange-300!",
+}
+
+const CODEX: RequestOrigin = {
+  label: "Codex",
+  className:
+    "bg-emerald-100! text-emerald-700! dark:bg-emerald-950! dark:text-emerald-300!",
+}
+
 // Ordem importa: o primeiro match vence. Padrões mais específicos primeiro
 // (um cliente pode mandar "cursor" E "openai-node" no mesmo UA).
 const BY_USER_AGENT: Array<{ match: string[]; origin: RequestOrigin }> = [
-  {
-    match: ["claude-cli", "claude-code", "claudecode"],
-    origin: {
-      label: "Claude Code",
-      className:
-        "bg-orange-100! text-orange-700! dark:bg-orange-950! dark:text-orange-300!",
-    },
-  },
-  {
-    match: ["codex"],
-    origin: {
-      label: "Codex",
-      className:
-        "bg-emerald-100! text-emerald-700! dark:bg-emerald-950! dark:text-emerald-300!",
-    },
-  },
+  { match: ["claude-cli", "claude-code", "claudecode"], origin: CLAUDE_CODE },
+  { match: ["codex"], origin: CODEX },
   {
     match: ["cursor"],
     origin: {
@@ -93,6 +93,24 @@ const BY_USER_AGENT: Array<{ match: string[]; origin: RequestOrigin }> = [
       className: "bg-sky-100! text-sky-700! dark:bg-sky-950! dark:text-sky-300!",
     },
   },
+  // Automação, não ferramenta de código — e é o perfil de uso que o Go
+  // mantém (documents/extract, images/extract, models), então o rótulo
+  // próprio é o que separa um workflow de produção de um curl de teste.
+  // O n8n manda o UA literal "n8n", sem versão e sem citar o axios que usa
+  // por baixo; mesmo assim vem antes de SDK/HTTP, porque no dia em que passar
+  // a mandar "n8n (axios/1.7)" o rótulo genérico venceria o específico.
+  //
+  // Cobre as chamadas do próprio n8n (listagem de modelos, nodes de HTTP e de
+  // extração). Os nodes de IA dele falam pelo SDK do LangChain e chegam como
+  // "langchainjs-openai/…", indistinguíveis de qualquer app LangChain JS —
+  // esses seguem caindo em SDK, e só um UA próprio no node resolveria.
+  {
+    match: ["n8n"],
+    origin: {
+      label: "n8n",
+      className: "bg-rose-100! text-rose-700! dark:bg-rose-950! dark:text-rose-300!",
+    },
+  },
   {
     match: ["openai-python", "openai-node", "anthropic-sdk", "anthropic-python", "langchain"],
     origin: {
@@ -110,8 +128,8 @@ const BY_USER_AGENT: Array<{ match: string[]; origin: RequestOrigin }> = [
 // Fallback por protocolo, para requisições sem user_agent (anteriores à
 // migration 0041, ou cliente que não mandou o header).
 const BY_PATH: Record<string, RequestOrigin> = {
-  messages: BY_USER_AGENT[0].origin, // /v1/messages: só o Claude Code fala
-  responses: BY_USER_AGENT[1].origin, // /v1/responses: só o Codex fala
+  messages: CLAUDE_CODE, // /v1/messages: só o Claude Code fala
+  responses: CODEX, // /v1/responses: só o Codex fala
 }
 
 export function requestOrigin(input: {

@@ -68,6 +68,11 @@ TOOL_PATTERNS: list[tuple[tuple[str, ...], str, str]] = [
     (("cline",), "cline", "Cline"),
     (("roo",), "roo", "Roo"),
     (("continue",), "continue", "Continue"),
+    # Automação, não ferramenta de código: fica FORA de CODING_TOOLS
+    # (cli_policy.py) de propósito, porque workflow de n8n é justamente o uso
+    # que o plano Go mantém. Antes de "sdk"/"http" porque o n8n manda hoje o UA
+    # literal "n8n", mas usa axios por baixo e pode voltar a citá-lo.
+    (("n8n",), "n8n", "n8n"),
     (
         ("openai-python", "openai-node", "anthropic-sdk", "anthropic-python", "langchain"),
         "sdk",
