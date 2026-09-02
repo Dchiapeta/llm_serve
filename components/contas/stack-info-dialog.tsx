@@ -5,11 +5,11 @@ import Link from "next/link"
 import { Copy, ExternalLink, Info } from "lucide-react"
 import { toast } from "sonner"
 
+import { PLAN_BADGE_VARIANT } from "@/lib/plan-badge"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
 import {
-  PLAN_BADGE_VARIANT,
   formatPurchaseDate,
   type StackInfo,
 } from "@/components/contas/contas-table"

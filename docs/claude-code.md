@@ -33,9 +33,15 @@ overcommit silencioso). O inverso (DB migrado, código antigo) é seguro.
 ## 2. Config dos templates (painel → Templates)
 
 Regras comuns:
-- **NÃO ligar prefix caching**: pods compartilhados rodam com
-  `DISABLE_PREFIX_CACHING=true` de propósito (canal lateral de timing entre
-  co-tenants — ver lib/types.ts SHARED_POD_PLANS). Não reverter.
+- **Prefix caching é LIGADO, com isolamento por tenant.** Este item já disse o
+  contrário ("NÃO ligar") e ficou desatualizado: as migrations 0040 (Go) e 0042
+  (Pro) o habilitaram via `PREFIX_CACHE_ISOLATION=cache_salt`, que é o que
+  resolve o canal lateral de timing entre co-tenants que antes o bloqueava.
+  Em `docker/entrypoint.sh` o `PREFIX_CACHE_ISOLATION=cache_salt` vence o
+  `DISABLE_PREFIX_CACHING=true` que `podInputFromTemplate` injeta para
+  `SHARED_POD_PLANS` — o `if` vem antes. E a flag explícita é **obrigatória**
+  nesses modelos: em modelo híbrido o vLLM desliga o prefix caching sozinho,
+  em silêncio, se ninguém passar `--enable-prefix-caching`.
 - `kv_reserve_gb_per_user` = a unidade de um usuário **low** (peso 1.0);
   um high custa 3× isso na ocupação.
 
@@ -48,19 +54,33 @@ config abaixo; falta recriar os pods e rodar os load tests.
 Mantido aqui porque explica de onde vem a config que o Go tem HOJE, e porque é
 o ponto de partida de qualquer recalibração para o perfil novo.
 
-O candidato a substituí-lo é o template **`Go_A40_Qwen3.5_64K-TEST`**
-(Supabase `6ef2312b-a9c7-4566-a763-dd24709416ab`, RunPod `frepvqwivj`):
-`--max-model-len 65536`, `--max-num-seqs 16`, `kv_reserve 1.0`, `max_users 25`,
-mesmo alias `vibecoder-base`. Promover depende de load test — o perfil a medir
-é concorrência de requests de API, não contexto grande de sessão agêntica.
+**Quem serve o plano hoje é o `Go_A40_Qwen3.5_64K-TEST`** (Supabase
+`6ef2312b-a9c7-4566-a763-dd24709416ab`, RunPod `frepvqwivj`): `--max-model-len
+65536`, `--max-num-seqs 16`, `kv_reserve 1.0`, `max_users 25`. Ele deixou de ser
+candidato e passou a ser produção — o `Go_A40_Qwen3.5` desta seção está
+`is_enabled: false`, e `getDefaultTemplateForPlan` filtra por `is_enabled=true,
+is_test=false`. O sufixo `-TEST` no nome é resíduo, não status.
+
+O candidato atual a substituí-lo é o **`GO-Teste`** (Supabase
+`cd74b56d-6da0-4a5f-98bb-31d90421167f`, RunPod `yhzwlzckt3`, `is_test: true`),
+que porta ao Go as duas otimizações medidas no Pro: `RedHatAI/Qwen3.5-9B-quantized.w4a16`
+(4-bit compressed-tensors — 15,87 → 8,00 GB lidos por step de decode) e, numa
+fase seguinte, `--speculative-config {"method":"mtp","num_speculative_tokens":2}`.
+Promover depende de load test — o perfil a medir é concorrência de requests de
+API, não contexto grande de sessão agêntica.
 
 ```
---dtype bfloat16 --max-model-len 131072 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name vibecoder-base
+--dtype bfloat16 --max-model-len 131072 --gpu-memory-utilization 0.90 --kv-cache-dtype fp8 --max-num-seqs 8 --served-model-name go-base
 ```
 
-- O alias servido é **`vibecoder-base`**, não `go-base`: a migration 0049
-  renomeou o PLANO, não o `--served-model-name` do template. Este doc já disse
-  `go-base` aqui e estava errado — quem copiar o nome errado leva 404 do pod.
+- O alias servido é **`go-base`**. Este item já afirmou o contrário
+  (`vibecoder-base`, "quem copiar o nome errado leva 404") e ficou
+  desatualizado: em 31/08/2026 o `--served-model-name go-base` foi gravado nos
+  dois templates Go, no Supabase e no RunPod. Confirmado no banco e nos pods
+  recentes (`llm-stack-401`, `402`, `413`, todos com
+  `machines.served_model_name = go-base`). O que continua valendo é o mecanismo:
+  o vLLM lê a flag só no boot, então um pod já de pé segue servindo o alias
+  antigo até ser **recriado** — start/stop não basta.
 - Janela nativa do Qwen3.5-9B é **262144** (config.json conferido) —
   **sem YaRN/hf-overrides**, só a flag. Era 16384 → 65536 → **131072 (128k,
   aplicado 23/07/2026)**; admissão mantida (kv_reserve 1.5, max_users 18).

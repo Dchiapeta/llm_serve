@@ -3,6 +3,7 @@
 import * as React from "react"
 import { ArrowDown, ArrowUp, ChevronsUpDown } from "lucide-react"
 
+import type { BillingStatus, Machine, TemplatePlan } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import {
   Table,
@@ -12,13 +13,29 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { ContaRowActions } from "@/components/contas/conta-row-actions"
 import { CopyableId } from "@/components/contas/copyable-id"
+
+// Stack vista da conta: o suficiente pro dialog de info e pra guarda do
+// delete. machineStatus null = stack sem máquina (nunca alocada ou órfã de
+// uma máquina já terminada).
+export type ContaStackSummary = {
+  id: string
+  name: string
+  slug: string
+  plan: TemplatePlan
+  billingStatus: BillingStatus
+  machineName: string | null
+  machineStatus: Machine["status"] | null
+}
 
 export type UsuarioRow = {
   id: string
   name: string
   email: string | null
+  userId: string | null
   stacks: number
+  stackList: ContaStackSummary[]
   tokens: number
   requests: number
   createdAt: string
@@ -86,12 +103,13 @@ export function UsuariosTable({ rows }: { rows: UsuarioRow[] }) {
           <SortableHead label="Tokens" col="tokens" {...headProps} />
           <SortableHead label="Requests" col="requests" {...headProps} />
           <SortableHead label="Criada em" col="createdAt" {...headProps} />
+          <TableHead className="w-10" />
         </TableRow>
       </TableHeader>
       <TableBody>
         {sorted.length === 0 && (
           <TableRow>
-            <TableCell colSpan={7} className="text-center text-muted-foreground">
+            <TableCell colSpan={8} className="text-center text-muted-foreground">
               Nenhuma conta ainda.
             </TableCell>
           </TableRow>
@@ -112,8 +130,14 @@ export function UsuariosTable({ rows }: { rows: UsuarioRow[] }) {
             <TableCell className="text-sm tabular-nums">
               {u.requests.toLocaleString("pt-BR")}
             </TableCell>
-            <TableCell className="text-sm">
+            <TableCell
+              className="text-sm whitespace-nowrap"
+              title={new Date(u.createdAt).toLocaleString("pt-BR")}
+            >
               {new Date(u.createdAt).toLocaleDateString("pt-BR")}
+            </TableCell>
+            <TableCell>
+              <ContaRowActions conta={u} />
             </TableCell>
           </TableRow>
         ))}

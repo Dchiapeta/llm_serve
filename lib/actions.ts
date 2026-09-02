@@ -7,6 +7,7 @@ import { randomBytes } from "crypto"
 
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { allowedDomainsLabel, isAllowedAdminEmail } from "./auth-admin"
+import { requireAdminSession } from "./auth-admin-server"
 import { computeCapacity, stackWeight, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
 import { vllmFlagsFromTemplate } from "./machines"
@@ -14,7 +15,7 @@ import { getClientLocation, listRoutesByMachine, setClientLocation } from "./rou
 import { insertStack } from "./stacks"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import { CLIENT_WINDOW_DAYS, MAX_KEYS_BY_PLAN, MAX_KNOWLEDGE_FILE_SIZE_BYTES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type ApiKey, type LoraAdapter, type Machine, type Stack, type StackClient, type Template, type TemplatePlan } from "./types"
+import { CLIENT_WINDOW_DAYS, MAX_KEYS_BY_PLAN, MAX_KNOWLEDGE_FILE_SIZE_BYTES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type Account, type ApiKey, type LoraAdapter, type Machine, type Stack, type StackClient, type Template, type TemplatePlan } from "./types"
 
 // Janela de deduplicação do provisionamento: um retry do gateway dentro desse
 // intervalo reusa a máquina 'creating' recém-criada em vez de criar outra.
@@ -1387,6 +1388,148 @@ export async function deleteStack(id: string) {
   if (error) throw new Error(error.message)
   revalidatePath("/stacks")
   revalidatePath("/accounts")
+}
+
+// Apaga uma conta e tudo que pende dela. O grosso é cascade no Postgres
+// (api_keys, stacks, lora_adapters, knowledge_chunks, routing_state,
+// routing_history); gateway_requests sobrevive com account_id nulo. Três
+// coisas o banco NÃO faz e esta função precisa fazer:
+//
+//  - recusar enquanto alguma stack ainda estiver numa máquina viva. Um pod
+//    hospeda várias stacks de clientes diferentes (SHARED_POD_PLANS), então
+//    apagar conta nunca pode encerrar máquina — desativar é ação separada em
+//    /machines, e o admin faz isso (ou migra a stack) antes de vir aqui;
+//  - limpar os buckets do Storage, que cascade nenhum alcança;
+//  - tirar as chaves de circulação no gateway e nos agents.
+//
+// O usuário do Supabase Auth continua existindo (accounts.user_id é
+// ON DELETE SET NULL, migration 0022): se a pessoa logar de novo pelo
+// TryStac, ensureAccountForUser cria uma conta nova e vazia.
+//
+// Erro devolvido em vez de lançado pelo mesmo motivo de setAutoProvisionEnabled:
+// em produção o Next redige a mensagem de exceções de Server Action, e tanto o
+// motivo do bloqueio quanto o erro do Postgres precisam chegar legíveis.
+export async function deleteAccount(id: string): Promise<{ error: string } | void> {
+  // Única action do arquivo que checa sessão no próprio corpo: Server Action é
+  // um endpoint POST próprio, o proxy é corte otimista e o gate real vive no
+  // layout do dashboard — que não roda numa invocação direta. Para a operação
+  // mais destrutiva do painel isso não basta.
+  await requireAdminSession()
+
+  const db = createSupabaseAdmin()
+
+  const { data: account } = await db
+    .from("accounts")
+    .select("id, name")
+    .eq("id", id)
+    .maybeSingle<Pick<Account, "id" | "name">>()
+  if (!account) return { error: "Conta não encontrada" }
+
+  const { data: stacksData } = await db
+    .from("stacks")
+    .select("id, slug, machine_id")
+    .eq("account_id", id)
+  const stacks = (stacksData ?? []) as Pick<Stack, "id" | "slug" | "machine_id">[]
+
+  const machineIds = [...new Set(stacks.map((s) => s.machine_id).filter((m) => m !== null))]
+  if (machineIds.length > 0) {
+    const { data: machinesData } = await db
+      .from("machines")
+      .select("id, name, status")
+      .in("id", machineIds)
+      .neq("status", "terminated")
+    const alive = new Map(
+      ((machinesData ?? []) as Pick<Machine, "id" | "name" | "status">[]).map((m) => [m.id, m])
+    )
+    const blocking = stacks
+      .filter((s) => s.machine_id && alive.has(s.machine_id))
+      .map((s) => `${s.slug} → ${alive.get(s.machine_id!)!.name}`)
+    if (blocking.length > 0) {
+      return {
+        error: `Conta com stack em máquina ativa: ${blocking.join(", ")}. Desative ou migre antes de apagar.`,
+      }
+    }
+  }
+
+  // Coletado antes do delete: depois as chaves já sumiram e não dá mais pra
+  // saber que agents precisam ser ressincronizados. Só as máquinas 'running'
+  // entram — o agent vive dentro do pod, então máquina pausada, terminada ou
+  // ainda subindo não tem quem atender /sync-keys (dá 404) e também não tem
+  // chave nenhuma em memória pra remover.
+  const { data: keysData } = await db
+    .from("api_keys")
+    .select("machine_id")
+    .eq("account_id", id)
+  const pinnedMachineIds = [
+    ...new Set(
+      ((keysData ?? []) as Pick<ApiKey, "machine_id">[])
+        .map((k) => k.machine_id)
+        .filter((m) => m !== null)
+    ),
+  ]
+  let keyMachineIds: string[] = []
+  if (pinnedMachineIds.length > 0) {
+    const { data: runningData } = await db
+      .from("machines")
+      .select("id")
+      .in("id", pinnedMachineIds)
+      .eq("status", "running")
+    keyMachineIds = ((runningData ?? []) as Pick<Machine, "id">[]).map((m) => m.id)
+  }
+
+  // Storage antes do banco (mesma ordem de deleteKnowledgeFile): depois do
+  // delete os stack_id e storage_path que dão o caminho dos arquivos somem.
+  // Best-effort de propósito — arquivo órfão no bucket é bem menos ruim que
+  // um delete que trava pela metade e deixa a conta meio apagada.
+  for (const stack of stacks) {
+    await removeStoragePrefix(KNOWLEDGE_BUCKET, stack.id).catch((e) =>
+      console.error(`Limpeza do bucket "${KNOWLEDGE_BUCKET}" para a stack ${stack.slug} falhou:`, e)
+    )
+  }
+  const { data: adapters } = await db
+    .from("lora_adapters")
+    .select("storage_path")
+    .eq("account_id", id)
+  for (const adapter of (adapters ?? []) as Pick<LoraAdapter, "storage_path">[]) {
+    await removeStoragePrefix(LORA_BUCKET, adapter.storage_path).catch((e) =>
+      console.error(`Limpeza do bucket "${LORA_BUCKET}" em ${adapter.storage_path} falhou:`, e)
+    )
+  }
+
+  const { error } = await db.from("accounts").delete().eq("id", id)
+  // Cobre também o 23503 que viria de uma FK RESTRICT de tabela do TryStac
+  // (chargefy_*) no mesmo projeto Supabase — a mensagem do Postgres diz qual.
+  if (error) return { error: error.message }
+
+  // Sem o flush, as chaves apagadas continuam válidas no gateway até o TTL
+  // do cache (60s); o sync tira do agent as que ficaram na memória do pod.
+  await flushGatewayKeyCache().catch((e) =>
+    console.error("Flush do cache do gateway falhou (a conta foi apagada no banco):", e)
+  )
+  for (const machineId of keyMachineIds) {
+    await syncMachineKeys(machineId).catch((e) =>
+      console.error(`Sync com o agent da máquina ${machineId} falhou (a conta foi apagada no banco):`, e)
+    )
+  }
+
+  revalidatePath("/contas")
+  revalidatePath("/stacks")
+  revalidatePath("/accounts")
+  revalidatePath("/crm")
+}
+
+// Apaga todos os arquivos sob um prefixo de bucket. list() não é recursivo e
+// remove() não aceita prefixo, então é listar-e-remover; entradas sem id são
+// "pastas" e não podem ser removidas como arquivo (mesma distinção de
+// registerLoraAdapter).
+async function removeStoragePrefix(bucket: string, prefix: string) {
+  const storage = createSupabaseAdmin().storage.from(bucket)
+  const { data: files, error: listErr } = await storage.list(prefix)
+  if (listErr) throw new Error(listErr.message)
+  const paths = (files ?? []).filter((f) => f.id).map((f) => `${prefix}/${f.name}`)
+  if (paths.length === 0) return
+  const { error } = await storage.remove(paths)
+  if (error) throw new Error(error.message)
 }
 
 // Migra uma stack para outra máquina: garante a chave da conta no destino

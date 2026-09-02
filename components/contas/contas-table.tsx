@@ -5,8 +5,9 @@ import Link from "next/link"
 import { Copy, Search } from "lucide-react"
 import { toast } from "sonner"
 
-import { TEMPLATE_PLANS, type Account, type ApiKey, type Machine, type RoutingState, type Stack, type TemplatePlan } from "@/lib/types"
+import { TEMPLATE_PLANS, type Account, type ApiKey, type Machine, type RoutingState, type Stack } from "@/lib/types"
 import { BILLING_BADGE, graceRemaining } from "@/lib/billing-status"
+import { PLAN_BADGE_VARIANT } from "@/lib/plan-badge"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -35,14 +36,8 @@ import type {
 } from "@/components/contas/create-stack-dialog"
 import { StackRowActions } from "@/components/contas/stack-row-actions"
 
-// Cor do badge por plano de produto — mantém a mesma paleta usada em
-// components/templates para o plano do template.
-export const PLAN_BADGE_VARIANT: Record<TemplatePlan, "secondary" | "info-light" | "success-light" | "warning-light"> = {
-  Go: "secondary",
-  Pro: "info-light",
-  Max: "success-light",
-  Enterprise: "warning-light",
-}
+// PLAN_BADGE_VARIANT vive em lib/plan-badge.ts — /contas também precisa dele
+// e importar daqui arrastaria o bundle desta página junto.
 
 // Status da máquina visto da stack; sem máquina (machine_id nulo ou
 // máquina terminada) a stack aparece como "Desativada".
