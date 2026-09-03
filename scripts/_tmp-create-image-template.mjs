@@ -4,12 +4,22 @@
 // template de origem compatível (todos os atuais são vLLM), então os campos vão
 // literais. O que se mantém do padrão daqueles scripts é o que importa:
 //
-//   - RunPod primeiro, Supabase depois (mesma ordem de lib/actions.ts:createTemplate);
 //   - insere usage_class_config e is_test, que a Server Action NÃO escreve
 //     (usage_class_config NULL = fail-open do machine_high_cap da migration 0037);
-//   - verify de leitura de volta nos dois lados, pelo precedente do
-//     updateTemplate que engole erro do RunPod em silêncio (lib/actions.ts:383);
+//   - verify por SELECT novo, pelo precedente do updateTemplate que engole erro
+//     em silêncio (lib/actions.ts:383);
 //   - idempotente: se o template já existe no Supabase, não faz nada.
+//
+// Duas coisas que ele faz DIFERENTE da Server Action, e por quê:
+//
+//   - Supabase primeiro, RunPod depois. A Server Action faz o inverso porque o
+//     runpod_template_id faz parte do único insert dela; aqui, RunPod-primeiro
+//     deixaria um template órfão no console do RunPod sempre que o insert
+//     falhasse (e o modo de falha mais provável é o CHECK de plano, com a 0057
+//     não aplicada).
+//   - verifica no registry que a tag da imagem resolve para o digest que foi de
+//     fato auditado. A 0.1.0 foi pushada antes de uma revisão e ficou no
+//     registry com bugs; a existência da tag não diz nada sobre o conteúdo.
 //
 // PRÉ-REQUISITOS (nesta ordem):
 //   1. supabase/migrations/0057_plan_image.sql aplicada — sem ela o CHECK
@@ -185,7 +195,76 @@ if (existing) {
   process.exit(0)
 }
 
-// ---------- 1. pré-checagem do invariante de capacidade ----------
+// ---------- 1. a tag publicada é a que esperamos? ----------
+//
+// Motivo concreto: a 0.1.0 foi pushada ANTES de uma revisão e ficou no registry
+// com bugs (500 em vez de 400 em campo com tipo errado, admissão da fila
+// furável por handler cancelado, request pendurada no shutdown). A existência
+// da tag não diz nada sobre o conteúdo dela — e o template aponta para a TAG.
+//
+// Aqui a tag é resolvida no registry e comparada com o digest que foi de fato
+// verificado. Se alguém re-pushar a tag, o script recusa em vez de registrar um
+// template apontando para conteúdo desconhecido.
+const EXPECTED_DIGEST =
+  "sha256:66c8f155356b5168ee165d780e19a3ab2fefe2618052819334dfdd9bbe283c5f"
+
+async function resolveTagDigest(repo, tag) {
+  const auth = await fetch(
+    `https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull`,
+  )
+  if (!auth.ok) throw new Error(`auth do registry falhou: ${auth.status}`)
+  const { token } = await auth.json()
+
+  const res = await fetch(`https://registry-1.docker.io/v2/${repo}/manifests/${tag}`, {
+    method: "HEAD",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      // os dois Accept: buildx publica índice OCI, mas uma imagem construída
+      // sem buildx seria manifest v2 — aceitar só um daria 404 enganoso
+      Accept: [
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+      ].join(", "),
+    },
+  })
+  if (res.status === 404) return null
+  if (!res.ok) throw new Error(`registry devolveu ${res.status}`)
+  return res.headers.get("docker-content-digest")
+}
+
+const [repo, tag] = IMAGE.split(":")
+let digest
+try {
+  digest = await resolveTagDigest(repo, tag)
+} catch (e) {
+  console.error(`\nnão foi possível verificar a imagem no registry: ${e.message}`)
+  console.error("Rode com IMAGE_CHECK=skip para seguir sem esta verificação.")
+  if (process.env.IMAGE_CHECK !== "skip") process.exit(1)
+}
+
+if (process.env.IMAGE_CHECK !== "skip") {
+  if (digest === null) {
+    console.error(`\nERRO: a tag ${IMAGE} não existe no registry.`)
+    console.error("Faça o build+push antes (ver docker/image/README.md).")
+    process.exit(1)
+  }
+  if (digest !== EXPECTED_DIGEST) {
+    console.error(`\nERRO: ${IMAGE} não é o artefato verificado.`)
+    console.error(`  esperado: ${EXPECTED_DIGEST}`)
+    console.error(`  registry: ${digest}`)
+    console.error(
+      "A tag foi re-pushada. Ou bumpe a versão (a regra é: tag nunca é\n" +
+        "re-pushada) ou atualize EXPECTED_DIGEST aqui e no README depois de\n" +
+        "verificar o conteúdo novo.",
+    )
+    process.exit(1)
+  }
+  console.log("imagem   : digest confere com o artefato verificado")
+}
+
+// ---------- 2. pré-checagem do invariante de capacidade ----------
 //
 // Espelha lib/capacity.ts:vramSlots. Checar AQUI evita criar um template que o
 // provisionMachine vai recusar depois — o erro apareceria só na hora de subir a
@@ -212,7 +291,44 @@ if (TEMPLATE.max_users > vramSlots) {
   process.exit(1)
 }
 
-// ---------- 2. cria no RunPod ----------
+// ---------- 3. insere no Supabase ----------
+//
+// ORDEM INVERTIDA em relação a lib/actions.ts:createTemplate (que cria no
+// RunPod primeiro), e de propósito.
+//
+// A Server Action faz RunPod-primeiro porque o `runpod_template_id` faz parte
+// do único insert dela. Aqui o fluxo é nosso, e o RunPod-primeiro tem um modo
+// de falha concreto: se o insert falhar — e o mais provável é justamente o
+// CHECK de plano, quando a 0057 não rodou — sobra um template ÓRFÃO no console
+// do RunPod, que ninguém referencia e que na próxima execução vira um segundo
+// órfão (o guard de idempotência olha o Supabase, não o RunPod).
+//
+// Supabase-primeiro não tem esse problema: se o insert falha, nada foi criado
+// em lugar nenhum. E a falha no sentido oposto (RunPod indisponível) já era
+// tolerada pelo desenho — o registro local vale sem o espelho, e dá para
+// vincular depois via importTemplate.
+
+const { data: inserted, error: insErr } = await db
+  .from("templates")
+  .insert({ ...TEMPLATE, runpod_template_id: null })
+  .select("*")
+  .single()
+
+if (insErr) {
+  if (/templates_plan_valid|violates check constraint/i.test(insErr.message)) {
+    console.error(
+      `\ninsert falhou no CHECK de plano: ${insErr.message}\n\n` +
+        "Aplique supabase/migrations/0057_plan_image.sql antes de rodar este\n" +
+        "script. Nada foi criado — nem no Supabase, nem no RunPod.",
+    )
+    process.exit(1)
+  }
+  throw new Error(`insert falhou: ${insErr.message}`)
+}
+
+console.log("\nregistro no Supabase criado:", inserted.id)
+
+// ---------- 4. cria no RunPod e vincula ----------
 
 let runpodTemplateId = null
 try {
@@ -235,53 +351,76 @@ try {
     },
   })
   runpodTemplateId = created.id
-  console.log("\nRunPod template criado:", runpodTemplateId)
+  const { error: linkErr } = await db
+    .from("templates")
+    .update({ runpod_template_id: runpodTemplateId })
+    .eq("id", inserted.id)
+  if (linkErr) {
+    // O template existe nos dois lados mas não está vinculado. Não é fatal —
+    // o provisionamento não usa runpod_template_id (podInputFromTemplate passa
+    // imageName e env explícitos) —, mas o id vai na mensagem para o vínculo
+    // manual, senão ele fica só no console do RunPod.
+    console.error(
+      `\nAVISO: template criado no RunPod (${runpodTemplateId}) mas o vínculo\n` +
+        `falhou: ${linkErr.message}\n` +
+        `Vincule à mão: update templates set runpod_template_id = '${runpodTemplateId}' where id = '${inserted.id}';`,
+    )
+  } else {
+    inserted.runpod_template_id = runpodTemplateId
+    console.log("RunPod template criado e vinculado:", runpodTemplateId)
+  }
 } catch (e) {
-  // Mesmo comportamento da Server Action: o registro local vale mesmo sem o
-  // espelho no console do RunPod (dá para vincular depois via importTemplate).
-  console.error("\nfalha ao criar no RunPod (seguindo só com o registro local):", e.message)
+  console.error(
+    `\nfalha ao criar no RunPod: ${e.message}\n` +
+      "O registro local vale mesmo sem o espelho no console do RunPod — o\n" +
+      "provisionamento passa imageName e env explícitos. Para vincular depois,\n" +
+      "use o import de template no painel.",
+  )
 }
 
-// ---------- 3. insere no Supabase ----------
+// ---------- 5. verify de leitura de volta ----------
+//
+// SELECT novo, e não a linha devolvida pelo insert: o vínculo do
+// runpod_template_id acontece num update DEPOIS, então a linha do insert está
+// desatualizada. E o precedente é o updateTemplate, que engole erro em
+// silêncio (lib/actions.ts:383) — a única forma de saber o que o banco tem é
+// perguntar ao banco.
 
-const { data: inserted, error: insErr } = await db
+const { data: row, error: readErr } = await db
   .from("templates")
-  .insert({ ...TEMPLATE, runpod_template_id: runpodTemplateId })
   .select("*")
+  .eq("id", inserted.id)
   .single()
 
-if (insErr) {
-  // O erro mais provável aqui é o CHECK de plano: se a 0057 não rodou,
-  // plan='Image' é rejeitado.
-  if (/templates_plan_valid|violates check constraint/i.test(insErr.message)) {
-    console.error(
-      `\ninsert falhou no CHECK de plano: ${insErr.message}\n` +
-        "Aplique supabase/migrations/0057_plan_image.sql antes de rodar este script.",
-    )
-    process.exit(1)
-  }
-  throw new Error(`insert falhou: ${insErr.message}`)
-}
-
-// ---------- 4. verify de leitura de volta ----------
+if (readErr) throw new Error(`leitura de volta falhou: ${readErr.message}`)
 
 const checks = {
-  plan: inserted.plan === "Image",
-  image_tag: inserted.image === IMAGE,
-  nao_usa_latest: !inserted.image.endsWith(":latest"),
-  model_name: inserted.model_name === TEMPLATE.model_name,
-  model_revision: inserted.env.IMAGE_MODEL_REVISION === MODEL_REVISION,
+  plan: row.plan === "Image",
+  image_tag: row.image === IMAGE,
+  nao_usa_latest: !row.image.endsWith(":latest"),
+  model_name: row.model_name === TEMPLATE.model_name,
+  model_revision: row.env.IMAGE_MODEL_REVISION === MODEL_REVISION,
   // as três que, se falharem, o pod sobe e parece saudável mas se comporta mal
-  hf_home_no_volume: inserted.env.HF_HOME?.startsWith(inserted.volume_mount_path),
-  server_process_match: inserted.env.SERVER_PROCESS_MATCH === "/opt/agent/server.py",
-  volume_persistente: Number(inserted.volume_gb) >= 40,
+  hf_home_no_volume: row.env.HF_HOME?.startsWith(row.volume_mount_path),
+  server_process_match: row.env.SERVER_PROCESS_MATCH === "/opt/agent/server.py",
+  volume_persistente: Number(row.volume_gb) >= 40,
   // dedicação da máquina
-  max_users: inserted.max_users === 1,
-  usage_class_config: JSON.stringify(inserted.usage_class_config) === JSON.stringify({ max_high: 1 }),
-  is_test: inserted.is_test === true,
-  is_enabled: inserted.is_enabled === true,
+  max_users: row.max_users === 1,
+  usage_class_config: JSON.stringify(row.usage_class_config) === JSON.stringify({ max_high: 1 }),
+  is_test: row.is_test === true,
+  is_enabled: row.is_enabled === true,
   // um VLLM_EXTRA_ARGS aqui indicaria template copiado de um de LLM por engano
-  sem_vllm_args: inserted.env.VLLM_EXTRA_ARGS === undefined,
+  sem_vllm_args: row.env.VLLM_EXTRA_ARGS === undefined,
+}
+
+// Vínculo com o RunPod: informativo, não fatal. O provisionamento não usa essa
+// coluna (podInputFromTemplate passa imageName e env explícitos), então um
+// template sem ela sobe pod normalmente — mas ele não aparece no console do
+// RunPod, e é bom saber disso agora em vez de estranhar depois.
+if (row.runpod_template_id) {
+  console.log("\nvínculo RunPod:", row.runpod_template_id)
+} else {
+  console.log("\nvínculo RunPod: AUSENTE (não impede subir pod; vincule via import no painel)")
 }
 
 console.log("\ntemplate criado:", inserted.id)
