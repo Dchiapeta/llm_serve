@@ -22,6 +22,7 @@ coisa que dá para abortar sem deixar a GPU num estado desconhecido.
 """
 
 import asyncio
+import random
 
 # Formatos de entrada aceitos, detectados por magic bytes e não pela extensão
 # nem pelo content-type do multipart — os dois são declarados pelo cliente. A
@@ -258,15 +259,35 @@ def validate_guidance_scale(raw, *, default: float) -> float:
     return value
 
 
+SEED_MAX = 2**64 - 1
+
+
 def validate_seed(raw) -> int | None:
     value = _as_int(raw, "seed")
     if value is None:
         return None
     # 2**64-1: teto do manual_seed do torch. Acima disso ele levanta, e o erro
     # sairia como 500 em vez de 400.
-    if value < 0 or value > 2**64 - 1:
+    if value < 0 or value > SEED_MAX:
         raise ImageRequestError("seed fora da faixa [0, 2^64-1]", code="invalid_seed")
     return value
+
+
+def ensure_seed(value: int | None) -> int:
+    """Seed efetiva da geração: a do cliente, ou uma sorteada aqui.
+
+    Sortear NESTE nível, em vez de deixar o torch decidir sozinho quando o
+    generator é None, é o que torna a geração descritível: a resposta passa a
+    poder dizer com que seed a imagem saiu, e quem guardar esse valor consegue
+    reproduzi-la. Enquanto o sorteio ficava implícito lá dentro, toda requisição
+    sem `seed` produzia uma imagem que ninguém — nem nós — sabia repetir.
+
+    random e não secrets: seed de imagem é um identificador de resultado, não um
+    segredo. Previsibilidade aqui não abre risco nenhum.
+    """
+    if value is not None:
+        return value
+    return random.getrandbits(64)
 
 
 def detect_format(data: bytes) -> str | None:

@@ -23,7 +23,13 @@ LORA_ALLOWED_FILES = LORA_REQUIRED_FILES | {
 
 
 class SupaClient:
-    def __init__(self, supabase_url: str, service_role_key: str, lora_bucket: str = "loras"):
+    def __init__(
+        self,
+        supabase_url: str,
+        service_role_key: str,
+        lora_bucket: str = "loras",
+        image_bucket: str = "images",
+    ):
         headers = {
             "apikey": service_role_key,
             "Authorization": f"Bearer {service_role_key}",
@@ -39,6 +45,7 @@ class SupaClient:
         )
         self._supabase_url = supabase_url
         self._bucket = lora_bucket
+        self._image_bucket = image_bucket
 
     async def aclose(self):
         await self._rest.aclose()
@@ -899,6 +906,157 @@ class SupaClient:
         )
         r.raise_for_status()
         return {f["name"] for f in r.json() if f.get("id")}
+
+    # ---------- imagens geradas (bucket "images" + image_generations) ----------
+    #
+    # Todo este bloco roda no CAMINHO CRÍTICO de /v1/images/*: o gateway sobe a
+    # imagem e grava a linha ANTES de responder ao cliente, para que uma resposta
+    # 200 signifique "a imagem está guardada". Duas consequências no design:
+    #
+    #   1. as escritas são IDEMPOTENTES (upsert no objeto, ignore-duplicates na
+    #      linha), porque um retry depois de um timeout é o caso normal, não a
+    #      exceção;
+    #   2. existem os dois `*_exists`, que só servem para responder "a escrita
+    #      cujo timeout eu vi chegou a acontecer?" antes de compensar. Sem eles,
+    #      um timeout na resposta de um insert BEM-SUCEDIDO faria o gateway
+    #      apagar os arquivos de uma linha viva.
+
+    async def upload_image_object(
+        self, storage_path: str, data: bytes, content_type: str
+    ) -> None:
+        """Sobe (ou sobrescreve) um objeto no bucket de imagens.
+
+        `x-upsert: true` é o que torna a operação idempotente: sem ele o
+        Supabase devolve 409 no segundo POST do mesmo path, e um retry depois de
+        um timeout viraria erro em cima de um upload que já tinha funcionado. O
+        path carrega batch_id e índice, então "sobrescrever" só acontece com o
+        mesmo conteúdo.
+
+        `content_type` explícito porque o client tem `application/json` nos
+        headers default (é o que as chamadas REST usam) — sem sobrescrever aqui,
+        o objeto seria servido como JSON e o navegador o baixaria em vez de
+        exibi-lo.
+        """
+        r = await self._storage.post(
+            f"/object/{self._image_bucket}/{storage_path}",
+            content=data,
+            headers={"Content-Type": content_type, "x-upsert": "true"},
+        )
+        r.raise_for_status()
+
+    async def image_object_exists(self, storage_path: str) -> bool:
+        """O objeto está no bucket? Usado só para decidir sobre compensação."""
+        r = await self._storage.request(
+            "HEAD", f"/object/{self._image_bucket}/{storage_path}"
+        )
+        if r.status_code == 404:
+            return False
+        r.raise_for_status()
+        return True
+
+    async def delete_image_objects(self, storage_paths: list[str]) -> None:
+        """Remove objetos do bucket. Usada na compensação e pelo reaper.
+
+        O 404 NÃO é erro aqui: objeto já ausente é o estado desejado. Tratá-lo
+        como falha faria o reaper repetir para sempre um lote cujo arquivo
+        alguém apagou à mão.
+        """
+        if not storage_paths:
+            return
+        r = await self._storage.request(
+            "DELETE",
+            f"/object/{self._image_bucket}",
+            json={"prefixes": storage_paths},
+        )
+        if r.status_code == 404:
+            return
+        r.raise_for_status()
+
+    async def signed_image_url(self, storage_path: str, ttl_s: int = 600) -> str:
+        """URL assinada para leitura de uma imagem. O bucket é privado; este é o
+        único caminho de leitura, e o TTL curto é o mesmo dos adapters LoRA."""
+        r = await self._storage.post(
+            f"/object/sign/{self._image_bucket}/{storage_path}",
+            json={"expiresIn": ttl_s},
+        )
+        r.raise_for_status()
+        rel = r.json()["signedURL"].lstrip("/")
+        return f"{self._supabase_url}/storage/v1/{rel}"
+
+    async def insert_image_generations(self, rows: list[dict]) -> None:
+        """Grava as linhas de um batch (migration 0059).
+
+        `resolution=ignore-duplicates` sobre o UNIQUE de storage_path é o que
+        torna o insert idempotente: reenviar o batch depois de um timeout não
+        duplica linha nem estoura 409. Diferente de insert_gateway_request, esta
+        chamada NÃO é fire-and-forget — quem chama espera por ela antes de
+        responder ao cliente.
+        """
+        if not rows:
+            return
+        r = await self._rest.post(
+            "/image_generations",
+            json=rows,
+            headers={"Prefer": "resolution=ignore-duplicates"},
+        )
+        r.raise_for_status()
+
+    async def image_batch_exists(self, batch_id: str) -> bool:
+        """Alguma linha deste batch chegou a ser gravada?
+
+        A pergunta que separa "o insert falhou" de "o insert funcionou e a
+        resposta se perdeu no caminho de volta". Só o segundo caso proíbe a
+        compensação — apagar os arquivos ali deixaria a linha viva apontando
+        para um objeto inexistente.
+        """
+        r = await self._rest.get(
+            "/image_generations",
+            params={"batch_id": f"eq.{batch_id}", "select": "id", "limit": "1"},
+        )
+        r.raise_for_status()
+        return bool(r.json())
+
+    async def list_expired_images(self, cutoff_iso: str, limit: int) -> list[dict]:
+        """Linhas cujo ARQUIVO já passou da validade e ainda não foi removido.
+
+        Ordenado por expires_at: o lote de cada ciclo é sempre o mais antigo, e
+        um acúmulo grande drena em ordem em vez de deixar linhas velhas presas
+        atrás das recentes.
+        """
+        r = await self._rest.get(
+            "/image_generations",
+            params={
+                "expires_at": f"lt.{cutoff_iso}",
+                "file_deleted_at": "is.null",
+                "select": "id,storage_path",
+                "order": "expires_at.asc",
+                "limit": str(limit),
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def mark_images_file_deleted(self, ids: list[str], ts: str) -> None:
+        """Fecha as linhas cujos arquivos saíram do bucket: marca file_deleted_at
+        e APAGA o prompt (retenção — ver o cabeçalho da migration 0059).
+
+        `file_deleted_at=is.null` na condição, e não só o filtro por id: é o que
+        torna o update idempotente sob concorrência (o loop e um
+        /admin/reap-images disparado à mão). Sem ele, o segundo a chegar
+        sobrescreveria o timestamp do primeiro com um mais recente, e o
+        histórico passaria a mentir sobre quando o arquivo foi removido.
+        """
+        if not ids:
+            return
+        r = await self._rest.patch(
+            "/image_generations",
+            params={
+                "id": f"in.({','.join(ids)})",
+                "file_deleted_at": "is.null",
+            },
+            json={"file_deleted_at": ts, "prompt": None},
+        )
+        r.raise_for_status()
 
     async def signed_lora_files(self, storage_path: str, ttl_s: int = 600) -> list[dict]:
         """Lista o prefixo do adapter e assina só arquivos da whitelist PEFT."""

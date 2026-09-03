@@ -116,6 +116,58 @@ advisory lock.
 | `DEMO_LIMIT_GLOBAL`       | não         | Teto da rota inteira por janela (default 300) — é este, não o por IP, que garante o custo máximo da demo |
 | `DEMO_LIMIT_WINDOW_S`     | não         | Janela deslizante dos dois limites acima, em segundos (default 3600) |
 | `DEMO_UPSTREAM_TIMEOUT_S` | não         | Teto de tempo da inferência da demo (default 20 — o terminal da hero desiste em 5s) |
+| `MAX_IMAGE_GENERATION_BYTES` | não      | Teto do corpo de `/v1/images/generations` (default 256 KiB). É JSON com prompt e escalares — o `MAX_BODY_BYTES` de 8 MB do catch-all seria três ordens de grandeza acima do uso real |
+| `MAX_IMAGE_EDIT_BYTES`    | não         | Teto do corpo de `/v1/images/edits` (default 4×15 MiB + 1 MiB de folga de boundaries). Precisa cobrir `IMAGE_MAX_REFERENCE_IMAGES` × `IMAGE_MAX_FILE_SIZE_MB` do template: menor que isso, o gateway recusa o que o pod aceitaria |
+| `IMAGE_UPSTREAM_TIMEOUT_S` | não        | Read do pod de imagem (default 90). Cobre a espera na fila (`IMAGE_QUEUE_WAIT_TIMEOUT_S`, 60s) mais a geração; não passa de 90 porque o Cloudflare do RunPod corta em ~100-127s |
+| `IMAGE_BUCKET`            | não         | Bucket das imagens geradas (default `images`, criado pela migration 0058). Privado: a leitura é por signed URL de TTL curto |
+| `RATE_LIMIT_BURST_IMAGE`  | não         | Rajada instantânea do plano Image (default 4), separada da taxa de 12/min. Alinhada à `IMAGE_QUEUE_CAPACITY` do pod: um bucket maior deixaria o cliente disparar mais do que cabe na fila, e o excedente voltaria como `queue_full` do pod em vez de 429 daqui |
+| `IMAGE_RETENTION_DAYS`    | não         | Prazo do ARQUIVO no bucket (default 30). Gravado por linha em `image_generations.expires_at` no momento da geração, então mudá-lo só afeta imagens novas. O registro em si nunca expira |
+| `IMAGE_RETENTION_INTERVAL_S` | não      | Intervalo do reaper de imagens (default 3600). A expiração tem granularidade de dias; checar mais rápido só gasta consulta |
+| `IMAGE_UPLOAD_ATTEMPTS`   | não         | Tentativas de upload por imagem antes de desistir (default 2). Curto de propósito: a GPU já foi paga, mas o cliente está esperando a resposta |
+| `IMAGE_UPLOAD_RETRY_BACKOFF_S` | não    | Backoff entre tentativas de upload (default 0.25) |
+| `IMAGE_QUEUE_RETRY_AFTER_S` | não       | `Retry-After` do 429 de fila cheia (default 5). Sintetizado no gateway: o agent remonta a resposta e não repassa o header do pod |
+| `IMAGE_BUCKET`            | não         | Bucket das imagens geradas (default `images`) |
+| `IMAGE_RETENTION_DAYS`    | não         | Prazo do ARQUIVO no bucket (default 30). Gravado por linha em `expires_at`, então mudar só afeta imagens novas — o registro em `image_generations` não expira |
+| `IMAGE_RETENTION_INTERVAL_S` | não      | Intervalo do reaper de imagens expiradas (default 3600) |
+| `IMAGE_UPLOAD_ATTEMPTS` / `_RETRY_BACKOFF_S` | não | Retry do upload ao bucket (defaults 2 e 0.25s). O upload é idempotente (`x-upsert`), então repetir nunca duplica |
+
+## Armazenamento das imagens geradas
+
+O pod de difusão devolve `b64_json` e não guarda nada. Quem persiste é o
+gateway, entre receber a resposta do pod e devolvê-la ao cliente:
+
+1. decodifica cada imagem e detecta o formato por magic bytes (`image_gen.py`) —
+   `IMAGE_OUTPUT_FORMAT` é env do pod, então assumir PNG estaria errado;
+2. sobe o objeto para `{stack_id}/{yyyy-mm-dd}/{batch_id}-{i}.{ext}` no bucket;
+3. grava uma linha por imagem em `image_generations`, ligando-a a
+   `account_id`/`stack_id`/`api_key_id`/`machine_id`.
+
+**Síncrono, não fire-and-forget.** É o que faz um 200 desta rota significar "a
+imagem está guardada". Custa ~200-500 ms sobre uma geração de 4-6 s. Uma task de
+fundo daria latência menor, mas morreria num restart do gateway — e, depois que
+o corpo foi entregue, não há de onde reconstruir a imagem.
+
+**As duas escritas são idempotentes** (`x-upsert` no objeto,
+`resolution=ignore-duplicates` na linha, sobre o UNIQUE de `storage_path`),
+porque retry depois de timeout é o caso normal, não a exceção.
+
+**Compensação só depois de verificar.** Se o insert falha, o gateway pergunta ao
+banco se alguma linha do batch existe antes de apagar os arquivos. Timeout não é
+prova de que a escrita não aconteceu: a resposta pode ter se perdido no retorno,
+e apagar ali deixaria uma linha viva apontando para um objeto inexistente. Na
+dúvida — quando a própria verificação falha — os arquivos ficam: um órfão custa
+alguns MB, o inverso corrompe o histórico em silêncio.
+
+**Falha confirmada vira 502**, com `detail` explícito. É a contrapartida de
+prometer armazenamento: preferimos o erro honesto a entregar a imagem dizendo
+que ela ficou guardada.
+
+**Retenção (`image_retention.py`, a cada hora):** aos `IMAGE_RETENTION_DAYS` o
+reaper apaga o arquivo do bucket e limpa o `prompt` da linha, marcando
+`file_deleted_at`. O resto do registro — quem gerou, quando, por qual stack —
+não expira. Storage sempre antes do banco: `storage_path` é o único ponteiro
+para o arquivo, e marcar primeiro deixaria objeto pago que nenhum ciclo futuro
+encontraria.
 
 ## Rodar local
 
@@ -145,6 +197,10 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
 - `POST /v1/documents/extract` — PDF → JSON via schema (OCR quando escaneado)
 - `POST /v1/images/extract` — imagem solta → JSON via schema (sempre via OCR)
 - `POST /v1/documents/generate` — HTML → PDF (direto ou por instrução ao modelo)
+- `POST /v1/images/generations` — text-to-image (plano Image). Corpo JSON,
+  resposta `b64_json`. A imagem é gravada no bucket antes da resposta sair
+- `POST /v1/images/edits` — image-to-image (plano Image). Multipart repassado em
+  streaming, sem materializar o corpo no gateway
 - `POST /demo` — demo pública da landing page: `{"prompt": "..."}` → SSE
   (`data: {"delta": "..."}`). **Sem autenticação** e a única rota chamada de um
   browser. Pod dedicado por env var, 200 caracteres de entrada, 80 tokens de
@@ -160,6 +216,9 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
 - `POST /admin/migrate` — `{account_id, target_machine_id}`: migra o adapter
   sem perder request (migrating → load no destino → flip → drain → unload)
 - `POST /admin/reap-idle` — dispara um ciclo do idle reaper (útil em teste)
+- `POST /admin/reap-images` — dispara um ciclo da retenção de imagens. É o que
+  permite verificar a expiração sem esperar 30 dias: força-se o `expires_at` de
+  uma linha para o passado e chama-se aqui
 - `POST /admin/consolidate` — dispara um ciclo de consolidação (útil em teste)
 - `POST /admin/stop-idle-machines` — dispara um ciclo de auto-pausa (útil em teste)
 - `POST /admin/ensure-capacity` — dispara um ciclo de reposição proativa (útil em teste; também chamado pelo painel na hora em que o interruptor liga)

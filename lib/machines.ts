@@ -71,6 +71,23 @@ export function parseImageLimit(args: string | null | undefined): number | null 
   }
 }
 
+// Teto de gerações em voo do pod de difusão (IMAGE_QUEUE_CAPACITY, lido em
+// docker/image/server.py). Ocupa o mesmo lugar do --max-num-seqs do vLLM: é o
+// número que o gateway usa pra decidir quando devolver 429, e vem do `env` do
+// template porque um pod de imagem não tem linha de comando de vLLM nenhuma.
+//
+// Null quando ausente ou ilegível — que é o que o gateway espera pra cair no
+// fallback dele. Um palpite aqui seria pior que não saber: alto demais empurra
+// carga que o pod recusa, baixo demais desperdiça a máquina.
+export function parseImageQueueCapacity(
+  env: Record<string, string> | null | undefined
+): number | null {
+  const raw = env?.IMAGE_QUEUE_CAPACITY
+  if (!raw) return null
+  const n = Number(raw)
+  return Number.isInteger(n) && n > 0 ? n : null
+}
+
 // Campos de `machines` derivados das flags do vLLM no template. O gateway lê
 // tudo da própria máquina (não busca o template a cada request), então essas
 // colunas são uma cópia denormalizada que precisa ser reescrita SEMPRE que o
@@ -93,8 +110,16 @@ export function vllmFlagsFromTemplate(tpl: {
     // ao orçamento restante; null se o template não usa a flag
     max_model_len: parseMaxModelLen(extra) ?? parseMaxModelLen(cmd),
     // teto de sequências concorrentes (--max-num-seqs), pro gateway aplicar
-    // o 429 no valor REAL do deploy em vez do fallback conservador dele
-    max_concurrent_seqs: parseMaxNumSeqs(extra) ?? parseMaxNumSeqs(cmd),
+    // o 429 no valor REAL do deploy em vez do fallback conservador dele.
+    //
+    // O pod de DIFUSÃO não tem --max-num-seqs (não roda vLLM): o teto dele é o
+    // IMAGE_QUEUE_CAPACITY, o total de gerações em voo que a fila admite
+    // (docker/image/policy.py). Sem este fallback a coluna ficava NULL, o
+    // gateway caía no DEFAULT_MAX_CONCURRENT_SEQS de 8 e deixava passar o dobro
+    // do que o pod aceita — o excedente voltava como 429 queue_full do pod, e
+    // não como o 429 com Retry-After do gateway.
+    max_concurrent_seqs:
+      parseMaxNumSeqs(extra) ?? parseMaxNumSeqs(cmd) ?? parseImageQueueCapacity(tpl.env),
     // teto de imagens por prompt (--limit-mm-per-prompt), pro gateway
     // recortar excedente em vez de deixar o pod devolver 400
     max_images_per_prompt: parseImageLimit(extra) ?? parseImageLimit(cmd),

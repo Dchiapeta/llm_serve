@@ -12,6 +12,8 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
+from recovery import machine_was_lost
+
 logger = logging.getLogger("gateway.lifecycle")
 
 
@@ -593,17 +595,26 @@ class LifecycleManager:
         de fato mesmo que a chamada reativa ao painel tenha falhado, sem religar
         nenhuma máquina proativamente (só age sobre o que a demanda já marcou).
 
-        Uma máquina sai da fila quando deixa de estar stopped/error (já subiu
-        por outro caminho, ou a recriação a levou pra creating/running) ou
-        sumiu; caso contrário, dispara try_recreate_machine de novo (que respeita
-        o cooldown e a trava, então é idempotente)."""
+        Uma máquina sai da fila quando deixa de estar recriável (já subiu por
+        outro caminho, ou a recriação a levou pra creating/running) ou sumiu do
+        banco; caso contrário, dispara try_recreate_machine de novo (que respeita
+        o cooldown e a trava, então é idempotente).
+
+        "Recriável" inclui 'terminated' com runpod_pod_id (ver machine_was_lost):
+        antes o filtro era só stopped/error, e uma máquina PERDIDA — que é
+        justamente a que o caminho reativo de resolve_base_machine enfileira —
+        saía do retry no primeiro ciclo. Bastava a chamada ao painel falhar por
+        rede uma vez pra ela nunca mais ser recriada.
+
+        O que continua de fora é o 'terminated' SEM pod_id: encerramento manual,
+        que ninguém quer de volta."""
         if self.try_recreate_machine is None or not self.pending_recreates:
             return []
         retried: list[str] = []
         for machine_id in list(self.pending_recreates):
             m = await self.supa.get_machine(machine_id)
-            if not m or m.get("status") not in ("stopped", "error"):
-                # subiu / creating / running / sumiu → nada a recriar
+            if not m or (m.get("status") != "stopped" and not machine_was_lost(m)):
+                # subiu / creating / running / apagada de propósito → nada a recriar
                 self.pending_recreates.discard(machine_id)
                 continue
             try:

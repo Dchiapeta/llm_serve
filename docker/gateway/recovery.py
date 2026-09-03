@@ -88,3 +88,34 @@ def template_allows_automatic_creation(machine: dict) -> bool:
     return template.get("is_enabled", True) is not False and not template.get(
         "is_test", False
     )
+
+
+def machine_was_lost(machine: dict) -> bool:
+    """A máquina SUMIU (merece recriação), ou foi apagada de propósito?
+
+    `status = 'terminated'` hoje carrega dois eventos opostos com o mesmo nome:
+
+      - **o pod sumiu do RunPod** — reconcile_statuses_once promove a
+        'terminated' quando o id some da listagem (host reclamou a instância,
+        pod deletado pelo console), e o painel faz o mesmo ao levar 404. Nos
+        dois o `runpod_pod_id` fica intacto, porque ninguém pediu que a máquina
+        deixasse de existir.
+      - **o usuário clicou em apagar** — terminateMachine (lib/actions.ts) chama
+        deletePod e ZERA runpod_pod_id/public_url junto com o status.
+
+    A distinção é o que separa "restaurar o que caiu" de "ressuscitar o que
+    alguém acabou de apagar" — e a segunda custa uma GPU por hora que ninguém
+    pediu. Sem ela, uma requisição atrasada de um cliente cujo Claude Code
+    ainda estava aberto religaria a máquina minutos depois do delete.
+
+    'error' entra sem exigir pod_id: é o status de um pod que existe e falhou,
+    não de um que foi removido.
+
+    Fail-CLOSED por omissão: sem runpod_pod_id não recria. Uma máquina legada
+    sem o campo preenchido perde a recriação automática (recuperável à mão); o
+    inverso criaria pod sozinho, que é o erro caro.
+    """
+    status = machine.get("status")
+    if status == "error":
+        return True
+    return status == "terminated" and bool(machine.get("runpod_pod_id"))

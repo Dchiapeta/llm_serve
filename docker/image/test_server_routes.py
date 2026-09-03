@@ -652,3 +652,54 @@ def test_excesso_de_arquivos_e_400_e_nao_500(client):
     )
     assert r.status_code == 400
     assert r.json()["error"]["code"] in ("too_many_reference_images", "invalid_multipart")
+
+
+# ---------------------------------------------------------------------------
+# meta: parâmetros efetivos da geração
+#
+# Existe para quem PERSISTE a imagem (o gateway grava cada geração no bucket e
+# precisa saber com que parâmetros ela saiu). Dois casos que o gateway não tem
+# como resolver sozinho: a seed sorteada, e o /v1/images/edits inteiro — lá o
+# corpo é multipart repassado em streaming e nunca chega a ser parseado por ele.
+# ---------------------------------------------------------------------------
+
+
+def test_generations_devolve_meta_com_os_parametros_efetivos(client):
+    r = client.post(
+        "/v1/images/generations",
+        json={"prompt": "um gato", "size": "1536x1024", "steps": 6, "seed": 42},
+    )
+    assert r.status_code == 200, r.text
+    meta = r.json()["meta"]
+    assert meta["prompt"] == "um gato"
+    assert (meta["width"], meta["height"]) == (1536, 1024)
+    assert meta["steps"] == 6
+    assert meta["seed"] == 42
+    assert meta["model"] == server.SERVED_MODEL_NAME
+
+
+def test_meta_traz_a_seed_sorteada_quando_o_cliente_nao_manda(client):
+    # sem isto a imagem seria irreproduzível: nem o cliente nem nós saberíamos
+    # com que seed ela saiu
+    r = client.post("/v1/images/generations", json={"prompt": "um gato"})
+    assert r.status_code == 200, r.text
+    seed = r.json()["meta"]["seed"]
+    assert isinstance(seed, int)
+    assert 0 <= seed <= policy.SEED_MAX
+    # e é a MESMA que foi para o pipeline
+    assert client.chamadas[-1].seed == seed
+
+
+def test_seed_sorteada_muda_entre_requisicoes(client):
+    seeds = set()
+    for _ in range(5):
+        r = client.post("/v1/images/generations", json={"prompt": "x"})
+        seeds.add(r.json()["meta"]["seed"])
+    assert len(seeds) > 1, "seed sorteada não deveria repetir sempre"
+
+
+def test_meta_nao_desloca_o_contrato_de_data(client):
+    # `meta` é campo EXTRA: cliente OpenAI ignora desconhecidos, mas `data`
+    # precisa continuar exatamente como estava
+    r = client.post("/v1/images/generations", json={"prompt": "um gato"})
+    assert r.json()["data"] == [{"b64_json": "QUlP"}]

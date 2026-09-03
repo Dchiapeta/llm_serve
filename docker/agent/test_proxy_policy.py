@@ -7,16 +7,24 @@ que dividem o mesmo processo vLLM. Um bug silencioso nestas funções não
 aparece como erro: aparece como um tenant lendo o tempo de resposta do outro.
 """
 
+import asyncio
 import json
+
+import pytest
 
 from proxy_policy import (
     ALLOWED_V1,
+    MAX_BODY_BYTES_BY_PATH,
     SALT_EXEMPT_PATHS,
     SALTED_PATHS,
+    BodyTooLarge,
     UnparseableBody,
     apply_cache_salt,
+    declared_length_exceeds,
+    max_body_bytes,
     merge_key_entry,
     prepare_proxy_body,
+    read_body_capped,
     salt_ident,
     tenant_cache_salt,
     upstream_content_type_for,
@@ -325,3 +333,107 @@ def test_multipart_maiusculo_e_normalizado_mas_o_boundary_nao():
 def test_multipart_sem_parametros():
     assert _ct("multipart/form-data") == "multipart/form-data"
     assert _ct("  Multipart/Form-Data  ") == "multipart/form-data"
+
+
+# ---------- teto de corpo por rota ----------
+
+
+async def _aiter(items):
+    for i in items:
+        yield i
+
+
+def test_toda_rota_da_allowlist_tem_teto():
+    """Guarda irmã do test_todo_post_da_allowlist_esta_classificado: rota nova
+    em ALLOWED_V1 sem teto cairia no DEFAULT conservador e provavelmente daria
+    413 em uso legítimo — ou, se alguém trocasse o default pelo maior valor,
+    reabriria o buraco de memória. Ou o teto é decidido, ou o build quebra."""
+    assert set(ALLOWED_V1) == set(MAX_BODY_BYTES_BY_PATH)
+
+
+def test_teto_das_rotas_de_llm_tem_folga_sobre_o_do_gateway():
+    """O gateway corta o corpo do CLIENTE em 8 MB e SÓ DEPOIS injeta model,
+    system prompt da stack, RAG e stream_options — o corpo chega aqui maior do
+    que entrou lá. Espelhar os 8 MB faria o agent recusar o que o gateway
+    aprovou, com um 413 que o cliente não tem como agir."""
+    assert max_body_bytes("chat/completions") > 8_000_000
+
+
+def test_generations_e_muito_mais_apertado_que_edits():
+    assert max_body_bytes("images/generations") < max_body_bytes("images/edits")
+
+
+def test_teto_de_edits_cobre_o_maximo_do_pod():
+    """4 arquivos de 15 MiB é o que IMAGE_MAX_REFERENCE_IMAGES e
+    IMAGE_MAX_FILE_SIZE_MB permitem. Um teto abaixo disso recusaria no pod o
+    que o gateway (image_proxy.max_edit_bytes) deixou passar."""
+    assert max_body_bytes("images/edits") > 4 * 15 * 1024 * 1024
+
+
+def test_rota_desconhecida_cai_no_teto_conservador():
+    """Falhar apertado é recuperável; falhar largo é o buraco que o mapa fecha."""
+    assert max_body_bytes("rota/que/nao/existe") == 256 * 1024
+
+
+# ---------- corte por Content-Length declarado ----------
+
+
+def test_content_length_acima_do_teto_e_recusado():
+    assert declared_length_exceeds("100", 10) is True
+
+
+def test_content_length_no_teto_passa():
+    assert declared_length_exceeds("10", 10) is False
+
+
+def test_content_length_ausente_nao_recusa():
+    """Chunked não tem o header. Quem cobre esse caso é read_body_capped — o
+    header só serve pra RECUSAR cedo, nunca pra ACEITAR."""
+    assert declared_length_exceeds(None, 10) is False
+    assert declared_length_exceeds("", 10) is False
+
+
+def test_content_length_ilegivel_nao_recusa():
+    assert declared_length_exceeds("abc", 10) is False
+    assert declared_length_exceeds("-5", 10) is False
+
+
+# ---------- leitura incremental ----------
+
+
+def test_corpo_abaixo_do_teto_e_montado_inteiro():
+    body = asyncio.run(read_body_capped(_aiter([b"ab", b"cd"]), "chat/completions", 10))
+    assert body == b"abcd"
+
+
+def test_corpo_exatamente_no_teto_passa():
+    body = asyncio.run(read_body_capped(_aiter([b"abcde"]), "chat/completions", 5))
+    assert body == b"abcde"
+
+
+def test_corpo_acima_do_teto_levanta():
+    with pytest.raises(BodyTooLarge) as e:
+        asyncio.run(read_body_capped(_aiter([b"abc", b"def"]), "images/edits", 5))
+    assert e.value.path == "images/edits"
+    assert e.value.ceiling == 5
+
+
+def test_corpo_vazio():
+    assert asyncio.run(read_body_capped(_aiter([]), "models", 10)) == b""
+
+
+def test_estouro_nao_le_o_corpo_inteiro():
+    """O ponto da leitura incremental: a exceção sobe no chunk que cruza o
+    teto, sem consumir o resto do stream. Com `await request.body()` seguido de
+    len(), os 10 GB já teriam sido carregados quando a comparação rodasse."""
+    consumidos = 0
+
+    async def contando():
+        nonlocal consumidos
+        for _ in range(1000):
+            consumidos += 1
+            yield b"x" * 1024
+
+    with pytest.raises(BodyTooLarge):
+        asyncio.run(read_body_capped(contando(), "images/generations", 4096))
+    assert consumidos <= 6  # ~5 chunks de 1 KiB pra cruzar 4 KiB, não 1000

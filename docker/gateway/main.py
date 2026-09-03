@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -52,6 +53,9 @@ from pydantic import BaseModel, Field
 import demo
 import document_extract
 import document_generate
+import image_gen
+import image_proxy
+import image_retention
 from anthropic_compat import (
     anthropic_error_body,
     anthropic_nonstreaming_body,
@@ -88,6 +92,7 @@ from lifecycle import LifecycleManager, MigrationError
 from recovery import (
     is_no_gpu_error,
     lock_active,
+    machine_was_lost,
     spawn_tracked,
     template_allows_automatic_creation,
 )
@@ -111,6 +116,17 @@ KEY_CACHE_TTL_S = float(os.environ.get("KEY_CACHE_TTL_S", "60"))
 KEY_CACHE_NEGATIVE_TTL_S = 5.0
 LORA_LOAD_TIMEOUT_S = float(os.environ.get("LORA_LOAD_TIMEOUT_S", "120"))
 LORA_BUCKET = os.environ.get("LORA_BUCKET", "loras")
+# Bucket das imagens geradas (migration 0058). Privado, como o de LoRA: a
+# leitura acontece por signed URL de TTL curto, nunca por URL pública.
+IMAGE_BUCKET = os.environ.get("IMAGE_BUCKET", "images")
+# Prazo do ARQUIVO no bucket. O registro em image_generations não expira — ver o
+# cabeçalho de image_retention.py. Gravado por linha (coluna expires_at) no
+# momento da geração, então mudar este valor só afeta imagens novas: o que já
+# está no bucket mantém o prazo com que foi gravado.
+IMAGE_RETENTION_DAYS = int(os.environ.get("IMAGE_RETENTION_DAYS", "30"))
+# De hora em hora: a expiração tem granularidade de dias, checar mais rápido só
+# gastaria consulta.
+IMAGE_RETENTION_INTERVAL_S = float(os.environ.get("IMAGE_RETENTION_INTERVAL_S", "3600"))
 # embeddings do RAG (Go) — mesmo modelo/dimensão usado na indexação
 # pelo painel (lib/actions.ts), senão a similaridade de cosseno não faz sentido
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -135,12 +151,50 @@ RATE_LIMIT_RPM = {
     "Pro": 120.0,
     "Max": 300.0,
     "Enterprise": 600.0,
+    # Image é a única linha aqui derivada da capacidade FÍSICA, não do preço: o
+    # pod de difusão gera uma imagem por vez (uma única task consumidora, ver
+    # docker/image/policy.py) com fila de 4 em voo. A ~5s por geração, o teto
+    # real é da ordem de 12/min — os 60 do default deixariam o cliente mandar 5x
+    # mais do que o pod pode aceitar, e o excedente voltaria como 429
+    # queue_full do pod em vez do 429 com Retry-After daqui.
+    "Image": 12.0,
 }
 DEFAULT_RATE_LIMIT_RPM = float(os.environ.get("RATE_LIMIT_RPM", "60"))
 
+# Capacidade do bucket — QUANTAS requisições cabem de uma vez, separada da taxa
+# de reposição acima.
+#
+# Nos planos de LLM as duas sempre foram o mesmo número, porque lá o burst não
+# machuca: o vLLM faz batching contínuo, e uma rajada de 60 requisições vira 60
+# sequências concorrentes que o próprio check_concurrency dimensiona.
+#
+# Em difusão não existe batching: a fila do pod tem QUEUE_CAPACITY (4 no
+# template) e o resto é recusado com queue_full. Um bucket de 12 deixaria o
+# cliente disparar 12 de uma vez para uma fila de 4 — 8 voltariam como 429 do
+# POD, que é o erro certo pelo motivo errado: o gateway sabia que não cabia e
+# mandou assim mesmo, gastando ida e volta até o RunPod para descobrir.
+#
+# 4 alinha o burst à profundidade real da fila. A vazão sustentada continua
+# sendo os 12/min do dict acima; o que muda é só o tamanho da rajada instantânea.
+#
+# Plano sem entrada aqui mantém burst == rpm, exatamente o comportamento
+# anterior — esta tabela é opt-in por plano.
+RATE_LIMIT_BURST = {
+    "Image": float(os.environ.get("RATE_LIMIT_BURST_IMAGE", "4")),
+}
+
 
 def rate_limit_rpm(plan: str | None) -> float:
+    """Taxa de reposição do bucket, em requisições por minuto."""
     return RATE_LIMIT_RPM.get(plan or "", DEFAULT_RATE_LIMIT_RPM)
+
+
+def rate_limit_burst(plan: str | None) -> float:
+    """Teto do bucket: o maior número de requisições aceitas de uma vez.
+
+    Cai em rate_limit_rpm quando o plano não declara burst próprio, que é o
+    comportamento que todo plano teve até existir esta tabela."""
+    return RATE_LIMIT_BURST.get(plan or "", rate_limit_rpm(plan))
 
 # concorrência: ELÁSTICA por MÁQUINA, não um teto fixo por chave — uma stack
 # sozinha no pod pode usar quase toda a capacidade; outras dividem o mesmo
@@ -165,6 +219,34 @@ MIN_RESERVED_SLOTS_SHARED_POD = int(os.environ.get("MIN_RESERVED_SLOTS_SHARED_PO
 # contra corpo absurdo/malformado, e 8 MB continua cumprindo esse papel.
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(8_000_000)))
 MAX_MESSAGES = int(os.environ.get("MAX_MESSAGES", "200"))
+
+# Rotas de geração de imagem: path completo → função que devolve o teto (ver
+# image_proxy.py). São FUNÇÕES, não valores, porque os tetos são lidos da env a
+# cada chamada — congelá-los aqui no import tiraria a possibilidade de ajustar
+# sem redeploy. Consumido pelo reject_oversized_upload logo abaixo.
+IMAGE_UPLOAD_CEILINGS = {
+    "/v1/images/generations": image_proxy.max_generation_bytes,
+    "/v1/images/edits": image_proxy.max_edit_bytes,
+}
+
+# Teto do read do upstream nas rotas de imagem. Tem que cobrir a espera na fila
+# do pod (IMAGE_QUEUE_WAIT_TIMEOUT_S, 60s no template) MAIS a geração — os 60s
+# do proxy_client matariam uma requisição saudável que só ficou na fila. E não
+# passa de 90s pelo mesmo motivo do MESSAGES_NONSTREAM_TIMEOUT_S: o Cloudflare
+# na frente do RunPod corta em ~100-127s com um 524 em HTML, então subir daqui
+# só trocaria um erro nosso, com mensagem útil, por um deles.
+IMAGE_UPSTREAM_TIMEOUT_S = float(os.environ.get("IMAGE_UPSTREAM_TIMEOUT_S", "90"))
+
+# Planos servidos por um pod de DIFUSÃO, não de vLLM. Mesmo padrão de
+# SHARED_POD_PLANS: um set, e não um campo no template, porque a decisão é por
+# plano e precisa ser consultável sem ir ao banco na hot path.
+#
+# Serve ao guard das rotas de imagem: sem ele, uma chave de plano de LLM
+# resolveria a máquina DELA (um pod de vLLM) e o gateway mandaria
+# /v1/images/generations pra lá. O agent é o mesmo binário nos dois tipos de
+# pod, então a rota está na allowlist dele também e a requisição seguiria até o
+# vLLM só pra morrer num 404 — três camadas abaixo de onde o erro é explicável.
+IMAGE_PLANS = {"Image"}
 
 # teto de tempo da inferência de extração de documento (/v1/documents/extract).
 # Não confundir com os 60s do proxy_client: lá o read mede o SILÊNCIO entre
@@ -544,7 +626,7 @@ runpod_client: RunPodClient | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global supa, store, proxy_client, document_client, openai_client, panel_client, demo_client, lifecycle_mgr, runpod_client
-    supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET)
+    supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET, IMAGE_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
     # read curto (60s): o Cloudflare na frente do RunPod às vezes derruba (RST)
     # conexões TCP em keep-alive; sem isso, uma conexão zumbi reaproveitada
@@ -643,6 +725,9 @@ async def lifespan(app: FastAPI):
     stale_routes_task = asyncio.create_task(stale_route_reconciliation_loop())
     usage_class_task = asyncio.create_task(usage_class_loop())
     billing_task = asyncio.create_task(billing_reconcile_loop())
+    image_retention_task = asyncio.create_task(
+        image_retention.image_retention_loop(supa, IMAGE_RETENTION_INTERVAL_S)
+    )
     yield
     reaper_task.cancel()
     machine_task.cancel()
@@ -650,6 +735,7 @@ async def lifespan(app: FastAPI):
     stale_routes_task.cancel()
     usage_class_task.cancel()
     billing_task.cancel()
+    image_retention_task.cancel()
     await proxy_client.aclose()
     await document_client.aclose()
     await openai_client.aclose()
@@ -752,6 +838,19 @@ async def reject_oversized_upload(request: Request, call_next):
             # da própria envelope JSON também precisa de folga.
             ceiling = document_generate.max_limit_bytes() + 4096
             if int(declared) > ceiling:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "corpo da requisição excede o limite"},
+                )
+    elif request.url.path in IMAGE_UPLOAD_CEILINGS:
+        # As rotas de geração de imagem têm handler próprio (registrado antes
+        # do catch-all /v1/{path}), então o MAX_BODY_BYTES dele NÃO as protege.
+        # As duas entram aqui, inclusive a de corpo JSON: sem o corte pelo
+        # header, um Content-Length gigante é lido inteiro pra RAM antes do
+        # handler rodar — mesmo motivo do /v1/documents/generate acima.
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit():
+            if int(declared) > IMAGE_UPLOAD_CEILINGS[request.url.path]():
                 return JSONResponse(
                     status_code=413,
                     content={"detail": "corpo da requisição excede o limite"},
@@ -1044,23 +1143,48 @@ async def authenticate(
     return entry, key_hash
 
 
-def check_rate_limit(key_hash: str, plan: str | None) -> None:
-    """Token bucket em memória por chave: rpm do plano tokens/min, com burst
-    até o teto do bucket. Estourou -> 429 + Retry-After; nunca enfileira, só
-    rejeita — o cliente decide se tenta de novo."""
+def rate_bucket_for_stack(stack_id: str) -> str:
+    """Chave de bucket compartilhada por todas as chaves de uma stack.
+
+    Prefixo `stack:` para nunca colidir com um key_hash, que é hex de sha256 e
+    não tem `:`. Os dois tipos de bucket dividem o mesmo dicionário porque a
+    mecânica é idêntica — o que muda é só o que conta como "um consumidor"."""
+    return f"stack:{stack_id}"
+
+
+def check_rate_limit(bucket_key: str, plan: str | None) -> None:
+    """Token bucket em memória: rpm do plano tokens/min, com burst até o teto
+    do bucket. Estourou -> 429 + Retry-After; nunca enfileira, só rejeita — o
+    cliente decide se tenta de novo.
+
+    `bucket_key` é QUEM divide o teto, e isso muda por rota. As rotas de LLM
+    passam o key_hash: o teto é por chave, porque lá o limite existe para conter
+    um cliente abusivo e a capacidade do pod já é protegida por
+    check_concurrency. As rotas de imagem passam rate_bucket_for_stack(): o teto
+    de RATE_LIMIT_RPM["Image"] foi derivado da capacidade FÍSICA do pod (uma
+    geração por vez, ~12/min), e um teto físico dividido por chave seria
+    multiplicado por quantas chaves a stack emitisse — o limite deixaria de
+    significar o que diz.
+
+    Duas grandezas independentes: `rpm` repõe o bucket (vazão sustentada) e
+    `burst` é o tamanho dele (rajada instantânea). Nos planos de LLM as duas
+    coincidem; ver RATE_LIMIT_BURST para por que em difusão não podem."""
     rpm = rate_limit_rpm(plan)
+    burst = rate_limit_burst(plan)
     now = time.time()
-    tokens, last = rate_buckets.get(key_hash, (rpm, now))
-    tokens = min(rpm, tokens + (now - last) * rpm / 60.0)
+    tokens, last = rate_buckets.get(bucket_key, (burst, now))
+    tokens = min(burst, tokens + (now - last) * rpm / 60.0)
     if tokens < 1.0:
-        rate_buckets[key_hash] = (tokens, now)
+        rate_buckets[bucket_key] = (tokens, now)
+        # o Retry-After é sempre função da TAXA, nunca do burst: o que o cliente
+        # espera é o tempo até o próximo token cair, e isso só depende do rpm.
         retry_after = max(1, int((1.0 - tokens) * 60.0 / rpm) + 1)
         raise HTTPException(
             status_code=429,
             detail="limite de requisições excedido, tente novamente em instantes",
             headers={"Retry-After": str(retry_after)},
         )
-    rate_buckets[key_hash] = (tokens - 1.0, now)
+    rate_buckets[bucket_key] = (tokens - 1.0, now)
 
 
 async def check_token_quota(account_id: str, plan: str | None, purpose: str = "customer") -> None:
@@ -2435,8 +2559,13 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
        sem GPU livre) → fallback por plano (comportamento original), agora
        com upsert lazy da chave — sem ele o pod da outra máquina rejeitaria
        a chave com 401.
+    4. Nada disso resolveu E a máquina da stack foi PERDIDA (o pod sumiu do
+       RunPod) → recriação reativa, no fim da função. Ver `lost_machine`.
     """
     stack, effective_plan = resolve_key_stack(entry)
+    # máquina da stack que sumiu e merece recriação (ver machine_was_lost e o
+    # bloco no fim desta função). Só é preenchida no ramo terminated/error.
+    lost_machine: dict | None = None
     if stack and stack.get("machine_id"):
         machine = await supa.get_machine(stack["machine_id"])
         if machine:
@@ -2448,6 +2577,8 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
                 target = await reallocate_stack(entry, stack, machine)
                 if target:
                     return target, effective_plan
+                if machine_was_lost(machine):
+                    lost_machine = machine
                 if status == "stopped":
                     slug = stack.get("slug") or stack["id"]
                     if lock_active(recreating_in_progress, machine["id"], RECREATE_LOCK_TTL_S):
@@ -2494,6 +2625,24 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
             effective_plan, "sem máquina para o modelo base"
         ):
             raise provisioning_503()
+        # Último recurso: a máquina da stack foi PERDIDA (pod sumiu do RunPod) e
+        # não há mais nada no plano pra servir. Sem isto o fluxo terminava num
+        # preparing_503() mudo e permanente — nenhum caminho recriava uma
+        # máquina terminated, porque o try_recreate_machine lá em cima só é
+        # alcançado a partir de 'stopped' + no_gpu.
+        #
+        # AQUI e não antes do fallback: recriar mais cedo tiraria dos outros
+        # planos o degradar-gracioso de servir numa máquina running sem vaga.
+        # Este ponto só é atingido quando não existe absolutamente nada.
+        #
+        # Recriar não é provisionar — não fica atrás do auto_provision_enabled
+        # pela mesma razão registrada no docstring de try_recreate_machine:
+        # restaura uma máquina que o usuário já provisionou, na MESMA row de
+        # machines (stacks e chaves seguem apontando pra ela).
+        if lost_machine is not None and await try_recreate_machine(
+            lost_machine, f"stack {stack.get('slug') or stack['id']}: pod sumiu do RunPod"
+        ):
+            raise recreating_503()
         raise preparing_503()
     machine = machines[0]
     await ensure_key_on_machine(entry, machine)
@@ -3461,6 +3610,14 @@ ALLOWED_V1: dict[str, set[str]] = {
     "embeddings": {"POST"},
     "models": {"GET"},
     "responses": {"POST"},  # Codex CLI (0.59+) só fala essa API, não chat/completions
+    # NÃO adicionar "images/generations"/"images/edits" aqui. Elas existem, mas
+    # como handlers PRÓPRIOS registrados antes do catch-all — e a diferença não
+    # é estilística. Entrar nesta allowlist as faria passar por validate_body,
+    # que injeta max_tokens e stream_options (campos de chat, sem sentido numa
+    # difusão) e, pior, ao ver o `prompt` string do corpo de imagem chama
+    # apply_context_budget → resolve_est_tokens, que bate no /tokenize do pod.
+    # O pod de imagem não roda vLLM e não tem esse endpoint: toda geração
+    # morreria numa tentativa de tokenizar o prompt.
 }
 
 
@@ -4310,6 +4467,449 @@ async def generate_document(
         release_flight(flight_key)
 
 
+# ---------- Geração de imagem (pod de difusão) ----------
+#
+# MESMA ORDENAÇÃO das rotas acima: registradas ANTES do catch-all
+# /v1/{path:path}. Aqui a razão é mais forte que "senão viram 404": elas
+# DELIBERADAMENTE não estão em ALLOWED_V1 (ver o comentário lá), então o
+# catch-all as recusaria — e se alguém as adicionasse à allowlist para
+# "consertar" isso, elas passariam por validate_body e morreriam no /tokenize de
+# um pod que não roda vLLM.
+#
+# O que estes dois handlers fazem, e o catch-all não faria: pulam validate_body,
+# aplicam teto de corpo próprio, exigem plano de imagem e repassam o multipart
+# do `edits` em streaming.
+GENERATIONS_PATH = "images/generations"
+EDITS_PATH = "images/edits"
+
+
+def _require_image_plan(plan: str, path: str) -> None:
+    """403 quando a chave não é de um plano servido por pod de difusão.
+
+    Fail-CLOSED, ao contrário do cli_block_reason (que erra para o lado de
+    deixar passar). Aqui a assimetria se inverte: deixar passar não é
+    permissivo, é quebrado — a requisição seguiria para o pod de vLLM da stack,
+    onde o agent (mesmo binário nos dois tipos de pod) a repassaria ao vLLM para
+    morrer num 404 sobre um "modelo" que o cliente nunca pediu. Um 403 daqui é a
+    única resposta que diz o que fazer."""
+    if plan in IMAGE_PLANS:
+        return
+    logger.info("images: plano %s barrado em /v1/%s", plan, path)
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"o plano {plan} não inclui geração de imagem — "
+            "a rota exige uma stack do plano Image"
+        ),
+    )
+
+
+async def _authorize_image_request(
+    authorization: str | None, request: Request, path: str
+) -> tuple[dict, str, dict, str, str]:
+    """Tronco comum de generations/edits: autentica, checa plano e limites,
+    resolve a máquina e reserva a vaga de concorrência.
+
+    Devolve (entry, account_id, machine, stack_id, effective_plan) com o
+    in_flight JÁ incrementado — quem chama é responsável pelo release_flight em
+    todos os caminhos de saída.
+
+    A ordem é a mesma do catch-all e do /v1/messages, e cada passo está onde
+    está por um motivo: o guard de plano vem antes do rate limit porque não faz
+    sentido gastar a cota de uma chave numa rota que ela não pode usar; o
+    in_flight++ vem antes dos awaits lentos porque o grace recheck da auto-pausa
+    o consulta, e quanto mais cedo, menor a janela pra pausa derrubar a máquina
+    com requisição já resolvida."""
+    entry, _key_hash = await authenticate(authorization, request.headers, path)
+    account_id = entry["account_id"]
+    key_stack, key_plan = resolve_key_stack(entry)
+    _require_image_plan(key_plan, path)
+    # Teto COMPARTILHADO pela stack, não por chave — ver check_rate_limit. A
+    # stack aqui é a da CHAVE (resolve_key_stack), e não a que resolve_route
+    # devolve: quem contratou é quem tem o teto, e a decisão precisa acontecer
+    # antes de gastar o resolve_route (que pode acordar máquina). key_stack é
+    # garantidamente não-None neste ponto: _require_image_plan já barrou o plano
+    # None que resolve_key_stack devolve quando não há stack.
+    check_rate_limit(rate_bucket_for_stack(key_stack["id"]), key_plan)
+    # Roda, e é INERTE de propósito: geração de imagem não produz tokens, então
+    # nada aqui incrementa a quota diária. Fica no fluxo para que o dia em que
+    # existir uma métrica de imagem não precise reencontrar o ponto de corte —
+    # e porque uma chave de conta que estourou a cota de texto não deveria
+    # continuar servindo por uma rota que esqueceu de checar.
+    await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+
+    machine, _rewrite_model, effective_plan, stack_id = await resolve_route(
+        account_id, entry
+    )
+    await maybe_touch(stack_id, machine["id"])
+
+    flight_key = (stack_id, machine["id"])
+    in_flight[flight_key] += 1
+    check_concurrency(flight_key, machine, effective_plan)
+    return entry, account_id, machine, stack_id, effective_plan
+
+
+def _image_log_ctx(
+    *, account_id: str, stack_id: str, entry: dict, machine: dict,
+    path: str, request: Request, started: float,
+) -> dict:
+    """log_ctx das rotas de imagem.
+
+    `model` sai de effective_model_name com rewrite_model=False: uma stack de
+    imagem não tem adapter LoRA, e o valor é o mesmo que o pin_model fixa no
+    corpo do generations — as duas coisas não podem divergir, senão a coluna
+    `model` do histórico mente sobre o que o pod serviu."""
+    return dict(
+        account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
+        machine_id=machine["id"], path=path,
+        model=effective_model_name(stack_id, False, machine),
+        user_agent=request.headers.get("user-agent"), started=started,
+    )
+
+
+def _image_upstream_timeout() -> httpx.Timeout:
+    """Read longo o bastante pra fila + geração; o resto fica com o do client.
+
+    Sem isto a requisição herdaria os 60s do proxy_client, que são o teto de
+    SILÊNCIO entre chunks de um stream. Aqui não há stream: o pod não manda byte
+    nenhum até a imagem inteira estar pronta, e antes disso ela pode ter esperado
+    até IMAGE_QUEUE_WAIT_TIMEOUT_S na fila. Mesmo raciocínio (e mesmo teto) do
+    MESSAGES_NONSTREAM_TIMEOUT_S."""
+    return httpx.Timeout(IMAGE_UPSTREAM_TIMEOUT_S, connect=5.0, write=10.0, pool=10.0)
+
+
+# Retry-After sintético do 429 de fila cheia. O pod devolve o dele
+# (docker/image/server.py), mas o AGENT monta uma JSONResponse nova e não
+# repassa headers do upstream — está anotado lá. Sem reconstruir o header aqui,
+# o cliente recebe um 429 sem nenhuma indicação de quando voltar, e a orientação
+# "fila curta, tente de novo" fica sem a metade acionável.
+IMAGE_QUEUE_RETRY_AFTER_S = int(os.environ.get("IMAGE_QUEUE_RETRY_AFTER_S", "5"))
+
+# Tentativas de upload por imagem antes de desistir. Curto de propósito: a GPU
+# já foi paga quando chegamos aqui, então vale insistir um pouco num soluço de
+# rede — mas o cliente está esperando a resposta, e um backoff longo trocaria um
+# erro honesto por um timeout do lado dele.
+IMAGE_UPLOAD_ATTEMPTS = int(os.environ.get("IMAGE_UPLOAD_ATTEMPTS", "2"))
+IMAGE_UPLOAD_RETRY_BACKOFF_S = float(os.environ.get("IMAGE_UPLOAD_RETRY_BACKOFF_S", "0.25"))
+
+
+
+async def _upload_image_with_retry(pending: image_gen.PendingImage) -> None:
+    """Sobe uma imagem, com retry curto. O upload é idempotente (x-upsert), então
+    repetir depois de um timeout nunca duplica nem colide."""
+    for attempt in range(1, IMAGE_UPLOAD_ATTEMPTS + 1):
+        try:
+            await supa.upload_image_object(
+                pending.storage_path, pending.data, pending.content_type
+            )
+            return
+        except Exception as e:
+            if attempt >= IMAGE_UPLOAD_ATTEMPTS:
+                raise
+            logger.warning(
+                "images: upload de %s falhou (tentativa %d/%d): %s",
+                pending.storage_path, attempt, IMAGE_UPLOAD_ATTEMPTS, e,
+            )
+            await asyncio.sleep(IMAGE_UPLOAD_RETRY_BACKOFF_S * attempt)
+
+
+async def _compensate_uploads(batch_id: str, storage_paths: list[str]) -> None:
+    """Apaga os objetos de um batch cuja gravação falhou — mas só depois de
+    CONFIRMAR que nenhuma linha dele sobreviveu.
+
+    Este é o ponto delicado do caminho de persistência. Um timeout no insert não
+    significa que ele não foi aplicado: a escrita pode ter acontecido e só a
+    resposta ter se perdido no retorno. Compensar às cegas nesse caso apagaria os
+    arquivos de uma linha VIVA, produzindo o pior estado possível — um registro
+    que promete uma imagem que não existe mais.
+
+    Por isso, na dúvida, NÃO apaga: se a própria verificação falhar, os objetos
+    ficam. Um órfão no bucket custa alguns MB até alguém reparar; o inverso
+    corrompe o histórico de forma invisível.
+    """
+    if not storage_paths:
+        return
+    try:
+        if await supa.image_batch_exists(batch_id):
+            logger.warning(
+                "images: batch %s tem linha gravada apesar do erro — "
+                "arquivos preservados", batch_id,
+            )
+            return
+    except Exception as e:
+        logger.warning(
+            "images: não foi possível verificar o batch %s (%s) — "
+            "arquivos preservados por precaução", batch_id, e,
+        )
+        return
+    try:
+        await supa.delete_image_objects(storage_paths)
+    except Exception as e:
+        # best-effort: o reaper não alcança estes objetos (não há linha com
+        # expires_at que os aponte), então o que sobra é o log.
+        logger.warning("images: compensação do batch %s falhou (%s)", batch_id, e)
+
+
+async def _persist_images(raw: bytes, log_ctx: dict, fallback_meta: dict) -> None:
+    """Sobe as imagens da resposta e grava as linhas de image_generations.
+
+    Síncrono no caminho da requisição de propósito: uma resposta 200 desta rota
+    significa "a imagem está guardada". Fire-and-forget daria latência menor mas
+    não daria essa garantia — a task pode morrer no restart do gateway, e não há
+    de onde reconstruir a imagem depois que o corpo foi entregue.
+
+    Levanta em falha confirmada; quem chama traduz para 502.
+    """
+    batch_id = str(uuid.uuid4())
+    try:
+        payload = json.loads(raw)
+    except ValueError as e:
+        # 200 com corpo não-JSON. Vira MalformedImageResponse para o chamador
+        # responder "formato inesperado" em vez de "falha ao armazenar": a
+        # segunda mensagem mandaria o cliente investigar o lado errado.
+        raise image_gen.MalformedImageResponse(f"resposta 200 não é JSON: {e}")
+
+    pending = image_gen.plan_persistence(
+        payload,
+        batch_id=batch_id,
+        account_id=log_ctx["account_id"],
+        stack_id=log_ctx["stack_id"],
+        api_key_id=log_ctx["api_key_id"],
+        machine_id=log_ctx["machine_id"],
+        path=log_ctx["path"],
+        model=log_ctx["model"],
+        fallback_meta=fallback_meta,
+        retention_days=IMAGE_RETENTION_DAYS,
+    )
+
+    uploaded: list[str] = []
+    try:
+        for item in pending:
+            await _upload_image_with_retry(item)
+            uploaded.append(item.storage_path)
+        await supa.insert_image_generations([item.row for item in pending])
+    except Exception:
+        await _compensate_uploads(batch_id, uploaded)
+        raise
+
+
+async def _relay_image_response(
+    upstream, flight_key: tuple[str, str], log_ctx: dict,
+    fallback_meta: dict | None = None,
+) -> Response:
+    """Grava as imagens e devolve a resposta do pod ao cliente.
+
+    A resposta é MATERIALIZADA (~1,7 MB para uma 1024×1024) em vez de repassada
+    em chunks, porque subir ao bucket exige o corpo em mãos — é o mesmo custo que
+    o catch-all já paga no ramo não-streaming. Repassar em streaming e persistir
+    depois só seria possível abrindo mão da garantia de armazenamento.
+
+    O corpo do cliente é o do pod, byte a byte: o contrato da rota continua sendo
+    `b64_json`, e a persistência é invisível para quem chama.
+
+    `usage=None` sempre: difusão não produz tokens. tokens_in/out ficam nulos em
+    gateway_requests, e é essa a informação correta — zero seria uma contagem,
+    null é a ausência dela."""
+    status_code = upstream.status_code
+    headers: dict[str, str] = {}
+    try:
+        try:
+            raw = await upstream.aread()
+        except (httpx.HTTPError, ConnectionError, OSError) as e:
+            logger.warning("images: resposta interrompida (%s)", e)
+            log_gateway_request(**log_ctx, status_code=502, stream=False, usage=None)
+            raise HTTPException(
+                status_code=502,
+                detail="a máquina interrompeu a resposta — tente novamente",
+            )
+
+        if status_code == 429:
+            # ver IMAGE_QUEUE_RETRY_AFTER_S: o header do pod não sobrevive ao
+            # agent, então ele é reconstruído aqui.
+            headers["Retry-After"] = str(IMAGE_QUEUE_RETRY_AFTER_S)
+
+        if status_code == 200:
+            try:
+                await _persist_images(raw, log_ctx, fallback_meta or {})
+            except image_gen.MalformedImageResponse as e:
+                # o pod respondeu 200 com um corpo que não reconhecemos. Não dá
+                # pra guardar nem pra prometer que guardamos.
+                logger.error("images: resposta 200 ilegível do pod (%s)", e)
+                log_gateway_request(**log_ctx, status_code=502, stream=False, usage=None)
+                raise HTTPException(
+                    status_code=502,
+                    detail="a máquina devolveu uma resposta em formato inesperado",
+                )
+            except Exception as e:
+                logger.error("images: falha ao armazenar o batch (%s)", e)
+                log_gateway_request(**log_ctx, status_code=502, stream=False, usage=None)
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "a imagem foi gerada mas não foi possível armazená-la — "
+                        "tente novamente"
+                    ),
+                )
+    finally:
+        await upstream.aclose()
+        release_flight(flight_key)
+
+    log_gateway_request(**log_ctx, status_code=status_code, stream=False, usage=None)
+    return Response(
+        content=raw,
+        status_code=status_code,
+        media_type=upstream.headers.get("content-type", "application/json"),
+        headers=headers or None,
+    )
+
+
+@app.post("/v1/images/generations")
+async def images_generations(
+    request: Request, authorization: str | None = Header(None)
+):
+    """text-to-image. Corpo JSON no formato da OpenAI, repassado ao pod.
+
+    O corpo é lido inteiro (é texto, com teto de centenas de KiB) porque o
+    pin_model precisa reescrevê-lo — ao contrário do edits, onde reescrever
+    significaria re-encodar o multipart."""
+    started = time.monotonic()
+    body = await request.body()
+    if len(body) > image_proxy.max_generation_bytes():
+        raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
+
+    entry, account_id, machine, stack_id, _plan = await _authorize_image_request(
+        authorization, request, GENERATIONS_PATH
+    )
+    flight_key = (stack_id, machine["id"])
+    log_ctx = _image_log_ctx(
+        account_id=account_id, stack_id=stack_id, entry=entry, machine=machine,
+        path=GENERATIONS_PATH, request=request, started=started,
+    )
+
+    # Metadados do corpo, usados só como FALLBACK do bloco `meta` que o pod
+    # devolve (ver image_gen). Extraídos aqui, antes do send, porque é o único
+    # ponto em que o corpo ainda está em mãos.
+    fallback_meta: dict = {}
+    try:
+        # pin_model e mais NADA de validate_body. O servidor decide o modelo
+        # aqui pelo mesmo motivo do chat, e o pod já foi construído esperando
+        # isto: MODEL_ALIASES (docker/image/server.py) aceita o path do HF
+        # justamente porque served_model_name é NULL neste template e o
+        # effective_model_name cai no machines.model_name. Sem o pin, um cliente
+        # que mandasse `"model": "dall-e-3"` levaria 404 do pod.
+        try:
+            body_json = json.loads(body)
+            if isinstance(body_json, dict):
+                fallback_meta = image_gen.request_meta(body_json)
+                pin_model(body_json, stack_id, False, machine)
+                body = json.dumps(body_json).encode()
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # corpo não-JSON segue como está; quem valida o formato é o pod
+
+        upstream_req = proxy_client.build_request(
+            "POST",
+            f"{machine['public_url']}/v1/{GENERATIONS_PATH}",
+            content=body,
+            headers={
+                "Authorization": authorization,
+                "Content-Type": "application/json",
+            },
+            timeout=_image_upstream_timeout(),
+        )
+        upstream = await proxy_client.send(upstream_req, stream=True)
+    except httpx.HTTPError as e:
+        release_flight(flight_key)
+        logger.warning("images/generations: upstream indisponível (%s)", e)
+        log_gateway_request(**log_ctx, status_code=503, stream=False, usage=None)
+        raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
+    except BaseException:
+        release_flight(flight_key)
+        raise
+
+    return await _relay_image_response(upstream, flight_key, log_ctx, fallback_meta)
+
+
+@app.post("/v1/images/edits")
+async def images_edits(request: Request, authorization: str | None = Header(None)):
+    """image-to-image. multipart/form-data repassado em STREAMING ao pod.
+
+    Nada de `await request.body()` nem `request.form()`: o corpo pode chegar a
+    dezenas de MiB (4 referências de 15 MiB), e este processo é réplica única
+    compartilhada por todos os tenants. Acumulá-lo aqui faria uma rajada de
+    uploads competir por RAM com o tráfego de chat de todo mundo. O pod é
+    dedicado (max_users: 1) e tem a própria memória para materializá-lo.
+
+    O `model` NÃO é pinado, ao contrário do generations: fixá-lo exigiria
+    re-encodar o multipart e jogaria fora exatamente o streaming acima. O pod
+    aceita `model` ausente (policy.validate_model), então o contrato da rota é
+    omiti-lo ou mandar o nome servido.
+    """
+    started = time.monotonic()
+    entry, account_id, machine, stack_id, _plan = await _authorize_image_request(
+        authorization, request, EDITS_PATH
+    )
+    flight_key = (stack_id, machine["id"])
+    log_ctx = _image_log_ctx(
+        account_id=account_id, stack_id=stack_id, entry=entry, machine=machine,
+        path=EDITS_PATH, request=request, started=started,
+    )
+
+    # inicializado antes do try: o UploadTooLarge sobe de DENTRO do send(),
+    # enquanto o corpo é escrito, e nesse ponto a resposta ainda não existe.
+    # Um aclose() incondicional no except viraria UnboundLocalError.
+    upstream = None
+    try:
+        upstream_req = proxy_client.build_request(
+            "POST",
+            f"{machine['public_url']}/v1/{EDITS_PATH}",
+            content=image_proxy.counting_stream(
+                request.stream(), image_proxy.max_edit_bytes()
+            ),
+            headers={
+                "Authorization": authorization,
+                # repassado INTACTO: é aqui que viaja o boundary=... que
+                # delimita as partes. Forçar application/json (como o catch-all
+                # faz) tornaria o corpo impossível de parsear do outro lado.
+                "Content-Type": request.headers.get(
+                    "content-type", "multipart/form-data"
+                ),
+            },
+            # retries=2 do transporte não conflita com o corpo em streaming: o
+            # httpx só reabre a conexão antes de escrever byte nenhum.
+            timeout=_image_upstream_timeout(),
+        )
+        upstream = await proxy_client.send(upstream_req, stream=True)
+    except BaseException as e:
+        # O UploadTooLarge chega EMBRULHADO num erro de transporte (ele é
+        # levantado de dentro do iterador que o httpx consome). Por isso o
+        # unwrap, e por isso este except vem antes de qualquer tratamento de
+        # httpx.HTTPError: sem os dois, um corpo grande demais viraria 503
+        # "máquina indisponível" e o cliente não teria o que corrigir.
+        too_large = image_proxy.unwrap(e)
+        if upstream is not None:
+            await upstream.aclose()
+        release_flight(flight_key)
+        if too_large is not None:
+            log_gateway_request(**log_ctx, status_code=413, stream=False, usage=None)
+            raise HTTPException(
+                status_code=413, detail="corpo da requisição excede o limite"
+            )
+        if isinstance(e, httpx.HTTPError):
+            logger.warning("images/edits: upstream indisponível (%s)", e)
+            log_gateway_request(**log_ctx, status_code=503, stream=False, usage=None)
+            raise HTTPException(
+                status_code=503, detail="máquina indisponível, tente novamente"
+            )
+        raise  # cliente desconectou no meio do upload, ou falha inesperada
+
+    # sem fallback_meta: o corpo do edits é multipart repassado em streaming e
+    # nunca é parseado aqui. Os metadados vêm do bloco `meta` da resposta do pod
+    # — e, num pod antigo que não o devolva, ficam nulos (ver image_gen).
+    return await _relay_image_response(upstream, flight_key, log_ctx)
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request, authorization: str | None = Header(None)):
     started = time.monotonic()
@@ -4920,6 +5520,18 @@ async def admin_reap_idle(x_admin_secret: str | None = Header(None)):
     require_admin(x_admin_secret)
     reaped = await lifecycle_mgr.reap_idle_once()
     return {"ok": True, "reaped": reaped}
+
+
+@app.post("/admin/reap-images")
+async def admin_reap_images(x_admin_secret: str | None = Header(None)):
+    """Dispara um ciclo da retenção de imagens manualmente.
+
+    É o que permite verificar a expiração sem esperar 30 dias: basta forçar o
+    expires_at de uma linha para o passado e chamar aqui. Seguro de repetir — o
+    ciclo é idempotente e pega a mesma trava do loop automático."""
+    require_admin(x_admin_secret)
+    removed = await image_retention.reap_expired_images_once(supa)
+    return {"ok": True, "removed": removed}
 
 
 @app.post("/admin/billing-reconcile")

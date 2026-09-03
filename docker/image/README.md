@@ -1,6 +1,6 @@
 # Pod de geração de imagem — FLUX.2 Klein 4B
 
-Imagem: `dchiapeta/diffusers-agent:flux2-klein-4b-0.1.1`
+Imagem: `dchiapeta/diffusers-agent:flux2-klein-4b-0.1.2`
 
 Ocupa o mesmo lugar arquitetural do pod de vLLM, trocando só o processo de
 inferência:
@@ -40,10 +40,10 @@ cd docker/image && ./lock-deps.sh
 # 2. build + push, com contexto em docker/
 cd docker
 docker buildx build -f image/Dockerfile --platform linux/amd64 \
-  -t dchiapeta/diffusers-agent:flux2-klein-4b-0.1.1 --push .
+  -t dchiapeta/diffusers-agent:flux2-klein-4b-0.1.2 --push .
 
 # 3. registrar o digest produzido, abaixo
-docker buildx imagetools inspect dchiapeta/diffusers-agent:flux2-klein-4b-0.1.1
+docker buildx imagetools inspect dchiapeta/diffusers-agent:flux2-klein-4b-0.1.2
 ```
 
 **A tag nunca é re-pushada.** Mudança de conteúdo é a versão seguinte. É isso
@@ -56,7 +56,8 @@ imagem pré-tool-calling.
 | Tag | Estado |
 |---|---|
 | `flux2-klein-4b-0.1.0` | **NÃO USAR.** Publicada antes da revisão. Devolve 500 (em vez de 400) para qualquer campo escalar com tipo errado; a admissão da fila é furável por handler cancelado (`CancelledError` não tratado — medido: `capacity=2` admitindo 21 gerações); `stop()` no meio de uma geração pendura a request para sempre; worker morto responde 504 indefinidamente com `/health` em 200; sem degradação pós-boot; sem teto de multipart no parser; recusa o `model` que o `pin_model` do gateway fixaria. |
-| `flux2-klein-4b-0.1.1` | Atual. Todas as correções acima, cada uma com teste. |
+| `flux2-klein-4b-0.1.1` | Todas as correções da 0.1.0, cada uma com teste. Não devolve o bloco `meta`, e sorteia a seed dentro do torch — uma geração sem `seed` explícita não é reproduzível, e o registro em `image_generations` nasce com `prompt`/parâmetros nulos no `edits`. |
+| `flux2-klein-4b-0.1.2` | Atual. `meta` na resposta (prompt, dimensões, steps, guidance, model) e `ensure_seed` sorteando no nível da policy, para que a seed gravada seja a realmente usada. Traz também o teto de corpo por rota do agent (`read_body_capped`), que fecha o pod para corpo sem `Content-Length`. |
 
 A `0.1.0` fica no registry de propósito, e não é deletada: apagá-la faria a
 referência a ela em qualquer log ou anotação antiga virar um mistério, em vez de
@@ -84,6 +85,20 @@ Duas particularidades da base, descobertas construindo:
 
 ### Digest da imagem produzida
 
+`flux2-klein-4b-0.1.2`, publicada em 03/09/2026:
+
+```
+índice OCI   sha256:d6f04e3d416f05b60f7034eee65c0e88e7719f3aff4a15102f4cb70a70b9777e
+linux/amd64  sha256:5ce8301a81a8c3d54b655bb3bde236d0b8245ccdc38bd8f159c82c30ec93c892
+```
+
+O índice desta versão traz um segundo manifesto `unknown/unknown`
+(`sha256:1ba8a539...`), que a 0.1.1 não tinha: é o **attestation manifest** de
+proveniência que o buildx passou a anexar por padrão. Não é uma segunda
+plataforma e não muda o que roda no pod — o runtime continua puxando só o
+`linux/amd64`. Fica anotado para que a diferença entre as duas listagens não
+vire mistério numa auditoria futura.
+
 `flux2-klein-4b-0.1.1`, publicada em 03/09/2026:
 
 ```
@@ -100,7 +115,7 @@ Para verificar que uma tag publicada tem o que se espera, sem subir GPU:
 
 ```bash
 docker run --rm --platform linux/amd64 --entrypoint bash \
-  dchiapeta/diffusers-agent:flux2-klein-4b-0.1.1 -c \
+  dchiapeta/diffusers-agent:flux2-klein-4b-0.1.2 -c \
   'cd /opt/agent && grep -l WorkerStopped policy.py && grep -l MODEL_ALIASES server.py'
 ```
 
@@ -170,6 +185,35 @@ da OpenAI usam `image[]` para múltiplas imagens, e `image[]` não é identifica
 Python válido, então o form é lido à mão em vez de declarado como parâmetro.
 
 Extensões nossas nas duas rotas: `steps`, `guidance_scale`, `seed`.
+
+A resposta de sucesso traz, além do `data` com os `b64_json`, um bloco `meta`
+com os parâmetros **efetivos** da geração:
+
+```json
+{
+  "created": 1756900000,
+  "data": [{ "b64_json": "..." }],
+  "meta": {
+    "prompt": "um gato", "width": 1024, "height": 1024,
+    "steps": 4, "guidance_scale": 1.0, "seed": 8151..., "n": 1,
+    "model": "flux2-klein-4b"
+  }
+}
+```
+
+Ele existe para quem **persiste** a imagem: o gateway grava cada geração no
+bucket (`docker/gateway/image_gen.py`) e precisa saber com que parâmetros ela
+saiu. Duas coisas ele não teria como descobrir sozinho — a `seed`, sorteada aqui
+quando o cliente não manda nenhuma (`policy.ensure_seed`), e, em
+`/v1/images/edits`, *todos* os campos: lá o corpo é multipart repassado em
+streaming, e o gateway nunca o parseia.
+
+A seed é do **batch**, não de cada imagem: com `n > 1` o pipeline consome de um
+único generator, então reproduzir a imagem *i* exige a mesma seed **e** o mesmo
+`n`.
+
+Campo extra não quebra cliente OpenAI (os SDKs ignoram desconhecidos), e o
+conteúdo é do próprio requisitante.
 
 Recusas explícitas, todas com `error.code` estável:
 
@@ -334,19 +378,47 @@ curl -X POST http://127.0.0.1:18000/v1/images/edits \
   -F "prompt=x" -F "image[]=@nao-e-imagem.png"
 ```
 
+## Pelo gateway
+
+As duas rotas são servidas por `api.trystac.com`, com handlers próprios em
+`docker/gateway/main.py` registrados **antes** do catch-all `/v1/{path}`. Elas
+deliberadamente **não** estão no `ALLOWED_V1` dele: entrar ali as faria passar
+por `validate_body`, que injeta `max_tokens`/`stream_options` e — ao ver o
+`prompt` string — tokenizaria o corpo contra um `/tokenize` que este pod não
+tem. O comentário no `ALLOWED_V1` registra isso no código.
+
+O que o gateway acrescenta ao caminho direto: autenticação por chave, corte por
+inadimplência (402), rate limit por plano, teto de concorrência, `last_activity_at`
+(sem o qual o idle-reaper pode **pausar a máquina em uso**), linha em
+`gateway_requests`, realocação/recriação automática da máquina, e o
+armazenamento das imagens no bucket (ver `image_gen.py`).
+
+Tetos de corpo próprios, em `docker/gateway/image_proxy.py` — os 8 MB do
+catch-all recusariam uma referência de 15 MiB:
+
+| Rota | Teto no gateway | Teto no agent |
+|---|---|---|
+| `images/generations` | 256 KiB (é texto) | 256 KiB |
+| `images/edits` | 4×15 MiB + folga | idem |
+
+O `edits` é repassado em **streaming** pelo gateway (`counting_stream`), então
+o processo compartilhado nunca acumula os 60 MiB. Não é streaming ponta a ponta:
+o agent ainda faz `read_body_capped` e o `server.py` materializa o multipart —
+o que o pod dedicado pode pagar, e o gateway não.
+
+Assimetria do campo `model`: no `generations` o gateway aplica `pin_model` (por
+isso `MODEL_ALIASES` existe); no `edits` não, porque reescrever o corpo exigiria
+re-encodar o multipart e jogaria fora o streaming. Nessa rota, **omita `model`**
+ou mande o nome servido.
+
 ## Limitações conhecidas
 
-- **O gateway ainda não expõe estas rotas.** `ALLOWED_V1` de
-  `docker/gateway/main.py` não tem `images/*`, então elas são alcançáveis só pela
-  URL pública do pod. E o `MAX_BODY_BYTES` de 8 MB é aplicado no catch-all
-  `/v1/{path}`: uma referência de 15 MB vira ~20 MB e leva 413. Antes de expor
-  comercialmente é preciso um limite próprio para as rotas de imagem e um
-  caminho que não copie o corpo inteiro em memória várias vezes.
-- **Sem moderação e sem storage.** A resposta é `b64_json` direto, nada é
-  persistido, e não há classificação de conteúdo de prompt nem de imagem.
-- **Uso não é contabilizado.** Geração de imagem não produz tokens, então
-  `gateway_requests.tokens_in/out` e `usage_metrics` ficam zerados — e
-  `check_token_quota` fica cega para este workload.
+- **Sem moderação.** Não há classificação de conteúdo de prompt nem de imagem.
+- **Uso não é contabilizado em tokens.** Geração de imagem não produz tokens,
+  então `gateway_requests.tokens_in/out` e `usage_metrics` ficam nulos — e
+  `check_token_quota` fica cega para este workload. Os freios reais são
+  `RATE_LIMIT_RPM` (12/min por stack, com rajada de 4) e `check_concurrency`. A tabela
+  `image_generations` é o contador que uma cota por imagem usaria.
 - **Volume não sobrevive à recriação do pod.** `CreatePodInput`
   (`lib/runpod.ts`) não expõe Network Volume, então `recreateMachine` rebaixa os
   16 GB. Stop/start (auto-pausa) preserva.

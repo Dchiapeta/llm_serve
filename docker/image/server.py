@@ -143,7 +143,10 @@ class GenPayload:
     steps: int
     guidance_scale: float
     n: int
-    seed: int | None
+    # sempre um inteiro desde que as rotas passaram a resolver a seed com
+    # policy.ensure_seed: nunca mais é None. É o que permite ao `meta` da
+    # resposta dizer com que seed a imagem saiu.
+    seed: int
     # bytes crus; a decodificação acontece na thread do worker, não no event
     # loop — 4 referências de 15 MB são trabalho de CPU suficiente para
     # travar o /health se fosse feito aqui.
@@ -180,9 +183,10 @@ def _run(payload: GenPayload) -> list[str]:
     assert PIPE is not None
     references = [_decode_reference(d) for d in payload.references]
 
-    generator = None
-    if payload.seed is not None:
-        generator = torch.Generator(device=DEVICE).manual_seed(payload.seed)
+    # sempre com generator explícito: a seed já vem resolvida (ensure_seed), e é
+    # ela que a resposta promete no `meta`. Deixar o torch sortear internamente
+    # tornaria essa promessa falsa.
+    generator = torch.Generator(device=DEVICE).manual_seed(payload.seed)
 
     with torch.inference_mode():
         out = PIPE(
@@ -467,6 +471,33 @@ async def _dispatch(payload: GenPayload) -> JSONResponse:
         content={
             "created": int(time.time()),
             "data": [{"b64_json": b} for b in images],
+            # Parâmetros EFETIVOS da geração — não os que o cliente pediu.
+            #
+            # Existe por causa de quem guarda a imagem: o gateway persiste cada
+            # geração no bucket (docker/gateway/image_gen.py) e precisa gravar
+            # com que parâmetros ela saiu. Duas coisas ele não teria como saber
+            # sozinho: a `seed`, que é sorteada aqui quando o cliente não manda
+            # nenhuma; e, em /v1/images/edits, TODOS os campos — lá o corpo é
+            # multipart repassado em streaming, e o gateway nunca o parseia.
+            #
+            # A seed é do BATCH, não de cada imagem: com n>1 o pipeline consome
+            # de um único generator, e reproduzir a imagem i exige a mesma seed
+            # E o mesmo n. Devolvê-la por item sugeriria uma independência que
+            # não existe.
+            #
+            # Campo extra não quebra cliente OpenAI (SDKs ignoram desconhecidos)
+            # e o conteúdo é do próprio requisitante — nada aqui é informação
+            # que ele já não tenha.
+            "meta": {
+                "prompt": payload.prompt,
+                "width": payload.width,
+                "height": payload.height,
+                "steps": payload.steps,
+                "guidance_scale": payload.guidance_scale,
+                "seed": payload.seed,
+                "n": payload.n,
+                "model": SERVED_MODEL_NAME,
+            },
         }
     )
 
@@ -511,7 +542,7 @@ async def images_generations(request: Request):
                 body.get("guidance_scale"), default=GUIDANCE_SCALE
             ),
             n=policy.validate_n(body.get("n"), maximum=IMAGES_PER_REQUEST_MAX),
-            seed=policy.validate_seed(body.get("seed")),
+            seed=policy.ensure_seed(policy.validate_seed(body.get("seed"))),
         )
     )
 
@@ -597,7 +628,7 @@ async def images_edits(request: Request):
                 form.get("guidance_scale"), default=GUIDANCE_SCALE
             ),
             n=policy.validate_n(form.get("n"), maximum=IMAGES_PER_REQUEST_MAX),
-            seed=policy.validate_seed(form.get("seed")),
+            seed=policy.ensure_seed(policy.validate_seed(form.get("seed"))),
             references=references,
         )
     )

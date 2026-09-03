@@ -931,7 +931,24 @@ export async function terminateMachine(machineId: string) {
       if (!String(e).includes("404")) throw e
     }
   }
-  await db.from("machines").update({ status: "terminated" }).eq("id", machineId)
+  // runpod_pod_id e public_url a NULL junto com o status, e isso não é
+  // faxina: é o que distingue "apagada de propósito" de "sumiu do RunPod".
+  //
+  // Os dois eventos gravam status "terminated" — o reconcile do gateway o faz
+  // quando o pod some da listagem da API, e o ramo de 404 logo acima nesta
+  // mesma tabela também. A diferença é que aqueles preservam o pod_id, porque
+  // ninguém pediu que a máquina deixasse de existir. O gateway lê exatamente
+  // esse campo (recovery.machine_was_lost) para decidir se recria a máquina
+  // sozinho quando chega requisição: sem o NULL aqui, uma requisição atrasada
+  // — de um cliente com o Claude Code ainda aberto, por exemplo — subiria de
+  // volta a GPU minutos depois do delete.
+  //
+  // O pod já foi deletado na RunPod acima, então manter o id era resíduo: ele
+  // não aponta mais para nada. O nome e o histórico de eventos continuam.
+  await db
+    .from("machines")
+    .update({ status: "terminated", runpod_pod_id: null, public_url: null })
+    .eq("id", machineId)
   await logEvent(machineId, "terminated", `Máquina "${m?.name}" apagada`)
   revalidatePath("/machines")
   redirect("/machines")

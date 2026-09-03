@@ -74,6 +74,108 @@ SALTED_PATHS = frozenset({"chat/completions", "completions", "responses"})
 # teste-guarda exige: toda rota POST nova tem que estar de um lado ou do outro.
 SALT_EXEMPT_PATHS = frozenset({"embeddings", "images/generations", "images/edits"})
 
+# ---------------------------------------------------------------------------
+# Teto de corpo por rota
+# ---------------------------------------------------------------------------
+#
+# O agent não tinha teto NENHUM: `await request.body()` materializava o que
+# viesse. Como o pod é alcançável direto pela URL pública do RunPod (é a mesma
+# razão da allowlist acima existir aqui e não só no gateway), bastava uma chave
+# válida pra mandar um corpo de vários GB e derrubar o pod por RAM — sem passar
+# perto do gateway.
+#
+# Por rota, e não um número global, porque as rotas não têm nada a ver entre si:
+# um prompt de chat e um multipart com quatro imagens de referência diferem em
+# duas ordens de grandeza, e o teto de um seria absurdo pro outro.
+#
+# ATENÇÃO ao valor das rotas de LLM: ele NÃO é o MAX_BODY_BYTES de 8 MB do
+# gateway, e a folga é deliberada. O gateway corta o corpo do CLIENTE e só
+# depois injeta model, system prompt da stack, contexto do RAG e stream_options
+# (validate_body em docker/gateway/main.py) — um corpo aceito perto do teto de
+# lá chega AQUI maior do que entrou. Espelhar os 8 MB faria o agent recusar
+# requisição que o gateway já aprovou, e o cliente veria um 413 sem ter como
+# saber o que reduzir.
+_MIB = 1024 * 1024
+MAX_BODY_BYTES_BY_PATH: dict[str, int] = {
+    "chat/completions": 16 * _MIB,
+    "completions": 16 * _MIB,
+    "responses": 16 * _MIB,
+    "embeddings": 16 * _MIB,
+    "models": 16 * _MIB,  # GET; o teto existe pra não haver rota sem teto
+    # texto puro (prompt + escalares) — três ordens de grandeza abaixo
+    "images/generations": 256 * 1024,
+    # IMAGE_MAX_REFERENCE_IMAGES × IMAGE_MAX_FILE_SIZE_MB (4 × 15 MiB no
+    # template atual) + folga pras boundaries e campos de texto do multipart.
+    # Espelha max_edit_bytes() de docker/gateway/image_proxy.py: um teto MENOR
+    # aqui recusaria no pod o que o gateway deixou passar.
+    "images/edits": 4 * 15 * _MIB + _MIB,
+}
+
+# Teto de quem não está no mapa. Só é alcançável se alguém adicionar rota à
+# ALLOWED_V1 sem entrada aqui — o que o teste-guarda de test_proxy_policy.py
+# impede. Fica como o conservador, e não como o maior dos valores: falhar
+# apertado é recuperável (413 num caso não previsto), falhar largo é o buraco
+# de memória que este mapa existe pra fechar.
+DEFAULT_MAX_BODY_BYTES = 256 * 1024
+
+
+def max_body_bytes(path: str) -> int:
+    """Teto de corpo da rota, em bytes."""
+    return MAX_BODY_BYTES_BY_PATH.get(path, DEFAULT_MAX_BODY_BYTES)
+
+
+class BodyTooLarge(ValueError):
+    """Corpo passou do teto da rota. O chamador traduz para 413.
+
+    Levantada DURANTE a leitura (ver read_body_capped), não depois: o ponto é
+    justamente nunca ter o corpo inteiro em memória pra poder medi-lo.
+    """
+
+    def __init__(self, path: str, ceiling: int):
+        self.path = path
+        self.ceiling = ceiling
+        super().__init__(f"corpo de /v1/{path} excede {ceiling} bytes")
+
+
+def declared_length_exceeds(content_length: str | None, ceiling: int) -> bool:
+    """O Content-Length declarado já estoura o teto?
+
+    Corte barato e antecipado: um cliente honesto declara o tamanho, e aí o 413
+    sai sem ler byte nenhum. Header ausente (chunked) ou ilegível devolve False
+    — quem cobre esse caso é a contagem incremental, não este atalho. Confiar
+    no header pra ACEITAR seria o erro; ele só é usado pra RECUSAR cedo.
+    """
+    if not content_length or not content_length.isdigit():
+        return False
+    return int(content_length) > ceiling
+
+
+async def read_body_capped(chunks, path: str, ceiling: int) -> bytes:
+    """Acumula o corpo cortando no teto, em vez de `await request.body()`.
+
+    O agent PRECISA do corpo inteiro (prepare_proxy_body faz json.loads nele), e
+    isso não muda — o que muda é o pior caso. Com `await request.body()` seguido
+    de um `len(body) > ceiling`, um corpo de 10 GB é integralmente carregado
+    antes da comparação: a checagem acontece quando o dano já foi feito. Aqui a
+    memória nunca passa do teto, porque a exceção sobe no chunk que o cruza.
+
+    É a metade que o `declared_length_exceeds` não cobre: sem Content-Length
+    (Transfer-Encoding: chunked) não existe header pra consultar, e esse era
+    exatamente o caminho sem proteção nenhuma.
+    """
+    parts: list[bytes] = []
+    seen = 0
+    async for chunk in chunks:
+        seen += len(chunk)
+        if seen > ceiling:
+            # solta o que já foi lido antes de propagar: o handler ainda vai
+            # montar a resposta de erro, e segurar centenas de MiB até o
+            # unwinding terminar desfaria metade do ganho
+            parts.clear()
+            raise BodyTooLarge(path, ceiling)
+        parts.append(chunk)
+    return b"".join(parts)
+
 # Prefixo versionado no HMAC: se um dia a granularidade ou o formato do
 # identificador mudar, bumpar isto invalida os salts antigos de uma vez em
 # vez de deixar dois esquemas coexistindo no mesmo pool de cache.

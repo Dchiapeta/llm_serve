@@ -26,9 +26,13 @@ from pydantic import BaseModel
 
 from proxy_policy import (
     ALLOWED_V1,
+    BodyTooLarge,
     UnparseableBody,
+    declared_length_exceeds,
+    max_body_bytes,
     merge_key_entry,
     prepare_proxy_body,
+    read_body_capped,
     upstream_content_type_for,
 )
 from usage_norm import SseUsageScanner, usage_from_event
@@ -541,7 +545,23 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
     prefix = entry["key_prefix"]
     account = entry["account_name"]
 
-    body = await request.body()
+    # Teto de corpo por rota. Autenticar ANTES é de propósito: uma chave
+    # inválida não deveria conseguir nem começar a mandar corpo, e o 401 sai
+    # sem ler byte nenhum. Depois disso, dois cortes:
+    #
+    #   1. Content-Length declarado — barato, resolve o cliente honesto sem ler
+    #      nada.
+    #   2. contagem incremental — cobre `Transfer-Encoding: chunked`, onde não
+    #      existe header pra consultar. Era o caminho sem proteção nenhuma: o
+    #      `await request.body()` que estava aqui materializava o que viesse,
+    #      e o pod é alcançável direto pela URL pública do RunPod.
+    ceiling = max_body_bytes(path)
+    if declared_length_exceeds(request.headers.get("content-length"), ceiling):
+        raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
+    try:
+        body = await read_body_capped(request.stream(), path, ceiling)
+    except BodyTooLarge:
+        raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
     total_requests += 1
     concurrent_now += 1
     concurrent_peak = max(concurrent_peak, concurrent_now)

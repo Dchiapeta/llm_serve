@@ -24,7 +24,7 @@
 // PRÉ-REQUISITOS (nesta ordem):
 //   1. supabase/migrations/0057_plan_image.sql aplicada — sem ela o CHECK
 //      rejeita plan='Image' e o insert falha.
-//   2. dchiapeta/diffusers-agent:flux2-klein-4b-0.1.1 publicada — o template
+//   2. dchiapeta/diffusers-agent:flux2-klein-4b-0.1.2 publicada — o template
 //      aponta para essa tag.
 //
 //   node --env-file=.env scripts/_tmp-create-image-template.mjs
@@ -36,7 +36,7 @@ const NAME = "IMAGE-A40-FLUX2-KLEIN-4B"
 // Tag versionada e imutável, nunca :latest. Mudança de conteúdo é 0.1.1 — é o
 // que torna apontar para a tag equivalente a apontar para o digest, e é a lição
 // do template que ficou pinado em :v2 servindo uma imagem pré-tool-calling.
-const IMAGE = "dchiapeta/diffusers-agent:flux2-klein-4b-0.1.1"
+const IMAGE = "dchiapeta/diffusers-agent:flux2-klein-4b-0.1.2"
 
 // Commit do repo no HF (lastModified 24/02/2026). Sem revision, o
 // from_pretrained segue o `main` e o load test deixa de ser reproduzível se a

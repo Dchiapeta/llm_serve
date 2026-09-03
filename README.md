@@ -73,6 +73,30 @@ limites e retry) está em [docs/integracao.md](docs/integracao.md).
    detalhe da máquina mostra slots, uso por conta, logs e variáveis, com ações
    de desativar/iniciar/apagar.
 
+## Imagens geradas
+
+As imagens do plano Image ficam num terceiro bucket privado do Supabase Storage,
+`images`, criado pela migration
+[0058_image_bucket.sql](supabase/migrations/0058_image_bucket.sql):
+
+```
+images/{stack_id}/{yyyy-mm-dd}/{batch_id}-{i}.png
+```
+
+Quem grava é o **gateway**, entre receber a resposta do pod de difusão e
+devolvê-la ao cliente — o pod continua sem credencial nenhuma do Supabase. Cada
+imagem gera uma linha em `image_generations`
+([0059](supabase/migrations/0059_image_generations.sql)) ligando-a a
+`account_id`/`stack_id`/`api_key_id`, que é o que responde "quem gerou esta
+imagem".
+
+O **arquivo** expira em 30 dias (`IMAGE_RETENTION_DAYS`), apagado pelo reaper do
+gateway junto com o `prompt` da linha. O **registro** não expira: quem gerou,
+quando e por qual stack continua respondível depois que a imagem já saiu.
+
+O contrato da API não muda — o cliente continua recebendo `b64_json`. Detalhes
+em [docker/gateway/README.md](docker/gateway/README.md#armazenamento-das-imagens-geradas).
+
 ## Adapters LoRA
 
 Adapters LoRA por conta ficam no Supabase Storage, em um bucket privado

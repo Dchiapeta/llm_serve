@@ -44,6 +44,40 @@ Ordem obrigatória: `0050` (aqui) **antes** de `0029` (lá), e as duas antes de
 qualquer deploy do gateway que leia as colunas — `find_active_key` faz
 `raise_for_status()`, então coluna faltando vira 500 em todo o tráfego.
 
+## Tabelas novas que o TryStac ainda vai precisar acessar
+
+### `image_generations` + bucket `images` (migrations `0058`/`0059` daqui)
+
+Registro de cada imagem gerada pelo plano Image: quem gerou (`account_id`,
+`stack_id`, `api_key_id`, `machine_id`), com que parâmetros, e onde o arquivo
+está no bucket privado `images`. Escrita **só** pelo gateway, no caminho da
+própria requisição (`docker/gateway/image_gen.py`).
+
+Este repo cria a tabela com RLS habilitada e **sem policy**, como todas as
+outras. Para o app do cliente listar as próprias imagens, o TryStac precisa
+adicionar, do lado dele:
+
+- `image_generations_select_own` — SELECT resolvendo a posse pelo join
+  `image_generations.stack_id → stacks.account_id → accounts.user_id = auth.uid()`,
+  no mesmo formato de `usage_metrics_select_own_stack`;
+- `grant select on image_generations to authenticated`.
+
+**Nenhum grant de INSERT/UPDATE/DELETE**: as linhas descrevem o que o gateway
+gravou, e um cliente que pudesse editá-las poderia atribuir a própria geração a
+outra stack. A expiração (`file_deleted_at`, e o `prompt` sendo apagado junto) é
+feita pelo reaper do gateway com service role.
+
+**A leitura do arquivo é por signed URL de TTL curto** — o bucket é privado, e
+`getPublicUrl` não funciona nem deve ser tentado. O padrão é o de
+`buildLoraSignedFiles` (`lib/actions.ts`) e `signed_image_url`
+(`docker/gateway/supa.py`). Uma policy de `storage.objects` para `authenticated`
+seria o caminho alternativo, mas aí a posse teria que ser derivada do prefixo do
+path (`{stack_id}/...`), o que é mais frágil que assinar no servidor.
+
+**Prazo:** o arquivo some aos 30 dias; a linha fica. Uma UI que assuma "linha
+existe ⇒ imagem existe" vai mostrar link quebrado — o campo a checar é
+`file_deleted_at is null`.
+
 ## Convenção usada pelo TryStac (pra não colidir nomes/policies)
 
 - Grants de UPDATE são sempre **por coluna** (`grant update (col) on table to authenticated`), nunca a tabela inteira — o resto das colunas (`plan`, `machine_id`, `account_id`, `usage_class`, etc.) continua sem grant nenhum pra `authenticated`.

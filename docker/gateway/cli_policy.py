@@ -59,7 +59,13 @@ CODING_TOOLS = frozenset({"claude-code", "codex", "cursor", "cline", "roo", "con
 # Planos sem CLI. "VibeCoder" é o nome antigo de "Go": entrada mantida como nos
 # outros dicts por plano do gateway (RATE_LIMIT_RPM, DAILY_TOKEN_BUDGET,
 # MAX_CLIENTS_BY_PLAN) até a migration 0049 rodar em produção.
-CLI_BLOCKED_PLANS = frozenset({"Go", "VibeCoder"})
+#
+# "Image" está aqui por um motivo diferente dos outros dois: não é uma decisão
+# comercial, é que um pod de difusão não fala /v1/chat/completions. Apontar
+# Claude Code ou Cursor para uma stack de imagem daria erro em toda requisição —
+# o 403 daqui pelo menos explica por quê. Espelha CLI_BLOCKED_PLANS de
+# lib/types.ts, que é quem impede o painel de ENSINAR essa configuração.
+CLI_BLOCKED_PLANS = frozenset({"Go", "VibeCoder", "Image"})
 
 # Corte x observação. Sobe LIGADO — diferente de CLIENT_LIMIT_ENFORCE, aqui não
 # há fingerprint a calibrar: o corte por path é exato, e o corte por UA erra só
@@ -88,7 +94,18 @@ def cli_block_reason(plan: str | None, path: str | None, user_agent: str | None)
 
 def _detail(plan: str | None) -> str:
     """Mensagem ao cliente. Mesmo tom de _client_limit_detail (main.py): diz o
-    que aconteceu e o que fazer a respeito, sem culpar a credencial."""
+    que aconteceu e o que fazer a respeito, sem culpar a credencial.
+
+    O Image não recebe a mesma frase que o Go: "faça upgrade" descreve o degrau
+    de um plano de LLM barato para um caro, e o Image não é um degrau dessa
+    escada — é outra linha de produto. Mandar quem tem uma stack de imagem fazer
+    upgrade sugeriria que existe um plano de imagem que fala chat/completions."""
+    if plan == "Image":
+        return (
+            "o plano Image serve geração de imagem (/v1/images/*), não conversa "
+            "nem código — uma CLI ou assistente de código precisa de uma stack "
+            "de um plano de LLM (Pro ou Max)"
+        )
     return (
         f"o plano {plan} não tem acesso à CLI nem a assistentes de código — "
         "para liberar o acesso, faça upgrade para o Pro ou o Max em app.trystac.com"

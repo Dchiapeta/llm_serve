@@ -10,6 +10,7 @@ from recovery import (
     _NO_GPU_ERROR_PATTERNS,
     is_no_gpu_error,
     lock_active,
+    machine_was_lost,
     template_allows_automatic_creation,
 )
 
@@ -115,3 +116,45 @@ def test_uma_chave_expirada_nao_afeta_outra_ativa():
     assert lock_active(lock, "nova", ttl=180) is True
     assert "velha" not in lock
     assert "nova" in lock
+
+
+# ---------- machine_was_lost ----------
+#
+# É o que separa "restaurar o que caiu" de "ressuscitar o que alguém apagou".
+# Errar para o lado permissivo aqui custa uma GPU por hora que ninguém pediu.
+
+
+def test_pod_sumiu_do_runpod_merece_recriacao():
+    """reconcile_statuses_once promove a 'terminated' quando o id some da
+    listagem, e o painel faz o mesmo ao levar 404 — nos dois o runpod_pod_id
+    fica intacto, porque ninguém pediu que a máquina deixasse de existir."""
+    assert machine_was_lost({"status": "terminated", "runpod_pod_id": "abc123"}) is True
+
+
+def test_encerramento_manual_nao_recria():
+    """terminateMachine zera runpod_pod_id junto com o status. Sem esta
+    distinção, uma requisição atrasada de um cliente com o Claude Code ainda
+    aberto religaria a máquina minutos depois do delete."""
+    assert machine_was_lost({"status": "terminated", "runpod_pod_id": None}) is False
+    assert machine_was_lost({"status": "terminated"}) is False
+    assert machine_was_lost({"status": "terminated", "runpod_pod_id": ""}) is False
+
+
+def test_error_merece_recriacao_sem_exigir_pod_id():
+    """'error' é o status de um pod que EXISTE e falhou, não de um removido."""
+    assert machine_was_lost({"status": "error"}) is True
+    assert machine_was_lost({"status": "error", "runpod_pod_id": "abc123"}) is True
+
+
+def test_maquina_viva_ou_pausada_nao_e_perdida():
+    """stopped tem caminho próprio (wake); running e creating não têm o que
+    recriar. Um True aqui recriaria pod em cima de pod."""
+    for status in ("running", "stopped", "creating"):
+        assert machine_was_lost({"status": status, "runpod_pod_id": "abc123"}) is False
+
+
+def test_status_desconhecido_nao_recria():
+    """Fail-closed: status novo que ninguém previu não pode virar criação
+    automática de GPU por omissão."""
+    assert machine_was_lost({"status": "algo_novo", "runpod_pod_id": "abc"}) is False
+    assert machine_was_lost({}) is False

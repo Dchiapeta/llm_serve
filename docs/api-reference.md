@@ -10,7 +10,7 @@ Em todos os casos:
 |---|---|
 | Base URL | `https://api.trystac.com` |
 | Autenticação | header `Authorization: Bearer <SUA_CHAVE_DE_ACESSO>` |
-| Content-Type | `application/json`, exceto `/v1/documents/extract` e `/v1/images/extract` (`multipart/form-data`) |
+| Content-Type | `application/json`, exceto `/v1/documents/extract`, `/v1/images/extract` e `/v1/images/edits` (`multipart/form-data`) |
 
 ---
 
@@ -360,6 +360,147 @@ Schema até 64 KB. Timeout do servidor: 240s.
 | `413` | Arquivo, resolução ou schema acima do limite |
 | `422` | `max_tokens` fora da faixa aceita |
 | `502` | Modelo não devolveu JSON aderente ao schema (resposta inclui `raw_output` para diagnóstico) |
+
+---
+
+## 3.9. Geração de imagem
+
+Cria uma imagem a partir de um prompt, ou edita uma imagem existente. Formato
+compatível com a OpenAI. **Exige uma chave de uma stack do plano `Image`** — uma
+chave de plano de LLM recebe `403`, porque o pod que gera imagem não é o mesmo
+que responde chat.
+
+A resposta é sempre `b64_json`. `response_format: "url"` é recusado.
+
+### 3.9.1. Texto → imagem
+
+`POST /v1/images/generations` — `application/json`
+
+```json
+{
+  "prompt": "um gato astronauta flutuando sobre a Terra",
+  "size": "1024x1024",
+  "n": 1,
+  "steps": 4,
+  "guidance_scale": 1.0,
+  "seed": 42
+}
+```
+
+| Campo | Obrigatório | Notas |
+|---|---|---|
+| `prompt` | sim | texto livre |
+| `size` | não | `1024x1024` (padrão), `1536x1024`, `1024x1536` — lista fechada |
+| `n` | não | máximo 1 por requisição |
+| `steps` | não | padrão 4, teto 8 (o checkpoint é *distilled*) |
+| `guidance_scale` | não | padrão 1.0 |
+| `seed` | não | inteiro (0 a 2^64-1). Omitido, o servidor sorteia e devolve o valor em `meta.seed` |
+| `model` | não | **ignorado**: o servidor fixa o modelo servido |
+
+Resposta:
+
+```json
+{
+  "created": 1767225600,
+  "data": [{ "b64_json": "iVBORw0KGgo..." }],
+  "meta": {
+    "prompt": "um gato astronauta flutuando sobre a Terra",
+    "width": 1024, "height": 1024, "steps": 4,
+    "guidance_scale": 1.0, "seed": 42, "n": 1,
+    "model": "flux2-klein-4b"
+  }
+}
+```
+
+`meta` traz os parâmetros **efetivos** da geração. O campo mais útil ali é a
+`seed`: quando você não manda uma, o servidor sorteia — e é esse valor que
+reproduz a mesma imagem depois. Sem ele, uma requisição sem `seed` produziria
+uma imagem que ninguém saberia repetir.
+
+A seed é do **lote**, não de cada imagem: com `n > 1`, reproduzir a imagem *i*
+exige a mesma `seed` **e** o mesmo `n`.
+
+### 3.9.2. Imagem → imagem
+
+`POST /v1/images/edits` — `multipart/form-data`, até 4 imagens de referência de
+15 MiB cada.
+
+```bash
+curl https://api.trystac.com/v1/images/edits \
+  -H "Authorization: Bearer $STAC_API_KEY" \
+  -F "prompt=deixe em preto e branco" \
+  -F "image[]=@foto.png"
+```
+
+O campo aceita os dois nomes: `image` e `image[]` (este último é o que os
+exemplos da OpenAI usam para múltiplas imagens). Formatos aceitos: PNG, JPEG e
+WEBP — detectados pelo conteúdo do arquivo, não pela extensão nem pelo
+`Content-Type`.
+
+> **`model` nesta rota:** ao contrário do `generations`, aqui o campo **não** é
+> corrigido pelo servidor. Omita-o, ou mande exatamente o nome servido — qualquer
+> outro valor recebe `404`.
+
+`mask` não é suportado (`400`): este pod carrega um pipeline só, e aplicar a
+edição na imagem inteira fingindo respeitar a máscara seria pior que recusar.
+
+**Erros específicos:**
+
+| Status | `code` | Significado |
+|---|---|---|
+| `400` | `invalid_size`, `invalid_steps`, … | campo fora da faixa ou com tipo errado |
+| `400` | `mask_not_supported` | `mask` não é suportado nesta versão |
+| `400` | `unsupported_image_format` | o arquivo não é PNG/JPEG/WEBP |
+| `400` | `wrong_route_for_reference_image` | mandou `image` no JSON do `generations` — use `/v1/images/edits` |
+| `403` | — | a chave não é de uma stack do plano `Image` |
+| `404` | `model_not_found` | `model` diferente do servido (só no `edits`) |
+| `413` | — | corpo acima do limite da rota |
+| `429` | `queue_full` | fila do pod cheia — respeite o `Retry-After` |
+| `429` | — | acima do ritmo permitido para a stack (ver abaixo) — respeite o `Retry-After` |
+| `503` | `model_not_ready` | máquina ainda carregando, ou degradada |
+| `502` | — | a imagem foi gerada mas não foi possível armazená-la (ver abaixo) |
+| `504` | `queue_timeout` | espera na fila excedida |
+
+### 3.9.3. Ritmo de requisições
+
+Geração de imagem **não tem cota diária** — você pode gerar quantas imagens
+quiser. O que existe é um limite de *ritmo*, porque o pod gera uma imagem por
+vez:
+
+| | Valor | O que significa |
+|---|---|---|
+| Vazão sustentada | **12 por minuto** | o ritmo que a stack mantém indefinidamente |
+| Rajada | **4 de uma vez** | quantas cabem simultaneamente antes do `429` |
+
+Os dois limites são **da stack**, não da chave: emitir mais chaves não aumenta a
+capacidade, porque quem gera as imagens é a mesma GPU.
+
+A rajada de 4 é a profundidade da fila do pod. Disparar 10 requisições de uma
+vez não as torna mais rápidas — 4 entram e 6 voltam `429`. Para volume, o padrão
+que funciona é manter até 4 em voo e emendar a próxima quando uma terminar.
+
+O `Retry-After` do `429` diz quantos segundos esperar; com 12/min, um lugar na
+fila se abre a cada 5 segundos.
+
+### 3.9.4. Armazenamento e retenção
+
+Toda imagem gerada é guardada, ligada à conta, à stack e à chave que a criou.
+Isso é feito no servidor e **não muda nada no seu código** — a resposta continua
+sendo `b64_json`.
+
+Duas consequências que valem conhecer:
+
+- **O `200` significa que a imagem foi armazenada.** A gravação acontece antes
+  da resposta sair, e adiciona algumas centenas de milissegundos a uma geração
+  que já leva alguns segundos.
+- **Um `502` pode acontecer com a imagem já gerada.** Se o armazenamento falhar,
+  preferimos o erro explícito a devolver a imagem dizendo que ela ficou
+  guardada. É seguro repetir a requisição — mas note que ela **gera de novo**, e
+  com uma seed nova se você não fixou nenhuma.
+
+**O arquivo é mantido por 30 dias.** Se você precisa da imagem por mais tempo,
+guarde o `b64_json` do seu lado — este armazenamento existe para rastreabilidade
+e para a visualização na plataforma, não como hospedagem permanente.
 
 ---
 
