@@ -19,6 +19,7 @@ from proxy_policy import (
     prepare_proxy_body,
     salt_ident,
     tenant_cache_salt,
+    upstream_content_type_for,
 )
 
 SECRET = "segredo-do-pod"
@@ -238,3 +239,89 @@ def test_corpo_nao_json_passa_com_o_salting_desligado():
         b"nao sou json", "chat/completions", _entry(), salt_enabled=False, secret=SECRET
     )
     assert out == b"nao sou json"
+
+
+# ---------- rotas de imagem (pod de difusão) ----------
+
+
+def test_rotas_de_imagem_estao_na_allowlist():
+    """Sem elas o próprio agent devolve 404 antes de chegar ao servidor de
+    difusão — o pod subiria saudável e não atenderia nada."""
+    assert ALLOWED_V1.get("images/generations") == {"POST"}
+    assert ALLOWED_V1.get("images/edits") == {"POST"}
+
+
+def test_rotas_de_imagem_sao_isentas_de_salt():
+    """Difusão não tem KV cache: não há canal lateral de prefixo para isolar."""
+    assert "images/generations" in SALT_EXEMPT_PATHS
+    assert "images/edits" in SALT_EXEMPT_PATHS
+    assert not (SALTED_PATHS & {"images/generations", "images/edits"})
+
+
+def test_corpo_multipart_atravessa_intacto():
+    """O /v1/images/edits é multipart, e o corpo NÃO pode ser reserializado: as
+    partes são delimitadas pelo boundary declarado no Content-Type, e qualquer
+    reescrita quebraria o parse do outro lado. Este teste fixa o comportamento
+    de que prepare_proxy_body devolve os bytes originais."""
+    raw = (
+        b"--b0undary\r\n"
+        b'Content-Disposition: form-data; name="prompt"\r\n\r\n'
+        b"um gato\r\n"
+        b"--b0undary\r\n"
+        b'Content-Disposition: form-data; name="image[]"; filename="a.png"\r\n'
+        b"Content-Type: image/png\r\n\r\n"
+        b"\x89PNG\r\n\x1a\n\x00\x00\r\n"
+        b"--b0undary--\r\n"
+    )
+    out, is_stream = prepare_proxy_body(
+        raw, "images/edits", _entry(), salt_enabled=True, secret=SECRET
+    )
+    assert out == raw, "corpo multipart foi reescrito — o boundary não sobrevive a isso"
+    assert is_stream is False
+
+
+def test_multipart_nao_recebe_cache_salt_injetado():
+    """Mesmo com o salting ligado no pod, um corpo que não é objeto JSON não
+    pode ganhar campo nenhum."""
+    raw = b"--b\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n--b--\r\n"
+    out, _ = prepare_proxy_body(
+        raw, "images/edits", _entry(), salt_enabled=True, secret=SECRET
+    )
+    assert b"cache_salt" not in out
+
+
+# ---------- normalização do Content-Type de upstream ----------
+
+
+def _ct(raw: str) -> str:
+    return upstream_content_type_for(raw)
+
+
+def test_nao_multipart_e_forcado_para_json():
+    """Comportamento histórico que NÃO pode regredir: cliente que manda corpo
+    JSON declarando text/plain funciona porque o agent corrige o header. Sem
+    isso ele passaria a tomar 422 do vLLM."""
+    for raw in ("application/json", "text/plain", "application/json; charset=utf-8", ""):
+        assert _ct(raw) == "application/json"
+
+
+def test_multipart_preserva_o_boundary():
+    """O boundary é o que delimita as partes — perdê-lo torna o corpo
+    impossível de parsear."""
+    assert _ct("multipart/form-data; boundary=XyZ123") == "multipart/form-data; boundary=XyZ123"
+
+
+def test_multipart_maiusculo_e_normalizado_mas_o_boundary_nao():
+    """Media type é case-insensitive (RFC 9110 §8.3.1), mas o request.form() do
+    Starlette compara com o literal b"multipart/form-data" sem normalizar: um
+    "Multipart/Form-Data" chega intacto e cai no ramo de form VAZIO, e a rota
+    responde missing_image em vez de processar as imagens. Medido no container.
+
+    O boundary tem que sobreviver com o case original — ele É case-sensitive."""
+    assert _ct("Multipart/Form-Data; boundary=XyZ123") == "multipart/form-data; boundary=XyZ123"
+    assert _ct("MULTIPART/FORM-DATA; boundary=AbC") == "multipart/form-data; boundary=AbC"
+
+
+def test_multipart_sem_parametros():
+    assert _ct("multipart/form-data") == "multipart/form-data"
+    assert _ct("  Multipart/Form-Data  ") == "multipart/form-data"

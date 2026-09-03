@@ -10,10 +10,14 @@ import type { TemplatePlan } from "./types"
 
 export const PLAN_BADGE_VARIANT: Record<
   TemplatePlan,
-  "secondary" | "info-light" | "success-light" | "warning-light"
+  "secondary" | "info-light" | "success-light" | "warning-light" | "primary-light"
 > = {
   Go: "secondary",
   Pro: "info-light",
   Max: "success-light",
   Enterprise: "warning-light",
+  // Variante distinta das quatro da escada de LLM de propósito: "Image" é
+  // outra linha de produto, e confundi-la visualmente com um degrau de plano
+  // levaria a suporte errado.
+  Image: "primary-light",
 }

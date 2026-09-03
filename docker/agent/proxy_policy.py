@@ -54,6 +54,12 @@ ALLOWED_V1: dict[str, set[str]] = {
     "embeddings": {"POST"},
     "models": {"GET"},
     "responses": {"POST"},  # Codex CLI (0.59+) só fala essa API
+    # Pod de geração de imagem (docker/image/server.py). O agent é o mesmo
+    # binário nos dois tipos de pod, então estas rotas existem na allowlist
+    # também nos pods de vLLM — lá elas caem no 404 do próprio vLLM, que é o
+    # mesmo status que o cliente já recebia, uma camada acima.
+    "images/generations": {"POST"},
+    "images/edits": {"POST"},  # multipart: image-to-image
 }
 
 # Rotas que aceitam `cache_salt` no corpo (os 3 protocolos generativos do
@@ -62,7 +68,11 @@ ALLOWED_V1: dict[str, set[str]] = {
 # uma allowlist positiva sozinha falharia aberta (endpoint novo entra em
 # ALLOWED_V1, ninguém lembra do salt, e ele passa sem isolamento).
 SALTED_PATHS = frozenset({"chat/completions", "completions", "responses"})
-SALT_EXEMPT_PATHS = frozenset({"embeddings"})
+# images/*: pipeline de difusão não tem KV cache, então não existe canal lateral
+# de prefixo para isolar — o salt não teria nada em que morder. A decisão é
+# registrada aqui (e não pela ausência em SALTED_PATHS) porque é o que o
+# teste-guarda exige: toda rota POST nova tem que estar de um lado ou do outro.
+SALT_EXEMPT_PATHS = frozenset({"embeddings", "images/generations", "images/edits"})
 
 # Prefixo versionado no HMAC: se um dia a granularidade ou o formato do
 # identificador mudar, bumpar isto invalida os salts antigos de uma vez em
@@ -158,6 +168,42 @@ def apply_cache_salt(
 class UnparseableBody(ValueError):
     """Corpo que precisa de salt e não é um objeto JSON. O chamador traduz
     para 400 — deixar passar seria uma request sem salt num pod COM caching."""
+
+
+# ---------------------------------------------------------------------------
+# Content-Type de upstream
+# ---------------------------------------------------------------------------
+
+
+def upstream_content_type_for(client_content_type: str) -> str:
+    """Content-Type a enviar ao servidor de inferência.
+
+    Duas regras, e as duas têm motivo concreto:
+
+    1. Fora do multipart o header é FORÇADO em "application/json", não
+       repassado. Cliente que manda corpo JSON declarando "text/plain"
+       (acontece em HTTP client simples) funciona hoje justamente porque o
+       agent corrige o header aqui — repassar cru passaria a dar 422.
+
+    2. No multipart o header é repassado, porque é nele que viaja o
+       `boundary=...` que delimita as partes — sobrescrevê-lo torna o corpo
+       impossível de parsear. Mas o MEDIA TYPE é normalizado para minúsculas,
+       preservando os parâmetros verbatim.
+
+    O porquê da normalização, que não é teórico: media type é case-insensitive
+    (RFC 9110 §8.3.1), mas o `request.form()` do Starlette compara o valor
+    parseado com o literal b"multipart/form-data" SEM normalizar. Um cliente que
+    mande "Multipart/Form-Data" chega com o header intacto e ainda assim cai no
+    ramo de form VAZIO — a rota responde "missing_image" em vez de processar as
+    imagens. Medido no container.
+
+    O `boundary` NÃO pode ser normalizado: é case-sensitive, e minusculizá-lo
+    quebraria a delimitação das partes.
+    """
+    media_type, sep, params = client_content_type.partition(";")
+    if not media_type.strip().lower().startswith("multipart/"):
+        return "application/json"
+    return media_type.strip().lower() + sep + params
 
 
 def prepare_proxy_body(

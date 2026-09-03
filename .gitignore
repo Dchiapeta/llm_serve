@@ -43,3 +43,6 @@ next-env.d.ts
 # test fixtures (downloaded model artifacts, too large for git)
 /test-lora-adapter
 __pycache__/
+
+# caches de pytest (docker/agent, docker/gateway, docker/image)
+.pytest_cache/

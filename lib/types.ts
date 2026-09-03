@@ -1,10 +1,24 @@
-export type TemplatePlan = "Go" | "Pro" | "Max" | "Enterprise"
+export type TemplatePlan = "Go" | "Pro" | "Max" | "Enterprise" | "Image"
 
+// A ordem é a ESCADA dos planos de LLM — `sortPlans` (lib/crm.ts) ordena pelo
+// índice aqui. "Image" fica no fim porque não é um degrau dessa escada: é outra
+// linha de produto (geração de imagem, pod de difusão), não um Enterprise mais
+// caro.
+//
+// ATENÇÃO: os espelhos Python do gateway (RATE_LIMIT_RPM em main.py,
+// MAX_CLIENTS_BY_PLAN em client_identity.py, os tetos em document_extract.py e
+// document_generate.py) ainda NÃO têm a chave "Image". Todos leem com
+// .get(plan, DEFAULT), então nada quebra — mas o que o gateway aplicaria seriam
+// os defaults, não os números abaixo. Enquanto nenhuma STACK tiver
+// plan='Image' (hoje só o template tem), isso é inconsequente; criar a
+// primeira stack de imagem exige espelhar lá primeiro, senão a UI passa a
+// mentir sobre os limites — mesmo cuidado de BILLING_GRACE_HOURS.
 export const TEMPLATE_PLANS: TemplatePlan[] = [
   "Go",
   "Pro",
   "Max",
   "Enterprise",
+  "Image",
 ]
 
 // Estado de cobrança da stack (migration 0050). Espelha o status da
@@ -33,7 +47,13 @@ export const BILLING_GRACE_HOURS = 72
 // Espelha CLI_BLOCKED_PLANS de docker/gateway/cli_policy.py, que é quem de fato
 // corta (403). Aqui serve para o painel não ENSINAR uma config que o gateway
 // recusa — mesmo cuidado de BILLING_GRACE_HOURS e MAX_CLIENTS_BY_PLAN abaixo.
-export const CLI_BLOCKED_PLANS: TemplatePlan[] = ["Go"]
+// "Image" entra aqui porque um pod de difusão não fala /v1/chat/completions:
+// ensinar Claude Code/Cursor a apontar para ele produziria erro em toda
+// requisição. O espelho em docker/gateway/cli_policy.py ainda não conhece
+// "Image" — nesta direção a divergência é segura (a UI é mais restritiva que o
+// gateway, então não ENSINA uma config que falha), mas precisa ser espelhada
+// antes da primeira stack de imagem.
+export const CLI_BLOCKED_PLANS: TemplatePlan[] = ["Go", "Image"]
 
 // Planos cujo pod é COMPARTILHADO entre tenants (várias stacks/contas no mesmo
 // processo vLLM). Espelha SHARED_POD_PLANS do gateway (docker/gateway/main.py).
@@ -50,6 +70,10 @@ export const RAG_FILE_LIMIT_BY_PLAN: Record<TemplatePlan, number | null> = {
   Pro: 20,
   Max: 50,
   Enterprise: null,
+  // 0 e não null: null aqui significa "sem limite" (Enterprise). Um pod de
+  // difusão não consome base de conhecimento — o upload tem que ficar
+  // indisponível, não ilimitado.
+  Image: 0,
 }
 
 // Quantos LUGARES o plano pode conectar. São duas constantes porque são duas
@@ -69,6 +93,9 @@ export const MAX_KEYS_BY_PLAN: Record<TemplatePlan, number | null> = {
   Pro: 25,
   Max: 50,
   Enterprise: null,
+  // PLACEHOLDER: o plano Image ainda não é vendido e nenhuma stack o usa. O
+  // número definitivo sai junto com o preço, depois do load test.
+  Image: 3,
 }
 
 // ATENÇÃO: espelha MAX_CLIENTS_BY_PLAN de docker/gateway/client_identity.py,
@@ -80,6 +107,10 @@ export const MAX_CLIENTS_BY_PLAN: Record<TemplatePlan, number | null> = {
   Pro: 25,
   Max: 50,
   Enterprise: null,
+  // PLACEHOLDER, junto com MAX_KEYS_BY_PLAN acima. E note que o espelho em
+  // docker/gateway/client_identity.py ainda não conhece "Image": enquanto não
+  // conhecer, quem aplica o teto é o default do gateway, não este número.
+  Image: 5,
 }
 
 // Janela deslizante da vaga de ambiente: um lugar sem uso há mais que isso

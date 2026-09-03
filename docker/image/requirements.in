@@ -1,0 +1,38 @@
+# Dependências DECLARADAS do pod de imagem. Não é o que entra na imagem — o
+# build final instala requirements.lock, que é este arquivo resolvido com todas
+# as transitivas pinadas.
+#
+# Para regerar o lock (ver docker/image/README.md):
+#   docker run --rm --platform linux/amd64 \
+#     pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime@sha256:6acf597eeb8e376a96580dde4952f37cc017fef732bb40bfc73f28f25e3f64b4 \
+#     bash -c "pip install -q -r /dev/stdin && pip freeze" < requirements.in > requirements.lock
+#
+# torch/torchvision NÃO entram aqui: já vêm na imagem base, com a build de CUDA
+# certa. Declará-los faria o pip reinstalar uma wheel genérica de PyPI por cima
+# — 2,5 GB de download e, no pior caso, uma build sem suporte à CUDA da base.
+
+# Flux2KleinPipeline existe a partir da 0.37.0.dev0; a 0.40.0 é a primeira
+# release ESTÁVEL que a contém
+# (src/diffusers/pipelines/flux2/pipeline_flux2_klein.py).
+diffusers==0.40.0
+
+# text_encoder do FLUX.2 Klein é um Qwem3ForCausalLM (ver model_index.json), daí
+# transformers; sentencepiece é do tokenizer.
+transformers
+accelerate
+safetensors
+sentencepiece
+
+# decodificação e reencode das imagens (referências de entrada e PNG de saída)
+pillow
+
+# servidor HTTP. python-multipart é obrigatório para o /v1/images/edits: sem
+# ele o Starlette levanta na leitura do form e a rota devolve 500.
+fastapi
+uvicorn
+python-multipart
+
+# o agent (docker/agent/main.py) roda no mesmo container e importa httpx +
+# pydantic; ver docker/agent/requirements.txt
+httpx
+pydantic

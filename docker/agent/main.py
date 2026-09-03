@@ -29,6 +29,7 @@ from proxy_policy import (
     UnparseableBody,
     merge_key_entry,
     prepare_proxy_body,
+    upstream_content_type_for,
 )
 from usage_norm import SseUsageScanner, usage_from_event
 
@@ -39,6 +40,14 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "")
 # O enforcement real é do painel (emissão de chaves) — aqui é só informativo.
 MAX_USERS = int(os.environ.get("MAX_USERS", "0") or 0)
 VLLM_LOG_FILE = os.environ.get("VLLM_LOG_FILE", "/var/log/vllm.log")
+# Substring procurada em /proc/*/cmdline para saber se o servidor de inferência
+# irmão está vivo (ver _vllm_process_alive). O default é a linha de comando do
+# vLLM; o pod de imagem sobrescreve com o caminho do server.py dele
+# (docker/image/entrypoint.sh). Como é comparada contra bytes, encoda aqui uma
+# vez em vez de a cada processo varrido.
+SERVER_PROCESS_MATCH = os.environ.get(
+    "SERVER_PROCESS_MATCH", "vllm.entrypoints.openai.api_server"
+).encode()
 # diretório local onde adapters LoRA baixados do storage ficam antes do load
 LORA_DIR = os.environ.get("LORA_DIR", "/workspace/loras")
 
@@ -418,8 +427,16 @@ async def root():
 
 
 def _vllm_process_alive() -> bool:
-    # O entrypoint sobe o vLLM como processo irmão; se ele morrer (ex.: OOM
-    # na inicialização), o pod continua RUNNING mas nunca ficará pronto.
+    # O entrypoint sobe o servidor de inferência como processo irmão; se ele
+    # morrer (ex.: OOM na inicialização), o pod continua RUNNING mas nunca
+    # ficará pronto.
+    #
+    # A agulha é configurável porque esta MESMA imagem de agent roda na frente
+    # de dois servidores diferentes: o vLLM (default) e o servidor de difusão
+    # (docker/image/server.py, que exporta SERVER_PROCESS_MATCH no entrypoint).
+    # Com a string do vLLM fixa aqui, um pod de imagem saudável reportaria
+    # vllm_alive=false durante todo o boot e o painel mostraria "Falha" enquanto
+    # ele apenas baixava os pesos.
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -427,7 +444,7 @@ def _vllm_process_alive() -> bool:
             cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
         except OSError:
             continue
-        if b"vllm.entrypoints.openai.api_server" in cmdline:
+        if SERVER_PROCESS_MATCH in cmdline:
             return True
     return False
 
@@ -543,10 +560,25 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
         except UnparseableBody:
             raise HTTPException(status_code=400, detail="corpo inválido (JSON esperado)")
 
+        # Content-Type: repassa o do cliente APENAS quando é multipart.
+        #
+        # O /v1/images/edits do pod de imagem é multipart/form-data, e é nesse
+        # header que viaja o `boundary=...` que delimita as partes —
+        # sobrescrevê-lo por "application/json" torna o corpo impossível de
+        # parsear do outro lado.
+        #
+        # Fora do multipart o header continua FORÇADO em application/json, e não
+        # repassado. Repassar sempre seria uma regressão silenciosa: cliente que
+        # manda corpo JSON declarando "text/plain" (acontece em HTTP client
+        # simples) funciona hoje justamente porque o agent corrige o header
+        # aqui; com o repasse cru ele passaria a tomar 422 do vLLM.
+        client_content_type = request.headers.get("content-type", "")
+        upstream_content_type = upstream_content_type_for(client_content_type)
+
         if is_stream:
             upstream_req = client.build_request(
                 request.method, f"/v1/{path}", content=body,
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": upstream_content_type},
             )
             upstream = await client.send(upstream_req, stream=True)
 
@@ -583,7 +615,7 @@ async def proxy_vllm(path: str, request: Request, authorization: str | None = He
 
         resp = await client.request(
             request.method, f"/v1/{path}", content=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": upstream_content_type},
         )
         concurrent_now -= 1
 
