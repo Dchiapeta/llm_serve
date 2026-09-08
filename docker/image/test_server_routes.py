@@ -18,6 +18,7 @@ Precisa de fastapi + python-multipart:
 
 import io
 import sys
+import time
 import types
 
 import pytest
@@ -637,6 +638,91 @@ def test_metrics_expoe_worker_e_degradacao(client):
     assert "image_consecutive_failures 0" in r.text
 
 
+def test_metrics_sem_cuda_nao_quebra_e_omite_vram(client):
+    """O stub de torch não tem `cuda` — e o /metrics tem que seguir 200.
+
+    Este /metrics é o upstream do /admin/vllm-metrics do agent: uma exceção
+    aqui trocaria uma métrica ausente por 502 na rota administrativa inteira.
+    Métrica de VRAM some, o resto continua."""
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "image_ready" in r.text
+    assert "image_vram" not in r.text
+
+
+def test_metrics_expoe_pico_de_vram_quando_ha_cuda(client, monkeypatch):
+    """Com CUDA presente, o pico de RESERVA aparece — é o número que dimensiona
+    a GPU (o allocated oscila dentro de uma geração e mediria o scrape)."""
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_properties=lambda i: types.SimpleNamespace(total_memory=48 * 1024**3),
+        memory_allocated=lambda: 18 * 1024**3,
+        memory_reserved=lambda: 20 * 1024**3,
+        max_memory_allocated=lambda: 21 * 1024**3,
+        max_memory_reserved=lambda: 23 * 1024**3,
+    )
+    monkeypatch.setattr(server.torch, "cuda", cuda, raising=False)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert f"image_vram_max_reserved_bytes {23 * 1024**3}" in r.text
+    assert f"image_vram_total_bytes {48 * 1024**3}" in r.text
+
+
+def test_metrics_expoe_a_ocupacao_real_do_device(monkeypatch, client):
+    """`mem_get_info` além do allocator: o caching allocator do PyTorch não
+    enxerga o contexto CUDA nem os buffers do cuDNN, que são centenas de MB fora
+    dele. Dimensionar a placa pelo `reserved` subestima, e o erro só apareceria
+    como OOM no boot de uma placa menor."""
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_properties=lambda i: types.SimpleNamespace(total_memory=48 * 1024**3),
+        memory_allocated=lambda: 18 * 1024**3,
+        memory_reserved=lambda: 20 * 1024**3,
+        max_memory_allocated=lambda: 21 * 1024**3,
+        max_memory_reserved=lambda: 23 * 1024**3,
+        mem_get_info=lambda: (25 * 1024**3, 48 * 1024**3),
+    )
+    monkeypatch.setattr(server.torch, "cuda", cuda, raising=False)
+    r = client.get("/metrics")
+    assert f"image_vram_device_used_bytes {23 * 1024**3}" in r.text
+    assert f"image_vram_device_free_bytes {25 * 1024**3}" in r.text
+
+
+def test_metrics_sobrevive_a_torch_sem_mem_get_info(monkeypatch, client):
+    """Build de torch sem a função não pode custar as OUTRAS métricas de VRAM —
+    elas já foram montadas quando a chamada falha."""
+    cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        get_device_properties=lambda i: types.SimpleNamespace(total_memory=48 * 1024**3),
+        memory_allocated=lambda: 1,
+        memory_reserved=lambda: 2,
+        max_memory_allocated=lambda: 3,
+        max_memory_reserved=lambda: 4,
+    )
+    monkeypatch.setattr(server.torch, "cuda", cuda, raising=False)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "image_vram_max_reserved_bytes 4" in r.text
+    assert "image_vram_device_used_bytes" not in r.text
+
+
+def test_metrics_expoe_as_series_por_cenario(monkeypatch, client):
+    """É o que faz um único scrape ao fim do teste de carga responder qual
+    combinação de resolução e nº de referências custa mais — sem ter que
+    sincronizar cada scrape com cada request."""
+    stats = policy.ScenarioStats()
+    stats.record(
+        size="1024x1536",
+        refs=4,
+        timings=policy.Timings(gpu_s=9.0, worker_s=12.0),
+        vram_peak_bytes=23 * 1024**3,
+    )
+    monkeypatch.setattr(server, "STATS", stats)
+    r = client.get("/metrics")
+    assert 'image_gpu_seconds_sum{size="1024x1536",refs="4"} 9.0000' in r.text
+    assert f'image_vram_peak_bytes{{size="1024x1536",refs="4"}} {23 * 1024**3}' in r.text
+
+
 # ---------------------------------------------------------------------------
 # multipart: teto imposto no parser
 # ---------------------------------------------------------------------------
@@ -703,3 +789,78 @@ def test_meta_nao_desloca_o_contrato_de_data(client):
     # precisa continuar exatamente como estava
     r = client.post("/v1/images/generations", json={"prompt": "um gato"})
     assert r.json()["data"] == [{"b64_json": "QUlP"}]
+
+
+# ---------------------------------------------------------------------------
+# meta.timings: o custo por fase
+#
+# Existe porque a medida de PONTA A PONTA soma coisas de donos diferentes —
+# upload das referências, espera na fila, GPU, encode, e ainda o upload ao
+# bucket que o gateway faz antes de responder. Com um número só não dá para
+# dizer se um `edits` com 4 referências de 14 MiB é lento por causa do modelo
+# ou da rede, que é exatamente a decisão pendente sobre o teto de arquivo.
+# ---------------------------------------------------------------------------
+
+
+def test_meta_traz_o_bloco_de_timings_com_as_chaves_estaveis(client):
+    r = client.post("/v1/images/generations", json={"prompt": "um gato"})
+    assert r.status_code == 200, r.text
+    timings = r.json()["meta"]["timings"]
+    assert set(timings) == {"queue_wait_s", "decode_s", "gpu_s", "encode_s", "worker_s"}
+    # a fila é real neste fixture (só o worker é falso), então a espera é o
+    # campo que tem valor de verdade aqui
+    assert timings["queue_wait_s"] is not None and timings["queue_wait_s"] >= 0
+
+
+def test_run_cronometra_cada_fase_e_registra_o_cenario(monkeypatch):
+    """Testa `_run` direto, e não pela rota: o fixture `client` troca o worker
+    por um falso, que é justamente a parte cronometrada aqui."""
+
+    class _PipeLento:
+        def __call__(self, **kwargs):
+            time.sleep(0.02)
+            return types.SimpleNamespace(images=[Image.new("RGB", (8, 8))])
+
+    stats = policy.ScenarioStats()
+    monkeypatch.setattr(server, "PIPE", _PipeLento())
+    monkeypatch.setattr(server, "STATS", stats)
+
+    payload = server.GenPayload(
+        prompt="um gato",
+        width=1024,
+        height=1024,
+        steps=4,
+        guidance_scale=1.0,
+        n=1,
+        seed=7,
+        references=[PNG_BYTES],
+    )
+    saida = server._run(payload)
+    assert len(saida) == 1
+
+    t = payload.timings
+    assert t.gpu_s >= 0.02
+    assert t.decode_s is not None and t.encode_s is not None
+    # worker_s ENGLOBA as três: se um dia deixar de englobar, a decomposição do
+    # relatório passa a não fechar e ninguém percebe olhando um número só
+    assert t.worker_s >= t.decode_s + t.gpu_s + t.encode_s
+
+    texto = "\n".join(stats.prometheus_lines())
+    assert 'image_scenario_generations_total{size="1024x1024",refs="1"} 1' in texto
+
+
+def test_run_sem_cuda_nao_quebra_a_geracao(monkeypatch):
+    """Sob os stubs não existe `torch.cuda`. Medir VRAM é acessório: uma falha
+    ali não pode derrubar a geração, que é o produto."""
+
+    class _Pipe:
+        def __call__(self, **kwargs):
+            return types.SimpleNamespace(images=[Image.new("RGB", (8, 8))])
+
+    monkeypatch.setattr(server, "PIPE", _Pipe())
+    monkeypatch.setattr(server, "STATS", policy.ScenarioStats())
+    payload = server.GenPayload(
+        prompt="x", width=1024, height=1024, steps=4, guidance_scale=1.0, n=1, seed=1
+    )
+    assert len(server._run(payload)) == 1
+    assert payload.timings.gpu_s is not None

@@ -1,6 +1,6 @@
 # Pod de geração de imagem — FLUX.2 Klein 4B
 
-Imagem: `dchiapeta/diffusers-agent:flux2-klein-4b-0.1.2`
+Imagem: `dchiapeta/diffusers-agent:flux2-klein-4b-0.1.3`
 
 Ocupa o mesmo lugar arquitetural do pod de vLLM, trocando só o processo de
 inferência:
@@ -40,10 +40,10 @@ cd docker/image && ./lock-deps.sh
 # 2. build + push, com contexto em docker/
 cd docker
 docker buildx build -f image/Dockerfile --platform linux/amd64 \
-  -t dchiapeta/diffusers-agent:flux2-klein-4b-0.1.2 --push .
+  -t dchiapeta/diffusers-agent:flux2-klein-4b-0.1.3 --push .
 
 # 3. registrar o digest produzido, abaixo
-docker buildx imagetools inspect dchiapeta/diffusers-agent:flux2-klein-4b-0.1.2
+docker buildx imagetools inspect dchiapeta/diffusers-agent:flux2-klein-4b-0.1.3
 ```
 
 **A tag nunca é re-pushada.** Mudança de conteúdo é a versão seguinte. É isso
@@ -57,7 +57,8 @@ imagem pré-tool-calling.
 |---|---|
 | `flux2-klein-4b-0.1.0` | **NÃO USAR.** Publicada antes da revisão. Devolve 500 (em vez de 400) para qualquer campo escalar com tipo errado; a admissão da fila é furável por handler cancelado (`CancelledError` não tratado — medido: `capacity=2` admitindo 21 gerações); `stop()` no meio de uma geração pendura a request para sempre; worker morto responde 504 indefinidamente com `/health` em 200; sem degradação pós-boot; sem teto de multipart no parser; recusa o `model` que o `pin_model` do gateway fixaria. |
 | `flux2-klein-4b-0.1.1` | Todas as correções da 0.1.0, cada uma com teste. Não devolve o bloco `meta`, e sorteia a seed dentro do torch — uma geração sem `seed` explícita não é reproduzível, e o registro em `image_generations` nasce com `prompt`/parâmetros nulos no `edits`. |
-| `flux2-klein-4b-0.1.2` | Atual. `meta` na resposta (prompt, dimensões, steps, guidance, model) e `ensure_seed` sorteando no nível da policy, para que a seed gravada seja a realmente usada. Traz também o teto de corpo por rota do agent (`read_body_capped`), que fecha o pod para corpo sem `Content-Length`. |
+| `flux2-klein-4b-0.1.2` | `meta` na resposta (prompt, dimensões, steps, guidance, model) e `ensure_seed` sorteando no nível da policy, para que a seed gravada seja a realmente usada. Traz também o teto de corpo por rota do agent (`read_body_capped`), que fecha o pod para corpo sem `Content-Length`. Não mede nada: sem tempo por fase e sem leitura de VRAM, dimensionar a GPU e o rate limit era estimativa. |
+| `flux2-klein-4b-0.1.3` | Atual. **Instrumentação.** `meta.timings` com o tempo de cada fase (fila, decode, GPU, encode), métricas de VRAM no `/metrics` (incluindo a ocupação real do device, que o allocator do PyTorch não enxerga) e agregação por cenário `(resolução, nº de referências)`. Nenhuma mudança de comportamento na geração. |
 
 A `0.1.0` fica no registry de propósito, e não é deletada: apagá-la faria a
 referência a ela em qualquer log ou anotação antiga virar um mistério, em vez de
@@ -84,6 +85,18 @@ Duas particularidades da base, descobertas construindo:
   gerenciado pelo apt é tocado.
 
 ### Digest da imagem produzida
+
+`flux2-klein-4b-0.1.3`, publicada em 08/09/2026:
+
+```
+índice OCI   sha256:1bfe810736bc9685837f588bc248f7ebe7fc2851bf9dd8913d0d91dd991d15a5
+linux/amd64  sha256:9c3fcb6c2d2b2f8da3920e257c9df3c5697ec52b2595796c72d475ba346c0c8c
+```
+
+Traz o `attestation-manifest` (`sha256:f6bc10f0...`) como a 0.1.2. Conferido no
+registry que a tag serve mesmo o código novo (`ScenarioStats` em `policy.py`,
+`mem_get_info` em `server.py`) — a tag existir não diz nada sobre o conteúdo,
+que é a lição da 0.1.0.
 
 `flux2-klein-4b-0.1.2`, publicada em 03/09/2026:
 
@@ -115,8 +128,8 @@ Para verificar que uma tag publicada tem o que se espera, sem subir GPU:
 
 ```bash
 docker run --rm --platform linux/amd64 --entrypoint bash \
-  dchiapeta/diffusers-agent:flux2-klein-4b-0.1.2 -c \
-  'cd /opt/agent && grep -l WorkerStopped policy.py && grep -l MODEL_ALIASES server.py'
+  dchiapeta/diffusers-agent:flux2-klein-4b-0.1.3 -c \
+  'cd /opt/agent && grep -l ScenarioStats policy.py && grep -l mem_get_info server.py'
 ```
 
 ### Por que o lock é um delta
@@ -196,7 +209,9 @@ com os parâmetros **efetivos** da geração:
   "meta": {
     "prompt": "um gato", "width": 1024, "height": 1024,
     "steps": 4, "guidance_scale": 1.0, "seed": 8151..., "n": 1,
-    "model": "flux2-klein-4b"
+    "model": "flux2-klein-4b",
+    "timings": { "queue_wait_s": 0.01, "decode_s": 0.0, "gpu_s": 4.10,
+                 "encode_s": 0.18, "worker_s": 4.28 }
   }
 }
 ```
@@ -207,6 +222,9 @@ saiu. Duas coisas ele não teria como descobrir sozinho — a `seed`, sorteada a
 quando o cliente não manda nenhuma (`policy.ensure_seed`), e, em
 `/v1/images/edits`, *todos* os campos: lá o corpo é multipart repassado em
 streaming, e o gateway nunca o parseia.
+
+O `timings` é a exceção dentro do `meta`: ele não descreve a imagem, mede o
+custo dela, e chegou na `0.1.3` — ver "Medição" abaixo.
 
 A seed é do **batch**, não de cada imagem: com `n > 1` o pipeline consome de um
 único generator, então reproduzir a imagem *i* exige a mesma seed **e** o mesmo
@@ -349,6 +367,81 @@ Do `env` do template (ver `scripts/_tmp-create-image-template.mjs`):
 única task consumidora), não configurável. Uma env com esse nome seria pior que
 nenhuma: pareceria o botão de paralelismo e não faria nada.
 
+## Medição: tempo por fase e VRAM
+
+Existe porque cronometrar de fora não responde as perguntas que decidem o
+produto. Uma medida de ponta a ponta soma coisas de donos diferentes — upload
+das referências, espera na fila, GPU, encode, e ainda o upload ao bucket que o
+gateway faz antes de responder —, então com ela não dá para dizer se um `edits`
+com 4 referências de 14 MiB é lento por causa do modelo ou da rede. E até a
+`0.1.2` não havia **nenhuma** leitura de VRAM: nem `/metrics`, nem `/admin/*`,
+nem a API do RunPod (que só devolve `memoryUtilPercent`, utilização do
+controlador, e dá 0 com a GPU parada), nem SSH (a imagem não roda sshd). A GPU
+era escolhida pelos ~16 GB de pesos medidos no HF, sem saber o pico de ativação
+de resolução nenhuma.
+
+### Na resposta: `meta.timings`
+
+```json
+"timings": {
+  "queue_wait_s": 0.01,
+  "decode_s": 0.42,
+  "gpu_s": 4.10,
+  "encode_s": 0.18,
+  "worker_s": 4.70
+}
+```
+
+As chaves são sempre as cinco, com `null` na fase que não aconteceu — chave
+ausente e chave nula são indistinguíveis para quem lê o relatório, e a diferença
+importa (fase que não rodou vs pod que não mede). `worker_s` engloba
+`decode + gpu + encode`; a fila é o único tempo que ele **não** contém, porque
+não é custo do trabalho e sim de outro cliente estar na frente.
+
+4 casas decimais porque o `decode_s` de uma referência de 18 KiB é da ordem de
+1e-3: em 2 casas ele viraria 0.0, apagando justamente o contraste com os 14 MiB.
+
+Campo extra não quebra cliente OpenAI, e o gateway repassa o corpo do pod byte a
+byte (`image_gen._pod_meta` lê só as chaves que conhece). **VRAM não entra
+aqui** — é número de dimensionamento nosso, não do requisitante.
+
+### No `/metrics`: VRAM e agregado por cenário
+
+| Métrica | Para quê |
+|---|---|
+| `image_vram_max_reserved_bytes` | pico de reserva desde o boot — **é o que dimensiona a GPU** |
+| `image_vram_device_used_bytes` | ocupação REAL do device (`total - free`) |
+| `image_vram_{allocated,reserved}_bytes` | instantâneo do allocator |
+| `image_gpu_seconds_sum{size,refs}` | tempo somado por cenário (idem decode/encode/fila/worker) |
+| `image_scenario_generations_total{size,refs}` | denominador das médias acima |
+| `image_vram_peak_bytes{size,refs}` | maior pico já visto **naquele** cenário |
+
+Duas escolhas que parecem detalhe e não são:
+
+- **`device_used` além de `reserved`.** O caching allocator do PyTorch não
+  enxerga o contexto CUDA nem os buffers do cuDNN, que são centenas de MB fora
+  dele. Responder "cabe numa placa de 24 GB?" pelo `reserved` subestima, e o
+  erro só apareceria como OOM no boot da placa menor.
+- **Pico por cenário, e não só global.** `_run` reseta o pico do allocator a
+  cada geração para poder atribuí-lo à combinação certa; um acumulador em Python
+  preserva o high-water global apesar dos resets. Isso só é correto porque a
+  serialização é **estrutural** (uma task consumidora): com duas gerações
+  concorrentes, o reset de uma apagaria o pico da outra.
+
+Cada geração também deixa uma linha no log do pod (`/admin/logs`), que responde
+"quanto custou ESTA geração" — o agregado, sendo soma, não responde.
+
+Como ler, sem subir nada além do que já está de pé:
+
+```bash
+curl -s -H "X-Admin-Secret: $AGENT_ADMIN_SECRET" \
+  https://<pod>-8000.proxy.runpod.net/admin/vllm-metrics | python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["metrics"])'
+```
+
+O `scripts/loadtest_image.py` faz esse scrape sozinho (`--admin-url`,
+`--admin-secret`) e imprime o pico por cenário no fim do teste.
+
 ## Testes
 
 ```bash
@@ -418,7 +511,10 @@ ou mande o nome servido.
   então `gateway_requests.tokens_in/out` e `usage_metrics` ficam nulos — e
   `check_token_quota` fica cega para este workload. Os freios reais são
   `RATE_LIMIT_RPM` (12/min por stack, com rajada de 4) e `check_concurrency`. A tabela
-  `image_generations` é o contador que uma cota por imagem usaria.
+  `image_generations` é o contador que uma cota por imagem usaria. Os 12/min
+  foram derivados de "~5 s por geração", estimativa que as medições posteriores
+  contradizem — `scripts/loadtest_image.py` mede a vazão real, que é de onde
+  esse número deveria sair.
 - **Volume não sobrevive à recriação do pod.** `CreatePodInput`
   (`lib/runpod.ts`) não expõe Network Volume, então `recreateMachine` rebaixa os
   16 GB. Stop/start (auto-pausa) preserva.

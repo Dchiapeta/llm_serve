@@ -171,6 +171,90 @@ Descobertas rodando o teste do plano Pro pela primeira vez — evitar repetir:
    cada chunk reseta o timer). Sem `stream: true`, a resposta inteira
    chega de uma vez, e qualquer tarefa acima de 60s de geração falha ali.
 
+## Plano Image (geração de imagem), que é outro teste
+
+O pod de difusão não fala tokens, não faz streaming e serializa a GPU numa fila
+de um consumidor — nada da metodologia acima se aplica diretamente, e o script é
+outro: `scripts/loadtest_image.py`. O que se mantém é o essencial: sempre pelo
+gateway, erro classificado por fase, e retry só no que não chegou a sair.
+
+### O que muda, e por quê
+
+- **A unidade de comparação é o CENÁRIO**, não o nível de concorrência. Um
+  cenário é `(resolução, nº de referências, tamanho de cada referência)`, e o
+  custo varia mais entre cenários do que entre níveis: `refs=0` é
+  `/v1/images/generations` (JSON, upload desprezível) e `refs>0` é
+  `/v1/images/edits` (multipart, até dezenas de MiB por request).
+- **Concorrência é medida contra `IMAGE_QUEUE_CAPACITY`** (4 no template
+  atual), que é o total EM VOO. Um nível acima dele existe para medir o 429, não
+  para medir vazão — e o script recusa calcular img/min nesse caso, porque uma
+  recusa volta em milissegundos e infla a vazão sem ter entregue imagem nenhuma.
+- **429 e 504 não são erro.** São a fila funcionando, e a contagem deles é o
+  dado de capacidade que o teste veio buscar. O relatório os conta separados de
+  falha de transporte.
+- **Timeout de leitura NUNCA é retentado** (ao contrário do teste de chat): uma
+  request de imagem que não respondeu pode estar com a GPU ocupada gerando, e
+  retentar dobraria a carga real — o relatório mediria um teste diferente do que
+  diz medir.
+
+### Como rodar
+
+```bash
+pip install httpx pillow
+
+# 1. sempre primeiro: mostra a matriz e o total de requests sem enviar nada
+python3 scripts/loadtest_image.py --dry-run \
+  --sizes 1024x1024,1024x1536 --refs 0,1,4 --ref-bytes 18k,14m --levels 1,2,4,8
+
+# 2. o teste
+python3 scripts/loadtest_image.py \
+  --base-url https://api.trystac.com \
+  --api-key <chave HEX da stack Image> \
+  --model flux2-klein-4b \
+  --sizes 1024x1024,1024x1536 --refs 0,1,4 --ref-bytes 18k,14m --levels 1,2,4,8 \
+  --admin-url https://<pod>-8000.proxy.runpod.net \
+  --admin-secret <AGENT_ADMIN_SECRET da máquina> \
+  --out image_loadtest.json
+```
+
+O `--dry-run` não é opcional na prática: a matriz completa acima são **300
+requests**, e a 5-20 s cada isso é mais de uma hora de GPU. Corte pelos eixos
+que a pergunta do dia não usa.
+
+`--admin-url`/`--admin-secret` fazem o scrape do `/admin/vllm-metrics` antes e
+depois, e é ele que traz a VRAM. Sem eles o teste roda, mas não responde a
+pergunta da GPU. Bater no `/admin/*` direto no pod é seguro: é rota
+administrativa, não gera carga, e o TRÁFEGO continua indo pelo gateway — que é
+o que mantém `last_activity_at` fresco e impede a auto-pausa no meio do teste
+(armadilha 1).
+
+### Métricas a reportar
+
+- **Por cenário**: n, ok, 429, `total_s` p50/p95, `gpu_s` p50, `decode_s` p50 e
+  `overhead_s` p50. O script imprime essa tabela no fim.
+- **Onde o tempo foi**: `gpu_s` vem do pod (`meta.timings`), e `overhead_s` é o
+  que sobra do tempo do cliente. Cuidado ao nomear: além de upload e download,
+  `overhead_s` contém o upload ao bucket e o insert em `image_generations`, que
+  o gateway faz **antes** de responder. Não é "rede".
+- **Custo do teto de arquivo**: o mesmo cenário com `18k` e com `14m` isola os
+  segundos que são só transferência. É o número que decide
+  `IMAGE_MAX_FILE_SIZE_MB`.
+- **Vazão sustentada** (img/min) no maior nível SEM recusa. É de onde
+  `RATE_LIMIT_RPM["Image"]` deveria sair — os 12/min atuais foram derivados de
+  uma estimativa de "~5 s por geração".
+- **VRAM**: `image_vram_device_used_bytes` e o `image_vram_peak_bytes` por
+  cenário. É o que decide se a placa pode ser menor que a A40.
+
+Dois avisos que o script emite e que invalidam o relatório se ignorados:
+`meta.timings` ausente (a máquina está numa imagem anterior à `0.1.3`, e as
+colunas de fase estão vazias por isso, não por serem rápidas) e `overhead_s`
+negativo (o pod reportou mais tempo do que o cliente mediu, o que é impossível
+num pod íntegro).
+
+Uma nota de custo lateral: cada geração é persistida no bucket pelo gateway com
+`expires_at` de 30 dias. Uma matriz completa grava algumas centenas de imagens
+de ~1,7 MB; o reaper as recolhe sozinho.
+
 ## Testes de hardening (verificar que os controles barram o esperado)
 
 Diferente da metodologia acima (que mede desempenho sob carga legítima),

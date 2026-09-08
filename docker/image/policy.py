@@ -23,6 +23,8 @@ coisa que dá para abortar sem deixar a GPU num estado desconhecido.
 
 import asyncio
 import random
+import time
+from dataclasses import dataclass
 
 # Formatos de entrada aceitos, detectados por magic bytes e não pela extensão
 # nem pelo content-type do multipart — os dois são declarados pelo cliente. A
@@ -347,6 +349,172 @@ def collect_reference_names(field_names: list[str], *, maximum: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cronometragem
+# ---------------------------------------------------------------------------
+#
+# Por que existe: até aqui, TUDO o que se sabia sobre o custo de uma geração
+# vinha de cronometrar do lado de fora — e a medida de fora soma coisas com
+# donos diferentes (upload das referências, fila, GPU, encode, e ainda o upload
+# ao bucket que o gateway faz antes de responder). Com um número só não dá para
+# responder a pergunta que decide o produto: um `edits` com 4 referências de
+# 14 MiB é lento por causa do MODELO ou por causa dos 56 MiB subindo pela rede?
+#
+# As quatro fases abaixo têm donos distintos, e é por isso que são separadas:
+#
+#   queue_wait_s  espera por causa de OUTRO cliente — não é custo do trabalho
+#   decode_s      CPU/PIL; é a fase que o teto de IMAGE_MAX_FILE_SIZE_MB infla
+#   gpu_s         o único número que fala do modelo, e o que dimensiona a GPU
+#   encode_s      PNG + base64 de uma 1024², que não é de graça
+
+
+@dataclass
+class Timings:
+    """Tempo de cada fase de UMA geração, em segundos.
+
+    Mora em `policy` e não em `server` porque a fila (que é daqui) preenche o
+    `queue_wait_s`, e porque assim o agregador abaixo é testável sem torch.
+
+    Todos os campos são opcionais: uma request que morre antes de uma fase tem
+    None ali, e None é a informação correta — 0.0 diria "mediu e deu zero".
+    """
+
+    queue_wait_s: float | None = None
+    decode_s: float | None = None
+    gpu_s: float | None = None
+    encode_s: float | None = None
+    worker_s: float | None = None
+
+    def as_meta(self) -> dict[str, float | None]:
+        """Bloco para o `meta` da resposta. Chaves SEMPRE presentes.
+
+        Chave ausente e chave nula são a mesma coisa para um consumidor
+        distraído, e não são: quem lê o relatório precisa distinguir "esta fase
+        não aconteceu" de "esta versão do pod não mede". Com o conjunto de
+        chaves fixo, a segunda pergunta se responde pela ausência do bloco
+        inteiro.
+
+        4 casas: o `decode_s` de uma referência de 18 KiB é da ordem de 1e-3, e
+        arredondar em 2 casas o transformaria em 0.0 — apagando justamente o
+        contraste com os 14 MiB que motivou a medição.
+        """
+        return {
+            k: (round(v, 4) if v is not None else None)
+            for k, v in (
+                ("queue_wait_s", self.queue_wait_s),
+                ("decode_s", self.decode_s),
+                ("gpu_s", self.gpu_s),
+                ("encode_s", self.encode_s),
+                ("worker_s", self.worker_s),
+            )
+        }
+
+
+# Teto de séries do agregador. Por construção não é alcançável hoje: `size` sai
+# de uma allowlist fechada (3 valores) e `refs` tem teto em
+# IMAGE_MAX_REFERENCE_IMAGES (4), o que dá 15 combinações. O teto existe para o
+# dia em que a allowlist crescer sem ninguém lembrar deste arquivo — uma
+# resolução por request transformaria o /metrics num vazamento de memória lento
+# e num corpo de resposta ilimitado.
+MAX_SCENARIO_SERIES = 32
+
+
+class ScenarioStats:
+    """Acumula tempo e pico de VRAM por (resolução, nº de referências).
+
+    Agregar POR CENÁRIO, e não só globalmente, é o que faz um único scrape ao
+    fim do teste de carga responder "qual combinação pede mais VRAM e mais GPU".
+    A alternativa era sincronizar cada scrape com cada request, que não dá para
+    fazer sem serializar o teste inteiro.
+
+    Emite `_sum` por fase com um `_count` ÚNICO por cenário, em vez de um par
+    sum/count por fase. As cinco fases pertencem à mesma geração, então os cinco
+    counts seriam sempre o mesmo número — cinco vezes mais linhas para dizer a
+    mesma coisa. Uma média continua sendo `_sum / generations_total`.
+    """
+
+    def __init__(self, max_series: int = MAX_SCENARIO_SERIES):
+        self._max_series = max_series
+        # chave -> acumuladores. dict comum: só a task consumidora escreve aqui
+        # (uma geração por vez, por construção da fila) e o /metrics só lê.
+        self._series: dict[tuple[str, int], dict[str, float]] = {}
+        self.dropped_series = 0
+
+    def record(
+        self,
+        *,
+        size: str,
+        refs: int,
+        timings: Timings,
+        vram_peak_bytes: int | None = None,
+    ) -> None:
+        key = (size, refs)
+        entry = self._series.get(key)
+        if entry is None:
+            if len(self._series) >= self._max_series:
+                # Contado, não silencioso: uma média que ignora metade dos
+                # cenários é pior que uma média ausente, e este contador é o que
+                # denuncia isso no próprio /metrics.
+                self.dropped_series += 1
+                return
+            entry = {
+                "generations": 0.0,
+                "queue_wait_s": 0.0,
+                "decode_s": 0.0,
+                "gpu_s": 0.0,
+                "encode_s": 0.0,
+                "worker_s": 0.0,
+                "vram_peak_bytes": 0.0,
+            }
+            self._series[key] = entry
+
+        entry["generations"] += 1
+        for field in ("queue_wait_s", "decode_s", "gpu_s", "encode_s", "worker_s"):
+            value = getattr(timings, field)
+            if value is not None:
+                entry[field] += value
+        if vram_peak_bytes is not None:
+            # MÁXIMO e não soma: VRAM não se acumula entre gerações (o allocator
+            # reaproveita), então somar produziria um número sem significado
+            # físico. O que dimensiona a placa é o pior caso já visto.
+            entry["vram_peak_bytes"] = max(entry["vram_peak_bytes"], float(vram_peak_bytes))
+
+    def prometheus_lines(self) -> list[str]:
+        """Texto no formato do /metrics, HELP/TYPE uma vez por métrica."""
+        lines: list[str] = []
+        if self.dropped_series:
+            lines += [
+                "# HELP image_scenario_series_dropped_total Cenários ignorados por exceder o teto de séries",
+                "# TYPE image_scenario_series_dropped_total counter",
+                f"image_scenario_series_dropped_total {self.dropped_series}",
+            ]
+        if not self._series:
+            return lines
+
+        # ordenado para que dois scrapes seguidos sejam diffáveis — sem isso, a
+        # ordem do dict faz o diff acusar mudança onde só houve reordenação.
+        keys = sorted(self._series)
+        metrics: tuple[tuple[str, str, str, str], ...] = (
+            ("image_scenario_generations_total", "generations", "counter", "Gerações concluídas neste cenário"),
+            ("image_queue_wait_seconds_sum", "queue_wait_s", "counter", "Tempo somado de espera na fila"),
+            ("image_decode_seconds_sum", "decode_s", "counter", "Tempo somado decodificando referências (CPU)"),
+            ("image_gpu_seconds_sum", "gpu_s", "counter", "Tempo somado dentro do pipeline (GPU)"),
+            ("image_encode_seconds_sum", "encode_s", "counter", "Tempo somado codificando a saída (CPU)"),
+            ("image_worker_seconds_sum", "worker_s", "counter", "Tempo somado dentro do worker (decode+gpu+encode)"),
+            ("image_vram_peak_bytes", "vram_peak_bytes", "gauge", "Maior pico de reserva de VRAM já visto neste cenário"),
+        )
+        for name, field, kind, help_text in metrics:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} {kind}")
+            for size, refs in keys:
+                value = self._series[(size, refs)][field]
+                # inteiro sem casa decimal onde o valor É inteiro (contagem,
+                # bytes): "22887628800.0" num campo de bytes só atrapalha quem lê
+                rendered = f"{value:.4f}" if field.endswith("_s") else f"{int(value)}"
+                lines.append(f'{name}{{size="{size}",refs="{refs}"}} {rendered}')
+        return lines
+
+
+# ---------------------------------------------------------------------------
 # Fila de geração
 # ---------------------------------------------------------------------------
 
@@ -371,7 +539,7 @@ class WorkerStopped(Exception):
 
 
 class Job:
-    __slots__ = ("payload", "started", "future", "cancelled")
+    __slots__ = ("payload", "started", "future", "cancelled", "queued_at")
 
     def __init__(self, payload, loop: asyncio.AbstractEventLoop):
         self.payload = payload
@@ -380,6 +548,9 @@ class Job:
         self.started = asyncio.Event()
         self.future: asyncio.Future = loop.create_future()
         self.cancelled = False
+        # monotonic e não time(): o relógio de parede pode andar para trás (NTP)
+        # e produzir uma espera negativa no meio do relatório.
+        self.queued_at = time.monotonic()
 
 
 def _swallow_orphan_exception(fut: asyncio.Future) -> None:
@@ -551,6 +722,17 @@ class GenerationQueue:
                 if job.cancelled:
                     # Desistiu enquanto esperava: a GPU nunca foi tocada.
                     continue
+                # Espera na fila, anotada no payload ANTES do started.set() —
+                # depois dele o handler volta a correr e já pode ler o campo.
+                #
+                # getattr e não payload.timings: a fila é genérica (recebe um
+                # callable e um payload opaco) e os testes dela passam strings e
+                # listas. Exigir o atributo acoplaria a serialização da GPU ao
+                # formato do payload do server, que é justamente o que manter a
+                # fila neste módulo puro evita.
+                timings = getattr(job.payload, "timings", None)
+                if timings is not None:
+                    timings.queue_wait_s = time.monotonic() - job.queued_at
                 job.started.set()
                 self._running += 1
                 if self._running > 1:  # pragma: no cover - invariante

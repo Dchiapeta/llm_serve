@@ -134,6 +134,17 @@ DEGRADED: str | None = None
 CONSECUTIVE_FAILURES = 0
 DEGRADED_AFTER_FAILURES = int(os.environ.get("IMAGE_DEGRADED_AFTER_FAILURES", "3"))
 
+# Tempo e VRAM por (resolução, nº de referências). Escrito só pela thread do
+# worker (uma geração por vez) e lido pelo /metrics.
+STATS = policy.ScenarioStats()
+
+# High-water mark de reserva de VRAM do processo inteiro.
+#
+# Existe em Python, e não como leitura direta do torch, porque _run reseta o
+# pico do allocator a cada geração para poder atribuí-lo ao cenário certo — sem
+# este acumulador, o "pico desde o boot" viraria "pico da última geração".
+PEAK_RESERVED_BYTES = 0
+
 
 @dataclass
 class GenPayload:
@@ -151,6 +162,11 @@ class GenPayload:
     # loop — 4 referências de 15 MB são trabalho de CPU suficiente para
     # travar o /health se fosse feito aqui.
     references: list[bytes] = field(default_factory=list)
+    # Preenchido em DOIS lugares: `queue_wait_s` pela fila (policy.py, no
+    # momento em que o worker pega o job) e o resto por _run. É o payload que
+    # os carrega porque ele é a única coisa que atravessa os dois — a fila
+    # devolve o resultado da geração, não um par (resultado, medições).
+    timings: policy.Timings = field(default_factory=policy.Timings)
 
 
 def _decode_reference(data: bytes) -> Image.Image:
@@ -178,16 +194,83 @@ def _encode_output(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _cuda():
+    """`torch.cuda` utilizável, ou None.
+
+    Guard centralizado porque as três leituras de VRAM falham do mesmo jeito e
+    por motivos diferentes: num container sem GPU (o smoke test do README) o
+    atributo existe e `is_available()` é False; sob os stubs dos testes o
+    atributo `cuda` nem existe.
+
+    Silencioso de propósito: é chamado a cada geração, e um log por chamada
+    encheria o arquivo que o /admin/logs serve com a mesma linha.
+    """
+    try:
+        cuda = getattr(torch, "cuda", None)
+        return cuda if cuda is not None and cuda.is_available() else None
+    except Exception:  # noqa: BLE001 - qualquer falha aqui é "sem métrica"
+        return None
+
+
+def _reset_vram_peak() -> None:
+    """Zera o pico do allocator para a geração que vai começar.
+
+    Só é correto porque a serialização é ESTRUTURAL (uma task consumidora, ver
+    policy.GenerationQueue): com duas gerações concorrentes, o reset de uma
+    apagaria o pico da outra e o cenário mais caro apareceria barato.
+    """
+    cuda = _cuda()
+    if cuda is None:
+        return
+    try:
+        cuda.reset_peak_memory_stats()
+    except Exception as e:  # noqa: BLE001 - medir não pode derrubar gerar
+        log(f"reset do pico de VRAM falhou: {e}")
+
+
+def _vram_peak_bytes() -> int | None:
+    """Pico de RESERVA desde o último reset, e atualiza o high-water global.
+
+    Reserva e não `memory_allocated`: quem dimensiona a placa precisa do que o
+    allocator pediu ao driver — a memória que a GPU tem de ter LIVRE —, não dos
+    tensores vivos num instante, que oscilam dentro da própria geração.
+    """
+    global PEAK_RESERVED_BYTES
+    cuda = _cuda()
+    if cuda is None:
+        return None
+    try:
+        peak = int(cuda.max_memory_reserved())
+    except Exception as e:  # noqa: BLE001 - ver _reset_vram_peak
+        log(f"leitura do pico de VRAM falhou: {e}")
+        return None
+    PEAK_RESERVED_BYTES = max(PEAK_RESERVED_BYTES, peak)
+    return peak
+
+
 def _run(payload: GenPayload) -> list[str]:
-    """Geração. SÍNCRONA e sempre executada em to_thread pela GenerationQueue."""
+    """Geração. SÍNCRONA e sempre executada em to_thread pela GenerationQueue.
+
+    Cronometra as três fases que acontecem aqui e mede o pico de VRAM da
+    geração. Nada disso precisa de lock apesar de rodar numa thread: existe UMA
+    task consumidora, então duas gerações nunca se sobrepõem (é a mesma
+    invariante que a fila existe para garantir, ver policy.GenerationQueue).
+    """
     assert PIPE is not None
+    t = payload.timings
+    worker_started = time.monotonic()
+
+    started = time.monotonic()
     references = [_decode_reference(d) for d in payload.references]
+    t.decode_s = time.monotonic() - started
 
     # sempre com generator explícito: a seed já vem resolvida (ensure_seed), e é
     # ela que a resposta promete no `meta`. Deixar o torch sortear internamente
     # tornaria essa promessa falsa.
     generator = torch.Generator(device=DEVICE).manual_seed(payload.seed)
 
+    _reset_vram_peak()
+    started = time.monotonic()
     with torch.inference_mode():
         out = PIPE(
             prompt=payload.prompt,
@@ -203,7 +286,50 @@ def _run(payload: GenPayload) -> list[str]:
             generator=generator,
             output_type="pil",
         )
-    return [_encode_output(img) for img in out.images]
+    # Sem torch.cuda.synchronize(): `output_type="pil"` obriga a transferência
+    # para a CPU, então o pipeline só retorna com a GPU já drenada. Um
+    # synchronize aqui mediria o mesmo e custaria uma chamada a mais.
+    t.gpu_s = time.monotonic() - started
+
+    started = time.monotonic()
+    encoded = [_encode_output(img) for img in out.images]
+    t.encode_s = time.monotonic() - started
+    t.worker_s = time.monotonic() - worker_started
+
+    _note_generation(payload, t)
+    return encoded
+
+
+def _note_generation(payload: GenPayload, t: policy.Timings) -> None:
+    """Fecha a contabilidade de uma geração: VRAM, agregado e log.
+
+    A linha de log existe além do /metrics porque o agregado é uma soma: ela
+    responde "quanto custou ESTA geração", que é a pergunta que se faz depois de
+    ver um pico estranho no relatório.
+
+    Envolvida inteira num except porque roda DENTRO do worker, depois de a
+    imagem estar pronta: uma exceção aqui sobe como falha de geração, o cliente
+    perde uma imagem que existe, e três seguidas marcariam o pod como degradado
+    (`_note_failure`). Contabilidade não pode derrubar o produto.
+    """
+    try:
+        peak = _vram_peak_bytes()
+        STATS.record(
+            size=f"{payload.width}x{payload.height}",
+            refs=len(payload.references),
+            timings=t,
+            vram_peak_bytes=peak,
+        )
+        vram = f" vram_peak={peak / 1024**3:.2f}GiB" if peak is not None else ""
+        log(
+            f"gen {payload.width}x{payload.height} refs={len(payload.references)} "
+            f"n={payload.n} steps={payload.steps} "
+            f"queue={t.queue_wait_s or 0:.2f}s decode={t.decode_s or 0:.2f}s "
+            f"gpu={t.gpu_s or 0:.2f}s encode={t.encode_s or 0:.2f}s "
+            f"worker={t.worker_s or 0:.2f}s{vram}"
+        )
+    except Exception as e:  # noqa: BLE001 — ver docstring
+        log(f"contabilidade da geração falhou: {type(e).__name__}: {e}")
 
 
 def _load_pipeline() -> Flux2KleinPipeline:
@@ -379,7 +505,80 @@ async def metrics():
         "# TYPE image_consecutive_failures gauge",
         f"image_consecutive_failures {CONSECUTIVE_FAILURES}",
     ]
+    lines.extend(_vram_metric_lines())
+    lines.extend(STATS.prometheus_lines())
     return PlainTextResponse("\n".join(lines) + "\n")
+
+
+def _vram_metric_lines() -> list[str]:
+    """VRAM do processo, em bytes. O que interessa é o `max_reserved`.
+
+    Sem estas métricas não existe NENHUMA forma de saber quanta memória o pod
+    usa de fato: nem o /metrics nem o /admin/* do agent expunham memória, a
+    API do RunPod só devolve `memoryUtilPercent` (que é utilização do
+    controlador, não ocupação — dá 0 com a GPU parada), o template não abre
+    porta TCP e a imagem não roda sshd, então `nvidia-smi` também está fora.
+    A consequência prática era escolher o tamanho da GPU pelos 18 GB de pesos
+    medidos no HF, sem saber o pico de ativação de nenhuma resolução.
+
+    `max_reserved` e não `allocated`: quem dimensiona a placa precisa do
+    high-water mark do que o allocator pediu ao driver, que é a memória que a
+    GPU tem de ter LIVRE. O `allocated` (tensores vivos agora) é menor e
+    oscila dentro de uma geração — mediria o instante do scrape, não o pico.
+
+    E `device_used` além do `reserved`: o caching allocator do PyTorch NÃO
+    enxerga o contexto CUDA nem os buffers do cuDNN, que são centenas de MB
+    fora dele. A pergunta "cabe numa placa de 24 GB?" se responde com
+    `total - free` do device, não com o que o allocator pediu — usar o
+    `reserved` ali subestimaria, e o erro só apareceria como OOM no boot.
+
+    Falha em silêncio (lista vazia): este /metrics é lido pelo
+    /admin/vllm-metrics do agent, e uma exceção aqui trocaria uma métrica
+    ausente por um 502 na rota administrativa inteira."""
+    cuda = _cuda()
+    if cuda is None:
+        return []
+    try:
+        total = cuda.get_device_properties(0).total_memory
+        # o max() cobre a janela ANTES da primeira geração (load dos pesos e
+        # warmup): ali ninguém resetou nada, e o pico do allocator é o único
+        # que conhece esse período.
+        peak_reserved = max(PEAK_RESERVED_BYTES, int(cuda.max_memory_reserved()))
+        lines = [
+            "# HELP image_vram_total_bytes VRAM total da GPU",
+            "# TYPE image_vram_total_bytes gauge",
+            f"image_vram_total_bytes {total}",
+            "# HELP image_vram_allocated_bytes Tensores vivos agora",
+            "# TYPE image_vram_allocated_bytes gauge",
+            f"image_vram_allocated_bytes {cuda.memory_allocated()}",
+            "# HELP image_vram_reserved_bytes Reservado pelo allocator agora",
+            "# TYPE image_vram_reserved_bytes gauge",
+            f"image_vram_reserved_bytes {cuda.memory_reserved()}",
+            "# HELP image_vram_max_allocated_bytes Pico de tensores vivos desde o boot",
+            "# TYPE image_vram_max_allocated_bytes gauge",
+            f"image_vram_max_allocated_bytes {cuda.max_memory_allocated()}",
+            "# HELP image_vram_max_reserved_bytes Pico de reserva desde o boot — é o que dimensiona a GPU",
+            "# TYPE image_vram_max_reserved_bytes gauge",
+            f"image_vram_max_reserved_bytes {peak_reserved}",
+        ]
+        # mem_get_info pode não existir em builds antigas do torch; a ausência
+        # dela não pode custar as métricas acima, que já foram montadas.
+        try:
+            free, device_total = cuda.mem_get_info()
+            lines += [
+                "# HELP image_vram_device_used_bytes Ocupação REAL do device (inclui contexto CUDA e cuDNN)",
+                "# TYPE image_vram_device_used_bytes gauge",
+                f"image_vram_device_used_bytes {int(device_total) - int(free)}",
+                "# HELP image_vram_device_free_bytes VRAM livre no device",
+                "# TYPE image_vram_device_free_bytes gauge",
+                f"image_vram_device_free_bytes {int(free)}",
+            ]
+        except Exception as e:  # noqa: BLE001 — ver comentário acima
+            log(f"mem_get_info indisponível: {e}")
+        return lines
+    except Exception as e:  # noqa: BLE001 — ver docstring
+        log(f"métricas de VRAM indisponíveis: {e}")
+        return []
 
 
 @app.get("/v1/models")
@@ -497,6 +696,17 @@ async def _dispatch(payload: GenPayload) -> JSONResponse:
                 "seed": payload.seed,
                 "n": payload.n,
                 "model": SERVED_MODEL_NAME,
+                # Tempo POR FASE desta geração. Sem ele, o único número
+                # disponível é o de ponta a ponta, que soma coisas de donos
+                # diferentes: upload das referências, espera na fila, GPU,
+                # encode, e ainda o upload ao bucket que o gateway faz antes de
+                # responder. É o que impede responder se um `edits` com 4
+                # referências de 14 MiB é lento por causa do modelo ou da rede.
+                #
+                # VRAM NÃO entra aqui: é número de dimensionamento nosso, não do
+                # requisitante. Fica no /metrics, atrás do require_admin do
+                # agent.
+                "timings": payload.timings.as_meta(),
             },
         }
     )

@@ -662,3 +662,129 @@ def test_erro_do_worker_fica_registrado():
         assert q.worker_error is not None and "morri" in q.worker_error
 
     asyncio.run(go())
+
+
+# ---------------------------------------------------------------------------
+# Cronometragem
+# ---------------------------------------------------------------------------
+
+
+class _ComTimings:
+    """Payload mínimo com o atributo que a fila procura."""
+
+    def __init__(self, nome):
+        self.nome = nome
+        self.timings = policy.Timings()
+
+
+def test_fila_anota_a_espera_no_payload():
+    """O tempo de fila é o único que a fila conhece — e é o que separa "o pod
+    está lento" de "havia outro cliente na frente"."""
+
+    async def go():
+        rec = _Recorder()
+        q = policy.GenerationQueue(rec, capacity=4, wait_timeout_s=30)
+        q.start()
+
+        primeiro = _ComTimings("ocupa")
+        t1 = asyncio.create_task(q.submit(primeiro))
+        for _ in range(200):
+            if rec.entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+        # o segundo espera o primeiro sair da GPU
+        segundo = _ComTimings("espera")
+        t2 = asyncio.create_task(q.submit(segundo))
+        await asyncio.sleep(0.2)
+        rec.release.set()
+        await asyncio.gather(t1, t2)
+
+        assert primeiro.timings.queue_wait_s is not None
+        assert segundo.timings.queue_wait_s is not None
+        # quem chegou com a GPU ocupada esperou mais que quem a pegou livre
+        assert segundo.timings.queue_wait_s > primeiro.timings.queue_wait_s
+        assert segundo.timings.queue_wait_s >= 0.15
+        await q.stop()
+
+    asyncio.run(go())
+
+
+def test_fila_aceita_payload_sem_timings():
+    """A fila é genérica: ela serializa a GPU e não conhece o formato do
+    payload. Exigir o atributo acoplaria a serialização ao server.py — e
+    quebraria todo teste desta suíte, que passa strings."""
+
+    async def go():
+        q = policy.GenerationQueue(_fast, capacity=2, wait_timeout_s=1)
+        q.start()
+        assert await q.submit("sem-timings") == "img-sem-timings"
+        await q.stop()
+
+    asyncio.run(go())
+
+
+def test_as_meta_mantem_as_chaves_e_nao_apaga_o_decode_curto():
+    """Chave sempre presente: ausente e nula são indistinguíveis para quem lê o
+    relatório, e a diferença importa (fase que não aconteceu vs pod que não
+    mede). E 4 casas porque o decode de uma referência de 18 KiB é da ordem de
+    1e-3 — em 2 casas ele vira 0.0, apagando o contraste com os 14 MiB que
+    motivou a medição."""
+    meta = policy.Timings(decode_s=0.0013, gpu_s=4.10422).as_meta()
+    assert set(meta) == {"queue_wait_s", "decode_s", "gpu_s", "encode_s", "worker_s"}
+    assert meta["decode_s"] == 0.0013
+    assert meta["gpu_s"] == 4.1042
+    assert meta["queue_wait_s"] is None
+
+
+def test_stats_somam_por_cenario_e_separam_resolucoes():
+    s = policy.ScenarioStats()
+    s.record(size="1024x1024", refs=0, timings=policy.Timings(gpu_s=4.0, worker_s=4.2))
+    s.record(size="1024x1024", refs=0, timings=policy.Timings(gpu_s=5.0, worker_s=5.2))
+    s.record(size="1024x1536", refs=4, timings=policy.Timings(gpu_s=9.0, worker_s=12.0))
+    texto = "\n".join(s.prometheus_lines())
+
+    assert 'image_gpu_seconds_sum{size="1024x1024",refs="0"} 9.0000' in texto
+    assert 'image_scenario_generations_total{size="1024x1024",refs="0"} 2' in texto
+    assert 'image_gpu_seconds_sum{size="1024x1536",refs="4"} 9.0000' in texto
+    assert 'image_scenario_generations_total{size="1024x1536",refs="4"} 1' in texto
+    # um HELP por métrica, não um por série
+    assert texto.count("# HELP image_gpu_seconds_sum") == 1
+
+
+def test_stats_guardam_o_MAXIMO_de_vram_nao_a_soma():
+    """VRAM não se acumula entre gerações — o allocator reaproveita. Somar
+    produziria um número sem significado físico, e crescente para sempre: o
+    relatório concluiria que o pod não cabe em placa nenhuma."""
+    s = policy.ScenarioStats()
+    s.record(size="1024x1024", refs=0, timings=policy.Timings(), vram_peak_bytes=20 * 1024**3)
+    s.record(size="1024x1024", refs=0, timings=policy.Timings(), vram_peak_bytes=23 * 1024**3)
+    s.record(size="1024x1024", refs=0, timings=policy.Timings(), vram_peak_bytes=21 * 1024**3)
+    texto = "\n".join(s.prometheus_lines())
+    assert f'image_vram_peak_bytes{{size="1024x1024",refs="0"}} {23 * 1024**3}' in texto
+
+
+def test_stats_tem_teto_de_series_e_denuncia_o_corte():
+    """Hoje as combinações são 15 (3 resoluções × 5 contagens de referência). O
+    teto é para o dia em que a allowlist crescer: uma série por resolução
+    arbitrária seria vazamento de memória lento e corpo de /metrics ilimitado.
+
+    Contado, e não silencioso: uma média que ignora metade dos cenários é pior
+    que uma média ausente."""
+    s = policy.ScenarioStats(max_series=2)
+    for i in range(5):
+        s.record(size=f"{i}x{i}", refs=0, timings=policy.Timings(gpu_s=1.0))
+    texto = "\n".join(s.prometheus_lines())
+    assert texto.count("image_scenario_generations_total{") == 2
+    assert "image_scenario_series_dropped_total 3" in texto
+    # a série já conhecida continua sendo atualizada depois do corte
+    s.record(size="0x0", refs=0, timings=policy.Timings(gpu_s=1.0))
+    assert 'image_scenario_generations_total{size="0x0",refs="0"} 2' in "\n".join(
+        s.prometheus_lines()
+    )
+
+
+def test_stats_vazios_nao_emitem_series():
+    """Antes da primeira geração o /metrics não pode inventar um cenário com
+    zeros — um p50 de 0.0s no relatório seria lido como pod instantâneo."""
+    assert policy.ScenarioStats().prometheus_lines() == []
