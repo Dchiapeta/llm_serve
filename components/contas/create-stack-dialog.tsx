@@ -8,8 +8,10 @@ import { createStack } from "@/lib/actions"
 import { computeCapacity } from "@/lib/capacity"
 import { generateStackSlug } from "@/lib/slug"
 import {
+  PRODUCT_CATEGORIES,
   TEMPLATE_PLANS,
   type Account,
+  type ProductCategory,
   type Template,
   type TemplatePlan,
 } from "@/lib/types"
@@ -54,7 +56,7 @@ import {
 
 export type StackTemplate = Pick<
   Template,
-  "id" | "name" | "plan" | "is_enabled" | "is_test" | "model_name" | "model_footprint_gb" | "kv_reserve_gb_per_user" | "gpu_types"
+  "id" | "name" | "plan" | "category" | "is_enabled" | "is_test" | "model_name" | "model_footprint_gb" | "kv_reserve_gb_per_user" | "gpu_types"
 >
 
 export type StackMachine = {
@@ -109,6 +111,7 @@ export function CreateStackDialog({
   const [email, setEmail] = React.useState("")
   const [name, setName] = React.useState("")
   const [plan, setPlan] = React.useState<TemplatePlan>("Go")
+  const [category, setCategory] = React.useState<ProductCategory>("llm")
   const [machineId, setMachineId] = React.useState("")
   const [slug, setSlug] = React.useState(generateStackSlug)
   const [result, setResult] = React.useState<StackResult | null>(null)
@@ -134,9 +137,11 @@ export function CreateStackDialog({
     (a) => a.email?.toLowerCase() === email.trim().toLowerCase()
   )
 
-  // O produto escolhido (Go/Pro/Max/Enterprise) determina o template:
-  // o cadastrado em /templates com aquele plano.
-  const template = templates.find((t) => t.plan === plan)
+  // Plano comercial + categoria determinam o pool. Go/llm e Go/image não
+  // podem compartilhar máquina, mesmo que tenham o mesmo tier.
+  const template = templates.find(
+    (t) => t.plan === plan && (t.category ?? "llm") === category
+  )
   const templateId = template?.id ?? ""
 
   // Máquinas elegíveis: rodando, do template escolhido, com slot livre —
@@ -163,6 +168,7 @@ export function CreateStackDialog({
       setEmail("")
       setName("")
       setPlan("Go")
+      setCategory("llm")
       setMachineId("")
       setSlug(generateStackSlug())
       setResult(null)
@@ -313,9 +319,35 @@ export function CreateStackDialog({
                       <SelectItem
                         key={p}
                         value={p}
-                        disabled={!templates.some((t) => t.plan === p)}
+                        disabled={!templates.some(
+                          (t) => t.plan === p && (t.category ?? "llm") === category
+                        )}
                       >
                         {p}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select
+                  value={category}
+                  onValueChange={(value) => {
+                    setCategory(value as ProductCategory)
+                    setMachineId("")
+                  }}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {PRODUCT_CATEGORIES.map((value) => (
+                      <SelectItem
+                        key={value}
+                        value={value}
+                        disabled={!templates.some(
+                          (t) => t.plan === plan && (t.category ?? "llm") === value
+                        )}
+                      >
+                        {value === "image" ? "Imagem" : "LLM"}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -326,7 +358,7 @@ export function CreateStackDialog({
                   </p>
                 ) : (
                   <p className="text-xs text-destructive">
-                    Nenhum produto {plan} cadastrado. Cadastre em Produtos.
+                    Nenhum produto {plan}/{category} cadastrado. Cadastre em Produtos.
                   </p>
                 )}
               </div>

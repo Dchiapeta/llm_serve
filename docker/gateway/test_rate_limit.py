@@ -5,10 +5,8 @@
 Duas propriedades que estes testes protegem, e que são fáceis de quebrar sem
 perceber porque ninguém vê o bucket:
 
-  * `rpm` e `burst` são grandezas DIFERENTES. Elas coincidem em todo plano de
-    LLM, então um refactor que voltasse a derivar uma da outra passaria em
-    qualquer teste que só olhasse esses planos — e mudaria o comportamento do
-    Image em silêncio.
+  * Go/llm e Go/image são produtos diferentes. O primeiro mantém o limite de
+    chat; o segundo tem 10 submissões/min e rajada inicial 3.
   * a chave do bucket é QUEM divide o teto. Nas rotas de imagem é a stack; se
     voltar a ser a chave, o teto passa a ser multiplicado por quantas chaves a
     stack emitir, sem que nada falhe visivelmente.
@@ -36,11 +34,12 @@ def _bucket_limpo():
     main.rate_buckets.clear()
 
 
-def _gastar(bucket_key, plan, n):
+def _gastar(bucket_key, plan, n, *, image=False):
     """Consome n permissões; devolve quantas passaram antes do primeiro 429."""
     for i in range(n):
         try:
-            main.check_rate_limit(bucket_key, plan)
+            checker = main.check_image_rate_limit if image else main.check_rate_limit
+            checker(bucket_key, plan)
         except HTTPException:
             return i
     return n
@@ -49,20 +48,21 @@ def _gastar(bucket_key, plan, n):
 # ---------- taxa e burst são independentes ----------
 
 
-def test_image_tem_taxa_de_12_por_minuto():
-    assert main.rate_limit_rpm("Image") == 12.0
+def test_go_image_tem_taxa_comercial_de_10_por_minuto():
+    assert main.image_rate_limit_rpm("Go") == 10.0
 
 
-def test_image_tem_burst_de_4():
-    # alinhado à QUEUE_CAPACITY do pod: mandar mais do que cabe na fila só
-    # gastaria ida e volta até o RunPod para receber queue_full
-    assert main.rate_limit_burst("Image") == 4.0
+def test_go_image_tem_burst_de_3():
+    # alinhado à QUEUE_CAPACITY para a rajada inicial. A concorrência contínua
+    # é protegida separadamente por check_concurrency.
+    assert main.image_rate_limit_burst("Go") == 3.0
 
 
-def test_burst_do_image_e_menor_que_a_taxa():
-    # é a propriedade que distingue difusão de LLM; se um dia forem iguais de
-    # novo, o bucket volta a deixar passar uma rajada que a fila não comporta
-    assert main.rate_limit_burst("Image") < main.rate_limit_rpm("Image")
+def test_go_llm_e_go_image_tem_limites_independentes():
+    assert main.rate_limit_rpm("Go") == 60.0
+    assert main.image_rate_limit_rpm("Go") == 10.0
+    assert main.rate_limit_burst("Go") == 60.0
+    assert main.image_rate_limit_burst("Go") == 3.0
 
 
 @pytest.mark.parametrize("plano", ["Go", "Pro", "Max", "Enterprise", "VibeCoder"])
@@ -84,14 +84,14 @@ def test_plano_none_nao_estoura():
 # ---------- o bucket respeita o burst, não a taxa ----------
 
 
-def test_image_aceita_exatamente_4_de_uma_vez():
-    assert _gastar("stack:s1", "Image", 10) == 4
+def test_image_aceita_exatamente_3_de_uma_vez():
+    assert _gastar("stack:s1", "Go", 10, image=True) == 3
 
 
-def test_a_quinta_requisicao_instantanea_do_image_e_429():
-    _gastar("stack:s1", "Image", 4)
+def test_a_quarta_requisicao_instantanea_do_image_e_429():
+    _gastar("stack:s1", "Go", 3, image=True)
     with pytest.raises(HTTPException) as e:
-        main.check_rate_limit("stack:s1", "Image")
+        main.check_image_rate_limit("stack:s1", "Go")
     assert e.value.status_code == 429
 
 
@@ -104,28 +104,27 @@ def test_plano_de_llm_continua_aceitando_a_rajada_inteira():
 
 
 def test_retry_after_vem_no_429():
-    _gastar("stack:s1", "Image", 4)
+    _gastar("stack:s1", "Go", 3, image=True)
     with pytest.raises(HTTPException) as e:
-        main.check_rate_limit("stack:s1", "Image")
+        main.check_image_rate_limit("stack:s1", "Go")
     assert int(e.value.headers["Retry-After"]) >= 1
 
 
 def test_retry_after_do_image_reflete_a_taxa_e_nao_o_burst():
-    """12/min = um token a cada 5s. Se o cálculo usasse o burst (4), o cliente
-    receberia ~15s e esperaria três vezes mais do que precisa."""
-    _gastar("stack:s1", "Image", 4)
+    """10/min = um token a cada 6s; Retry-After usa a taxa, não o burst 3."""
+    _gastar("stack:s1", "Go", 3, image=True)
     with pytest.raises(HTTPException) as e:
-        main.check_rate_limit("stack:s1", "Image")
-    # 60/12 = 5s, +1 do arredondamento defensivo
-    assert int(e.value.headers["Retry-After"]) <= 6
+        main.check_image_rate_limit("stack:s1", "Go")
+    # 60/10 = 6s, +1 do arredondamento defensivo
+    assert int(e.value.headers["Retry-After"]) <= 7
 
 
 # ---------- quem divide o teto ----------
 
 
 def test_buckets_diferentes_nao_se_afetam():
-    _gastar("stack:s1", "Image", 4)
-    assert _gastar("stack:s2", "Image", 4) == 4
+    _gastar("stack:s1", "Go", 3, image=True)
+    assert _gastar("stack:s2", "Go", 3, image=True) == 3
 
 
 def test_chave_de_bucket_da_stack_tem_prefixo():
@@ -141,10 +140,10 @@ def test_duas_chaves_da_mesma_stack_dividem_o_mesmo_bucket():
     Duas chaves da mesma stack somam no mesmo teto; se cada uma tivesse o seu,
     emitir chaves multiplicaria a capacidade que foi dimensionada pela GPU."""
     bucket = main.rate_bucket_for_stack("s1")
-    gastas_pela_primeira = _gastar(bucket, "Image", 2)
-    gastas_pela_segunda = _gastar(bucket, "Image", 10)
+    gastas_pela_primeira = _gastar(bucket, "Go", 2, image=True)
+    gastas_pela_segunda = _gastar(bucket, "Go", 10, image=True)
     assert gastas_pela_primeira == 2
-    assert gastas_pela_segunda == 2  # sobraram 2 do burst de 4, não 4
+    assert gastas_pela_segunda == 1  # sobrou 1 do burst de 3, não outro bucket
 
 
 # ---------- reposição ----------
@@ -154,16 +153,16 @@ def test_bucket_repoe_com_o_tempo(monkeypatch):
     relogio = {"t": 1000.0}
     monkeypatch.setattr(main.time, "time", lambda: relogio["t"])
 
-    assert _gastar("stack:s1", "Image", 4) == 4
-    relogio["t"] += 10.0  # 10s a 12/min = 2 tokens
-    assert _gastar("stack:s1", "Image", 5) == 2
+    assert _gastar("stack:s1", "Go", 3, image=True) == 3
+    relogio["t"] += 12.0  # 12s a 10/min = 2 tokens
+    assert _gastar("stack:s1", "Go", 5, image=True) == 2
 
 
 def test_reposicao_nao_passa_do_burst(monkeypatch):
     relogio = {"t": 1000.0}
     monkeypatch.setattr(main.time, "time", lambda: relogio["t"])
 
-    _gastar("stack:s1", "Image", 4)
+    _gastar("stack:s1", "Go", 3, image=True)
     relogio["t"] += 3600.0  # uma hora parado
     # o bucket enche até o teto e para: não acumula uma hora de crédito
-    assert _gastar("stack:s1", "Image", 20) == 4
+    assert _gastar("stack:s1", "Go", 20, image=True) == 3

@@ -104,11 +104,11 @@ MAX_BODY_BYTES_BY_PATH: dict[str, int] = {
     "models": 16 * _MIB,  # GET; o teto existe pra não haver rota sem teto
     # texto puro (prompt + escalares) — três ordens de grandeza abaixo
     "images/generations": 256 * 1024,
-    # IMAGE_MAX_REFERENCE_IMAGES × IMAGE_MAX_FILE_SIZE_MB (4 × 15 MiB no
+    # IMAGE_MAX_REFERENCE_IMAGES × IMAGE_MAX_FILE_SIZE_MB (4 × 5 MiB no
     # template atual) + folga pras boundaries e campos de texto do multipart.
     # Espelha max_edit_bytes() de docker/gateway/image_proxy.py: um teto MENOR
     # aqui recusaria no pod o que o gateway deixou passar.
-    "images/edits": 4 * 15 * _MIB + _MIB,
+    "images/edits": 4 * 5 * _MIB + _MIB,
 }
 
 # Teto de quem não está no mapa. Só é alcançável se alguém adicionar rota à

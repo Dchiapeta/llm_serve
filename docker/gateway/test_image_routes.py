@@ -45,7 +45,7 @@ import main  # noqa: E402
 # A fixture `admissao` desliga o rate limit (os outros testes dela fariam
 # rajadas e se atrapalhariam entre si). Guardado aqui, no import, para o teste
 # que precisa do limite REAL poder religá-lo.
-CHECK_RATE_LIMIT_REAL = main.check_rate_limit
+CHECK_RATE_LIMIT_REAL = main.check_image_rate_limit
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"conteudo da imagem"
 PNG_B64 = base64.b64encode(PNG).decode()
@@ -114,7 +114,7 @@ def ctx(monkeypatch):
     async def fake_authorize(authorization, request, path):
         flight_key = (STACK_ID, MACHINE["id"])
         main.in_flight[flight_key] += 1
-        return ENTRY, "acc-1", MACHINE, STACK_ID, "Image"
+        return ENTRY, "acc-1", MACHINE, STACK_ID, "Go"
 
     monkeypatch.setattr(main, "_authorize_image_request", fake_authorize)
 
@@ -438,7 +438,14 @@ def admissao(monkeypatch):
     supa = FakeSupa()
     monkeypatch.setattr(main, "supa", supa, raising=False)
 
-    estado = {"plan": "Image", "logged": [], "tocado": [], "upstream": []}
+    estado = {
+        "plan": "Go",
+        "category": "image",
+        "logged": [],
+        "tocado": [],
+        "upstream": [],
+        "quota": [],
+    }
 
     async def fake_authenticate(authorization, headers, path):
         if not authorization:
@@ -447,17 +454,22 @@ def admissao(monkeypatch):
             "account_id": "acc-1",
             "api_key_id": "key-1",
             "stack_id": STACK_ID,
-            "stacks": [{"id": STACK_ID, "plan": estado["plan"]}],
+            "stacks": [{
+                "id": STACK_ID,
+                "plan": estado["plan"],
+                "category": estado["category"],
+            }],
             "purpose": "customer",
         }, "hash-da-chave"
 
     async def fake_resolve_route(account_id, entry):
-        return {**MACHINE, "max_concurrent_seqs": 4}, False, estado["plan"], STACK_ID
+        return {**MACHINE, "max_concurrent_seqs": 3}, False, estado["plan"], STACK_ID
 
     async def fake_touch(stack_id, machine_id=None):
         estado["tocado"].append((stack_id, machine_id))
 
     async def fake_quota(account_id, plan, purpose="customer"):
+        estado["quota"].append((account_id, plan, purpose))
         return None
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -469,7 +481,7 @@ def admissao(monkeypatch):
     monkeypatch.setattr(main, "resolve_route", fake_resolve_route)
     monkeypatch.setattr(main, "maybe_touch", fake_touch)
     monkeypatch.setattr(main, "check_token_quota", fake_quota)
-    monkeypatch.setattr(main, "check_rate_limit", lambda *a, **k: None)
+    monkeypatch.setattr(main, "check_image_rate_limit", lambda *a, **k: None)
     monkeypatch.setattr(main, "log_gateway_request", lambda **kw: estado["logged"].append(kw))
     monkeypatch.setattr(
         main, "proxy_client",
@@ -493,20 +505,22 @@ def _gen(estado, **body):
 
 
 @pytest.mark.parametrize("plano", ["Go", "Pro", "Max", "Enterprise"])
-def test_chave_de_plano_de_llm_leva_403(admissao, plano):
+def test_chave_de_categoria_llm_leva_403(admissao, plano):
     """Sem o guard, a requisição iria para o pod de vLLM da própria stack —
     cujo agent tem images/generations na allowlist, porque é o MESMO binário — e
     só morreria num 404 do vLLM, três camadas abaixo de onde dá pra explicar."""
     admissao["plan"] = plano
+    admissao["category"] = "llm"
     r = _gen(admissao)
     assert r.status_code == 403
-    assert "Image" in r.json()["detail"]
+    assert "categoria image" in r.json()["detail"]
     assert admissao["upstream"] == []  # o pod nunca foi tocado
     assert _flight_total() == 0
 
 
-def test_guard_de_plano_vale_para_edits(admissao):
+def test_guard_de_categoria_vale_para_edits(admissao):
     admissao["plan"] = "Pro"
+    admissao["category"] = "llm"
     r = admissao["client"].post(
         "/v1/images/edits",
         headers={"Authorization": "Bearer sk-teste"},
@@ -537,6 +551,41 @@ def test_concorrencia_acima_da_capacidade_vira_429(admissao):
     r = _gen(admissao)
     assert r.status_code == 429
     assert admissao["upstream"] == []
+
+
+def test_go_image_usa_as_3_vagas_da_fila_sem_reserva_de_llm(admissao):
+    """Go também é SHARED_POD_PLAN no LLM, mas image é um pod dedicado.
+
+    Com duas requisições já abertas, a terceira precisa entrar; a quarta é que
+    recebe 429. Este teste reproduz a regressão encontrada na revisão externa.
+    """
+    main.in_flight[(STACK_ID, "mach-1")] = 2
+    assert _gen(admissao).status_code == 200
+
+    main.in_flight[(STACK_ID, "mach-1")] = 3
+    assert _gen(admissao).status_code == 429
+    assert len(admissao["upstream"]) == 1
+
+
+def test_go_image_nao_herda_quota_diaria_de_tokens_do_llm(admissao):
+    assert _gen(admissao).status_code == 200
+    assert admissao["quota"] == []
+
+
+def test_go_llm_continua_reservando_vagas_em_pod_compartilhado():
+    flight_key = ("stack-llm", "mach-llm")
+    main.in_flight.clear()
+    main.in_flight[flight_key] = 2
+    with pytest.raises(main.HTTPException) as exc:
+        main.check_concurrency(
+            flight_key,
+            {"max_concurrent_seqs": 3},
+            "Go",
+            "llm",
+        )
+    assert exc.value.status_code == 429
+    assert main.in_flight[flight_key] == 1
+    main.in_flight.clear()
 
 
 def test_generations_nao_injeta_campos_de_chat(admissao):
@@ -661,7 +710,9 @@ def test_corpo_200_nao_json_vira_erro_de_formato_e_nao_de_armazenamento(ctx):
 def _espiar_rate_limit(monkeypatch):
     vistos = []
     monkeypatch.setattr(
-        main, "check_rate_limit", lambda bucket_key, plan: vistos.append((bucket_key, plan))
+        main,
+        "check_image_rate_limit",
+        lambda bucket_key, plan: vistos.append((bucket_key, plan)),
     )
     return vistos
 
@@ -669,7 +720,7 @@ def _espiar_rate_limit(monkeypatch):
 def test_generations_limita_pela_stack_e_nao_pela_chave(admissao, monkeypatch):
     vistos = _espiar_rate_limit(monkeypatch)
     _gen(admissao)
-    assert vistos == [(f"stack:{STACK_ID}", "Image")]
+    assert vistos == [(f"stack:{STACK_ID}", "Go")]
 
 
 def test_edits_limita_pela_stack_e_nao_pela_chave(admissao, monkeypatch):
@@ -679,7 +730,7 @@ def test_edits_limita_pela_stack_e_nao_pela_chave(admissao, monkeypatch):
         files={"image": ("ref.png", PNG, "image/png")},
         headers={"Authorization": "Bearer sk-teste"},
     )
-    assert vistos == [(f"stack:{STACK_ID}", "Image")]
+    assert vistos == [(f"stack:{STACK_ID}", "Go")]
 
 
 def test_o_bucket_usado_nao_e_o_hash_da_chave(admissao, monkeypatch):
@@ -689,17 +740,17 @@ def test_o_bucket_usado_nao_e_o_hash_da_chave(admissao, monkeypatch):
     assert vistos[0][0] != "hash-da-chave"
 
 
-def test_o_teto_do_image_e_de_4_por_rajada_ponta_a_ponta(admissao):
-    """Com o check_rate_limit real: a 5ª requisição instantânea leva 429.
+def test_o_teto_do_image_e_de_3_por_rajada_ponta_a_ponta(admissao):
+    """Com o check_image_rate_limit real: a 4ª requisição instantânea leva 429.
 
-    É o burst de RATE_LIMIT_BURST["Image"] chegando ao cliente — alinhado à
-    profundidade da fila do pod, não aos 12/min da vazão sustentada."""
-    main.check_rate_limit = CHECK_RATE_LIMIT_REAL  # a fixture o havia desligado
+    É a rajada inicial do token bucket do Go/image. O teste separado de
+    check_concurrency protege as 3 requisições realmente abertas."""
+    main.check_image_rate_limit = CHECK_RATE_LIMIT_REAL
     main.rate_buckets.clear()
     try:
-        status = [_gen(admissao).status_code for _ in range(6)]
+        status = [_gen(admissao).status_code for _ in range(5)]
     finally:
         main.rate_buckets.clear()
-    assert status[:4] == [200, 200, 200, 200]
+    assert status[:3] == [200, 200, 200]
+    assert status[3] == 429
     assert status[4] == 429
-    assert status[5] == 429

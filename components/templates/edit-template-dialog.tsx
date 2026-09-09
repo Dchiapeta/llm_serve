@@ -26,7 +26,7 @@ import {
 import { Textarea } from "@/components/ui/textarea"
 import { Switch } from "@/components/ui/switch"
 import { CollapsibleSection } from "@/components/templates/collapsible-section"
-import { TEMPLATE_PLANS } from "@/lib/types"
+import { PRODUCT_CATEGORIES, TEMPLATE_PLANS } from "@/lib/types"
 
 export function EditTemplateDialog({
   template,
@@ -134,6 +134,28 @@ export function EditTemplateDialog({
                 ))}
               </SelectContent>
             </Select>
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="edit-category">Categoria</Label>
+            <Select
+              name="category"
+              defaultValue={template.category ?? "llm"}
+              disabled
+            >
+              <SelectTrigger id="edit-category" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {PRODUCT_CATEGORIES.map((category) => (
+                  <SelectItem key={category} value={category}>
+                    {category}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              Categoria imutável: crie outro produto para usar um pool diferente.
+            </p>
           </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="edit-model_name">Modelo (Hugging Face)</Label>

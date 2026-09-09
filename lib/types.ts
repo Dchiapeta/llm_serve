@@ -1,24 +1,16 @@
+// `Image` permanece na união apenas para leitura de linhas legadas durante a
+// migration 0060. Produtos novos usam plan=Go/category=image e a opção antiga
+// não aparece mais em TEMPLATE_PLANS.
 export type TemplatePlan = "Go" | "Pro" | "Max" | "Enterprise" | "Image"
+export type ProductCategory = "llm" | "image"
+export const PRODUCT_CATEGORIES: ProductCategory[] = ["llm", "image"]
 
-// A ordem é a ESCADA dos planos de LLM — `sortPlans` (lib/crm.ts) ordena pelo
-// índice aqui. "Image" fica no fim porque não é um degrau dessa escada: é outra
-// linha de produto (geração de imagem, pod de difusão), não um Enterprise mais
-// caro.
-//
-// ATENÇÃO: os espelhos Python do gateway (RATE_LIMIT_RPM em main.py,
-// MAX_CLIENTS_BY_PLAN em client_identity.py, os tetos em document_extract.py e
-// document_generate.py) ainda NÃO têm a chave "Image". Todos leem com
-// .get(plan, DEFAULT), então nada quebra — mas o que o gateway aplicaria seriam
-// os defaults, não os números abaixo. Enquanto nenhuma STACK tiver
-// plan='Image' (hoje só o template tem), isso é inconsequente; criar a
-// primeira stack de imagem exige espelhar lá primeiro, senão a UI passa a
-// mentir sobre os limites — mesmo cuidado de BILLING_GRACE_HOURS.
+// A ordem é a escada de planos comerciais; categoria (llm/image) é outro eixo.
 export const TEMPLATE_PLANS: TemplatePlan[] = [
   "Go",
   "Pro",
   "Max",
   "Enterprise",
-  "Image",
 ]
 
 // Estado de cobrança da stack (migration 0050). Espelha o status da
@@ -93,8 +85,8 @@ export const MAX_KEYS_BY_PLAN: Record<TemplatePlan, number | null> = {
   Pro: 25,
   Max: 50,
   Enterprise: null,
-  // PLACEHOLDER: o plano Image ainda não é vendido e nenhuma stack o usa. O
-  // número definitivo sai junto com o preço, depois do load test.
+  // Compatibilidade com linhas legadas até a migration 0060 convertê-las para
+  // plan=Go/category=image.
   Image: 3,
 }
 
@@ -107,9 +99,7 @@ export const MAX_CLIENTS_BY_PLAN: Record<TemplatePlan, number | null> = {
   Pro: 25,
   Max: 50,
   Enterprise: null,
-  // PLACEHOLDER, junto com MAX_KEYS_BY_PLAN acima. E note que o espelho em
-  // docker/gateway/client_identity.py ainda não conhece "Image": enquanto não
-  // conhecer, quem aplica o teto é o default do gateway, não este número.
+  // Compatibilidade com linhas legadas; o produto atual usa Go/image.
   Image: 5,
 }
 
@@ -135,6 +125,7 @@ export type Template = {
   image: string
   model_name: string
   plan: TemplatePlan
+  category: ProductCategory
   gpu_types: string[]
   gpu_count: number
   env: Record<string, string>
@@ -206,6 +197,7 @@ export type Stack = {
   account_id: string
   machine_id: string | null
   plan: TemplatePlan
+  category: ProductCategory
   purchase_date: string // date "YYYY-MM-DD"
   slug: string
   // Coluna do TryStac (supabase/SHARED_SCHEMA.md), não deste repo — hoje

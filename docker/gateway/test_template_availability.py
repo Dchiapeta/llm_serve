@@ -59,25 +59,30 @@ def test_get_machine_traz_flags_para_bloquear_recriacao_automatica():
     assert "templates(is_enabled,is_test)" in params["select"]
 
 
-def test_picks_running_e_stopped_por_plano_excluem_teste_e_desabilitado():
+def test_picks_running_e_stopped_por_produto_excluem_teste_e_desabilitado():
     client = client_with_rest()
 
-    asyncio.run(client.list_running_machines_for_plan("Pro"))
-    asyncio.run(client.list_stopped_machines_for_plan("Pro"))
+    asyncio.run(client.list_running_machines_for_plan("Go", "image"))
+    asyncio.run(client.list_stopped_machines_for_plan("Go", "image"))
 
     assert len(client._rest.calls) == 2
     for path, params in client._rest.calls:
         assert path == "/machines"
-        assert params["templates.plan"] == "eq.Pro"
+        assert params["templates.plan"] == "eq.Go"
+        assert params["templates.category"] == "eq.image"
         assert_production_filters(params)
 
 
-def test_reposicao_proativa_so_percorre_planos_de_producao():
-    client = client_with_rest([{"plan": "Pro"}, {"plan": "Pro"}, {"plan": "Go"}])
+def test_reposicao_proativa_percorre_plano_e_categoria_de_producao():
+    client = client_with_rest([
+        {"plan": "Go", "category": "llm"},
+        {"plan": "Go", "category": "image"},
+        {"plan": "Go", "category": "image"},
+    ])
 
-    plans = asyncio.run(client.list_distinct_plans())
+    products = asyncio.run(client.list_distinct_products())
 
-    assert plans == ["Go", "Pro"]
+    assert products == [("Go", "image"), ("Go", "llm")]
     path, params = client._rest.calls[0]
     assert path == "/templates"
     assert params["is_enabled"] == "eq.true"

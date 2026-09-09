@@ -687,7 +687,7 @@ class GenerationQueue:
                 # que o worker já passou.
                 if not job.started.is_set():
                     job.cancelled = True
-                    # Solta as referências (até 4 × 15 MB) agora, em vez de
+                    # Solta as referências (até 4 × 5 MiB) agora, em vez de
                     # deixá-las presas no job até o worker chegar nele — o
                     # worker pode estar minutos dentro de uma geração.
                     job.payload = None

@@ -112,7 +112,7 @@ class SupaClient:
                 "use_custom_prompt,system_prompt,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
                 "accounts(name,"
-                "stacks(id,machine_id,plan,slug,created_at,system_prompt,"
+                "stacks(id,machine_id,plan,category,slug,created_at,system_prompt,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
                 "billing_status,past_due_since))",
                 "limit": "1",
@@ -312,8 +312,10 @@ class SupaClient:
         r.raise_for_status()
         return r.json()
 
-    async def list_running_machines_for_plan(self, plan: str) -> list[dict]:
-        """Máquinas running cujo template serve o plano da conta.
+    async def list_running_machines_for_plan(
+        self, plan: str, category: str = "llm"
+    ) -> list[dict]:
+        """Máquinas running cujo template serve o plano e a categoria da stack.
 
         Sem este filtro, uma conta sem adapter cairia em QUALQUER máquina
         running (ver list_running_machines) — inofensivo com um único
@@ -326,8 +328,9 @@ class SupaClient:
             params={
                 "status": "eq.running",
                 "public_url": "not.is.null",
-                "select": "*,templates!inner(plan,is_enabled,is_test)",
+                "select": "*,templates!inner(plan,category,is_enabled,is_test)",
                 "templates.plan": f"eq.{plan}",
+                "templates.category": f"eq.{category}",
                 "templates.is_enabled": "eq.true",
                 "templates.is_test": "eq.false",
                 "order": "created_at.asc",
@@ -336,7 +339,9 @@ class SupaClient:
         r.raise_for_status()
         return r.json()
 
-    async def list_stopped_machines_for_plan(self, plan: str) -> list[dict]:
+    async def list_stopped_machines_for_plan(
+        self, plan: str, category: str = "llm"
+    ) -> list[dict]:
         """Máquinas pausadas (stopPod) cujo template serve o plano — candidatas
         a auto-wake quando chega request e não há capacidade running. O proxy
         URL do RunPod não muda entre stop/start, então public_url segue válido."""
@@ -346,8 +351,9 @@ class SupaClient:
                 "status": "eq.stopped",
                 "public_url": "not.is.null",
                 "runpod_pod_id": "not.is.null",
-                "select": "*,templates!inner(plan,is_enabled,is_test)",
+                "select": "*,templates!inner(plan,category,is_enabled,is_test)",
                 "templates.plan": f"eq.{plan}",
+                "templates.category": f"eq.{category}",
                 "templates.is_enabled": "eq.true",
                 "templates.is_test": "eq.false",
                 "order": "created_at.asc",
@@ -798,21 +804,23 @@ class SupaClient:
 
     # ---------- templates ----------
 
-    async def list_distinct_plans(self) -> list[str]:
-        """Planos com pelo menos 1 template cadastrado — base do loop de
-        reposição proativa (ensure_capacity_once), que roda por plano.
+    async def list_distinct_products(self) -> list[tuple[str, str]]:
+        """Pares (plano, categoria) com pelo menos 1 template cadastrado.
+
+        É a base do loop de reposição proativa. Plano sozinho deixou de
+        identificar um pool quando Go passou a existir em llm e image.
         PostgREST não tem DISTINCT para coluna arbitrária sem RPC; a tabela é
         pequena, então dedup em memória é barato mesmo a cada tick de 300s."""
         r = await self._rest.get(
             "/templates",
             params={
-                "select": "plan",
+                "select": "plan,category",
                 "is_enabled": "eq.true",
                 "is_test": "eq.false",
             },
         )
         r.raise_for_status()
-        return sorted({row["plan"] for row in r.json()})
+        return sorted({(row["plan"], row.get("category") or "llm") for row in r.json()})
 
     # ---------- system_settings ----------
 

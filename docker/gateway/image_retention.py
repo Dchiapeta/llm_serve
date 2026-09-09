@@ -1,6 +1,6 @@
 """Retenção das imagens geradas: apaga o ARQUIVO aos 30 dias, mantém o registro.
 
-O bucket cresce com tudo que o plano Image gera e nada sai sozinho — uma imagem
+O bucket cresce com tudo que a categoria image gera e nada sai sozinho — uma imagem
 1024×1024 pesa ~1,5 MB, e sem expiração o custo de storage é monotônico. Este é
 o primeiro job de retenção do projeto; até aqui nenhuma tabela tinha prazo.
 

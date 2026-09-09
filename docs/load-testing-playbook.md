@@ -171,7 +171,7 @@ Descobertas rodando o teste do plano Pro pela primeira vez — evitar repetir:
    cada chunk reseta o timer). Sem `stream: true`, a resposta inteira
    chega de uma vez, e qualquer tarefa acima de 60s de geração falha ali.
 
-## Plano Image (geração de imagem), que é outro teste
+## Go / categoria image, que é outro teste
 
 O pod de difusão não fala tokens, não faz streaming e serializa a GPU numa fila
 de um consumidor — nada da metodologia acima se aplica diretamente, e o script é
@@ -185,7 +185,7 @@ gateway, erro classificado por fase, e retry só no que não chegou a sair.
   custo varia mais entre cenários do que entre níveis: `refs=0` é
   `/v1/images/generations` (JSON, upload desprezível) e `refs>0` é
   `/v1/images/edits` (multipart, até dezenas de MiB por request).
-- **Concorrência é medida contra `IMAGE_QUEUE_CAPACITY`** (4 no template
+- **Concorrência é medida contra `IMAGE_QUEUE_CAPACITY`** (3 no template
   atual), que é o total EM VOO. Um nível acima dele existe para medir o 429, não
   para medir vazão — e o script recusa calcular img/min nesse caso, porque uma
   recusa volta em milissegundos e infla a vazão sem ter entregue imagem nenhuma.
@@ -204,14 +204,14 @@ pip install httpx pillow
 
 # 1. sempre primeiro: mostra a matriz e o total de requests sem enviar nada
 python3 scripts/loadtest_image.py --dry-run \
-  --sizes 1024x1024,1024x1536 --refs 0,1,4 --ref-bytes 18k,14m --levels 1,2,4,8
+  --sizes 1024x1024,1024x1536 --refs 0,1,4 --ref-bytes 18k,5m --levels 1,2,3,4
 
 # 2. o teste
 python3 scripts/loadtest_image.py \
   --base-url https://api.trystac.com \
-  --api-key <chave HEX da stack Image> \
+  --api-key <chave HEX da stack Go/image> \
   --model flux2-klein-4b \
-  --sizes 1024x1024,1024x1536 --refs 0,1,4 --ref-bytes 18k,14m --levels 1,2,4,8 \
+  --sizes 1024x1024,1024x1536 --refs 0,1,4 --ref-bytes 18k,5m --levels 1,2,3,4 \
   --admin-url https://<pod>-8000.proxy.runpod.net \
   --admin-secret <AGENT_ADMIN_SECRET da máquina> \
   --out image_loadtest.json
@@ -236,12 +236,12 @@ o que mantém `last_activity_at` fresco e impede a auto-pausa no meio do teste
   que sobra do tempo do cliente. Cuidado ao nomear: além de upload e download,
   `overhead_s` contém o upload ao bucket e o insert em `image_generations`, que
   o gateway faz **antes** de responder. Não é "rede".
-- **Custo do teto de arquivo**: o mesmo cenário com `18k` e com `14m` isola os
+- **Custo do teto de arquivo**: o mesmo cenário com `18k` e com `5m` isola os
   segundos que são só transferência. É o número que decide
   `IMAGE_MAX_FILE_SIZE_MB`.
-- **Vazão sustentada** (img/min) no maior nível SEM recusa. É de onde
-  `RATE_LIMIT_RPM["Image"]` deveria sair — os 12/min atuais foram derivados de
-  uma estimativa de "~5 s por geração".
+- **Vazão concluída** (img/min) no maior nível SEM recusa. Ela valida a
+  capacidade física por cenário; o teto comercial do Go/image é separado e
+  vale 10 submissões/min por stack.
 - **VRAM**: `image_vram_device_used_bytes` e o `image_vram_peak_bytes` por
   cenário. É o que decide se a placa pode ser menor que a A40.
 

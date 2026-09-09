@@ -131,10 +131,10 @@ def test_teto_de_generations_e_muito_menor_que_o_de_edits():
 
 
 def test_teto_de_edits_cobre_o_maximo_que_o_pod_aceita():
-    """4 arquivos de 15 MiB (IMAGE_MAX_REFERENCE_IMAGES × IMAGE_MAX_FILE_SIZE_MB)
+    """4 arquivos de 5 MiB (IMAGE_MAX_REFERENCE_IMAGES × IMAGE_MAX_FILE_SIZE_MB)
     mais o overhead do multipart. Um teto abaixo disso recusaria no gateway um
     pedido que o pod aceitaria — o pior lugar pra divergir."""
-    assert image_proxy.max_edit_bytes() > 4 * 15 * 1024 * 1024
+    assert image_proxy.max_edit_bytes() == 21 * 1024 * 1024
 
 
 def test_env_sobrescreve_o_default(monkeypatch):

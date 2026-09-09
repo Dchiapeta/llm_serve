@@ -151,13 +151,10 @@ RATE_LIMIT_RPM = {
     "Pro": 120.0,
     "Max": 300.0,
     "Enterprise": 600.0,
-    # Image é a única linha aqui derivada da capacidade FÍSICA, não do preço: o
-    # pod de difusão gera uma imagem por vez (uma única task consumidora, ver
-    # docker/image/policy.py) com fila de 4 em voo. A ~5s por geração, o teto
-    # real é da ordem de 12/min — os 60 do default deixariam o cliente mandar 5x
-    # mais do que o pod pode aceitar, e o excedente voltaria como 429
-    # queue_full do pod em vez do 429 com Retry-After daqui.
-    "Image": 12.0,
+    # Compatibilidade durante a migração 0060. Stacks novas de imagem são
+    # plan=Go/category=image e usam IMAGE_RATE_LIMIT_* abaixo; uma stack antiga
+    # ainda cacheada como Image não pode cair no default de 60.
+    "Image": 10.0,
 }
 DEFAULT_RATE_LIMIT_RPM = float(os.environ.get("RATE_LIMIT_RPM", "60"))
 
@@ -168,19 +165,34 @@ DEFAULT_RATE_LIMIT_RPM = float(os.environ.get("RATE_LIMIT_RPM", "60"))
 # machuca: o vLLM faz batching contínuo, e uma rajada de 60 requisições vira 60
 # sequências concorrentes que o próprio check_concurrency dimensiona.
 #
-# Em difusão não existe batching: a fila do pod tem QUEUE_CAPACITY (4 no
-# template) e o resto é recusado com queue_full. Um bucket de 12 deixaria o
-# cliente disparar 12 de uma vez para uma fila de 4 — 8 voltariam como 429 do
+# Em difusão não existe batching: a fila do pod tem QUEUE_CAPACITY (3 no
+# template) e o resto é recusado com queue_full. Um bucket comercial de 10
+# deixaria o cliente disparar 10 de uma vez para uma fila de 3 — 7 voltariam como 429 do
 # POD, que é o erro certo pelo motivo errado: o gateway sabia que não cabia e
 # mandou assim mesmo, gastando ida e volta até o RunPod para descobrir.
 #
-# 4 alinha o burst à profundidade real da fila. A vazão sustentada continua
-# sendo os 12/min do dict acima; o que muda é só o tamanho da rajada instantânea.
+# 3 limita a rajada inicial ao que cabe na fila. Não é contador de requisições
+# abertas: créditos voltam a cada 6s; o teto físico em voo é garantido por
+# check_concurrency + QUEUE_CAPACITY. A taxa comercial de imagem mora em
+# IMAGE_RATE_LIMIT_RPM, separada da taxa de LLM do plano Go.
 #
 # Plano sem entrada aqui mantém burst == rpm, exatamente o comportamento
 # anterior — esta tabela é opt-in por plano.
 RATE_LIMIT_BURST = {
-    "Image": float(os.environ.get("RATE_LIMIT_BURST_IMAGE", "4")),
+    "Image": float(os.environ.get("RATE_LIMIT_BURST_IMAGE", "3")),
+}
+
+# Geração de imagem é outro workload dentro do mesmo plano comercial Go. Não
+# pode usar RATE_LIMIT_RPM["Go"] (chat/LLM): o produto de difusão tem capacidade
+# e fila próprias. Dez é o teto COMERCIAL de submissão; três é a admissão
+# síncrona segura (uma executando + duas esperando) para o pior cenário medido.
+IMAGE_RATE_LIMIT_RPM = {
+    "Go": float(os.environ.get("IMAGE_RATE_LIMIT_RPM_GO", "10")),
+    "Image": float(os.environ.get("IMAGE_RATE_LIMIT_RPM_GO", "10")),
+}
+IMAGE_RATE_LIMIT_BURST = {
+    "Go": float(os.environ.get("IMAGE_RATE_LIMIT_BURST_GO", "3")),
+    "Image": float(os.environ.get("IMAGE_RATE_LIMIT_BURST_GO", "3")),
 }
 
 
@@ -195,6 +207,16 @@ def rate_limit_burst(plan: str | None) -> float:
     Cai em rate_limit_rpm quando o plano não declara burst próprio, que é o
     comportamento que todo plano teve até existir esta tabela."""
     return RATE_LIMIT_BURST.get(plan or "", rate_limit_rpm(plan))
+
+
+def image_rate_limit_rpm(plan: str | None) -> float:
+    """Teto comercial de submissão das rotas de geração de imagem."""
+    return IMAGE_RATE_LIMIT_RPM.get(plan or "", IMAGE_RATE_LIMIT_RPM["Go"])
+
+
+def image_rate_limit_burst(plan: str | None) -> float:
+    """Capacidade do token bucket: maior rajada inicial sem reposição."""
+    return IMAGE_RATE_LIMIT_BURST.get(plan or "", IMAGE_RATE_LIMIT_BURST["Go"])
 
 # concorrência: ELÁSTICA por MÁQUINA, não um teto fixo por chave — uma stack
 # sozinha no pod pode usar quase toda a capacidade; outras dividem o mesmo
@@ -237,16 +259,31 @@ IMAGE_UPLOAD_CEILINGS = {
 # só trocaria um erro nosso, com mensagem útil, por um deles.
 IMAGE_UPSTREAM_TIMEOUT_S = float(os.environ.get("IMAGE_UPSTREAM_TIMEOUT_S", "90"))
 
-# Planos servidos por um pod de DIFUSÃO, não de vLLM. Mesmo padrão de
-# SHARED_POD_PLANS: um set, e não um campo no template, porque a decisão é por
-# plano e precisa ser consultável sem ir ao banco na hot path.
+# Categorias servidas por um pod de difusão, não de vLLM. Desde a migration
+# 0060, categoria e plano comercial são eixos diferentes: Go pode existir nos
+# dois workloads sem misturar seus pools de máquinas.
 #
-# Serve ao guard das rotas de imagem: sem ele, uma chave de plano de LLM
+# Serve ao guard das rotas de imagem: sem ele, uma chave Go de LLM
 # resolveria a máquina DELA (um pod de vLLM) e o gateway mandaria
 # /v1/images/generations pra lá. O agent é o mesmo binário nos dois tipos de
 # pod, então a rota está na allowlist dele também e a requisição seguiria até o
 # vLLM só pra morrer num 404 — três camadas abaixo de onde o erro é explicável.
-IMAGE_PLANS = {"Image"}
+IMAGE_CATEGORY = "image"
+LLM_CATEGORY = "llm"
+IMAGE_GENERATION_PATHS = {"images/generations", "images/edits"}
+
+# O que uma stack de categoria image pode chamar. É superconjunto de
+# IMAGE_GENERATION_PATHS por causa de `models`: o pod de difusão IMPLEMENTA
+# GET /v1/models (docker/image/server.py) devolvendo o modelo servido, e o
+# agent tem a rota na allowlist dele. Barrar aqui seria o gateway fechando uma
+# porta que as três camadas abaixo abrem de propósito — e todo cliente
+# OpenAI-compatível chama /v1/models para descobrir o modelo antes de gerar.
+IMAGE_STACK_ALLOWED_PATHS = IMAGE_GENERATION_PATHS | {"models"}
+
+
+def product_pool_key(plan: str, category: str = LLM_CATEGORY) -> str:
+    """Identidade do pool de máquinas; plano sozinho não separa Go LLM/Image."""
+    return f"{plan}:{category}"
 
 # teto de tempo da inferência de extração de documento (/v1/documents/extract).
 # Não confundir com os 60s do proxy_client: lá o read mede o SILÊNCIO entre
@@ -1106,6 +1143,21 @@ async def authenticate(
     if not entry.get("stack_id"):
         raise HTTPException(status_code=401, detail="chave sem stack associada — contate o suporte")
 
+    # Categoria é a capacidade do produto, não o tier comercial. Uma stack Go
+    # de imagem não pode cair no catch-all de LLM só porque ambas dizem "Go".
+    # Este guard também vale para a chave interna de Playground: diagnóstico
+    # não transforma um pod de difusão em vLLM.
+    product_stack, _product_plan = resolve_key_stack(entry)
+    if (
+        product_stack
+        and (product_stack.get("category") or LLM_CATEGORY) == IMAGE_CATEGORY
+        and path not in IMAGE_STACK_ALLOWED_PATHS
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="esta stack serve geração de imagem, não endpoints de LLM",
+        )
+
     # Corte por inadimplência. Fica aqui, e não junto de check_rate_limit nos
     # 4 call-sites de inferência, por dois motivos: authenticate_anthropic
     # delega pra cá (então /v1/messages fica coberto de graça), e endpoint
@@ -1152,32 +1204,17 @@ def rate_bucket_for_stack(stack_id: str) -> str:
     return f"stack:{stack_id}"
 
 
-def check_rate_limit(bucket_key: str, plan: str | None) -> None:
-    """Token bucket em memória: rpm do plano tokens/min, com burst até o teto
-    do bucket. Estourou -> 429 + Retry-After; nunca enfileira, só rejeita — o
-    cliente decide se tenta de novo.
+def _check_rate_limit_values(bucket_key: str, rpm: float, burst: float) -> None:
+    """Consome um token de um bucket com taxa e capacidade já resolvidas."""
+    if rpm <= 0 or burst <= 0:
+        logger.error("rate limit inválido: rpm=%s burst=%s", rpm, burst)
+        raise HTTPException(status_code=503, detail="limite de capacidade mal configurado")
 
-    `bucket_key` é QUEM divide o teto, e isso muda por rota. As rotas de LLM
-    passam o key_hash: o teto é por chave, porque lá o limite existe para conter
-    um cliente abusivo e a capacidade do pod já é protegida por
-    check_concurrency. As rotas de imagem passam rate_bucket_for_stack(): o teto
-    de RATE_LIMIT_RPM["Image"] foi derivado da capacidade FÍSICA do pod (uma
-    geração por vez, ~12/min), e um teto físico dividido por chave seria
-    multiplicado por quantas chaves a stack emitisse — o limite deixaria de
-    significar o que diz.
-
-    Duas grandezas independentes: `rpm` repõe o bucket (vazão sustentada) e
-    `burst` é o tamanho dele (rajada instantânea). Nos planos de LLM as duas
-    coincidem; ver RATE_LIMIT_BURST para por que em difusão não podem."""
-    rpm = rate_limit_rpm(plan)
-    burst = rate_limit_burst(plan)
     now = time.time()
     tokens, last = rate_buckets.get(bucket_key, (burst, now))
     tokens = min(burst, tokens + (now - last) * rpm / 60.0)
     if tokens < 1.0:
         rate_buckets[bucket_key] = (tokens, now)
-        # o Retry-After é sempre função da TAXA, nunca do burst: o que o cliente
-        # espera é o tempo até o próximo token cair, e isso só depende do rpm.
         retry_after = max(1, int((1.0 - tokens) * 60.0 / rpm) + 1)
         raise HTTPException(
             status_code=429,
@@ -1185,6 +1222,29 @@ def check_rate_limit(bucket_key: str, plan: str | None) -> None:
             headers={"Retry-After": str(retry_after)},
         )
     rate_buckets[bucket_key] = (tokens - 1.0, now)
+
+
+def check_rate_limit(bucket_key: str, plan: str | None) -> None:
+    """Token bucket dos workloads de LLM, por chave.
+
+    `bucket_key` é QUEM divide o teto, e isso muda por rota. As rotas de LLM
+    passam o key_hash: o teto é por chave, porque lá o limite existe para conter
+    um cliente abusivo e a capacidade do pod já é protegida por
+    check_concurrency.
+
+    Duas grandezas independentes: `rpm` repõe o bucket (vazão sustentada) e
+    `burst` é o tamanho dele (rajada instantânea). Nos planos de LLM as duas
+    coincidem; ver RATE_LIMIT_BURST para por que em difusão não podem."""
+    _check_rate_limit_values(bucket_key, rate_limit_rpm(plan), rate_limit_burst(plan))
+
+
+def check_image_rate_limit(bucket_key: str, plan: str | None) -> None:
+    """Token bucket do Go/image, compartilhado por todas as chaves da stack."""
+    _check_rate_limit_values(
+        bucket_key,
+        image_rate_limit_rpm(plan),
+        image_rate_limit_burst(plan),
+    )
 
 
 async def check_token_quota(account_id: str, plan: str | None, purpose: str = "customer") -> None:
@@ -1880,8 +1940,8 @@ async def wake_machine(machine: dict, reason: str) -> str:
     return "woke"
 
 
-async def wake_some_machine_for_plan(plan: str) -> str:
-    """Tenta pôr de pé alguma máquina pausada do template do plano. Só é chamado
+async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) -> str:
+    """Tenta pôr de pé máquina pausada do mesmo plano/categoria. Só é chamado
     quando não há NENHUMA máquina running com vaga.
 
     Cascata por máquina pausada: religa (startPod); se o host cedeu a GPU
@@ -1892,7 +1952,7 @@ async def wake_some_machine_for_plan(plan: str) -> str:
       - 'waking'    : há pausada subindo (cooldown de um wake recente bem
                       encaminhado), cliente reintenta;
       - 'none'      : não há pausada nenhuma (chamador decide provisionar)."""
-    stopped = await supa.list_stopped_machines_for_plan(plan)
+    stopped = await supa.list_stopped_machines_for_plan(plan, category)
     if not stopped:
         return "none"
     recreating = False
@@ -1982,7 +2042,9 @@ def capacity_503(plan: str, reason: str) -> HTTPException:
     )
 
 
-async def provision_machine_for_plan(plan: str) -> dict | None:
+async def provision_machine_for_plan(
+    plan: str, category: str = LLM_CATEGORY
+) -> dict | None:
     """POST {PANEL_URL}/api/machines/provision — pede ao painel Next.js pra
     criar uma máquina nova do plano (o gateway nunca fala com a API de
     criação da RunPod diretamente, ver comentário das env vars no topo).
@@ -1993,15 +2055,19 @@ async def provision_machine_for_plan(plan: str) -> dict | None:
     try:
         r = await panel_client.post(
             f"{PANEL_URL}/api/machines/provision",
-            json={"plan": plan},
+            json={"plan": plan, "category": category},
             headers={"X-Admin-Secret": PANEL_ADMIN_SECRET},
         )
     except httpx.HTTPError as e:
-        logger.warning("provisionamento: chamada ao painel (%s) falhou (%s)", plan, e)
+        logger.warning(
+            "provisionamento: chamada ao painel (%s/%s) falhou (%s)",
+            plan, category, e,
+        )
         return None
     if r.status_code != 200:
         logger.warning(
-            "provisionamento: painel recusou %s (%s): %s", plan, r.status_code, r.text
+            "provisionamento: painel recusou %s/%s (%s): %s",
+            plan, category, r.status_code, r.text,
         )
         return None
     return r.json()
@@ -2151,11 +2217,13 @@ async def _sync_keys_when_healthy(machine_id: str) -> None:
         key_sync_in_progress.pop(machine_id, None)
 
 
-async def _provision_and_track(plan: str, reason: str, pause_when_healthy: bool) -> None:
+async def _provision_and_track(
+    plan: str, category: str, reason: str, pause_when_healthy: bool
+) -> None:
     """Task de background: cria -> espera saudável -> opcionalmente pausa
     (reposição proativa) — nunca deixa exceção escapar (fire-and-forget)."""
     try:
-        machine = await provision_machine_for_plan(plan)
+        machine = await provision_machine_for_plan(plan, category)
         if not machine:
             return
         try:
@@ -2183,13 +2251,16 @@ async def _provision_and_track(plan: str, reason: str, pause_when_healthy: bool)
                         machine["machine_id"], e,
                     )
     except Exception as e:
-        logger.warning("provisionamento automático (%s) falhou (%s)", plan, e)
+        logger.warning(
+            "provisionamento automático (%s/%s) falhou (%s)", plan, category, e
+        )
     finally:
-        provisioning_in_progress.pop(plan, None)
+        provisioning_in_progress.pop(product_pool_key(plan, category), None)
 
 
 async def _try_provision_machine_for_plan(
-    plan: str, reason: str, pause_when_healthy: bool
+    plan: str, reason: str, pause_when_healthy: bool,
+    category: str = LLM_CATEGORY,
 ) -> bool:
     """Dispara a criação em background se o interruptor estiver ligado, o
     painel estiver configurado, não houver uma criação em andamento pro
@@ -2205,49 +2276,60 @@ async def _try_provision_machine_for_plan(
         # None — sem essa checagem aqui, o chamador levantaria um
         # provisioning_503() mentiroso (promete retry, mas nunca vai criar)
         return False
-    if lock_active(provisioning_in_progress, plan, PROVISION_LOCK_TTL_S):
+    pool_key = product_pool_key(plan, category)
+    if lock_active(provisioning_in_progress, pool_key, PROVISION_LOCK_TTL_S):
         return False
     now = time.time()
-    if now - last_provision_attempt.get(plan, 0) < PROVISION_COOLDOWN_S:
+    if now - last_provision_attempt.get(pool_key, 0) < PROVISION_COOLDOWN_S:
         return False
     # daqui pra baixo não há mais nenhum await antes de marcar a trava —
     # checagem + marcação são atômicas dentro do event loop (mesmo cuidado
     # do wake_machine existente)
-    last_provision_attempt[plan] = now
-    provisioning_in_progress[plan] = now
-    spawn_tracked(_provision_and_track(plan, reason, pause_when_healthy))
+    last_provision_attempt[pool_key] = now
+    provisioning_in_progress[pool_key] = now
+    spawn_tracked(_provision_and_track(plan, category, reason, pause_when_healthy))
     return True
 
 
-async def try_provision_for_request(plan: str, reason: str) -> bool:
+async def try_provision_for_request(
+    plan: str, reason: str, category: str = LLM_CATEGORY
+) -> bool:
     """Cascata reativa (3º nível): não pausa ao ficar saudável — o próprio
     request que disparou precisa da máquina de pé pro retry."""
-    return await _try_provision_machine_for_plan(plan, reason, pause_when_healthy=False)
+    return await _try_provision_machine_for_plan(
+        plan, reason, pause_when_healthy=False, category=category
+    )
 
 
-async def try_provision_for_pool(plan: str, reason: str) -> bool:
+async def try_provision_for_pool(
+    plan: str, reason: str, category: str = LLM_CATEGORY
+) -> bool:
     """Reposição proativa: pausa ao ficar saudável — ninguém está esperando,
     minimiza custo de GPU ociosa."""
-    return await _try_provision_machine_for_plan(plan, reason, pause_when_healthy=True)
+    return await _try_provision_machine_for_plan(
+        plan, reason, pause_when_healthy=True, category=category
+    )
 
 
-async def pick_machine_with_free_slot(plan: str) -> dict:
+async def pick_machine_with_free_slot(plan: str, category: str = LLM_CATEGORY) -> dict:
     """Alocação placeholder: primeira máquina running (do template do plano
     da conta) com slot LoRA livre. Sem capacidade → tenta religar um pod
     pausado do plano (auto-wake); sem pausada, tenta provisionar uma nova
     (3º nível, se o interruptor estiver ligado) antes de desistir."""
-    machines = await supa.list_running_machines_for_plan(plan)
+    machines = await supa.list_running_machines_for_plan(plan, category)
     for m in machines:
         if await machine_free_slots(m) > 0:
             return m
-    woke = await wake_some_machine_for_plan(plan)
+    woke = await wake_some_machine_for_plan(plan, category)
     if woke == "recreating":
         raise recreating_503()
     if woke != "none":
         raise waking_503()
     if lock_active(
-        provisioning_in_progress, plan, PROVISION_LOCK_TTL_S
-    ) or await try_provision_for_request(plan, "sem máquina com vaga nem pausada"):
+        provisioning_in_progress, product_pool_key(plan, category), PROVISION_LOCK_TTL_S
+    ) or await try_provision_for_request(
+        plan, "sem máquina com vaga nem pausada", category
+    ):
         raise provisioning_503()
     if not machines:
         raise capacity_503(plan, "nenhuma máquina disponível")
@@ -2405,11 +2487,14 @@ async def machine_admits(machine_id: str, usage_class: str = "low") -> bool:
 
 
 async def pick_running_machine_with_stack_slot(
-    plan: str, exclude_machine_id: str | None = None, usage_class: str = "low"
+    plan: str,
+    exclude_machine_id: str | None = None,
+    usage_class: str = "low",
+    category: str = LLM_CATEGORY,
 ) -> dict | None:
     """Primeira máquina running do plano que admite uma stack da classe dada
     (ver machine_admits para as duas restrições)."""
-    for m in await supa.list_running_machines_for_plan(plan):
+    for m in await supa.list_running_machines_for_plan(plan, category):
         if exclude_machine_id and m["id"] == exclude_machine_id:
             continue
         if await machine_admits(m["id"], usage_class):
@@ -2431,7 +2516,9 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
     admin migrar via migrateStack.
     """
     moved = False
-    async with realloc_locks[stack["plan"]]:
+    category = stack.get("category") or LLM_CATEGORY
+    pool_key = product_pool_key(stack["plan"], category)
+    async with realloc_locks[pool_key]:
         fresh = await supa.get_stack(stack["id"])
         if not fresh:
             return None
@@ -2452,6 +2539,7 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
                 # emergência (máquina pausada) resolveria a indisponibilidade
                 # às custas de criar um pod desbalanceado
                 usage_class=fresh.get("usage_class") or "low",
+                category=category,
             )
             if not target:
                 return None
@@ -2503,7 +2591,9 @@ async def place_base_stack(entry: dict, stack: dict) -> dict | None:
     None = sem vaga em máquina nenhuma (o chamador cai no wake/provision por
     plano) ou perdeu a corrida sem a máquina do vencedor estar pronta.
     """
-    async with realloc_locks[stack["plan"]]:
+    category = stack.get("category") or LLM_CATEGORY
+    pool_key = product_pool_key(stack["plan"], category)
+    async with realloc_locks[pool_key]:
         fresh = await supa.get_stack(stack["id"])
         if not fresh:
             return None
@@ -2518,6 +2608,7 @@ async def place_base_stack(entry: dict, stack: dict) -> dict | None:
         target = await pick_running_machine_with_stack_slot(
             stack["plan"],
             usage_class=fresh.get("usage_class") or "low",
+            category=category,
         )
         if not target:
             return None
@@ -2563,6 +2654,7 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
        RunPod) → recriação reativa, no fim da função. Ver `lost_machine`.
     """
     stack, effective_plan = resolve_key_stack(entry)
+    category = (stack or {}).get("category") or LLM_CATEGORY
     # máquina da stack que sumiu e merece recriação (ver machine_was_lost e o
     # bloco no fim desta função). Só é preenchida no ramo terminated/error.
     lost_machine: dict | None = None
@@ -2612,17 +2704,19 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
             return target, effective_plan
         # sem vaga em lugar nenhum → cai no fallback (wake/provision por plano)
 
-    machines = await supa.list_running_machines_for_plan(effective_plan)
+    machines = await supa.list_running_machines_for_plan(effective_plan, category)
     if not machines:
-        woke = await wake_some_machine_for_plan(effective_plan)
+        woke = await wake_some_machine_for_plan(effective_plan, category)
         if woke == "recreating":
             raise recreating_503()  # host sem GPU → recriando num host novo
         if woke != "none":
             raise waking_503()  # despausando agora ou uma já está subindo
         if lock_active(
-            provisioning_in_progress, effective_plan, PROVISION_LOCK_TTL_S
+            provisioning_in_progress,
+            product_pool_key(effective_plan, category),
+            PROVISION_LOCK_TTL_S,
         ) or await try_provision_for_request(
-            effective_plan, "sem máquina para o modelo base"
+            effective_plan, "sem máquina para o modelo base", category
         ):
             raise provisioning_503()
         # Último recurso: a máquina da stack foi PERDIDA (pod sumiu do RunPod) e
@@ -3709,18 +3803,28 @@ def machine_capacity(machine: dict) -> int:
     return cap if isinstance(cap, int) and cap > 0 else DEFAULT_MAX_CONCURRENT_SEQS
 
 
-def check_concurrency(flight_key: tuple[str, str], machine: dict, plan: str) -> None:
+def check_concurrency(
+    flight_key: tuple[str, str],
+    machine: dict,
+    plan: str,
+    category: str = LLM_CATEGORY,
+) -> None:
     """Concorrência elástica por MÁQUINA, não por chave: uma stack sozinha no
     pod pode ocupar quase toda a capacidade; outras dividem o mesmo teto
-    conforme aparecem. Em pod compartilhado (SHARED_POD_PLANS) reserva um
+    conforme aparecem. Em pod LLM compartilhado (SHARED_POD_PLANS) reserva um
     piso mínimo (MIN_RESERVED_SLOTS_SHARED_POD) pra quem chegar depois nunca
-    ficar 100% bloqueado esperando um tenant pesado — em pod dedicado não há
-    vizinho pra proteger, o teto é a capacidade cheia.
+    ficar 100% bloqueado esperando um tenant pesado. Categoria image é pod
+    dedicado mesmo quando o plano comercial é Go, portanto usa a capacidade
+    cheia da fila.
 
     Chamada logo após incrementar in_flight[flight_key] (mesmo padrão do
     antigo teto por chave): se estourar, desfaz o incremento e rejeita."""
     machine_id = flight_key[1]
-    reserved = MIN_RESERVED_SLOTS_SHARED_POD if plan in SHARED_POD_PLANS else 0
+    reserved = (
+        MIN_RESERVED_SLOTS_SHARED_POD
+        if category == LLM_CATEGORY and plan in SHARED_POD_PLANS
+        else 0
+    )
     ceiling = max(machine_capacity(machine) - reserved, 1)
     total_on_machine = sum(n for (_, m), n in in_flight.items() if m == machine_id)
     if total_on_machine > ceiling:
@@ -4477,14 +4581,14 @@ async def generate_document(
 # um pod que não roda vLLM.
 #
 # O que estes dois handlers fazem, e o catch-all não faria: pulam validate_body,
-# aplicam teto de corpo próprio, exigem plano de imagem e repassam o multipart
+# aplicam teto de corpo próprio, exigem categoria image e repassam o multipart
 # do `edits` em streaming.
 GENERATIONS_PATH = "images/generations"
 EDITS_PATH = "images/edits"
 
 
-def _require_image_plan(plan: str, path: str) -> None:
-    """403 quando a chave não é de um plano servido por pod de difusão.
+def _require_image_product(stack: dict | None, plan: str | None, path: str) -> None:
+    """403 quando a chave não é de um produto servido por pod de difusão.
 
     Fail-CLOSED, ao contrário do cli_block_reason (que erra para o lado de
     deixar passar). Aqui a assimetria se inverte: deixar passar não é
@@ -4492,14 +4596,20 @@ def _require_image_plan(plan: str, path: str) -> None:
     onde o agent (mesmo binário nos dois tipos de pod) a repassaria ao vLLM para
     morrer num 404 sobre um "modelo" que o cliente nunca pediu. Um 403 daqui é a
     única resposta que diz o que fazer."""
-    if plan in IMAGE_PLANS:
+    category = (stack or {}).get("category") or LLM_CATEGORY
+    # `plan == Image` é uma janela de compatibilidade para uma entrada antiga
+    # do key_cache durante o rollout 0060→0061. Depois do contract, o estado
+    # persistido é plan=Go/category=image.
+    if category == IMAGE_CATEGORY or plan == "Image":
         return
-    logger.info("images: plano %s barrado em /v1/%s", plan, path)
+    logger.info(
+        "images: produto %s/%s barrado em /v1/%s", plan, category, path
+    )
     raise HTTPException(
         status_code=403,
         detail=(
-            f"o plano {plan} não inclui geração de imagem — "
-            "a rota exige uma stack do plano Image"
+            f"a stack {plan}/{category} não inclui geração de imagem — "
+            "a rota exige um produto da categoria image"
         ),
     )
 
@@ -4507,7 +4617,7 @@ def _require_image_plan(plan: str, path: str) -> None:
 async def _authorize_image_request(
     authorization: str | None, request: Request, path: str
 ) -> tuple[dict, str, dict, str, str]:
-    """Tronco comum de generations/edits: autentica, checa plano e limites,
+    """Tronco comum de generations/edits: autentica, checa produto e limites,
     resolve a máquina e reserva a vaga de concorrência.
 
     Devolve (entry, account_id, machine, stack_id, effective_plan) com o
@@ -4515,7 +4625,7 @@ async def _authorize_image_request(
     todos os caminhos de saída.
 
     A ordem é a mesma do catch-all e do /v1/messages, e cada passo está onde
-    está por um motivo: o guard de plano vem antes do rate limit porque não faz
+    está por um motivo: o guard de produto vem antes do rate limit porque não faz
     sentido gastar a cota de uma chave numa rota que ela não pode usar; o
     in_flight++ vem antes dos awaits lentos porque o grace recheck da auto-pausa
     o consulta, e quanto mais cedo, menor a janela pra pausa derrubar a máquina
@@ -4523,20 +4633,17 @@ async def _authorize_image_request(
     entry, _key_hash = await authenticate(authorization, request.headers, path)
     account_id = entry["account_id"]
     key_stack, key_plan = resolve_key_stack(entry)
-    _require_image_plan(key_plan, path)
+    _require_image_product(key_stack, key_plan, path)
     # Teto COMPARTILHADO pela stack, não por chave — ver check_rate_limit. A
     # stack aqui é a da CHAVE (resolve_key_stack), e não a que resolve_route
     # devolve: quem contratou é quem tem o teto, e a decisão precisa acontecer
     # antes de gastar o resolve_route (que pode acordar máquina). key_stack é
-    # garantidamente não-None neste ponto: _require_image_plan já barrou o plano
-    # None que resolve_key_stack devolve quando não há stack.
-    check_rate_limit(rate_bucket_for_stack(key_stack["id"]), key_plan)
-    # Roda, e é INERTE de propósito: geração de imagem não produz tokens, então
-    # nada aqui incrementa a quota diária. Fica no fluxo para que o dia em que
-    # existir uma métrica de imagem não precise reencontrar o ponto de corte —
-    # e porque uma chave de conta que estourou a cota de texto não deveria
-    # continuar servindo por uma rota que esqueceu de checar.
-    await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+    # garantidamente não-None neste ponto: _require_image_product já barrou a
+    # ausência de uma stack da categoria image.
+    check_image_rate_limit(rate_bucket_for_stack(key_stack["id"]), key_plan)
+    # Não aplica check_token_quota: imagem não produz tokens e o orçamento do
+    # Go/LLM é outro produto. Uma conta que esgotou texto não pode bloquear uma
+    # stack Go/image independente.
 
     machine, _rewrite_model, effective_plan, stack_id = await resolve_route(
         account_id, entry
@@ -4545,7 +4652,7 @@ async def _authorize_image_request(
 
     flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
-    check_concurrency(flight_key, machine, effective_plan)
+    check_concurrency(flight_key, machine, effective_plan, IMAGE_CATEGORY)
     return entry, account_id, machine, stack_id, effective_plan
 
 
@@ -4836,7 +4943,7 @@ async def images_edits(request: Request, authorization: str | None = Header(None
     """image-to-image. multipart/form-data repassado em STREAMING ao pod.
 
     Nada de `await request.body()` nem `request.form()`: o corpo pode chegar a
-    dezenas de MiB (4 referências de 15 MiB), e este processo é réplica única
+    até 20 MiB de referências (4 × 5 MiB), e este processo é réplica única
     compartilhada por todos os tenants. Acumulá-lo aqui faria uma rajada de
     uploads competir por RAM com o tráfego de chat de todo mundo. O pod é
     dedicado (max_users: 1) e tem a própria memória para materializá-lo.
@@ -4925,7 +5032,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
 
     entry, key_hash = await authenticate(authorization, request.headers, path)
     account_id = entry["account_id"]
-    _, key_plan = resolve_key_stack(entry)
+    key_stack, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
 
@@ -4937,7 +5044,19 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     # menor a janela pra pausa derrubar a máquina com request já resolvido
     flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
-    check_concurrency(flight_key, machine, effective_plan)
+    # A categoria importa aqui por causa do único path de stack de imagem que
+    # chega ao catch-all: `models`. Sem ela, plan=Go cairia em SHARED_POD_PLANS
+    # e reservaria MIN_RESERVED_SLOTS_SHARED_POD num pod de difusão DEDICADO —
+    # e como as gerações dividem este mesmo flight_key, uma geração em voo já
+    # derrubaria o /v1/models em 429. As rotas de imagem passam IMAGE_CATEGORY
+    # pelo mesmo motivo; os outros call-sites são exclusivos de LLM, onde o
+    # guard de categoria em authenticate já barrou a stack de imagem.
+    check_concurrency(
+        flight_key,
+        machine,
+        effective_plan,
+        (key_stack or {}).get("category") or LLM_CATEGORY,
+    )
 
     log_ctx = dict(
         account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],

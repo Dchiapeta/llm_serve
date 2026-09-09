@@ -354,8 +354,8 @@ Do `env` do template (ver `scripts/_tmp-create-image-template.mjs`):
 | `IMAGE_OUTPUT_FORMAT` | `png` | |
 | `IMAGE_MAX_REFERENCE_IMAGES` | `4` | |
 | `IMAGE_ALLOWED_FORMATS` | `png,jpeg,webp` | detectado por magic bytes, não por content-type |
-| `IMAGE_MAX_FILE_SIZE_MB` | `15` | |
-| `IMAGE_QUEUE_CAPACITY` | `4` | total em voo |
+| `IMAGE_MAX_FILE_SIZE_MB` | `5` | por referência; até 4 PNG/JPEG/WEBP |
+| `IMAGE_QUEUE_CAPACITY` | `3` | total em voo: 1 executando + 2 esperando |
 | `IMAGE_QUEUE_WAIT_TIMEOUT_S` | `60` | e não 120: o edge do RunPod corta em ~100-127 s, então 120 nunca dispararia — o cliente receberia 524 do Cloudflare em vez do nosso 504 |
 | `IMAGE_WARMUP_RUNS` | `2` | `/health` só fica 200 depois deles |
 | `IMAGE_ALLOW_TF32` | `true` | A40 é SM 8.6 |
@@ -487,15 +487,15 @@ inadimplência (402), rate limit por plano, teto de concorrência, `last_activit
 armazenamento das imagens no bucket (ver `image_gen.py`).
 
 Tetos de corpo próprios, em `docker/gateway/image_proxy.py` — os 8 MB do
-catch-all recusariam uma referência de 15 MiB:
+catch-all recusariam o corpo máximo de quatro referências de 5 MiB:
 
 | Rota | Teto no gateway | Teto no agent |
 |---|---|---|
 | `images/generations` | 256 KiB (é texto) | 256 KiB |
-| `images/edits` | 4×15 MiB + folga | idem |
+| `images/edits` | 4×5 MiB + folga (21 MiB) | idem |
 
 O `edits` é repassado em **streaming** pelo gateway (`counting_stream`), então
-o processo compartilhado nunca acumula os 60 MiB. Não é streaming ponta a ponta:
+o processo compartilhado nunca acumula os 20 MiB de referências. Não é streaming ponta a ponta:
 o agent ainda faz `read_body_capped` e o `server.py` materializa o multipart —
 o que o pod dedicado pode pagar, e o gateway não.
 
@@ -510,11 +510,11 @@ ou mande o nome servido.
 - **Uso não é contabilizado em tokens.** Geração de imagem não produz tokens,
   então `gateway_requests.tokens_in/out` e `usage_metrics` ficam nulos — e
   `check_token_quota` fica cega para este workload. Os freios reais são
-  `RATE_LIMIT_RPM` (12/min por stack, com rajada de 4) e `check_concurrency`. A tabela
-  `image_generations` é o contador que uma cota por imagem usaria. Os 12/min
-  foram derivados de "~5 s por geração", estimativa que as medições posteriores
-  contradizem — `scripts/loadtest_image.py` mede a vazão real, que é de onde
-  esse número deveria sair.
+  `IMAGE_RATE_LIMIT_RPM_GO` (10 submissões/min por stack, com 3 em voo) e
+  `check_concurrency`. A tabela
+  `image_generations` é o contador que uma cota por imagem usaria. O teto de
+  10/min é de submissão comercial; `scripts/loadtest_image.py` mede a vazão
+  concluída real, que varia entre geração e edição.
 - **Volume não sobrevive à recriação do pod.** `CreatePodInput`
   (`lib/runpod.ts`) não expõe Network Volume, então `recreateMachine` rebaixa os
   16 GB. Stop/start (auto-pausa) preserva.

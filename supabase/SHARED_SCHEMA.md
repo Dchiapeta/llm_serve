@@ -44,11 +44,31 @@ Ordem obrigatória: `0050` (aqui) **antes** de `0029` (lá), e as duas antes de
 qualquer deploy do gateway que leia as colunas — `find_active_key` faz
 `raise_for_status()`, então coluna faltando vira 500 em todo o tráfego.
 
+### Categoria do produto (`0060`)
+
+`plan` é o tier comercial; `category` é o workload (`llm` ou `image`). O
+primeiro produto de imagem é `plan=Go`, `category=image`, template
+`GO-IMAGE-A40`. O checkout do TryStac deve enviar `category: "image"` ao
+`POST /api/stacks`; ausência continua significando `llm` por compatibilidade.
+
+Rollout sem indisponibilidade:
+
+1. aplicar `0060_product_category.sql` (EXPAND): cria as colunas, classifica o
+   produto e atualiza seus limites, mas preserva o plano legado `Image`;
+2. publicar painel e gateway category-aware em todas as réplicas;
+3. publicar o TryStac enviando `category: "image"` no checkout;
+4. aguardar/limpar o cache antigo de chaves;
+5. aplicar `0061_go_image_contract.sql` (CONTRACT), convertendo o estado para
+   `plan=Go/category=image`.
+
+Não publique o gateway novo antes da 0060: `find_active_key` seleciona
+`stacks.category` explicitamente e falha fechado se a coluna ainda não existir.
+
 ## Tabelas novas que o TryStac ainda vai precisar acessar
 
 ### `image_generations` + bucket `images` (migrations `0058`/`0059` daqui)
 
-Registro de cada imagem gerada pelo plano Image: quem gerou (`account_id`,
+Registro de cada imagem gerada por uma stack da categoria `image`: quem gerou (`account_id`,
 `stack_id`, `api_key_id`, `machine_id`), com que parâmetros, e onde o arquivo
 está no bucket privado `images`. Escrita **só** pelo gateway, no caminho da
 própria requisição (`docker/gateway/image_gen.py`).

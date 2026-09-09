@@ -98,7 +98,7 @@ export function ContaDetalhesDialog({
                   </div>
                   <div className="flex shrink-0 flex-col items-end gap-1">
                     <Badge variant={PLAN_BADGE_VARIANT[stack.plan]} size="sm">
-                      {stack.plan}
+                      {stack.plan} · {stack.category === "image" ? "Imagem" : "LLM"}
                     </Badge>
                     {billing && (
                       <Badge variant={billing.variant} size="sm">

@@ -364,10 +364,10 @@ def test_generations_e_muito_mais_apertado_que_edits():
 
 
 def test_teto_de_edits_cobre_o_maximo_do_pod():
-    """4 arquivos de 15 MiB é o que IMAGE_MAX_REFERENCE_IMAGES e
+    """4 arquivos de 5 MiB é o que IMAGE_MAX_REFERENCE_IMAGES e
     IMAGE_MAX_FILE_SIZE_MB permitem. Um teto abaixo disso recusaria no pod o
     que o gateway (image_proxy.max_edit_bytes) deixou passar."""
-    assert max_body_bytes("images/edits") > 4 * 15 * 1024 * 1024
+    assert max_body_bytes("images/edits") == 21 * 1024 * 1024
 
 
 def test_rota_desconhecida_cai_no_teto_conservador():

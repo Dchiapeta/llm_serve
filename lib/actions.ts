@@ -15,7 +15,7 @@ import { getClientLocation, listRoutesByMachine, setClientLocation } from "./rou
 import { insertStack } from "./stacks"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import { CLIENT_WINDOW_DAYS, MAX_KEYS_BY_PLAN, MAX_KNOWLEDGE_FILE_SIZE_BYTES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type Account, type ApiKey, type LoraAdapter, type Machine, type Stack, type StackClient, type Template, type TemplatePlan } from "./types"
+import { CLIENT_WINDOW_DAYS, MAX_KEYS_BY_PLAN, MAX_KNOWLEDGE_FILE_SIZE_BYTES, PRODUCT_CATEGORIES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type Account, type ApiKey, type LoraAdapter, type Machine, type ProductCategory, type Stack, type StackClient, type Template, type TemplatePlan } from "./types"
 
 // Janela de deduplicação do provisionamento: um retry do gateway dentro desse
 // intervalo reusa a máquina 'creating' recém-criada em vez de criar outra.
@@ -128,6 +128,18 @@ function parsePlan(formData: FormData): TemplatePlan {
   return raw as TemplatePlan
 }
 
+function parseProductCategory(
+  raw: FormDataEntryValue | null,
+  fallback: ProductCategory = "llm"
+): ProductCategory {
+  if (raw == null || String(raw).trim() === "") return fallback
+  const value = String(raw).trim()
+  if (!PRODUCT_CATEGORIES.includes(value as ProductCategory)) {
+    throw new Error("Categoria inválida")
+  }
+  return value as ProductCategory
+}
+
 type TemplateAvailability = Pick<Template, "is_enabled" | "is_test">
 
 function machineCreationBlockedReason(
@@ -205,6 +217,7 @@ export async function createTemplate(formData: FormData) {
   const image = String(formData.get("image"))
   const modelName = String(formData.get("model_name"))
   const plan = parsePlan(formData)
+  const category = parseProductCategory(formData.get("category"))
   const diskGb = Number(formData.get("disk_gb") || 40)
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
@@ -253,6 +266,7 @@ export async function createTemplate(formData: FormData) {
     image,
     model_name: modelName,
     plan,
+    category,
     gpu_types: gpuTypes,
     gpu_count: gpuCount,
     env,
@@ -286,6 +300,7 @@ export async function importTemplate(formData: FormData) {
 
   const modelName = String(formData.get("model_name"))
   const plan = parsePlan(formData)
+  const category = parseProductCategory(formData.get("category"))
   const footprint = Number(formData.get("model_footprint_gb") || 16)
   const kvReserve = Number(formData.get("kv_reserve_gb_per_user") || 2)
   const loraFootprint = Number(formData.get("lora_footprint_gb") || 0.5)
@@ -310,6 +325,7 @@ export async function importTemplate(formData: FormData) {
     image: remote.imageName,
     model_name: modelName,
     plan,
+    category,
     gpu_types: gpuTypes,
     gpu_count: gpuCount,
     env: remote.env ?? {},
@@ -366,6 +382,12 @@ export async function updateTemplate(formData: FormData) {
   }
 
   const { data: tpl } = await db.from("templates").select("*").eq("id", id).single<Template>()
+  const category = parseProductCategory(formData.get("category"), tpl?.category ?? "llm")
+  if (tpl && category !== tpl.category) {
+    throw new Error(
+      "A categoria de um produto existente não pode ser alterada; crie outro produto para evitar mover máquinas e stacks entre pools"
+    )
+  }
 
   // reflete a alteração no RunPod quando o template está sincronizado
   if (tpl?.runpod_template_id) {
@@ -394,6 +416,7 @@ export async function updateTemplate(formData: FormData) {
       image,
       model_name: modelName,
       plan,
+      category,
       gpu_types: gpuTypes,
       gpu_count: gpuCount,
       env,
@@ -601,6 +624,7 @@ export async function createMachine(formData: FormData) {
 // só chama isso quando o watermark do plano já está violado).
 export async function provisionMachineForPlan(input: {
   plan: TemplatePlan
+  category?: ProductCategory
   templateId?: string | null
 }): Promise<
   | { machineId: string; name: string; publicUrl: string | null }
@@ -617,11 +641,14 @@ export async function provisionMachineForPlan(input: {
       .single<Template>()
     tpl = data
   } else {
-    tpl = await getDefaultTemplateForPlan(db, input.plan)
+    tpl = await getDefaultTemplateForPlan(db, input.plan, input.category ?? "llm")
   }
   if (!tpl) return { error: `Nenhum produto ${input.plan} cadastrado` }
   if (input.templateId && tpl.plan !== input.plan) {
     return { error: "O template informado não pertence ao plano informado" }
+  }
+  if (input.templateId && tpl.category !== (input.category ?? "llm")) {
+    return { error: "O template informado não pertence à categoria informada" }
   }
   const blocked = machineCreationBlockedReason(tpl, true)
   if (blocked) return { error: blocked }
@@ -1057,12 +1084,14 @@ async function viableGpuIdsForTemplate(
 // tornar essa escolha determinística, em vez de arbitrária).
 async function getDefaultTemplateForPlan(
   db: ReturnType<typeof createSupabaseAdmin>,
-  plan: TemplatePlan
+  plan: TemplatePlan,
+  category: ProductCategory = "llm"
 ): Promise<Template | null> {
   const { data } = await db
     .from("templates")
     .select("*")
     .eq("plan", plan)
+    .eq("category", category)
     .eq("is_enabled", true)
     .eq("is_test", false)
     .order("created_at", { ascending: true })
@@ -1159,9 +1188,9 @@ export async function ensureStackMachine(stackId: string): Promise<string> {
   const db = createSupabaseAdmin()
   const { data: stack } = await db
     .from("stacks")
-    .select("id, plan, machine_id")
+    .select("id, plan, category, machine_id")
     .eq("id", stackId)
-    .single<{ id: string; plan: TemplatePlan; machine_id: string | null }>()
+    .single<{ id: string; plan: TemplatePlan; category: ProductCategory; machine_id: string | null }>()
   if (!stack) throw new Error("Stack não encontrada")
   if (stack.machine_id) return stack.machine_id
 
@@ -1185,21 +1214,30 @@ export async function ensureStackMachine(stackId: string): Promise<string> {
     const { data: historicalTemplate } = historicalMachine?.template_id
       ? await db
           .from("templates")
-          .select("is_enabled, is_test")
+          .select("is_enabled, is_test, plan, category")
           .eq("id", historicalMachine.template_id)
-          .maybeSingle<TemplateAvailability>()
+          .maybeSingle<
+            TemplateAvailability & Pick<Template, "plan" | "category">
+          >()
       : { data: null }
-    // Sem template é máquina legada e mantém o comportamento antigo. Com
-    // template indisponível, o pin histórico não pode virar uma NOVA casa:
-    // segue para a alocação num produto de produção.
-    if (!historicalTemplate || !userAllocationBlockedReason(historicalTemplate)) {
+    // O pin histórico só pode virar uma NOVA casa se continuar pertencendo
+    // ao mesmo produto. Isso evita que um upgrade de Go/LLM para Go/Image
+    // recoloque a stack na máquina antiga apontada pela chave do cliente.
+    const historicalCategory = historicalTemplate?.category ?? "llm"
+    const sameProduct =
+      historicalTemplate?.plan === stack.plan && historicalCategory === stack.category
+    if (
+      historicalTemplate &&
+      sameProduct &&
+      !userAllocationBlockedReason(historicalTemplate)
+    ) {
       return customerKey.machine_id
     }
   }
 
   // Stack nunca homeada e sem chave anterior: aloca de vez, com a mesma
   // cascata de createStack (running com vaga → pausada com vaga → nova).
-  const tpl = await getDefaultTemplateForPlan(db, stack.plan)
+  const tpl = await getDefaultTemplateForPlan(db, stack.plan, stack.category)
   if (!tpl) throw new Error(`Nenhum produto configurado para o plano ${stack.plan}`)
   const alloc = await allocateMachineForTemplate(db, tpl)
   const { error } = await db
@@ -1235,15 +1273,18 @@ export async function createStack(formData: FormData): Promise<{
 
   const { data: tpl } = await db
     .from("templates")
-    .select("id, plan, is_enabled, is_test, gpu_types, gpu_count, max_users, model_footprint_gb, kv_reserve_gb_per_user")
+    .select("id, plan, category, is_enabled, is_test, gpu_types, gpu_count, max_users, model_footprint_gb, kv_reserve_gb_per_user")
     .eq("id", templateId)
     .single<
       Pick<
         Template,
-        "id" | "plan" | "is_enabled" | "is_test" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
+        "id" | "plan" | "category" | "is_enabled" | "is_test" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
       >
-    >()
+  >()
   if (!tpl) throw new Error("Produto não encontrado")
+  if (tpl.plan !== plan) {
+    throw new Error("O produto selecionado não pertence ao plano informado")
+  }
   const allocationBlocked = userAllocationBlockedReason(tpl)
   if (allocationBlocked) throw new Error(allocationBlocked)
 
@@ -1289,7 +1330,14 @@ export async function createStack(formData: FormData): Promise<{
 
   // Insert (com retry de colisão de slug) compartilhado com o provisionamento
   // por checkout — ver lib/stacks.ts.
-  const inserted = await insertStack({ db, accountId, plan, slug, purchaseDate })
+  const inserted = await insertStack({
+    db,
+    accountId,
+    plan,
+    category: tpl.category,
+    slug,
+    purchaseDate,
+  })
   const stackId = inserted.stackId
   slug = inserted.slug
 
@@ -1563,10 +1611,10 @@ export async function migrateStack(input: {
 
   const { data: stack } = await db
     .from("stacks")
-    .select("id, account_id, machine_id, plan, slug, usage_class")
+    .select("id, account_id, machine_id, plan, category, slug, usage_class")
     .eq("id", input.stackId)
     .single<
-      Pick<Stack, "id" | "account_id" | "machine_id" | "plan" | "slug" | "usage_class">
+      Pick<Stack, "id" | "account_id" | "machine_id" | "plan" | "category" | "slug" | "usage_class">
     >()
   if (!stack) throw new Error("Stack não encontrada")
   // peso real da stack que chega ao destino (0032): um high custa 3 slots —
@@ -1593,22 +1641,25 @@ export async function migrateStack(input: {
     templateId = m?.template_id ?? null
   }
   if (!templateId) {
-    const defaultTpl = await getDefaultTemplateForPlan(db, stack.plan)
+    const defaultTpl = await getDefaultTemplateForPlan(db, stack.plan, stack.category)
     templateId = defaultTpl?.id ?? null
   }
   if (!templateId) throw new Error(`Nenhum produto ${stack.plan} cadastrado`)
 
   const { data: targetTemplate } = await db
     .from("templates")
-    .select("id, is_enabled, is_test, gpu_types, gpu_count, max_users, model_footprint_gb, kv_reserve_gb_per_user")
+    .select("id, plan, category, is_enabled, is_test, gpu_types, gpu_count, max_users, model_footprint_gb, kv_reserve_gb_per_user")
     .eq("id", templateId)
     .single<
       Pick<
         Template,
-        "id" | "is_enabled" | "is_test" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
+        "id" | "plan" | "category" | "is_enabled" | "is_test" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
       >
     >()
   if (!targetTemplate) throw new Error("Produto não encontrado")
+  if (targetTemplate.plan !== stack.plan || targetTemplate.category !== stack.category) {
+    throw new Error("O produto da máquina atual não corresponde ao plano e à categoria da stack")
+  }
   const allocationBlocked = userAllocationBlockedReason(targetTemplate)
   if (allocationBlocked) throw new Error(allocationBlocked)
 

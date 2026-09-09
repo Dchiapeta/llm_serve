@@ -24,7 +24,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { TEMPLATE_PLANS } from "@/lib/types"
+import { PRODUCT_CATEGORIES, TEMPLATE_PLANS } from "@/lib/types"
 
 export function ImportTemplateDialog({
   runpodTemplateId,
@@ -99,6 +99,22 @@ export function ImportTemplateDialog({
               placeholder="Qwen/Qwen2.5-7B-Instruct"
               required
             />
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <Label htmlFor={`category-${runpodTemplateId}`}>Categoria</Label>
+            <Select name="category" defaultValue="llm">
+              <SelectTrigger id={`category-${runpodTemplateId}`} className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {PRODUCT_CATEGORIES.map((category) => (
+                  <SelectItem key={category} value={category}>
+                    {category}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
 
           <div className="grid grid-cols-2 gap-4">

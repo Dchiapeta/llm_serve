@@ -92,9 +92,9 @@ ALLOWED_FORMATS = frozenset(
     for f in os.environ.get("IMAGE_ALLOWED_FORMATS", "png,jpeg,webp").split(",")
     if f.strip()
 )
-MAX_FILE_SIZE_BYTES = int(os.environ.get("IMAGE_MAX_FILE_SIZE_MB", "15")) * 1024 * 1024
+MAX_FILE_SIZE_BYTES = int(os.environ.get("IMAGE_MAX_FILE_SIZE_MB", "5")) * 1024 * 1024
 
-QUEUE_CAPACITY = int(os.environ.get("IMAGE_QUEUE_CAPACITY", "4"))
+QUEUE_CAPACITY = int(os.environ.get("IMAGE_QUEUE_CAPACITY", "3"))
 QUEUE_WAIT_TIMEOUT_S = float(os.environ.get("IMAGE_QUEUE_WAIT_TIMEOUT_S", "60"))
 WARMUP_RUNS = int(os.environ.get("IMAGE_WARMUP_RUNS", "2"))
 ALLOW_TF32 = os.environ.get("IMAGE_ALLOW_TF32", "true").lower() == "true"
@@ -159,7 +159,7 @@ class GenPayload:
     # resposta dizer com que seed a imagem saiu.
     seed: int
     # bytes crus; a decodificação acontece na thread do worker, não no event
-    # loop — 4 referências de 15 MB são trabalho de CPU suficiente para
+    # loop — 4 referências de 5 MiB são trabalho de CPU suficiente para
     # travar o /health se fosse feito aqui.
     references: list[bytes] = field(default_factory=list)
     # Preenchido em DOIS lugares: `queue_wait_s` pela fila (policy.py, no

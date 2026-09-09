@@ -86,6 +86,7 @@ export async function TemplatesBody() {
               <TableRow>
                 <TableHead>Nome</TableHead>
                 <TableHead>Plano</TableHead>
+                <TableHead>Categoria</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Modelo</TableHead>
                 <TableHead>Imagem</TableHead>
@@ -99,7 +100,7 @@ export async function TemplatesBody() {
             <TableBody>
               {templates.length === 0 && notImported.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={10} className="text-center text-muted-foreground">
+                  <TableCell colSpan={11} className="text-center text-muted-foreground">
                     Nenhum produto ainda. Crie o primeiro.
                   </TableCell>
                 </TableRow>
@@ -110,6 +111,9 @@ export async function TemplatesBody() {
                   <TableCell className="font-medium">{t.name}</TableCell>
                   <TableCell>
                     <Badge variant="outline">{t.plan}</Badge>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="secondary">{t.category ?? "llm"}</Badge>
                   </TableCell>
                   <TableCell>
                     {!t.is_enabled ? (
@@ -154,6 +158,7 @@ export async function TemplatesBody() {
               {notImported.map((t) => (
                 <TableRow key={t.id} className="text-muted-foreground">
                   <TableCell className="font-medium">{t.name}</TableCell>
+                  <TableCell className="text-xs">—</TableCell>
                   <TableCell className="text-xs">—</TableCell>
                   <TableCell className="text-xs">—</TableCell>
                   <TableCell className="text-xs">—</TableCell>

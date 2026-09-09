@@ -3,7 +3,7 @@
 import * as React from "react"
 import { ArrowDown, ArrowUp, ChevronsUpDown } from "lucide-react"
 
-import type { BillingStatus, Machine, TemplatePlan } from "@/lib/types"
+import type { BillingStatus, Machine, ProductCategory, TemplatePlan } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import {
   Table,
@@ -24,6 +24,7 @@ export type ContaStackSummary = {
   name: string
   slug: string
   plan: TemplatePlan
+  category: ProductCategory
   billingStatus: BillingStatus
   machineName: string | null
   machineStatus: Machine["status"] | null

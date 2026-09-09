@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Teste de carga do plano Image (FLUX.2 Klein 4B): mede tempo, capacidade e VRAM
+Teste de carga do produto Go/image (FLUX.2 Klein 4B): mede tempo, capacidade e VRAM
 do pod de difusão através do GATEWAY, cenário a cenário.
 
 Por que não é uma flag no scripts/loadtest.py: aquele script é chat — pool de
@@ -16,9 +16,9 @@ respondia:
      encode; o resto do tempo é `overhead_s` (ver a nota abaixo, que é honesta
      sobre o que há lá dentro).
   2. Quanto o teto de IMAGE_MAX_FILE_SIZE_MB custa. Rodar o MESMO cenário com
-     referências de 18 KiB e de 14 MiB isola os segundos que são só rede.
+     referências de 18 KiB e de 5 MiB isola os segundos que são só rede.
   3. Quantas gerações por minuto o pod entrega de fato — que é o número do qual
-     RATE_LIMIT_RPM["Image"] deveria ter saído.
+     a capacidade física e o teto comercial de submissão devem ser comparados.
   4. Quanta VRAM cada combinação pede (com --admin-url), que é o que decide se
      a placa pode ser menor que uma A40.
 
@@ -34,7 +34,7 @@ Uso:
     --model flux2-klein-4b \
     --sizes 1024x1024,1024x1536 \
     --refs 0,1,4 \
-    --ref-bytes 18k,14m \
+    --ref-bytes 18k,5m \
     --levels 1,2,4,8 \
     --admin-url https://<pod>-8000.proxy.runpod.net \
     --admin-secret <AGENT_ADMIN_SECRET> \
@@ -124,7 +124,7 @@ def make_reference(target_bytes: int, fmt: str, seed: int = 1) -> bytes:
 
 
 def parse_bytes(raw: str) -> int:
-    """'18k' -> 18432, '14m' -> 14680064, '1024' -> 1024."""
+    """'18k' -> 18432, '5m' -> 5242880, '1024' -> 1024."""
     text = raw.strip().lower()
     mult = 1
     if text.endswith("k"):
@@ -561,9 +561,9 @@ async def main():
         "(text-to-image); >0 = /v1/images/edits (multipart)",
     )
     parser.add_argument(
-        "--ref-bytes", default="18k,14m",
-        help="tamanhos de arquivo de referência a testar. O par 18k,14m "
-        "reproduz o contraste que motivou a revisão do teto de 15 MiB.",
+        "--ref-bytes", default="18k,5m",
+        help="tamanhos de arquivo de referência a testar. O par 18k,5m "
+        "permite comparar referências leves e próximas do teto comercial.",
     )
     parser.add_argument("--ref-format", default="png", choices=("png", "jpeg"))
     parser.add_argument(
@@ -573,7 +573,7 @@ async def main():
     )
     parser.add_argument(
         "--levels", default="1,4",
-        help="níveis de concorrência. IMAGE_QUEUE_CAPACITY é 4 no template "
+        help="níveis de concorrência. IMAGE_QUEUE_CAPACITY é 3 no template "
         "atual, então um nível acima disso é o que mede o 429.",
     )
     parser.add_argument("--requests-per-user", type=int, default=2)

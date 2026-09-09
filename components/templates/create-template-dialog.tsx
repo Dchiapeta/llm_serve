@@ -26,7 +26,7 @@ import {
 } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { CollapsibleSection } from "@/components/templates/collapsible-section"
-import { TEMPLATE_PLANS } from "@/lib/types"
+import { PRODUCT_CATEGORIES, TEMPLATE_PLANS } from "@/lib/types"
 
 export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
   const [open, setOpen] = React.useState(false)
@@ -73,6 +73,21 @@ export function CreateTemplateDialog({ gpus }: { gpus: GpuType[] }) {
                 {TEMPLATE_PLANS.map((p) => (
                   <SelectItem key={p} value={p}>
                     {p}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="category">Categoria</Label>
+            <Select name="category" defaultValue="llm">
+              <SelectTrigger id="category" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {PRODUCT_CATEGORIES.map((category) => (
+                  <SelectItem key={category} value={category}>
+                    {category}
                   </SelectItem>
                 ))}
               </SelectContent>

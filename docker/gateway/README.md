@@ -117,10 +117,11 @@ advisory lock.
 | `DEMO_LIMIT_WINDOW_S`     | não         | Janela deslizante dos dois limites acima, em segundos (default 3600) |
 | `DEMO_UPSTREAM_TIMEOUT_S` | não         | Teto de tempo da inferência da demo (default 20 — o terminal da hero desiste em 5s) |
 | `MAX_IMAGE_GENERATION_BYTES` | não      | Teto do corpo de `/v1/images/generations` (default 256 KiB). É JSON com prompt e escalares — o `MAX_BODY_BYTES` de 8 MB do catch-all seria três ordens de grandeza acima do uso real |
-| `MAX_IMAGE_EDIT_BYTES`    | não         | Teto do corpo de `/v1/images/edits` (default 4×15 MiB + 1 MiB de folga de boundaries). Precisa cobrir `IMAGE_MAX_REFERENCE_IMAGES` × `IMAGE_MAX_FILE_SIZE_MB` do template: menor que isso, o gateway recusa o que o pod aceitaria |
+| `MAX_IMAGE_EDIT_BYTES`    | não         | Teto do corpo de `/v1/images/edits` (default 4×5 MiB + 1 MiB de folga de boundaries = 21 MiB). Precisa cobrir `IMAGE_MAX_REFERENCE_IMAGES` × `IMAGE_MAX_FILE_SIZE_MB` do template |
 | `IMAGE_UPSTREAM_TIMEOUT_S` | não        | Read do pod de imagem (default 90). Cobre a espera na fila (`IMAGE_QUEUE_WAIT_TIMEOUT_S`, 60s) mais a geração; não passa de 90 porque o Cloudflare do RunPod corta em ~100-127s |
 | `IMAGE_BUCKET`            | não         | Bucket das imagens geradas (default `images`, criado pela migration 0058). Privado: a leitura é por signed URL de TTL curto |
-| `RATE_LIMIT_BURST_IMAGE`  | não         | Rajada instantânea do plano Image (default 4), separada da taxa de 12/min. Alinhada à `IMAGE_QUEUE_CAPACITY` do pod: um bucket maior deixaria o cliente disparar mais do que cabe na fila, e o excedente voltaria como `queue_full` do pod em vez de 429 daqui |
+| `IMAGE_RATE_LIMIT_RPM_GO` | não         | Teto comercial das rotas de imagem do Go (default 10 submissões/min por stack), separado do rate limit de LLM do mesmo plano |
+| `IMAGE_RATE_LIMIT_BURST_GO` | não       | Capacidade do token bucket do Go/image (default 3): limita a rajada inicial. O teto real de 3 em voo é aplicado separadamente por concorrência + `IMAGE_QUEUE_CAPACITY` |
 | `IMAGE_RETENTION_DAYS`    | não         | Prazo do ARQUIVO no bucket (default 30). Gravado por linha em `image_generations.expires_at` no momento da geração, então mudá-lo só afeta imagens novas. O registro em si nunca expira |
 | `IMAGE_RETENTION_INTERVAL_S` | não      | Intervalo do reaper de imagens (default 3600). A expiração tem granularidade de dias; checar mais rápido só gasta consulta |
 | `IMAGE_UPLOAD_ATTEMPTS`   | não         | Tentativas de upload por imagem antes de desistir (default 2). Curto de propósito: a GPU já foi paga, mas o cliente está esperando a resposta |
@@ -197,9 +198,9 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
 - `POST /v1/documents/extract` — PDF → JSON via schema (OCR quando escaneado)
 - `POST /v1/images/extract` — imagem solta → JSON via schema (sempre via OCR)
 - `POST /v1/documents/generate` — HTML → PDF (direto ou por instrução ao modelo)
-- `POST /v1/images/generations` — text-to-image (plano Image). Corpo JSON,
+- `POST /v1/images/generations` — text-to-image (Go/category=image). Corpo JSON,
   resposta `b64_json`. A imagem é gravada no bucket antes da resposta sair
-- `POST /v1/images/edits` — image-to-image (plano Image). Multipart repassado em
+- `POST /v1/images/edits` — image-to-image (Go/category=image). Multipart repassado em
   streaming, sem materializar o corpo no gateway
 - `POST /demo` — demo pública da landing page: `{"prompt": "..."}` → SSE
   (`data: {"delta": "..."}`). **Sem autenticação** e a única rota chamada de um

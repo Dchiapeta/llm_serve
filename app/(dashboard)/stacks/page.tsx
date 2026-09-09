@@ -48,7 +48,7 @@ export default async function ContasPage() {
     db.from("stacks").select("*").order("created_at"),
     db
       .from("templates")
-      .select("id, name, plan, is_enabled, is_test, model_name, model_footprint_gb, kv_reserve_gb_per_user, gpu_types")
+      .select("id, name, plan, category, is_enabled, is_test, model_name, model_footprint_gb, kv_reserve_gb_per_user, gpu_types")
       .eq("is_enabled", true)
       .eq("is_test", false)
       .order("name"),
@@ -77,7 +77,7 @@ export default async function ContasPage() {
   const stacks = (stacksData ?? []) as Stack[]
   const templates = (templatesData ?? []) as Pick<
     Template,
-    "id" | "name" | "plan" | "is_enabled" | "is_test" | "model_name" | "model_footprint_gb" | "kv_reserve_gb_per_user" | "gpu_types"
+    "id" | "name" | "plan" | "category" | "is_enabled" | "is_test" | "model_name" | "model_footprint_gb" | "kv_reserve_gb_per_user" | "gpu_types"
   >[]
 
   const stacksByAccount = new Map<string, Stack[]>()

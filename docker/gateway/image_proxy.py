@@ -8,7 +8,7 @@ DIFERENTE do dele nos dois sentidos:
   - `generations` é texto (prompt + parâmetros). 8 MB ali seria três ordens de
     grandeza acima de qualquer corpo legítimo.
   - `edits` carrega até IMAGE_MAX_REFERENCE_IMAGES arquivos de
-    IMAGE_MAX_FILE_SIZE_MB cada (4 × 15 MiB no template atual). 8 MB recusaria
+    IMAGE_MAX_FILE_SIZE_MB cada (4 × 5 MiB no template atual). 8 MB recusaria
     o caso de uso normal da rota.
 
 ## Por que DOIS guards, e não só o middleware
@@ -37,11 +37,11 @@ from typing import AsyncIterator
 # que é quem conhece a própria configuração. O gateway só precisa de um teto de
 # corpo grande o bastante pra nunca recusar um pedido que o pod aceitaria.
 _REF_IMAGES = 4
-_BYTES_PER_REF = 15 * 1024 * 1024
+_BYTES_PER_REF = 5 * 1024 * 1024
 
 # Folga sobre a soma dos arquivos: cada parte do multipart carrega headers
 # (Content-Disposition, Content-Type) mais a boundary, e ainda há os campos de
-# texto (prompt, size, steps...). Comparar cru contra 4×15 MiB recusaria um
+# texto (prompt, size, steps...). Comparar cru contra 4×5 MiB recusaria um
 # upload legítimo exatamente no limite — mesma lógica do MAX_SCHEMA_BYTES + 64 KiB
 # que o guard de /v1/documents/extract já usa.
 _MULTIPART_OVERHEAD = 1024 * 1024

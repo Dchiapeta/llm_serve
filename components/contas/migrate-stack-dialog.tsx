@@ -54,7 +54,9 @@ export function MigrateStackDialog({
   // máquina, o produto cadastrado com o plano da stack.
   const templateId =
     stack.machine?.template_id ??
-    templates.find((t) => t.plan === stack.plan)?.id
+    templates.find(
+      (t) => t.plan === stack.plan && (t.category ?? "llm") === stack.category
+    )?.id
   const template = templates.find((t) => t.id === templateId)
 
   // Máquinas elegíveis: rodando, do mesmo produto, com vaga livre e

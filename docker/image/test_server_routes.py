@@ -430,7 +430,7 @@ def test_fila_cheia_devolve_429_com_retry_after(client, monkeypatch):
         worker_error = None
 
         async def submit(self, _payload):
-            raise policy.QueueFull("fila de geração cheia (4 em voo)")
+            raise policy.QueueFull("fila de geração cheia (3 em voo)")
 
     monkeypatch.setattr(server, "QUEUE", _Cheia())
     r = client.post("/v1/images/generations", json={"prompt": "x"})

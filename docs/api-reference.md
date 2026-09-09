@@ -366,9 +366,9 @@ Schema até 64 KB. Timeout do servidor: 240s.
 ## 3.9. Geração de imagem
 
 Cria uma imagem a partir de um prompt, ou edita uma imagem existente. Formato
-compatível com a OpenAI. **Exige uma chave de uma stack do plano `Image`** — uma
-chave de plano de LLM recebe `403`, porque o pod que gera imagem não é o mesmo
-que responde chat.
+compatível com a OpenAI. **Exige uma chave de uma stack Go da categoria
+`image`** — uma chave Go da categoria `llm` recebe `403`, porque o pod que gera
+imagem não é o mesmo que responde chat.
 
 A resposta é sempre `b64_json`. `response_format: "url"` é recusado.
 
@@ -423,7 +423,7 @@ exige a mesma `seed` **e** o mesmo `n`.
 ### 3.9.2. Imagem → imagem
 
 `POST /v1/images/edits` — `multipart/form-data`, até 4 imagens de referência de
-15 MiB cada.
+5 MiB cada (PNG, JPEG ou WEBP). O corpo multipart completo tem teto de 21 MiB.
 
 ```bash
 curl https://api.trystac.com/v1/images/edits \
@@ -452,7 +452,7 @@ edição na imagem inteira fingindo respeitar a máscara seria pior que recusar.
 | `400` | `mask_not_supported` | `mask` não é suportado nesta versão |
 | `400` | `unsupported_image_format` | o arquivo não é PNG/JPEG/WEBP |
 | `400` | `wrong_route_for_reference_image` | mandou `image` no JSON do `generations` — use `/v1/images/edits` |
-| `403` | — | a chave não é de uma stack do plano `Image` |
+| `403` | — | a chave não é de uma stack da categoria `image` |
 | `404` | `model_not_found` | `model` diferente do servido (só no `edits`) |
 | `413` | — | corpo acima do limite da rota |
 | `429` | `queue_full` | fila do pod cheia — respeite o `Retry-After` |
@@ -463,24 +463,36 @@ edição na imagem inteira fingindo respeitar a máscara seria pior que recusar.
 
 ### 3.9.3. Ritmo de requisições
 
-Geração de imagem **não tem cota diária** — você pode gerar quantas imagens
-quiser. O que existe é um limite de *ritmo*, porque o pod gera uma imagem por
-vez:
+Geração de imagem **não tem cota diária**. O Go aceita até 10 submissões por
+minuto, mas o pod gera uma imagem por vez e a vazão concluída depende do
+workload:
 
 | | Valor | O que significa |
 |---|---|---|
-| Vazão sustentada | **12 por minuto** | o ritmo que a stack mantém indefinidamente |
-| Rajada | **4 de uma vez** | quantas cabem simultaneamente antes do `429` |
+| Submissão comercial | **10 por minuto** | teto compartilhado por `generations` e `edits` |
+| Em voo | **3 de uma vez** | 1 processando + até 2 aguardando |
+| Espera máxima na fila | **60 segundos** | depois disso a API responde `504 queue_timeout` |
 
 Os dois limites são **da stack**, não da chave: emitir mais chaves não aumenta a
 capacidade, porque quem gera as imagens é a mesma GPU.
 
-A rajada de 4 é a profundidade da fila do pod. Disparar 10 requisições de uma
-vez não as torna mais rápidas — 4 entram e 6 voltam `429`. Para volume, o padrão
-que funciona é manter até 4 em voo e emendar a próxima quando uma terminar.
+A capacidade de 3 é a profundidade síncrona do pod. Disparar 10 requisições de
+uma vez não as torna mais rápidas — 3 entram e 7 voltam `429`. Para volume, o
+padrão que funciona é manter até 3 em voo e emendar a próxima quando uma
+terminar.
 
-O `Retry-After` do `429` diz quantos segundos esperar; com 12/min, um lugar na
-fila se abre a cada 5 segundos.
+O bucket de taxa também começa com 3 créditos para limitar a rajada inicial,
+mas ele não conta conexões abertas: a garantia de no máximo 3 em voo vem do
+controle de concorrência do gateway e da fila do pod.
+
+O `Retry-After` do `429` diz quando tentar novamente. O teto de 10/min significa
+um novo crédito de submissão a cada 6 segundos; a liberação física da fila pode
+demorar mais em edições pesadas.
+
+Tempos observados pelo caminho completo do cliente: aproximadamente 6–9 s para
+texto → imagem e 7–21 s para edição, variando com quantidade, dimensões e peso
+das referências. “10/min” é limite de submissão, não promessa de dez resultados
+concluídos por minuto.
 
 ### 3.9.4. Armazenamento e retenção
 

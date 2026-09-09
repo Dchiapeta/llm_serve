@@ -1,6 +1,6 @@
 import { generateStackSlug, STACK_SLUG_RE } from "./slug"
 import type { createSupabaseAdmin } from "./supabase/server"
-import type { TemplatePlan } from "./types"
+import type { ProductCategory, TemplatePlan } from "./types"
 
 type Db = ReturnType<typeof createSupabaseAdmin>
 
@@ -8,6 +8,7 @@ export type InsertStackInput = {
   db: Db
   accountId: string
   plan: TemplatePlan
+  category?: ProductCategory
   /** Nome exibido ao cliente. Sem isto, cai no slug. */
   name?: string | null
   /** ISO date (YYYY-MM-DD). Omitido = default do banco (current_date). */
@@ -65,6 +66,7 @@ export async function insertStack(input: InsertStackInput): Promise<InsertStackR
       .insert({
         account_id: accountId,
         plan,
+        category: input.category ?? "llm",
         slug,
         // `name` é coluna do TryStac (supabase/SHARED_SCHEMA.md), NOT NULL sem
         // default — sem isto o insert falha com 23502, que nem cai no retry

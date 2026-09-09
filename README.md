@@ -75,7 +75,7 @@ limites e retry) está em [docs/integracao.md](docs/integracao.md).
 
 ## Imagens geradas
 
-As imagens do plano Image ficam num terceiro bucket privado do Supabase Storage,
+As imagens dos produtos da categoria `image` ficam num terceiro bucket privado do Supabase Storage,
 `images`, criado pela migration
 [0058_image_bucket.sql](supabase/migrations/0058_image_bucket.sql):
 

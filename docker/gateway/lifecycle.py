@@ -568,22 +568,27 @@ class LifecycleManager:
         if self.auto_provision_enabled is not None and not await self.auto_provision_enabled():
             return []
         triggered: list[str] = []
-        for plan in await self.supa.list_distinct_plans():
-            # isolado por plano: uma falha (ex.: RPC do Supabase) não deve
-            # abortar os planos seguintes deste mesmo tick
+        for plan, category in await self.supa.list_distinct_products():
+            # isolado por produto: uma falha (ex.: RPC do Supabase) não deve
+            # abortar os produtos seguintes deste mesmo tick
             try:
-                running = await self.supa.list_running_machines_for_plan(plan)
-                stopped = await self.supa.list_stopped_machines_for_plan(plan)
+                running = await self.supa.list_running_machines_for_plan(plan, category)
+                stopped = await self.supa.list_stopped_machines_for_plan(plan, category)
                 free_slots_total = 0
                 for m in running + stopped:
                     free_slots_total += await self.machine_free_slots(m)
                 if free_slots_total >= self.pool_watermark_slots:
                     continue
-                reason = f"reposição proativa (slots livres do plano: {free_slots_total})"
-                if await self.try_provision_for_pool(plan, reason):
-                    triggered.append(plan)
+                reason = (
+                    f"reposição proativa (slots livres de {plan}/{category}: "
+                    f"{free_slots_total})"
+                )
+                if await self.try_provision_for_pool(plan, reason, category):
+                    triggered.append(f"{plan}/{category}")
             except Exception as e:
-                logger.warning("ensure-capacity: plano %s falhou (%s)", plan, e)
+                logger.warning(
+                    "ensure-capacity: produto %s/%s falhou (%s)", plan, category, e
+                )
         return triggered
 
     # ---------- Recriação de máquina presa (host sem GPU) ----------

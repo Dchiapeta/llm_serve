@@ -28,7 +28,7 @@ export default async function ContasPage() {
     db.from("accounts").select("*").order("created_at", { ascending: false }),
     db
       .from("stacks")
-      .select("id, account_id, name, slug, plan, billing_status, machine_id"),
+      .select("id, account_id, name, slug, plan, category, billing_status, machine_id"),
     db.from("machines").select("id, name, status"),
     db.from("api_keys").select("id, account_id"),
     db.from("usage_metrics").select("api_key_id, tokens_in, tokens_out, requests"),
@@ -37,7 +37,7 @@ export default async function ContasPage() {
   const accounts = (accountsData ?? []) as Account[]
   const stacks = (stacksData ?? []) as Pick<
     Stack,
-    "id" | "account_id" | "name" | "slug" | "plan" | "billing_status" | "machine_id"
+    "id" | "account_id" | "name" | "slug" | "plan" | "category" | "billing_status" | "machine_id"
   >[]
   const machines = (machinesData ?? []) as Pick<Machine, "id" | "name" | "status">[]
   const keys = (keysData ?? []) as { id: string; account_id: string }[]
@@ -59,6 +59,7 @@ export default async function ContasPage() {
       name: s.name,
       slug: s.slug,
       plan: s.plan,
+      category: s.category,
       billingStatus: s.billing_status,
       machineName: machine?.name ?? null,
       machineStatus: machine?.status ?? null,

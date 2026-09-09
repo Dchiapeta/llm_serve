@@ -132,9 +132,8 @@ MAX_CLIENTS_BY_PLAN: dict[str, int | None] = {
     "Pro": _cap_from_env("MAX_CLIENTS_PRO", 25),
     "Max": _cap_from_env("MAX_CLIENTS_MAX", 50),
     "Enterprise": _cap_from_env("MAX_CLIENTS_ENTERPRISE", None),
-    # PLACEHOLDER, espelhando lib/types.ts: o plano Image ainda não tem preço
-    # definido. O número precisa existir aqui de qualquer forma — sem a chave, o
-    # gateway aplicaria o default (5 do "Go") e o painel exibiria outro valor.
+    # Compatibilidade com stacks ainda cacheadas como Image durante o deploy da
+    # migration 0060. O produto persistido novo usa plan=Go/category=image.
     "Image": _cap_from_env("MAX_CLIENTS_IMAGE", 5),
 }
 

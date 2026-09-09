@@ -5,7 +5,7 @@ import Link from "next/link"
 import { Copy, Search } from "lucide-react"
 import { toast } from "sonner"
 
-import { TEMPLATE_PLANS, type Account, type ApiKey, type Machine, type RoutingState, type Stack } from "@/lib/types"
+import { type Account, type ApiKey, type Machine, type RoutingState, type Stack } from "@/lib/types"
 import { BILLING_BADGE, graceRemaining } from "@/lib/billing-status"
 import { PLAN_BADGE_VARIANT } from "@/lib/plan-badge"
 import { Badge } from "@/components/reui/badge"
@@ -69,6 +69,14 @@ const STATUS_FILTER_OPTIONS = [
 
 const ALL = "__all__"
 
+function productKey(stack: Pick<Stack, "plan" | "category">) {
+  return `${stack.plan}:${stack.category ?? "llm"}`
+}
+
+function productLabel(stack: Pick<Stack, "plan" | "category">) {
+  return `${stack.plan} · ${stack.category === "image" ? "Imagem" : "LLM"}`
+}
+
 export type StackInfo = Stack & {
   machineName?: string
   machine?: Pick<
@@ -125,6 +133,9 @@ export function ContasTable({
   const [query, setQuery] = React.useState("")
   const [productFilter, setProductFilter] = React.useState(ALL)
   const [statusFilter, setStatusFilter] = React.useState(ALL)
+  const productOptions = Array.from(
+    new Map(rows.map(({ stack }) => [productKey(stack), productLabel(stack)])).entries()
+  )
 
   function copyStackId(stackId: string) {
     navigator.clipboard.writeText(stackId)
@@ -139,7 +150,7 @@ export function ContasTable({
         r.account.name.toLowerCase().includes(normalizedQuery) ||
         r.account.email?.toLowerCase().includes(normalizedQuery)
       : true
-    const matchesProduct = productFilter === ALL || r.stack.plan === productFilter
+    const matchesProduct = productFilter === ALL || productKey(r.stack) === productFilter
     const statusValue = r.stack.machine?.status ?? "none"
     const matchesStatus = statusFilter === ALL || statusValue === statusFilter
     return matchesQuery && matchesProduct && matchesStatus
@@ -165,9 +176,9 @@ export function ContasTable({
           </SelectTrigger>
           <SelectContent>
             <SelectItem value={ALL}>Todos os produtos</SelectItem>
-            {TEMPLATE_PLANS.map((plan) => (
-              <SelectItem key={plan} value={plan}>
-                {plan}
+            {productOptions.map(([key, label]) => (
+              <SelectItem key={key} value={key}>
+                {label}
               </SelectItem>
             ))}
           </SelectContent>
@@ -255,7 +266,7 @@ export function ContasTable({
                 </TableCell>
                 <TableCell>
                   <Badge variant={PLAN_BADGE_VARIANT[stack.plan]} size="sm">
-                    {stack.plan}
+                    {productLabel(stack)}
                   </Badge>
                 </TableCell>
                 <TableCell>

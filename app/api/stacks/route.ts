@@ -3,7 +3,11 @@ import { NextRequest, NextResponse } from "next/server"
 
 import { findStackByProvisioningRef, insertStack } from "@/lib/stacks"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
-import { TEMPLATE_PLANS, type TemplatePlan } from "@/lib/types"
+import {
+  TEMPLATE_PLANS,
+  type ProductCategory,
+  type TemplatePlan,
+} from "@/lib/types"
 
 function secretsMatch(a: string, b: string): boolean {
   const bufA = Buffer.from(a)
@@ -41,6 +45,11 @@ function parsePlan(raw: unknown): TemplatePlan | null {
   return TEMPLATE_PLANS.includes(raw as TemplatePlan) ? (raw as TemplatePlan) : null
 }
 
+function parseCategory(raw: unknown): ProductCategory | null {
+  if (raw == null || raw === "") return "llm"
+  return raw === "llm" || raw === "image" ? raw : null
+}
+
 // Provisiona a stack de um pagamento confirmado. Chamada pelo handler de
 // webhook da Chargefy (repo TryStac), nunca pelo browser.
 //
@@ -66,6 +75,13 @@ export async function POST(req: NextRequest) {
       { status: 400 }
     )
   }
+  const category = parseCategory(body?.category)
+  if (!category) {
+    return NextResponse.json(
+      { error: "category inválida (esperado: llm ou image)" },
+      { status: 400 }
+    )
+  }
 
   const db = createSupabaseAdmin()
 
@@ -81,6 +97,7 @@ export async function POST(req: NextRequest) {
       .from("templates")
       .select("id")
       .eq("plan", plan)
+      .eq("category", category)
       .eq("is_enabled", true)
       .eq("is_test", false)
       .limit(1)
@@ -102,7 +119,7 @@ export async function POST(req: NextRequest) {
     // pod) que o idle reaper já faz.
     const { data: updated, error } = await db
       .from("stacks")
-      .update({ plan, machine_id: null })
+      .update({ plan, category, machine_id: null })
       .eq("id", stackId)
       .select("id, slug")
       .maybeSingle<{ id: string; slug: string }>()
@@ -153,6 +170,7 @@ export async function POST(req: NextRequest) {
     .from("templates")
     .select("id")
     .eq("plan", plan)
+    .eq("category", category)
     .eq("is_enabled", true)
     .eq("is_test", false)
     .limit(1)
@@ -172,6 +190,7 @@ export async function POST(req: NextRequest) {
       db,
       accountId,
       plan,
+      category,
       name,
       provisioningRef,
       billingStatus,

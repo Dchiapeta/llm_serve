@@ -96,10 +96,9 @@ def _detail(plan: str | None) -> str:
     """Mensagem ao cliente. Mesmo tom de _client_limit_detail (main.py): diz o
     que aconteceu e o que fazer a respeito, sem culpar a credencial.
 
-    O Image não recebe a mesma frase que o Go: "faça upgrade" descreve o degrau
-    de um plano de LLM barato para um caro, e o Image não é um degrau dessa
-    escada — é outra linha de produto. Mandar quem tem uma stack de imagem fazer
-    upgrade sugeriria que existe um plano de imagem que fala chat/completions."""
+    O ramo Image existe só para entradas legadas durante a migration 0060. As
+    stacks atuais Go/image são barradas antes, pelo guard de categoria em
+    authenticate, porque Go sozinho já não identifica o workload."""
     if plan == "Image":
         return (
             "o plano Image serve geração de imagem (/v1/images/*), não conversa "

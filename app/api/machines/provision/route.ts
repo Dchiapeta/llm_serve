@@ -2,7 +2,11 @@ import { timingSafeEqual } from "crypto"
 import { NextRequest, NextResponse } from "next/server"
 
 import { provisionMachineForPlan } from "@/lib/actions"
-import { TEMPLATE_PLANS, type TemplatePlan } from "@/lib/types"
+import {
+  TEMPLATE_PLANS,
+  type ProductCategory,
+  type TemplatePlan,
+} from "@/lib/types"
 
 function secretsMatch(a: string, b: string): boolean {
   const bufA = Buffer.from(a)
@@ -25,14 +29,29 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => null)
   const plan = body?.plan
-  if (typeof plan !== "string" || !TEMPLATE_PLANS.includes(plan as TemplatePlan)) {
+  // Image é aceito apenas nesta API interna durante o rollout 0060→0061: o
+  // gateway novo já separa por category, mas o contract do banco ainda pode
+  // não ter convertido o plano legado para Go.
+  const validPlan =
+    typeof plan === "string" &&
+    (TEMPLATE_PLANS.includes(plan as TemplatePlan) || plan === "Image")
+  if (!validPlan) {
     return NextResponse.json({ error: "plan inválido" }, { status: 400 })
   }
   const templateId = typeof body?.template_id === "string" ? body.template_id : null
+  const rawCategory = body?.category ?? "llm"
+  if (rawCategory !== "llm" && rawCategory !== "image") {
+    return NextResponse.json({ error: "category inválida" }, { status: 400 })
+  }
+  const category: ProductCategory = rawCategory
 
   let result: Awaited<ReturnType<typeof provisionMachineForPlan>>
   try {
-    result = await provisionMachineForPlan({ plan: plan as TemplatePlan, templateId })
+    result = await provisionMachineForPlan({
+      plan: plan as TemplatePlan,
+      category,
+      templateId,
+    })
   } catch (e) {
     // provisionMachine (RunPod/Supabase) pode lançar fora dos caminhos de
     // erro já tratados — nunca deixa o gateway receber o 500 HTML padrão do
@@ -57,6 +76,7 @@ export async function POST(req: NextRequest) {
 function statusForError(message: string): number {
   if (/^Nenhum produto/.test(message)) return 404
   if (/não pertence ao plano informado/.test(message)) return 400
+  if (/não pertence à categoria informada/.test(message)) return 400
   if (/não tem tipos de GPU configurados/.test(message) || /Nenhuma GPU/.test(message)) return 422
   return 502
 }

@@ -43,7 +43,7 @@ fi
 
 echo "[entrypoint] subindo servidor de imagem (${MODEL_NAME}) na porta ${IMAGE_PORT}"
 echo "[entrypoint] revision=${IMAGE_MODEL_REVISION:-main} dtype=${IMAGE_DTYPE:-bfloat16} steps=${IMAGE_STEPS:-4}"
-echo "[entrypoint] fila: capacity=${IMAGE_QUEUE_CAPACITY:-4} wait_timeout=${IMAGE_QUEUE_WAIT_TIMEOUT_S:-60}s warmup=${IMAGE_WARMUP_RUNS:-2}"
+echo "[entrypoint] fila: capacity=${IMAGE_QUEUE_CAPACITY:-3} wait_timeout=${IMAGE_QUEUE_WAIT_TIMEOUT_S:-60}s warmup=${IMAGE_WARMUP_RUNS:-2}"
 
 # stdout do servidor vai para o stdout do container (visível no RunPod) E para o
 # arquivo que o agent serve em /admin/logs.

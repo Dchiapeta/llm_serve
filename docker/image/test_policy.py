@@ -565,8 +565,8 @@ def test_handler_cancelado_ANTES_do_start_nao_fura_a_admissao():
 
 
 def test_job_abandonado_solta_o_payload():
-    """As referências podem ser 4 × 15 MB. Deixá-las presas no job até o worker
-    chegar nele significa segurar 60 MB enquanto ele está minutos dentro de uma
+    """As referências podem ser 4 × 5 MiB. Deixá-las presas no job até o worker
+    chegar nele significa segurar 20 MiB enquanto ele está dentro de uma
     geração."""
 
     async def go():

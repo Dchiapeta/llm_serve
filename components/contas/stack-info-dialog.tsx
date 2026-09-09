@@ -57,7 +57,7 @@ export function StackInfoDialog({
               <dt className="text-muted-foreground">Produto</dt>
               <dd>
                 <Badge variant={PLAN_BADGE_VARIANT[stack.plan]} size="sm">
-                  {stack.plan}
+                  {stack.plan} · {stack.category === "image" ? "Imagem" : "LLM"}
                 </Badge>
               </dd>
 

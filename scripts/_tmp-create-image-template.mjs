@@ -15,23 +15,26 @@
 //   - Supabase primeiro, RunPod depois. A Server Action faz o inverso porque o
 //     runpod_template_id faz parte do único insert dela; aqui, RunPod-primeiro
 //     deixaria um template órfão no console do RunPod sempre que o insert
-//     falhasse (e o modo de falha mais provável é o CHECK de plano, com a 0057
-//     não aplicada).
+//     falhasse (e o modo de falha mais provável é a coluna category ausente,
+//     com a 0060 não aplicada).
 //   - verifica no registry que a tag da imagem resolve para o digest que foi de
 //     fato auditado. A 0.1.0 foi pushada antes de uma revisão e ficou no
 //     registry com bugs; a existência da tag não diz nada sobre o conteúdo.
 //
 // PRÉ-REQUISITOS (nesta ordem):
-//   1. supabase/migrations/0057_plan_image.sql aplicada — sem ela o CHECK
-//      rejeita plan='Image' e o insert falha.
-//   2. dchiapeta/diffusers-agent:flux2-klein-4b-0.1.3 publicada — o template
+//   1. supabase/migrations/0060_product_category.sql aplicada — ela separa o
+//      plano comercial Go da categoria image.
+//   2. painel/gateway category-aware publicados; criar um template Go/image
+//      enquanto o gateway antigo atende faria ele interpretar Go como LLM.
+//   3. supabase/migrations/0061_go_image_contract.sql aplicada.
+//   4. dchiapeta/diffusers-agent:flux2-klein-4b-0.1.3 publicada — o template
 //      aponta para essa tag.
 //
 //   node --env-file=.env scripts/_tmp-create-image-template.mjs
 
 import { createClient } from "@supabase/supabase-js"
 
-const NAME = "IMAGE-A40-FLUX2-KLEIN-4B"
+const NAME = "GO-IMAGE-A40"
 
 // Tag versionada e imutável, nunca :latest. Mudança de conteúdo é 0.1.1 — é o
 // que torna apontar para a tag equivalente a apontar para o digest, e é a lição
@@ -45,7 +48,8 @@ const MODEL_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
 
 const TEMPLATE = {
   name: NAME,
-  plan: "Image",
+  plan: "Go",
+  category: "image",
   image: IMAGE,
   model_name: "black-forest-labs/FLUX.2-klein-4B",
   gpu_types: ["NVIDIA A40"],
@@ -122,7 +126,7 @@ const TEMPLATE = {
 
     IMAGE_MAX_REFERENCE_IMAGES: "4",
     IMAGE_ALLOWED_FORMATS: "png,jpeg,webp",
-    IMAGE_MAX_FILE_SIZE_MB: "15",
+    IMAGE_MAX_FILE_SIZE_MB: "5",
 
     // capacity é TOTAL EM VOO (em execução + esperando), não tamanho de fila.
     //
@@ -131,7 +135,7 @@ const TEMPLATE = {
     // env com esse nome seria pior que nenhuma — pareceria o botão de
     // paralelismo e não faria nada. Mesmo motivo para IMAGE_PIPELINE não estar
     // aqui: o server importa Flux2KleinPipeline diretamente.
-    IMAGE_QUEUE_CAPACITY: "4",
+    IMAGE_QUEUE_CAPACITY: "3",
     // 60 e não 120: o edge do RunPod corta em ~100-127 s, então um timeout de
     // 120 nunca chegaria a disparar — o cliente receberia 524 do Cloudflare em
     // vez do nosso 504.
@@ -298,8 +302,8 @@ if (TEMPLATE.max_users > vramSlots) {
 //
 // A Server Action faz RunPod-primeiro porque o `runpod_template_id` faz parte
 // do único insert dela. Aqui o fluxo é nosso, e o RunPod-primeiro tem um modo
-// de falha concreto: se o insert falhar — e o mais provável é justamente o
-// CHECK de plano, quando a 0057 não rodou — sobra um template ÓRFÃO no console
+// de falha concreto: se o insert falhar — e o mais provável é justamente a
+// migration 0060 ausente — sobra um template ÓRFÃO no console
 // do RunPod, que ninguém referencia e que na próxima execução vira um segundo
 // órfão (o guard de idempotência olha o Supabase, não o RunPod).
 //
@@ -315,10 +319,10 @@ const { data: inserted, error: insErr } = await db
   .single()
 
 if (insErr) {
-  if (/templates_plan_valid|violates check constraint/i.test(insErr.message)) {
+  if (/category|templates_plan_valid|violates check constraint/i.test(insErr.message)) {
     console.error(
-      `\ninsert falhou no CHECK de plano: ${insErr.message}\n\n` +
-        "Aplique supabase/migrations/0057_plan_image.sql antes de rodar este\n" +
+      `\ninsert falhou no schema de produto: ${insErr.message}\n\n` +
+        "Aplique supabase/migrations/0060_product_category.sql antes de rodar este\n" +
         "script. Nada foi criado — nem no Supabase, nem no RunPod.",
     )
     process.exit(1)
@@ -395,11 +399,15 @@ const { data: row, error: readErr } = await db
 if (readErr) throw new Error(`leitura de volta falhou: ${readErr.message}`)
 
 const checks = {
-  plan: row.plan === "Image",
+  plan: row.plan === "Go",
+  category: row.category === "image",
   image_tag: row.image === IMAGE,
   nao_usa_latest: !row.image.endsWith(":latest"),
   model_name: row.model_name === TEMPLATE.model_name,
   model_revision: row.env.IMAGE_MODEL_REVISION === MODEL_REVISION,
+  reference_file_mb: row.env.IMAGE_MAX_FILE_SIZE_MB === "5",
+  queue_capacity: row.env.IMAGE_QUEUE_CAPACITY === "3",
+  queue_timeout: row.env.IMAGE_QUEUE_WAIT_TIMEOUT_S === "60",
   // as três que, se falharem, o pod sobe e parece saudável mas se comporta mal
   hf_home_no_volume: row.env.HF_HOME?.startsWith(row.volume_mount_path),
   server_process_match: row.env.SERVER_PROCESS_MATCH === "/opt/agent/server.py",
