@@ -439,6 +439,10 @@ export default async function MachineDetailPage({
                 // decide se a aba Ferramentas (Claude Code, Codex, Cursor)
                 // aparece: planos em CLI_BLOCKED_PLANS levam 403 nessas rotas
                 plan={template?.plan ?? null}
+                // troca os exemplos inteiros: uma máquina de difusão não fala
+                // /v1/chat/completions, então os snippets de chat retornariam
+                // 403 nela (guard de categoria em authenticate, no gateway)
+                category={template?.category ?? null}
               />
             </CardContent>
           </Card>

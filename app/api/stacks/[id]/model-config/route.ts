@@ -42,12 +42,49 @@ function parseIntegerOrNull(value: unknown, min: number): number | null | typeof
   return INVALID
 }
 
+// Inteiro dentro de [lo, hi], ou null explícito. Separado de parseIntegerOrNull
+// porque aquele existe justamente para o caso SEM teto (max_tokens); steps tem
+// um teto real e baixo, vindo do pod.
+function parseBoundedIntegerOrNull(
+  value: unknown,
+  lo: number,
+  hi: number
+): number | null | typeof INVALID {
+  if (value === null) return null
+  if (typeof value === "number" && Number.isInteger(value) && value >= lo && value <= hi) return value
+  return INVALID
+}
+
+// Tamanhos aceitos pelo pod de difusão (IMAGE_ALLOWED_SIZES em
+// docker/image/server.py) e replicados no CHECK da migration 0062. Lista
+// fechada dos dois lados: o pod recusa o resto com 400.
+const IMAGE_SIZES = ["1024x1024", "1536x1024", "1024x1536"]
+
+// Como parseBoundedNumberOrNull, mas para o `size`: um da lista, ou null
+// explícito (limpa o default).
+function parseImageSizeOrNull(value: unknown): string | null | typeof INVALID {
+  if (value === null) return null
+  if (typeof value === "string" && IMAGE_SIZES.includes(value)) return value
+  return INVALID
+}
+
 // Configura defaults de sampling (temperature/top_p/max_tokens/
 // presence_penalty) aplicados pelo gateway quando o cliente final não manda o
 // parâmetro na requisição (temperature/top_p: migration 0035; max_tokens/
 // presence_penalty: migration 0056). Pensada para um sistema externo (ex.:
 // LP/admin de outro projeto) configurar isso por stack sem precisar de sessão
 // do painel.
+//
+// Desde a migration 0062 a mesma rota configura os defaults de GERAÇÃO DE
+// IMAGEM (default_image_size/default_image_steps/
+// default_image_guidance_scale), aplicados pelo gateway em
+// apply_stack_image_defaults. Uma rota só, e não duas, porque os dois conjuntos
+// respondem à mesma pergunta ("o que a stack usa quando o cliente não diz") e
+// vêm da mesma tela do TryStac — a de Comportamento, que só troca quais campos
+// mostra conforme stacks.category. Os conjuntos são disjuntos na prática:
+// nenhuma stack usa os dois, porque nenhuma serve texto e imagem ao mesmo
+// tempo. O `in body` de cada campo é o que mantém isso verdadeiro — o payload
+// de uma stack de imagem não menciona os campos de sampling, e vice-versa.
 export async function PATCH(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -61,7 +98,7 @@ export async function PATCH(
     return NextResponse.json({ error: "corpo inválido" }, { status: 400 })
   }
 
-  const update: Record<string, number | null> = {}
+  const update: Record<string, number | string | null> = {}
   if ("default_temperature" in body) {
     const v = parseBoundedNumberOrNull(body.default_temperature, 0, 2)
     if (v === INVALID) {
@@ -102,11 +139,46 @@ export async function PATCH(
     }
     update.default_presence_penalty = v
   }
+  if ("default_image_size" in body) {
+    const v = parseImageSizeOrNull(body.default_image_size)
+    if (v === INVALID) {
+      return NextResponse.json(
+        { error: `default_image_size deve ser um de ${IMAGE_SIZES.join(", ")}, ou null` },
+        { status: 400 }
+      )
+    }
+    update.default_image_size = v
+  }
+  if ("default_image_steps" in body) {
+    // Teto 8, e não "sem teto" como o de max_tokens: o checkpoint é destilado
+    // e produz imagem pronta em pouquíssimos passos (STEPS_MAX no pod). Aceitar
+    // 50 aqui seria gravar um default que só queima GPU.
+    const v = parseBoundedIntegerOrNull(body.default_image_steps, 1, 8)
+    if (v === INVALID) {
+      return NextResponse.json(
+        { error: "default_image_steps deve ser um inteiro entre 1 e 8, ou null" },
+        { status: 400 }
+      )
+    }
+    update.default_image_steps = v
+  }
+  if ("default_image_guidance_scale" in body) {
+    const v = parseBoundedNumberOrNull(body.default_image_guidance_scale, 0, 20)
+    if (v === INVALID) {
+      return NextResponse.json(
+        { error: "default_image_guidance_scale deve ser number entre 0 e 20, ou null" },
+        { status: 400 }
+      )
+    }
+    update.default_image_guidance_scale = v
+  }
   if (Object.keys(update).length === 0) {
     return NextResponse.json(
       {
         error:
-          "informe default_temperature, default_top_p, default_max_tokens e/ou default_presence_penalty",
+          "informe ao menos um de: default_temperature, default_top_p, " +
+          "default_max_tokens, default_presence_penalty, default_image_size, " +
+          "default_image_steps, default_image_guidance_scale",
       },
       { status: 400 }
     )

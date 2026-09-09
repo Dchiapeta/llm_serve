@@ -58,7 +58,8 @@ imagem pré-tool-calling.
 | `flux2-klein-4b-0.1.0` | **NÃO USAR.** Publicada antes da revisão. Devolve 500 (em vez de 400) para qualquer campo escalar com tipo errado; a admissão da fila é furável por handler cancelado (`CancelledError` não tratado — medido: `capacity=2` admitindo 21 gerações); `stop()` no meio de uma geração pendura a request para sempre; worker morto responde 504 indefinidamente com `/health` em 200; sem degradação pós-boot; sem teto de multipart no parser; recusa o `model` que o `pin_model` do gateway fixaria. |
 | `flux2-klein-4b-0.1.1` | Todas as correções da 0.1.0, cada uma com teste. Não devolve o bloco `meta`, e sorteia a seed dentro do torch — uma geração sem `seed` explícita não é reproduzível, e o registro em `image_generations` nasce com `prompt`/parâmetros nulos no `edits`. |
 | `flux2-klein-4b-0.1.2` | `meta` na resposta (prompt, dimensões, steps, guidance, model) e `ensure_seed` sorteando no nível da policy, para que a seed gravada seja a realmente usada. Traz também o teto de corpo por rota do agent (`read_body_capped`), que fecha o pod para corpo sem `Content-Length`. Não mede nada: sem tempo por fase e sem leitura de VRAM, dimensionar a GPU e o rate limit era estimativa. |
-| `flux2-klein-4b-0.1.3` | Atual. **Instrumentação.** `meta.timings` com o tempo de cada fase (fila, decode, GPU, encode), métricas de VRAM no `/metrics` (incluindo a ocupação real do device, que o allocator do PyTorch não enxerga) e agregação por cenário `(resolução, nº de referências)`. Nenhuma mudança de comportamento na geração. |
+| `flux2-klein-4b-0.1.3` | Atual em produção. **Instrumentação.** `meta.timings` com o tempo de cada fase (fila, decode, GPU, encode), métricas de VRAM no `/metrics` (incluindo a ocupação real do device, que o allocator do PyTorch não enxerga) e agregação por cenário `(resolução, nº de referências)`. Nenhuma mudança de comportamento na geração. |
+| `flux2-klein-4b-0.1.4` | **Ainda não publicada.** Prompt configurado na chave: as duas rotas resolvem o `prompt` por `policy.resolve_prompt`, e o `edits` passa a ler o `PROMPT_HEADER` que o gateway manda. Enquanto o pod rodar a `0.1.3`, o header é ignorado e uma chave que dependa do prompt configurado leva `400 missing_prompt` **só no `edits`** — o `generations` não depende desta versão, porque o gateway resolve o prompt no corpo. |
 
 A `0.1.0` fica no registry de propósito, e não é deletada: apagá-la faria a
 referência a ela em qualquer log ou anotação antiga virar um mistério, em vez de
@@ -198,6 +199,14 @@ da OpenAI usam `image[]` para múltiplas imagens, e `image[]` não é identifica
 Python válido, então o form é lido à mão em vez de declarado como parâmetro.
 
 Extensões nossas nas duas rotas: `steps`, `guidance_scale`, `seed`.
+
+`prompt` é obrigatório **a não ser** que venha o header `x-default-prompt-b64`
+(base64 de UTF-8), que é como o gateway entrega o prompt configurado na chave
+ou na stack. A precedência é a mesma do system prompt do produto de texto — o
+`prompt` do corpo ganha, e um `prompt` em branco conta como não-mandado. Só o
+`edits` depende do header na prática: em `generations` o gateway já resolve a
+precedência no corpo, porque lá ele o materializa para o `pin_model`. Ver
+`policy.resolve_prompt` e `docker/gateway/key_prompt.py`.
 
 A resposta de sucesso traz, além do `data` com os `b64_json`, um bloco `meta`
 com os parâmetros **efetivos** da geração:

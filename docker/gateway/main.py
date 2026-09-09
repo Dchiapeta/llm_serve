@@ -87,7 +87,12 @@ from context_budget import (
     prompt_text_for_tokenize,
 )
 from context_budget import resolve_est_tokens as _resolve_est_tokens
-from key_prompt import resolve_system_prompt
+from key_prompt import (
+    IMAGE_PROMPT_HEADER,
+    encode_prompt_header,
+    resolve_image_prompt,
+    resolve_system_prompt,
+)
 from lifecycle import LifecycleManager, MigrationError
 from recovery import (
     is_no_gpu_error,
@@ -2457,6 +2462,69 @@ def apply_key_sampling_defaults(
         and entry.get("default_presence_penalty") is not None
     ):
         body_json["presence_penalty"] = entry["default_presence_penalty"]
+
+
+def apply_key_image_defaults(body_json: dict, entry: dict) -> None:
+    """Aplica os defaults de imagem da própria CHAVE (migration 0063) quando o
+    cliente não mandou o parâmetro — mesma mecânica de
+    apply_stack_image_defaults, um nível ACIMA dela na precedência.
+
+    Chamada ANTES da de stack, e é isso que implementa a precedência: um valor
+    de chave preenchido aqui passa a ocupar a posição de "o cliente mandou"
+    para o resto do fluxo, então o `not in body_json` da função de stack deixa
+    de ser verdade e o default da stack não sobrescreve. Mesmo desenho de
+    apply_key_sampling_defaults sobre apply_stack_sampling_defaults.
+
+    O caso de uso é uma conta com várias chaves — uma por cliente ou por
+    superfície do produto — que precisa de proporção ou custo diferentes em
+    cada uma sem criar uma stack nova só para isso."""
+    if "size" not in body_json and entry.get("default_image_size") is not None:
+        body_json["size"] = entry["default_image_size"]
+    if "steps" not in body_json and entry.get("default_image_steps") is not None:
+        body_json["steps"] = entry["default_image_steps"]
+    if (
+        "guidance_scale" not in body_json
+        and entry.get("default_image_guidance_scale") is not None
+    ):
+        body_json["guidance_scale"] = entry["default_image_guidance_scale"]
+
+
+def apply_stack_image_defaults(body_json: dict, entry: dict) -> None:
+    """Aplica default_image_size/default_image_steps/
+    default_image_guidance_scale da stack (migration 0062) quando o cliente não
+    mandou o parâmetro — o par, para o produto de imagem, do que
+    apply_stack_sampling_defaults faz para o de texto.
+
+    Mesma mecânica e mesma precedência: `not in body_json` significa "ninguém
+    opinou ainda", e só aí o default da stack entra. Roda DEPOIS de
+    apply_key_image_defaults, que já terá preenchido o que a chave define — a
+    ordem das duas chamadas é a precedência. Abaixo desta só restam os defaults
+    do pod (IMAGE_DEFAULT_SIZE/IMAGE_STEPS/IMAGE_GUIDANCE_SCALE em
+    docker/image/server.py).
+
+    Não valida faixa: os CHECKs da 0062 já garantem que o que está gravado é
+    aceitável, e o pod revalida tudo de qualquer jeito (validate_size,
+    validate_steps com maximum=STEPS_MAX, validate_guidance_scale). Um valor
+    impossível aqui vira 400 do pod, não uma imagem errada.
+
+    Só chamada em /v1/images/generations. O /edits NÃO passa por aqui, e não é
+    esquecimento: o corpo dele é multipart repassado em streaming justamente
+    para não materializar até 20 MiB de referências neste processo, e injetar um
+    campo exigiria re-encodar o multipart inteiro — trocaria o streaming por um
+    default. Enquanto isso não mudar no pod, uma stack com defaults gravados os
+    vê em generations e não em edits."""
+    stack, _ = resolve_key_stack(entry)
+    if not stack:
+        return
+    if "size" not in body_json and stack.get("default_image_size") is not None:
+        body_json["size"] = stack["default_image_size"]
+    if "steps" not in body_json and stack.get("default_image_steps") is not None:
+        body_json["steps"] = stack["default_image_steps"]
+    if (
+        "guidance_scale" not in body_json
+        and stack.get("default_image_guidance_scale") is not None
+    ):
+        body_json["guidance_scale"] = stack["default_image_guidance_scale"]
 
 
 async def machine_admits(machine_id: str, usage_class: str = "low") -> bool:
@@ -4907,6 +4975,24 @@ async def images_generations(
         try:
             body_json = json.loads(body)
             if isinstance(body_json, dict):
+                # ANTES do request_meta: o prompt configurado é o que o pod vai
+                # de fato usar, e o fallback_meta é justamente o que grava o
+                # histórico quando o pod não devolve `meta`. Resolver depois
+                # gravaria "sem prompt" para uma imagem que teve um.
+                key_stack, _ = resolve_key_stack(entry)
+                effective_prompt = resolve_image_prompt(
+                    body_json.get("prompt"), entry, key_stack
+                )
+                if effective_prompt is not None:
+                    body_json["prompt"] = effective_prompt
+                # Pelo mesmo motivo do prompt acima, e antes do request_meta
+                # pela mesma razão: o fallback_meta precisa descrever a
+                # requisição que de fato SAIU daqui. Extraído antes da injeção,
+                # gravaria "steps ausente" numa geração enviada com os steps
+                # configurados. A ordem das duas chamadas É a precedência:
+                # chave ganha da stack.
+                apply_key_image_defaults(body_json, entry)
+                apply_stack_image_defaults(body_json, entry)
                 fallback_meta = image_gen.request_meta(body_json)
                 pin_model(body_json, stack_id, False, machine)
                 body = json.dumps(body_json).encode()
@@ -4952,6 +5038,12 @@ async def images_edits(request: Request, authorization: str | None = Header(None
     re-encodar o multipart e jogaria fora exatamente o streaming acima. O pod
     aceita `model` ausente (policy.validate_model), então o contrato da rota é
     omiti-lo ou mandar o nome servido.
+
+    O `prompt` configurado (chave ou stack) viaja num HEADER pelo mesmo motivo,
+    e não injetado no corpo: sem parsear o multipart o gateway não sabe se o
+    cliente mandou um `prompt`, e quem aplica a precedência precisa ser quem
+    tem o form em mãos — o pod. Ver key_prompt.py, seção "As rotas de imagem
+    entram na MESMA precedência".
     """
     started = time.monotonic()
     entry, account_id, machine, stack_id, _plan = await _authorize_image_request(
@@ -4962,6 +5054,23 @@ async def images_edits(request: Request, authorization: str | None = Header(None
         account_id=account_id, stack_id=stack_id, entry=entry, machine=machine,
         path=EDITS_PATH, request=request, started=started,
     )
+
+    upstream_headers = {
+        "Authorization": authorization,
+        # repassado INTACTO: é aqui que viaja o boundary=... que
+        # delimita as partes. Forçar application/json (como o catch-all
+        # faz) tornaria o corpo impossível de parsear do outro lado.
+        "Content-Type": request.headers.get("content-type", "multipart/form-data"),
+    }
+    # O header só existe quando há prompt configurado. Mandá-lo vazio faria o
+    # pod distinguir "" de ausente sem ganho nenhum, e o header vindo do CLIENTE
+    # é descartado junto: quem manda instrução por essa via é o gateway, e um
+    # cliente que queira mandar prompt tem o campo do form para isso.
+    prompt_header = encode_prompt_header(
+        resolve_system_prompt(entry, resolve_key_stack(entry)[0])
+    )
+    if prompt_header:
+        upstream_headers[IMAGE_PROMPT_HEADER] = prompt_header
 
     # inicializado antes do try: o UploadTooLarge sobe de DENTRO do send(),
     # enquanto o corpo é escrito, e nesse ponto a resposta ainda não existe.
@@ -4974,15 +5083,7 @@ async def images_edits(request: Request, authorization: str | None = Header(None
             content=image_proxy.counting_stream(
                 request.stream(), image_proxy.max_edit_bytes()
             ),
-            headers={
-                "Authorization": authorization,
-                # repassado INTACTO: é aqui que viaja o boundary=... que
-                # delimita as partes. Forçar application/json (como o catch-all
-                # faz) tornaria o corpo impossível de parsear do outro lado.
-                "Content-Type": request.headers.get(
-                    "content-type", "multipart/form-data"
-                ),
-            },
+            headers=upstream_headers,
             # retries=2 do transporte não conflita com o corpo em streaming: o
             # httpx só reabre a conexão antes de escrever byte nenhum.
             timeout=_image_upstream_timeout(),

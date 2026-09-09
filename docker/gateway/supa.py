@@ -102,7 +102,17 @@ class SupaClient:
         (default_temperature/default_top_p/default_max_tokens/
         default_presence_penalty, dentro de `stacks` abaixo — os dois últimos
         desde a migration 0056, mesmo ATENÇÃO) e do clamp de segurança
-        global."""
+        global.
+
+        `default_image_size`/`default_image_steps`/
+        `default_image_guidance_scale` são o par disso para o produto de
+        imagem, e vêm em DUAS alturas do select, como os de sampling: os da
+        própria CHAVE (migration 0063, aplicados em apply_key_image_defaults) e
+        os da STACK (migration 0062, dentro de `stacks` abaixo, aplicados em
+        apply_stack_image_defaults) — o mesmo ATENÇÃO de ordem de deploy vale
+        para as duas. Sampling e imagem nunca se cruzam: nenhuma stack serve
+        texto e imagem ao mesmo tempo, então uma linha sempre tem um dos dois
+        conjuntos nulo."""
         r = await self._rest.get(
             "/api_keys",
             params={
@@ -111,9 +121,11 @@ class SupaClient:
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,purpose,"
                 "use_custom_prompt,system_prompt,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
+                "default_image_size,default_image_steps,default_image_guidance_scale,"
                 "accounts(name,"
                 "stacks(id,machine_id,plan,category,slug,created_at,system_prompt,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
+                "default_image_size,default_image_steps,default_image_guidance_scale,"
                 "billing_status,past_due_since))",
                 "limit": "1",
             },
@@ -138,6 +150,9 @@ class SupaClient:
             "default_top_p": row.get("default_top_p"),
             "default_max_tokens": row.get("default_max_tokens"),
             "default_presence_penalty": row.get("default_presence_penalty"),
+            "default_image_size": row.get("default_image_size"),
+            "default_image_steps": row.get("default_image_steps"),
+            "default_image_guidance_scale": row.get("default_image_guidance_scale"),
             "account_name": account.get("name", "?"),
             "stacks": account.get("stacks") or [],
         }

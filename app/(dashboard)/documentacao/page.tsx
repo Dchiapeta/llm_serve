@@ -384,6 +384,69 @@ export default function DocumentacaoPage() {
               </AccordionContent>
             </AccordionItem>
 
+            <AccordionItem value="categoria-imagem">
+              <AccordionTrigger className="text-base font-medium text-foreground">
+                Categoria de workload: LLM e imagem
+              </AccordionTrigger>
+              <AccordionContent>
+                <Lead>
+                  A categoria (<code>llm</code> ou <code>image</code>) é um eixo
+                  separado do plano comercial: uma stack de imagem hoje é{" "}
+                  <code>plan=Go</code> + <code>category=image</code>. O plano
+                  diz quanto se paga; a categoria diz que workload a máquina
+                  serve.
+                </Lead>
+                <List>
+                  <li>
+                    <span className="font-medium text-foreground">
+                      O pod de imagem não fala chat
+                    </span>{" "}
+                    — é difusão (FLUX.2 Klein 4B), não vLLM. Por isso os dois
+                    guards de <code>403</code> em direções opostas: uma stack de
+                    imagem só pode chamar <code>/v1/images/generations</code>,{" "}
+                    <code>/v1/images/edits</code> e <code>GET /v1/models</code>;
+                    uma stack de LLM é barrada nas duas primeiras.
+                  </li>
+                  <li>
+                    <span className="font-medium text-foreground">
+                      Pod dedicado
+                    </span>{" "}
+                    — <code>max_users: 1</code>, uma geração por vez. A
+                    capacidade não é medida em slots de VRAM como nos planos de
+                    LLM, e sim em profundidade de fila: 3 requisições em voo (1
+                    gerando + 2 aguardando), 60s de espera máxima.
+                  </li>
+                  <li>
+                    <span className="font-medium text-foreground">
+                      Sem cota de tokens
+                    </span>{" "}
+                    — difusão não produz tokens, então{" "}
+                    <code>tokens_in</code>/<code>tokens_out</code> ficam nulos
+                    em <code>gateway_requests</code> e o orçamento diário não se
+                    aplica. O que limita é 10 submissões/min por stack.
+                  </li>
+                  <li>
+                    <span className="font-medium text-foreground">
+                      Toda imagem é armazenada
+                    </span>{" "}
+                    — gravada em bucket privado antes de a resposta sair, ligada
+                    a conta/stack/chave, e apagada em 30 dias. É por isso que um{" "}
+                    <code>502</code> pode significar &ldquo;gerada mas não
+                    guardada&rdquo;.
+                  </li>
+                </List>
+                <p>
+                  Cuidado ao ler os dois painéis: aqui a coluna{" "}
+                  <code>stacks.category</code> vale <code>llm</code>/
+                  <code>image</code>, enquanto no app do cliente existe também
+                  uma categoria <span className="italic">comercial</span> (
+                  <code>coding</code>/<code>image</code>) usada só nas tabelas
+                  de cobrança. As duas colidem em <code>image</code> e não são a
+                  mesma coisa.
+                </p>
+              </AccordionContent>
+            </AccordionItem>
+
             <AccordionItem value="lora">
               <AccordionTrigger className="text-base font-medium text-foreground">
                 Adapters LoRA

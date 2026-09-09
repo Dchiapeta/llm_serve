@@ -22,6 +22,8 @@ coisa que dá para abortar sem deixar a GPU num estado desconhecido.
 """
 
 import asyncio
+import base64
+import binascii
 import random
 import time
 from dataclasses import dataclass
@@ -189,6 +191,61 @@ def validate_model(raw, *, served: str, also_accept: frozenset[str] = frozenset(
             status_code=404,
         )
     return served
+
+
+# Header pelo qual o GATEWAY entrega o prompt configurado na chave (ou, na falta
+# dele, na stack) — base64 de UTF-8. Ver docker/gateway/key_prompt.py.
+#
+# Só /v1/images/edits o consulta. Em /v1/images/generations o gateway já
+# resolve a precedência sozinho, porque lá ele materializa e reescreve o JSON
+# para o pin_model; aqui o corpo é multipart repassado em streaming e o gateway
+# nunca o parseia, então ele não tem como saber se o cliente mandou `prompt` e
+# a decisão precisa acontecer deste lado, com o form em mãos.
+PROMPT_HEADER = "x-default-prompt-b64"
+
+
+def decode_prompt_header(raw) -> str | None:
+    """Texto do PROMPT_HEADER, ou None se ausente/ilegível.
+
+    Header corrompido degrada para "não há prompt configurado" em vez de virar
+    500: o cliente veria um erro sobre um header que ele não mandou e não
+    controla. Sem prompt no form o caminho normal já cobre (`missing_prompt`,
+    400), e a mensagem de lá cita as duas origens — que é a informação
+    acionável para quem configurou o prompt na chave e mesmo assim levou 400.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        text = base64.b64decode(raw, validate=True).decode("utf-8")
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return None
+    return text.strip() or None
+
+
+def resolve_prompt(form_prompt, header_value) -> str:
+    """Prompt efetivo de uma request de edição: o do cliente, senão o configurado.
+
+    Mesma precedência do system prompt do produto de texto (gateway/
+    key_prompt.py): o que o cliente manda no corpo ganha, e a configuração é o
+    default de quem não mandou nada. `prompt` em branco conta como não-mandado —
+    caso contrário um campo vazio esvaziaria em silêncio o prompt que a conta
+    configurou, que é exatamente o oposto do que quem deixou o campo em branco
+    espera.
+
+    Levanta `missing_prompt` quando não há nenhum dos dois: a mensagem cita as
+    duas origens, senão quem configurou o prompt na chave e mesmo assim levou
+    400 não tem como saber que o header não chegou.
+    """
+    if isinstance(form_prompt, str) and form_prompt.strip():
+        return form_prompt
+    configured = decode_prompt_header(header_value)
+    if configured:
+        return configured
+    raise ImageRequestError(
+        "prompt é obrigatório: mande o campo `prompt` ou configure um prompt "
+        "na chave de API",
+        code="missing_prompt",
+    )
 
 
 def validate_response_format(raw) -> str:

@@ -16,6 +16,7 @@ Precisa de fastapi + python-multipart:
     <venv>/bin/python -m pytest docker/image/test_server_routes.py -q
 """
 
+import base64
 import io
 import sys
 import time
@@ -95,6 +96,11 @@ def _png(size=(8, 8)) -> bytes:
 
 
 PNG_BYTES = _png()
+
+
+def _prompt_header(text: str) -> str:
+    """Valor do PROMPT_HEADER como o gateway o monta (key_prompt.encode_prompt_header)."""
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
 @pytest.fixture
@@ -341,6 +347,51 @@ def test_edits_mistura_image_e_image_bracket_na_mesma_lista(client):
     )
     assert r.status_code == 200, r.text
     assert len(client.chamadas[-1].references) == 2
+
+
+def test_edits_usa_o_prompt_configurado_quando_o_cliente_nao_manda(client):
+    """O caso que o header existe para servir: o cliente manda só a imagem, e a
+    instrução vem da chave de API. O gateway não pode injetá-la no corpo porque
+    repassa o multipart em streaming, sem parsear — ver policy.resolve_prompt."""
+    r = client.post(
+        "/v1/images/edits",
+        headers={policy.PROMPT_HEADER: _prompt_header("prova esta camisa")},
+        files={"image": ("a.png", PNG_BYTES, "image/png")},
+    )
+    assert r.status_code == 200, r.text
+    assert client.chamadas[-1].prompt == "prova esta camisa"
+
+
+def test_edits_prompt_do_cliente_ganha_do_configurado(client):
+    r = client.post(
+        "/v1/images/edits",
+        headers={policy.PROMPT_HEADER: _prompt_header("da chave")},
+        data={"prompt": "do cliente"},
+        files={"image": ("a.png", PNG_BYTES, "image/png")},
+    )
+    assert r.status_code == 200, r.text
+    assert client.chamadas[-1].prompt == "do cliente"
+
+
+def test_edits_sem_prompt_e_sem_header_continua_400(client):
+    r = client.post(
+        "/v1/images/edits",
+        files={"image": ("a.png", PNG_BYTES, "image/png")},
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "missing_prompt"
+
+
+def test_generations_aceita_o_header_de_quem_bate_direto_no_pod(client):
+    """Em produção o gateway resolve o prompt no corpo antes de chegar aqui, e
+    o header nem é mandado. A rota o aceita para não ter duas regras."""
+    r = client.post(
+        "/v1/images/generations",
+        headers={policy.PROMPT_HEADER: _prompt_header("da chave")},
+        json={},
+    )
+    assert r.status_code == 200, r.text
+    assert client.chamadas[-1].prompt == "da chave"
 
 
 def test_edits_sem_imagem_e_400(client):

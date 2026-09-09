@@ -3,13 +3,18 @@
 import { CodeBlock } from "@/components/ui/code-block"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { autoCompactWindow } from "@/lib/context-window"
-import { CLI_BLOCKED_PLANS, type TemplatePlan } from "@/lib/types"
+import {
+  CLI_BLOCKED_PLANS,
+  type ProductCategory,
+  type TemplatePlan,
+} from "@/lib/types"
 
 export function MachineAbout({
   gatewayUrl,
   modelName,
   maxModelLen,
   plan,
+  category = null,
 }: {
   gatewayUrl: string | null
   modelName: string | null
@@ -18,17 +23,178 @@ export function MachineAbout({
   // saber o plano) — mostra as ferramentas, mesmo fail-open do gateway quando
   // o plano não é resolvível.
   plan: TemplatePlan | null
+  // Categoria de workload do template. Uma máquina de difusão não fala
+  // /v1/chat/completions — o gateway responde 403 —, então ensinar os exemplos
+  // de chat nela seria mandar o cliente montar algo que falha em toda request.
+  // null cai no caminho de LLM, mesmo fail-open de `plan`.
+  category?: ProductCategory | null
 }) {
-  // Planos sem CLI não podem ver a config de Claude Code/Codex: o gateway
-  // responde 403 nessas rotas (docker/gateway/cli_policy.py), então ensiná-la
-  // aqui seria mandar o cliente montar algo que não funciona.
-  const cliAllowed = !plan || !CLI_BLOCKED_PLANS.includes(plan)
   // Sempre o gateway, nunca o proxy do pod: o pod muda/pausa e o cliente não
   // pode saber disso — realocação e auto-wake só funcionam via gateway.
   // Fallback é a URL real de produção (Railway) — GATEWAY_URL pode não estar
   // setado no ambiente do painel, e um placeholder deixaria o snippet inútil.
   const url =
     gatewayUrl?.replace(/\/$/, "") ?? "https://api.trystac.com"
+
+  if (category === "image") return <ImageAbout url={url} />
+
+  return <LlmAbout url={url} modelName={modelName} maxModelLen={maxModelLen} plan={plan} />
+}
+
+/** Exemplos das rotas de difusão. Ver components/documentacao/api-reference.tsx
+ *  (seção 4) e content/docs/*\/api-reference/image.mdx no TryStac — os três
+ *  precisam contar a mesma história. */
+function ImageAbout({ url }: { url: string }) {
+  const curlGeracao = `curl -X POST ${url}/v1/images/generations \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer <SUA_CHAVE_DE_ACESSO>" \\
+  -d '{
+    "prompt": "uma camisa social branca dobrada sobre uma mesa de madeira",
+    "size": "1024x1024",
+    "seed": 42
+  }'`
+
+  // Sem "model" de propósito: nesta rota o gateway não aplica pin_model, e um
+  // nome diferente do servido devolve 404 do pod.
+  const curlEdicao = `curl -X POST ${url}/v1/images/edits \\
+  -H "Authorization: Bearer <SUA_CHAVE_DE_ACESSO>" \\
+  -F "prompt=deixe em preto e branco" \\
+  -F "size=1024x1024" \\
+  -F "image[]=@foto.png"`
+
+  const python = `# pip install requests
+import base64
+import os
+
+import requests
+
+r = requests.post(
+    "${url}/v1/images/generations",
+    headers={"Authorization": f"Bearer {os.environ['STACK_API_KEY']}"},
+    json={"prompt": "um gato astronauta", "size": "1024x1024"},
+    timeout=180,
+)
+r.raise_for_status()
+payload = r.json()
+
+with open("saida.png", "wb") as f:
+    f.write(base64.b64decode(payload["data"][0]["b64_json"]))
+
+print(payload["meta"]["seed"], payload["meta"]["timings"]["gpu_s"])`
+
+  const javascript = `import { writeFile } from "node:fs/promises"
+
+const r = await fetch("${url}/v1/images/generations", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Authorization: \`Bearer \${process.env.STACK_API_KEY}\`,
+  },
+  body: JSON.stringify({ prompt: "um gato astronauta", size: "1024x1024" }),
+})
+
+const payload = await r.json()
+await writeFile("saida.png", Buffer.from(payload.data[0].b64_json, "base64"))`
+
+  return (
+    <div className="flex flex-col gap-6">
+      <dl className="grid gap-3 rounded-md border p-4 text-sm sm:grid-cols-[auto_1fr] sm:gap-x-6">
+        <dt className="font-medium">Endpoints</dt>
+        <dd className="font-mono text-xs break-all text-muted-foreground">
+          POST {url}/v1/images/generations
+          <br />
+          POST {url}/v1/images/edits
+        </dd>
+        <dt className="font-medium">Autenticação</dt>
+        <dd className="text-muted-foreground">
+          <code className="font-mono text-xs">
+            Authorization: Bearer &lt;chave&gt;
+          </code>{" "}
+          — <code className="font-mono text-xs">x-api-key</code> não funciona
+          nestas rotas
+        </dd>
+        <dt className="font-medium">Resposta</dt>
+        <dd className="text-muted-foreground">
+          Sempre <code className="font-mono text-xs">b64_json</code>, em{" "}
+          <code className="font-mono text-xs">data[0].b64_json</code>.{" "}
+          <code className="font-mono text-xs">response_format: &quot;url&quot;</code>{" "}
+          é recusado.
+        </dd>
+        <dt className="font-medium">Campo model</dt>
+        <dd className="text-muted-foreground">
+          Livre em <code className="font-mono text-xs">generations</code> (o
+          gateway reescreve). Em{" "}
+          <code className="font-mono text-xs">edits</code>{" "}
+          <span className="font-medium text-foreground">não é reescrito</span> —
+          omita, ou o pod devolve{" "}
+          <code className="font-mono text-xs">404</code>.
+        </dd>
+        <dt className="font-medium">Ritmo</dt>
+        <dd className="text-muted-foreground">
+          10 submissões/min por stack, 3 em voo (1 gerando + 2 na fila), 60s de
+          espera máxima. Sem cota de tokens.
+        </dd>
+        <dt className="font-medium">Prompt</dt>
+        <dd className="text-muted-foreground">
+          Truncado em 512 tokens,{" "}
+          <span className="font-medium text-foreground">sem aviso</span>.
+        </dd>
+      </dl>
+
+      <Tabs defaultValue="terminal">
+        <TabsList variant="line">
+          <TabsTrigger value="terminal">Terminal</TabsTrigger>
+          <TabsTrigger value="python">Python</TabsTrigger>
+          <TabsTrigger value="js">JS / TS</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="terminal" className="mt-4 flex flex-col gap-6">
+          <div>
+            <h3 className="mb-2 text-sm font-medium">curl — texto → imagem</h3>
+            <CodeBlock code={curlGeracao} />
+          </div>
+          <div>
+            <h3 className="mb-2 text-sm font-medium">
+              curl — edição (até 4 referências de 5 MiB, PNG/JPEG/WEBP)
+            </h3>
+            <CodeBlock code={curlEdicao} />
+          </div>
+        </TabsContent>
+
+        <TabsContent value="python" className="mt-4">
+          <CodeBlock code={python} />
+        </TabsContent>
+
+        <TabsContent value="js" className="mt-4">
+          <CodeBlock code={javascript} />
+        </TabsContent>
+      </Tabs>
+
+      <p className="text-xs text-muted-foreground">
+        Esta máquina serve difusão, não chat: as rotas de LLM respondem{" "}
+        <code className="font-mono">403</code> com uma chave desta stack. Toda
+        imagem gerada é armazenada por 30 dias. Detalhes completos na aba
+        Documentação.
+      </p>
+    </div>
+  )
+}
+
+function LlmAbout({
+  url,
+  modelName,
+  maxModelLen,
+  plan,
+}: {
+  url: string
+  modelName: string | null
+  maxModelLen: number | null
+  plan: TemplatePlan | null
+}) {
+  // Planos sem CLI não podem ver a config de Claude Code/Codex: o gateway
+  // responde 403 nessas rotas (docker/gateway/cli_policy.py), então ensiná-la
+  // aqui seria mandar o cliente montar algo que não funciona.
+  const cliAllowed = !plan || !CLI_BLOCKED_PLANS.includes(plan)
   const model = modelName ?? "<modelo>"
 
   const curlOpenAI = `curl ${url}/v1/chat/completions \\

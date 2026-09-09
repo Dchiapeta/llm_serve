@@ -114,7 +114,10 @@ def ctx(monkeypatch):
     async def fake_authorize(authorization, request, path):
         flight_key = (STACK_ID, MACHINE["id"])
         main.in_flight[flight_key] += 1
-        return ENTRY, "acc-1", MACHINE, STACK_ID, "Go"
+        # `state["entry"]` e não ENTRY: os testes de prompt configurado trocam a
+        # chave em voo. O default é a chave sem prompt nenhum, que é o que todo
+        # o resto do arquivo assume.
+        return state["entry"], "acc-1", MACHINE, STACK_ID, "Go"
 
     monkeypatch.setattr(main, "_authorize_image_request", fake_authorize)
 
@@ -123,6 +126,7 @@ def ctx(monkeypatch):
             200, json={"created": 1, "data": [{"b64_json": PNG_B64}]}
         ),
         "seen": [],
+        "entry": ENTRY,
     }
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -754,3 +758,112 @@ def test_o_teto_do_image_e_de_3_por_rajada_ponta_a_ponta(admissao):
     assert status[:3] == [200, 200, 200]
     assert status[3] == 429
     assert status[4] == 429
+
+
+# ---------------------------------------------------------------------------
+# prompt configurado na chave (key_prompt.py)
+# ---------------------------------------------------------------------------
+
+KEY_COM_PROMPT = {
+    **ENTRY,
+    "stack_id": STACK_ID,
+    "use_custom_prompt": True,
+    "system_prompt": "prova a peça na pessoa da foto, mantendo o fundo",
+}
+
+
+def _sent_body(ctx) -> dict:
+    """Corpo JSON que o pod recebeu na última chamada."""
+    return json.loads(ctx.state["seen"][-1][1])
+
+
+def _sent_headers(ctx):
+    return ctx.state["seen"][-1][0].headers
+
+
+def _post_edit(ctx, headers=None, **fields):
+    return ctx.client.post(
+        "/v1/images/edits",
+        data=fields,
+        files={"image": ("a.png", PNG, "image/png")},
+        headers={"Authorization": "Bearer sk-teste", **(headers or {})},
+    )
+
+
+def test_generations_usa_o_prompt_da_chave_quando_o_corpo_nao_manda(ctx):
+    """O que o cliente manda passa a ser só url + chave + parâmetros."""
+    ctx.state["entry"] = KEY_COM_PROMPT
+    r = ctx.client.post(
+        "/v1/images/generations",
+        json={"size": "1024x1024"},
+        headers={"Authorization": "Bearer sk-teste"},
+    )
+    assert r.status_code == 200, r.text
+    assert _sent_body(ctx)["prompt"] == KEY_COM_PROMPT["system_prompt"]
+
+
+def test_generations_prompt_do_corpo_ganha_do_da_chave(ctx):
+    ctx.state["entry"] = KEY_COM_PROMPT
+    _post_generation(ctx)
+    assert _sent_body(ctx)["prompt"] == "um gato"
+
+
+def test_generations_sem_prompt_em_lugar_nenhum_nao_inventa_campo(ctx):
+    """Sem prompt configurado o corpo segue como veio, e quem responde 400 é o
+    pod — o gateway não valida o corpo destas rotas."""
+    ctx.client.post(
+        "/v1/images/generations",
+        json={"size": "1024x1024"},
+        headers={"Authorization": "Bearer sk-teste"},
+    )
+    assert "prompt" not in _sent_body(ctx)
+
+
+def test_prompt_da_chave_e_o_que_vai_pro_historico(ctx):
+    """O fallback_meta é extraído DEPOIS da resolução: gravar o corpo cru
+    registraria "sem prompt" para uma imagem que teve um."""
+    ctx.state["entry"] = KEY_COM_PROMPT
+    ctx.state["response"] = lambda request: httpx.Response(
+        200, json={"created": 1, "data": [{"b64_json": PNG_B64}]}  # pod sem `meta`
+    )
+    ctx.client.post(
+        "/v1/images/generations",
+        json={},
+        headers={"Authorization": "Bearer sk-teste"},
+    )
+    assert ctx.supa.rows[-1]["prompt"] == KEY_COM_PROMPT["system_prompt"]
+
+
+def test_edits_leva_o_prompt_da_chave_no_header(ctx):
+    """No multipart o gateway não parseia o corpo, então não injeta nada nele:
+    manda o prompt configurado no header e o POD aplica a precedência."""
+    ctx.state["entry"] = KEY_COM_PROMPT
+    r = _post_edit(ctx)
+    assert r.status_code == 200, r.text
+    enviado = _sent_headers(ctx)[main.IMAGE_PROMPT_HEADER]
+    assert base64.b64decode(enviado).decode() == KEY_COM_PROMPT["system_prompt"]
+
+
+def test_edits_sem_prompt_configurado_nao_manda_header(ctx):
+    """Header vazio faria o pod distinguir "" de ausente sem ganho nenhum."""
+    _post_edit(ctx)
+    assert main.IMAGE_PROMPT_HEADER not in _sent_headers(ctx)
+
+
+def test_edits_ignora_o_header_vindo_do_cliente(ctx):
+    """O header é do gateway. Não é questão de segurança — mandar `prompt` no
+    form tem o mesmo efeito e é o caminho documentado — mas repassar o do
+    cliente faria a origem do prompt depender de quem chamou."""
+    _post_edit(ctx, headers={main.IMAGE_PROMPT_HEADER: "Zm9yamFkbw=="})
+    assert main.IMAGE_PROMPT_HEADER not in _sent_headers(ctx)
+
+
+def test_edits_continua_repassando_o_multipart_intacto(ctx):
+    """O header não pode ter custado o streaming: o corpo segue byte a byte,
+    com o boundary do cliente."""
+    ctx.state["entry"] = KEY_COM_PROMPT
+    _post_edit(ctx, prompt="deixa em preto e branco")
+    request, body = ctx.state["seen"][-1]
+    assert request.headers["content-type"].startswith("multipart/form-data; boundary=")
+    assert b"deixa em preto e branco" in body
+    assert PNG in body

@@ -732,9 +732,14 @@ async def images_generations(request: Request):
         )
     policy.reject_mask(body.get("mask") is not None)
 
-    prompt = body.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise policy.ImageRequestError("prompt é obrigatório", code="missing_prompt")
+    # Nesta rota o gateway já resolveu a precedência sozinho (ele materializa e
+    # reescreve o JSON para o pin_model), então o header normalmente nem chega:
+    # ele vale para quem bate direto no pod, e mantém as duas rotas com uma
+    # regra só. Em /v1/images/edits é o contrário — lá o header é o único
+    # caminho, porque o gateway não parseia o multipart.
+    prompt = policy.resolve_prompt(
+        body.get("prompt"), request.headers.get(policy.PROMPT_HEADER)
+    )
 
     policy.validate_model(body.get("model"), served=SERVED_MODEL_NAME, also_accept=MODEL_ALIASES)
     policy.validate_response_format(body.get("response_format"))
@@ -806,9 +811,11 @@ async def images_edits(request: Request):
         )
     policy.collect_reference_names(uploads, maximum=MAX_REFERENCE_IMAGES)
 
-    prompt = form.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise policy.ImageRequestError("prompt é obrigatório", code="missing_prompt")
+    # `prompt` do form ganha; sem ele vale o prompt configurado na chave/stack,
+    # que o gateway entrega em PROMPT_HEADER. Ver policy.resolve_prompt.
+    prompt = policy.resolve_prompt(
+        form.get("prompt"), request.headers.get(policy.PROMPT_HEADER)
+    )
 
     policy.validate_model(form.get("model"), served=SERVED_MODEL_NAME, also_accept=MODEL_ALIASES)
     policy.validate_response_format(form.get("response_format"))

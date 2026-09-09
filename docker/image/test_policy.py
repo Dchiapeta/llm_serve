@@ -9,6 +9,7 @@ síncrono, porque não há pytest-asyncio instalado
 """
 
 import asyncio
+import base64
 import threading
 
 import pytest
@@ -130,6 +131,67 @@ def test_seed_acima_do_teto_do_torch_e_400_e_nao_500():
     with pytest.raises(policy.ImageRequestError) as e:
         policy.validate_seed(2**64)
     assert e.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# prompt: corpo do cliente vs. configurado na chave
+# ---------------------------------------------------------------------------
+
+
+def _header(text: str) -> str:
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def test_prompt_do_cliente_ganha_do_configurado():
+    assert policy.resolve_prompt("do cliente", _header("da chave")) == "do cliente"
+
+
+def test_sem_prompt_no_corpo_vale_o_configurado():
+    assert policy.resolve_prompt(None, _header("da chave")) == "da chave"
+
+
+def test_prompt_em_branco_nao_apaga_o_configurado():
+    """O oposto do que quem deixou o campo vazio espera seria gerar sem
+    instrução nenhuma — e, pior, silenciosamente."""
+    assert policy.resolve_prompt("   ", _header("da chave")) == "da chave"
+
+
+def test_prompt_do_cliente_vai_cru_sem_strip():
+    """O campo é do cliente: o servidor decide se ele CONTA, não como ele é."""
+    assert policy.resolve_prompt("  com espaço  ", None) == "  com espaço  "
+
+
+def test_sem_prompt_em_lugar_nenhum_e_400():
+    with pytest.raises(policy.ImageRequestError) as e:
+        policy.resolve_prompt(None, None)
+    assert e.value.code == "missing_prompt"
+    # a mensagem cita a chave: sem isso, quem configurou o prompt lá e mesmo
+    # assim levou 400 não tem como saber que o header não chegou.
+    assert "chave" in e.value.message
+
+
+def test_header_com_acento_e_emoji_sobrevive():
+    assert policy.resolve_prompt(None, _header("coração 🧥 não")) == "coração 🧥 não"
+
+
+def test_header_quebrado_nao_vira_500():
+    """Degrada para "não há prompt configurado": o cliente não mandou nem
+    controla esse header, então um erro sobre ele seria inacionável."""
+    for lixo in ("!!!nao-e-base64!!!", "", "   ", _header("x")[:-1] + "@"):
+        with pytest.raises(policy.ImageRequestError) as e:
+            policy.resolve_prompt(None, lixo)
+        assert e.value.code == "missing_prompt"
+
+
+def test_header_com_bytes_que_nao_sao_utf8_nao_vira_500():
+    invalido = base64.b64encode(b"\xff\xfe").decode("ascii")
+    with pytest.raises(policy.ImageRequestError):
+        policy.resolve_prompt(None, invalido)
+
+
+def test_header_so_com_espaco_nao_conta_como_prompt():
+    with pytest.raises(policy.ImageRequestError):
+        policy.resolve_prompt(None, _header("   "))
 
 
 # ---------------------------------------------------------------------------

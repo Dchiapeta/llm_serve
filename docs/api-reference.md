@@ -389,7 +389,7 @@ A resposta é sempre `b64_json`. `response_format: "url"` é recusado.
 
 | Campo | Obrigatório | Notas |
 |---|---|---|
-| `prompt` | sim | texto livre |
+| `prompt` | condicional | texto livre. Pode ser omitido se a chave (ou a stack) tiver prompt configurado — ver 3.9.3 |
 | `size` | não | `1024x1024` (padrão), `1536x1024`, `1024x1536` — lista fechada |
 | `n` | não | máximo 1 por requisição |
 | `steps` | não | padrão 4, teto 8 (o checkpoint é *distilled*) |
@@ -444,6 +444,33 @@ WEBP — detectados pelo conteúdo do arquivo, não pela extensão nem pelo
 `mask` não é suportado (`400`): este pod carrega um pipeline só, e aplicar a
 edição na imagem inteira fingindo respeitar a máscara seria pior que recusar.
 
+### 3.9.3. Prompt configurado na chave
+
+O `prompt` das duas rotas segue a **mesma precedência do system prompt** das
+rotas de texto: o que vem no corpo ganha; sem ele (ou em branco) vale o prompt
+da chave; sem o da chave, o da stack. A chave é a mesma coluna que o produto de
+texto usa — o campo de prompt do painel do cliente — então uma stack de imagem
+configura o prompt no mesmo lugar de sempre.
+
+Na prática é o que permite ao cliente mandar só URL, chave e imagem:
+
+```bash
+curl https://api.trystac.com/v1/images/edits \
+  -H "Authorization: Bearer $STAC_API_KEY" \
+  -F "image[]=@foto.png"
+```
+
+| No corpo | Na chave/stack | Vale |
+|---|---|---|
+| `prompt` com texto | qualquer coisa | o do corpo |
+| ausente ou em branco | configurado | o configurado |
+| ausente ou em branco | nada | `400 missing_prompt` |
+
+> **Substitui, não soma.** Não há concatenação entre o prompt da chave e o do
+> request: quem manda `prompt` descarta o configurado por inteiro. E o texto da
+> chave gasta o mesmo orçamento de **512 tokens** do pipeline — um prompt longo
+> na chave não deixa espaço para mais nada, e o corte continua silencioso.
+
 **Erros específicos:**
 
 | Status | `code` | Significado |
@@ -461,7 +488,7 @@ edição na imagem inteira fingindo respeitar a máscara seria pior que recusar.
 | `502` | — | a imagem foi gerada mas não foi possível armazená-la (ver abaixo) |
 | `504` | `queue_timeout` | espera na fila excedida |
 
-### 3.9.3. Ritmo de requisições
+### 3.9.4. Ritmo de requisições
 
 Geração de imagem **não tem cota diária**. O Go aceita até 10 submissões por
 minuto, mas o pod gera uma imagem por vez e a vazão concluída depende do
@@ -494,7 +521,7 @@ texto → imagem e 7–21 s para edição, variando com quantidade, dimensões e
 das referências. “10/min” é limite de submissão, não promessa de dez resultados
 concluídos por minuto.
 
-### 3.9.4. Armazenamento e retenção
+### 3.9.5. Armazenamento e retenção
 
 Toda imagem gerada é guardada, ligada à conta, à stack e à chave que a criou.
 Isso é feito no servidor e **não muda nada no seu código** — a resposta continua
