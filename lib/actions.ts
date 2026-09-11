@@ -1249,14 +1249,13 @@ export async function ensureStackMachine(stackId: string): Promise<string> {
 }
 
 // pelo admin (machine_id do form), ou numa recém-provisionada com o
-// template selecionado (nome = llm-stack-N, GPU = primeira compatível). Em
-// ambos os casos emite a chave HEX da conta na máquina; a plainKey é
-// retornada UMA única vez.
+// template selecionado (nome = llm-stack-N, GPU = primeira compatível). A
+// stack nasce SEM chave de cliente: quem emite é o cliente no painel dele
+// (/api/keys) ou o admin pelo CreateKeyDialog.
 export async function createStack(formData: FormData): Promise<{
   slug: string
   machineId: string
   machineCreated: boolean
-  plainKey: string
 }> {
   const db = createSupabaseAdmin()
   const name = String(formData.get("name") || "").trim()
@@ -1360,15 +1359,14 @@ export async function createStack(formData: FormData): Promise<{
     .eq("id", stackId)
   if (linkError) throw new Error(linkError.message)
 
-  const { plainKey } = await createKey({ accountId, machineId, stackId })
-  // Chave interna de Playground, gerada junto e nunca exibida ao cliente —
-  // ver getOrCreatePlaygroundKey para o caminho de backfill de stacks antigas.
+  // Só a chave interna de Playground, nunca exibida ao cliente — ver
+  // getOrCreatePlaygroundKey para o caminho de backfill de stacks antigas.
   await createKey({ accountId, machineId, stackId, purpose: "playground" })
 
   revalidatePath("/stacks")
   revalidatePath("/accounts")
   if (machineCreated) revalidatePath("/machines")
-  return { slug, machineId, machineCreated, plainKey }
+  return { slug, machineId, machineCreated }
 }
 
 // Devolve a chave interna de Playground de uma stack (texto puro), criando-a

@@ -98,7 +98,14 @@ export async function PATCH(
     return NextResponse.json({ error: "corpo inválido" }, { status: 400 })
   }
 
-  const update: Record<string, number | string | null> = {}
+  const update: Record<string, number | string | boolean | null> = {}
+  if ("default_enable_thinking" in body) {
+    const value = body.default_enable_thinking
+    if (value !== null && typeof value !== "boolean") {
+      return NextResponse.json({ error: "default_enable_thinking deve ser boolean ou null" }, { status: 400 })
+    }
+    update.default_enable_thinking = value
+  }
   if ("default_temperature" in body) {
     const v = parseBoundedNumberOrNull(body.default_temperature, 0, 2)
     if (v === INVALID) {
@@ -177,7 +184,7 @@ export async function PATCH(
       {
         error:
           "informe ao menos um de: default_temperature, default_top_p, " +
-          "default_max_tokens, default_presence_penalty, default_image_size, " +
+          "default_max_tokens, default_presence_penalty, default_enable_thinking, default_image_size, " +
           "default_image_steps, default_image_guidance_scale",
       },
       { status: 400 }
