@@ -499,20 +499,40 @@ export default function DocumentacaoPage() {
               </AccordionTrigger>
               <AccordionContent>
                 <Lead>
-                  Cada conta pode ter um system prompt próprio e arquivos
-                  indexados como base de conhecimento.
+                  Cada stack pode ter um system prompt próprio e arquivos
+                  indexados como base de conhecimento. São duas decisões
+                  separadas, com donos diferentes.
                 </Lead>
                 <List>
                   <li>
-                    Em toda chamada de chat, o gateway injeta o system prompt
-                    configurado da conta como primeira mensagem.
+                    <strong>System prompt</strong> — injetado como primeira
+                    mensagem, vindo da chave (quando ela tem prompt próprio) ou
+                    da stack. Só vale quando o cliente <em>não</em> manda um{" "}
+                    <code>system</code> na requisição: Cursor, Codex e Claude
+                    Code mandam o deles e não podem ter a personalidade trocada
+                    por baixo.
                   </li>
                   <li>
-                    Se a conta tem arquivos indexados, a última mensagem do
-                    usuário é usada para buscar os trechos mais similares
-                    (embeddings) e injetá-los como contexto antes da mensagem
-                    do usuário — é best-effort: se a busca falhar, a chamada
-                    segue normalmente, só sem o contexto extra.
+                    <strong>Base de conhecimento</strong> — a última mensagem do
+                    usuário vira embedding e busca os trechos mais similares da
+                    stack. Quem decide se isso acontece é a{" "}
+                    <strong>chave</strong> (migration 0065), escolhida na
+                    criação e alterável na listagem de chaves: <em>ligada</em>{" "}
+                    consulta sempre, inclusive com <code>system</code> do
+                    cliente (o trecho entra depois da instrução dele);{" "}
+                    <em>desligada</em> nunca consulta; <em>automático</em> é o
+                    comportamento antigo, que consulta só quando não há{" "}
+                    <code>system</code>.
+                  </li>
+                  <li>
+                    Ligue em automação e atendimento — o n8n, por exemplo,
+                    sempre manda <code>system</code>, então uma chave em
+                    automático nunca consultaria a base. Em chave de CLI de
+                    código, prefira desligada.
+                  </li>
+                  <li>
+                    A busca é best-effort: se falhar, a chamada segue
+                    normalmente, só sem o contexto extra.
                   </li>
                 </List>
               </AccordionContent>

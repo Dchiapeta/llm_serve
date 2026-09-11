@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { CreateKeyDialog } from "@/components/accounts/create-key-dialog"
+import { KnowledgeBaseToggle } from "@/components/accounts/knowledge-base-toggle"
 import { RevokeKeyButton } from "@/components/accounts/revoke-key-button"
 import { CapacityBar } from "@/components/machines/capacity-bar"
 import { MachineAbout } from "@/components/machines/machine-about"
@@ -328,13 +329,14 @@ export default async function MachineDetailPage({
                     <TableHead>Requisições</TableHead>
                     <TableHead>Tokens</TableHead>
                     <TableHead>Criada em</TableHead>
+                    <TableHead>Base de conhecimento</TableHead>
                     <TableHead className="w-24" />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {keys.length === 0 && (
                     <TableRow>
-                      <TableCell colSpan={7} className="text-center text-muted-foreground">
+                      <TableCell colSpan={8} className="text-center text-muted-foreground">
                         Nenhuma chave acessou esta máquina ainda.
                       </TableCell>
                     </TableRow>
@@ -362,6 +364,19 @@ export default async function MachineDetailPage({
                         </TableCell>
                         <TableCell className="text-xs text-muted-foreground">
                           {new Date(k.created_at).toLocaleDateString("pt-BR")}
+                        </TableCell>
+                        <TableCell>
+                          {/* Mesma regra da listagem de /accounts: chave
+                              revogada não faz request, e a de playground é
+                              interna — nenhuma das duas se configura aqui. */}
+                          {k.status === "active" && k.purpose !== "playground" ? (
+                            <KnowledgeBaseToggle
+                              keyId={k.id}
+                              initial={k.enable_knowledge_base}
+                            />
+                          ) : (
+                            <span className="text-xs text-muted-foreground">—</span>
+                          )}
                         </TableCell>
                         <TableCell>
                           {k.status === "active" && (

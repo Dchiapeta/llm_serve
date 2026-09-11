@@ -114,7 +114,7 @@ from reasoning_filter import (
 from stream_watchdog import UpstreamStreamTimeout, aiter_bytes_watchdog
 from supa import SupaClient
 from generation_trace import request_trace_id, trace_decision
-from rag_policy import is_isolated_greeting
+from rag_policy import is_isolated_greeting, resolve_rag_policy
 from thinking_policy import (
     ThinkingPolicyError, apply_thinking_policy, resolve_thinking_policy,
 )
@@ -584,7 +584,10 @@ demo_client: httpx.AsyncClient
 # cache de chaves: key_hash -> (entry | None, expira_em)
 key_cache: dict[str, tuple[dict | None, float]] = {}
 
-# cache do interruptor liga/desliga (system_settings.auto_provision_enabled)
+# cache do interruptor liga/desliga (system_settings.auto_provision_enabled).
+# O interruptor gateia só o provisionamento PROATIVO (pool de reserva e
+# rebalanceamento); o caminho de request (try_provision_for_request) ignora
+# ele — ver docstring de _try_provision_machine_for_plan.
 auto_provision_cache: tuple[bool, float] | None = None
 
 # requests em voo por (account_id, machine_id) — base do drain da Fase 5.
@@ -2282,16 +2285,26 @@ async def _provision_and_track(
 
 async def _try_provision_machine_for_plan(
     plan: str, reason: str, pause_when_healthy: bool,
-    category: str = LLM_CATEGORY,
+    category: str = LLM_CATEGORY, ignore_switch: bool = False,
 ) -> bool:
-    """Dispara a criação em background se o interruptor estiver ligado, o
-    painel estiver configurado, não houver uma criação em andamento pro
-    plano e o cooldown já tiver passado. Fonte única de verdade do
-    interruptor — os 3 chamadores (cascata reativa x2, ensure_capacity_once)
-    não precisam checar auto_provision_enabled() cada um por conta própria.
-    A decisão de SE vale a pena criar (dado que está ligado) é toda do
-    chamador — aqui só há as travas."""
-    if not await auto_provision_enabled():
+    """Dispara a criação em background se o interruptor estiver ligado (ou
+    `ignore_switch`), o painel estiver configurado, não houver uma criação em
+    andamento pro plano e o cooldown já tiver passado. Fonte única de verdade
+    do interruptor — os chamadores (cascata reativa x2, ensure_capacity_once,
+    rebalance) não precisam checar auto_provision_enabled() cada um por conta
+    própria. A decisão de SE vale a pena criar é toda do chamador — aqui só
+    há as travas.
+
+    `ignore_switch=True` é o caminho de REQUEST (try_provision_for_request):
+    uma chave paga acabou de chegar e não há máquina nenhuma do plano — nem
+    running, nem pausada. Criar chave nunca aloca máquina (é o uso que aloca,
+    ver /api/keys no painel), então este é o ÚNICO ponto em que a primeira
+    request de uma stack nova vira pod; se ficasse atrás do interruptor, o
+    cliente veria um 503 "preparando" eterno sem nada subindo. O interruptor
+    continua sendo a trava de custo do provisionamento PROATIVO (pool de
+    reserva, rebalance), que ninguém está esperando. Cooldown e lock por
+    plano valem em todos os casos."""
+    if not ignore_switch and not await auto_provision_enabled():
         return False
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
         # sem painel configurado, provision_machine_for_plan sempre devolve
@@ -2317,9 +2330,12 @@ async def try_provision_for_request(
     plan: str, reason: str, category: str = LLM_CATEGORY
 ) -> bool:
     """Cascata reativa (3º nível): não pausa ao ficar saudável — o próprio
-    request que disparou precisa da máquina de pé pro retry."""
+    request que disparou precisa da máquina de pé pro retry. Ignora o
+    interruptor auto_provision_enabled de propósito (ver
+    _try_provision_machine_for_plan): há um cliente pagante esperando."""
     return await _try_provision_machine_for_plan(
-        plan, reason, pause_when_healthy=False, category=category
+        plan, reason, pause_when_healthy=False, category=category,
+        ignore_switch=True,
     )
 
 
@@ -3207,9 +3223,49 @@ async def validate_body(
     # `{"role":"system","content":""}` engolia a configuração da conta e não
     # colocava nada no lugar.
     if client_system_text:
-        messages.insert(0, {"role": "system", "content": client_system_text})
-        trace_decision("rag", entry, policy="greeting_gate_v1", reason="client_system",
-                       retrieved_chunks=0, inserted_chunks=0)
+        # A PRECEDÊNCIA DO SYSTEM PROMPT NÃO MUDA aqui: com instrução do
+        # cliente, o `system_prompt` de chave/stack continua NÃO sendo
+        # injetado (ver key_prompt.py) — trocar a personalidade de um Cursor
+        # ou Claude Code por baixo quebraria a ferramenta. O que passa a
+        # entrar, e só quando a chave pede (migration 0065), é o bloco de
+        # RAG: a base de conhecimento é o "sobre o quê", não o "como
+        # responder", e não compete com a instrução do cliente. Foi o bypass
+        # inteiro deste ramo que fez o RAG nunca funcionar pelo n8n, cujo nó
+        # sempre manda um System Message ("You are a helpful assistant").
+        rag = resolve_rag_policy(entry)
+        context = None
+        if rag.enabled:
+            context = await retrieve_stack_context(
+                entry, stack, _last_user_text_from_messages(messages), client_prompt=True)
+        else:
+            # Sem chamada de busca nenhuma nos dois ramos restantes, mas por
+            # motivos diferentes — daí os dois `reason`: "disabled" é escolha
+            # explícita da chave, "client_system" é o bypass LEGADO (coluna
+            # NULL), que é só o que esse nome significa de agora em diante.
+            trace_decision("rag", entry, policy="greeting_gate_v1", source=rag.source,
+                           reason="disabled" if rag.enabled is False else "client_system",
+                           client_prompt=True, retrieved_chunks=0, inserted_chunks=0)
+        # UMA mensagem system, no índice 0: o chat template do Qwen3.x rejeita
+        # ("System message must be at the beginning") qualquer outra coisa —
+        # por isso o contexto é concatenado DENTRO da mensagem do cliente, e
+        # não inserido como mensagem própria.
+        #
+        # E o contexto vem DEPOIS da instrução, por ordem de leitura: a
+        # instrução é o enquadramento e o contexto é material de consulta —
+        # invertido, o modelo lê trechos soltos antes de saber o que fazer com
+        # eles. NÃO justifique esta ordem por prefix cache: os Qwen3.x híbridos
+        # que servimos desligam prefix caching sozinhos (atenção linear), e
+        # mesmo onde ele existe o ganho aqui é pequeno, porque tudo o que vem
+        # DEPOIS do system (a conversa inteira) muda de offset a cada turno.
+        #
+        # Com rag.enabled None (legado) o join é de um elemento só e devolve
+        # exatamente `client_system_text` — este ramo sai idêntico ao de antes
+        # para a mesma entrada. (A extração da query mudou à parte, e de
+        # propósito: ver _last_user_text_from_messages, que corrigiu o descarte
+        # silencioso de `content` em lista. Uma chave legada com pergunta
+        # multimodal passa a buscar, onde antes era pulada sem aviso.)
+        messages.insert(0, {"role": "system", "content": "\n\n---\n\n".join(
+            [client_system_text] + ([context] if context else []))})
     else:
         system_message = await build_stack_system_message(messages, entry)
         if system_message:
@@ -3273,11 +3329,9 @@ async def build_stack_system_message(messages: list, entry: dict) -> dict | None
     if system_prompt:
         system_parts.append(system_prompt)
 
-    last_user = next(
-        (m for m in reversed(messages) if m.get("role") == "user"), None
+    context = await retrieve_stack_context(
+        entry, stack, _last_user_text_from_messages(messages)
     )
-    user_text = last_user.get("content") if last_user else None
-    context = await retrieve_stack_context(entry, stack, user_text)
     if context:
         system_parts.append(context)
 
@@ -3286,11 +3340,31 @@ async def build_stack_system_message(messages: list, entry: dict) -> dict | None
     return {"role": "system", "content": "\n\n---\n\n".join(system_parts)}
 
 
-async def retrieve_stack_context(entry: dict, stack: dict | None, user_text) -> str | None:
+async def retrieve_stack_context(entry: dict, stack: dict | None, user_text,
+                                 *, client_prompt: bool = False) -> str | None:
     """Porta única de recuperação documental, compartilhada por chat e
     Responses. Antes cada caminho tinha sua própria cópia da busca, e qualquer
     regra nova (como a saudação) teria que ser escrita duas vezes — com o risco
-    de divergirem. Devolve o bloco pronto pro system, ou None."""
+    de divergirem. Devolve o bloco pronto pro system, ou None.
+
+    Sendo a porta única, é aqui que o desligamento explícito da chave
+    (migration 0065) tem que ser checado — e ANTES de qualquer outra coisa:
+    uma chave com a base desligada não pode pagar uma chamada de embedding
+    (rede + custo por request) para descobrir que o resultado seria jogado
+    fora.
+
+    `client_prompt` não decide nada, é METADADO de trace: diz se a request já
+    trazia instrução própria do cliente. É o que permite separar, nos logs, o
+    RAG que rodou junto do system prompt da plataforma do que rodou por cima
+    do prompt de uma integração — sem ele, os dois caminhos novos ficariam
+    indistinguíveis do antigo."""
+    policy = resolve_rag_policy(entry)
+    if policy.enabled is False:
+        trace_decision("rag", entry, policy="greeting_gate_v1", source=policy.source,
+                       reason="disabled", client_prompt=client_prompt,
+                       retrieved_chunks=0, inserted_chunks=0)
+        return None
+
     chunks = []
     if not isinstance(user_text, str) or not user_text.strip():
         reason = "no_user_text"
@@ -3299,13 +3373,40 @@ async def retrieve_stack_context(entry: dict, stack: dict | None, user_text) -> 
     else:
         embedding = await embed_query(user_text)
         if embedding:
-            chunks = await supa.match_knowledge_chunks(
-                entry["account_id"], stack["id"] if stack else None, embedding, RAG_TOP_K
-            )
-            reason = "retrieved" if chunks else "no_results"
+            try:
+                chunks = await supa.match_knowledge_chunks(
+                    entry["account_id"], stack["id"] if stack else None, embedding, RAG_TOP_K
+                )
+            except Exception:
+                # BEST-EFFORT DE VERDADE, e não só no embedding. embed_query já
+                # engole toda exceção (main.py), mas match_knowledge_chunks faz
+                # raise_for_status (supa.py) — então um 500 do PostgREST ou um
+                # timeout do pool subia daqui e estourava o validate_body
+                # INTEIRO. As duas consequências eram graves e silenciosas:
+                #
+                #   1. No proxy genérico, `body = json.dumps(body_json)` só roda
+                #      depois do validate_body e o `except Exception: pass` logo
+                #      abaixo deixa o corpo ORIGINAL seguir pro pod — ou seja, a
+                #      request ia sem o model pinado, sem clamp de `n`, sem pop
+                #      de logit_bias e sem o piso/teto de max_tokens.
+                #   2. Em /v1/messages o try só captura ContextWindowExceeded e
+                #      HTTPException, então release_flight não rodava e o
+                #      contador in_flight daquela máquina ficava preso acima de
+                #      zero até o restart — segurando um slot de concorrência e
+                #      impedindo a auto-pausa do pod (GPU acesa sem uso).
+                #
+                # Uma falha da base de conhecimento não pode derrubar nem
+                # deformar a inferência: responder sem contexto é a degradação
+                # certa. logger.exception e não warning porque, sem stack trace,
+                # uma indisponibilidade do Supabase viraria só "no_results".
+                logger.exception("RAG: busca de chunks falhou; seguindo sem contexto")
+                reason = "search_failed"
+            else:
+                reason = "retrieved" if chunks else "no_results"
         else:
             reason = "embedding_unavailable"
-    trace_decision("rag", entry, policy="greeting_gate_v1", reason=reason,
+    trace_decision("rag", entry, policy="greeting_gate_v1", source=policy.source,
+                   reason=reason, client_prompt=client_prompt,
                    retrieved_chunks=len(chunks), inserted_chunks=len(chunks))
     if not chunks:
         return None
@@ -3332,7 +3433,59 @@ async def build_stack_instructions(entry: dict, last_user_text: str | None) -> s
     return "\n\n---\n\n".join(system_parts)
 
 
+def _last_user_text_from_messages(messages) -> str | None:
+    """Texto da última mensagem do usuário no formato chat completions, ou
+    None quando não há texto nenhum.
+
+    Irmão de _last_user_text_from_responses_input, e existe porque este era o
+    ÚNICO dos quatro extratores do repo (o das Responses acima, o text_of de
+    content_policy e o de anthropic_compat são os outros três) que tratava
+    `content` em lista de partes tipadas como "sem texto": o call site passava
+    `last_user.get("content")` cru e retrieve_stack_context testa
+    `isinstance(user_text, str)`, então toda request multimodal caía em
+    reason="no_user_text" e a busca era pulada EM SILÊNCIO. Atinge também todo
+    /v1/messages com mais de um bloco no user, porque anthropic_compat só
+    emite string quando há exatamente uma parte de texto.
+
+    None e não "" quando não sobra texto (user só com imagem): quem chama
+    distingue "não veio texto" de texto vazio, e um "" seguiria para o
+    embedding como pergunta legítima.
+
+    NÃO usa text_of, apesar de ser o extrator canônico: ele junta as partes com
+    "" (content_policy.py), porque o caso dele é remontar UM system prompt que
+    o cliente picou em blocos. Aqui as partes são parágrafos distintos da
+    pergunta, e colar sem separador gera "linha umlinha dois" — uma palavra
+    inexistente bem no meio do texto que vai virar embedding, o que degrada a
+    similaridade justamente na query. O irmão da Responses
+    (_last_user_text_from_responses_input) já junta com "\n"; é ele que este
+    aqui espelha."""
+    last_user = next(
+        (m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "user"),
+        None,
+    )
+    if last_user is None:
+        return None
+    content = last_user.get("content")
+    if isinstance(content, str):
+        return content or None
+    if isinstance(content, list):
+        parts = [
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        return "\n".join(filter(None, parts)) or None
+    return None
+
+
 def _last_user_text_from_responses_input(input_items) -> str | None:
+    # `input` como STRING é forma válida da Responses API ("input": "pergunta"),
+    # e é a mais curta de todas — quem chama a rota na mão costuma usar essa. Sem
+    # este ramo, ela caía no `return None` e a request inteira ficava sem busca
+    # com reason="no_user_text", mesmo numa chave com a base LIGADA: a promessa
+    # "consulta sempre" valia no chat e falhava em silêncio aqui.
+    if isinstance(input_items, str):
+        return input_items or None
     if not isinstance(input_items, list):
         return None
     for item in reversed(input_items):
@@ -3448,15 +3601,47 @@ async def validate_responses_body(
                 dropped_images, stack_id, machine.get("max_images_per_prompt"),
             )
 
-    if not body_json.get("instructions"):
+    client_instructions = body_json.get("instructions")
+    if not client_instructions:
         instructions = await build_stack_instructions(
             entry, _last_user_text_from_responses_input(input_items)
         )
         if instructions:
             body_json["instructions"] = instructions
     else:
-        trace_decision("rag", entry, policy="greeting_gate_v1", reason="client_instructions",
-                       retrieved_chunks=0, inserted_chunks=0)
+        # Espelho exato do ramo de chat completions em validate_body, com
+        # "instructions" no papel do `system`: mesmas três invariantes (um
+        # campo só, contexto DEPOIS da instrução para preservar o prefixo no
+        # cache do pod, e legado saindo byte a byte igual — sem contexto o
+        # campo nem é reescrito). A precedência do system prompt também não
+        # muda: build_stack_instructions continua fora deste ramo.
+        rag = resolve_rag_policy(entry)
+        context = None
+        # isinstance(str) e não text_of: aqui o campo vem CRU do cliente (a
+        # Responses API não normalizou nada antes deste ponto, ao contrário
+        # das messages do chat). Um `instructions` que venha como objeto ou
+        # lista cai no trace abaixo em vez de estourar TypeError no join.
+        if rag.enabled and isinstance(client_instructions, str):
+            context = await retrieve_stack_context(
+                entry, stack, _last_user_text_from_responses_input(input_items),
+                client_prompt=True)
+        else:
+            # Três motivos distintos caem aqui, e o log precisa separá-los:
+            # "disabled" é escolha da chave, "client_instructions" é o bypass
+            # LEGADO, e "instructions_not_text" é a chave PEDINDO a base e não
+            # sendo atendida porque o campo veio como objeto/lista. Sem o
+            # terceiro, esse caso se disfarçaria de legado e ninguém acharia.
+            if rag.enabled is False:
+                reason = "disabled"
+            elif rag.enabled:
+                reason = "instructions_not_text"
+            else:
+                reason = "client_instructions"
+            trace_decision("rag", entry, policy="greeting_gate_v1", source=rag.source,
+                           reason=reason,
+                           client_prompt=True, retrieved_chunks=0, inserted_chunks=0)
+        if context:
+            body_json["instructions"] = "\n\n---\n\n".join([client_instructions, context])
 
     # mesmo clamp dinâmico do validate_body, no campo da Responses API; o
     # "input" pode ser string ou lista de itens — json.dumps cobre os dois.

@@ -104,6 +104,14 @@ class SupaClient:
         desde a migration 0056, mesmo ATENÇÃO) e do clamp de segurança
         global.
 
+        `enable_knowledge_base` (migration 0065, mesmo ATENÇÃO) é a única das
+        colunas de política que NÃO tem par dentro de `stacks`: a base de
+        conhecimento continua sendo da stack, mas quem decide consultá-la é a
+        integração — ver resolve_rag_policy (rag_policy.py). Pedir a coluna
+        aqui é o que faz o ATENÇÃO acima valer para ela: sem a migration
+        aplicada, o PostgREST recusa o select inteiro e nem a resolução de
+        chave sobrevive.
+
         `default_image_size`/`default_image_steps`/
         `default_image_guidance_scale` são o par disso para o produto de
         imagem, e vêm em DUAS alturas do select, como os de sampling: os da
@@ -119,7 +127,7 @@ class SupaClient:
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,purpose,"
-                "use_custom_prompt,system_prompt,default_enable_thinking,"
+                "use_custom_prompt,system_prompt,default_enable_thinking,enable_knowledge_base,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
                 "default_image_size,default_image_steps,default_image_guidance_scale,"
                 "accounts(name,"
@@ -147,6 +155,7 @@ class SupaClient:
             "use_custom_prompt": row.get("use_custom_prompt", False),
             "system_prompt": row.get("system_prompt"),
             "default_enable_thinking": row.get("default_enable_thinking"),
+            "enable_knowledge_base": row.get("enable_knowledge_base"),
             "default_temperature": row.get("default_temperature"),
             "default_top_p": row.get("default_top_p"),
             "default_max_tokens": row.get("default_max_tokens"),

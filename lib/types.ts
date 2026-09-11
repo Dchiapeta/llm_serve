@@ -254,6 +254,13 @@ export type ApiKeyPurpose = "customer" | "playground"
 
 export type ApiKey = {
   default_enable_thinking?: boolean | null
+  // Política de consulta à base de conhecimento (RAG da stack) desta chave —
+  // migration 0065. null = legado, NÃO "desligada": o gateway só monta o bloco
+  // de contexto quando a request não traz system próprio
+  // (build_stack_system_message em docker/gateway/main.py). true = sempre
+  // consulta; false = nunca. O painel nunca grava null: chave nova nasce com
+  // true/false explícito e chave antiga vira explícita no primeiro clique.
+  enable_knowledge_base?: boolean | null
   id: string
   account_id: string
   // Pin histórico da máquina, não rota: o gateway resolve por

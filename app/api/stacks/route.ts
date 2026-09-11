@@ -56,8 +56,9 @@ function parseCategory(raw: unknown): ProductCategory | null {
 // NÃO aloca máquina nem emite chave: cria só a linha de `stacks` e volta em
 // milissegundos. Subir pod aqui significaria manter uma função serverless
 // aberta por ~1min dentro de um webhook — a Chargefy desistiria e reentregaria,
-// e a reentrega criaria um segundo pod. A alocação é lazy e já existe em três
-// caminhos (ensureStackMachine, place_base_stack, resolve_base_machine).
+// e a reentrega criaria um segundo pod. A alocação é lazy e acontece no gateway
+// na primeira request da chave (place_base_stack, resolve_base_machine) —
+// emitir a chave em /api/keys também não aloca.
 //
 // Idempotente por `provisioning_ref`: a entrega é at-least-once (até 9
 // tentativas em ~3 dias), então reprocessar o mesmo pagamento tem que devolver

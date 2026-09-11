@@ -64,8 +64,14 @@ painel para ela, ou a da stack (Comportamento) caso contrário. É o que permite
 mesma stack para coisas diferentes sem mudar o código: cada integração fica com a sua
 chave, e a request continua sendo só `model` + `messages`. Mandar `system` na request
 sobrescreve os dois — é por isso que Claude Code, Codex e Cursor, que embutem o próprio
-system prompt, não são afetados. A base de conhecimento (RAG) é sempre a da stack,
-independente da opção escolhida na chave.
+system prompt, não são afetados.
+
+**Base de conhecimento: da stack, ligada na chave.** O acervo é sempre o da stack — a
+chave não tem base própria. O que a chave decide é se *consulta* esse acervo, opção
+escolhida na criação e alterável depois: **ativada** consulta em toda pergunta (mesmo com
+`system` na request, caso em que o trecho recuperado é anexado depois da sua instrução),
+**desativada** nunca consulta, e **automático** — estado das chaves anteriores a essa
+opção — consulta só quando a request não traz `system`.
 
 ---
 
@@ -125,8 +131,9 @@ EOF
 **Resposta:** mesma forma do chat comum — texto em `choices[0].message.content`.
 
 **System prompt:** como é a rota de chat, vale a regra padrão — sem mensagem `system`, o
-system prompt configurado (o da chave ou o da stack) e o RAG são aplicados; com `system`,
-o seu substitui os dois.
+system prompt configurado (o da chave ou o da stack) é aplicado; com `system`, o seu
+substitui. A base de conhecimento não entra nessa disputa: ela segue a configuração da
+própria chave.
 
 **Saída estruturada:** funciona aqui também. Adicione `response_format` com um JSON Schema
 e a resposta vem como JSON validado, igual ao caso 3 — a diferença é que a entrada é uma

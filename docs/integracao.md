@@ -434,18 +434,33 @@ Dois pontos que costumam surpreender:
 do plano menos essa reserva. Um prompt muito longo é recusado mesmo parecendo caber.
 
 **Se você enviar uma mensagem `system`, a sua é usada.** O system prompt configurado na
-sua conta e o contexto de base de conhecimento (RAG) não são aplicados nessa chamada.
-Isso é intencional — ferramentas como Cursor e Claude Code embutem o próprio system
-prompt e quebrariam se recebessem outro por cima. Se você depende do system prompt
-configurado na conta, **não envie um `system`**.
+sua conta não é aplicado nessa chamada. Isso é intencional — ferramentas como Cursor e
+Claude Code embutem o próprio system prompt e quebrariam se recebessem outro por cima. Se
+você depende do system prompt configurado na conta, **não envie um `system`**.
 
-A regra completa, incluindo o caso do `system` sem conteúdo:
+**A base de conhecimento (RAG) é decidida à parte, na chave.** Ela responde pelo "sobre o
+quê", não pelo "como responder", então não compete com a sua instrução: quando a chave está
+configurada para consultá-la, o trecho recuperado é anexado **depois** do seu `system`,
+dentro da mesma mensagem. A opção é escolhida ao criar a chave e pode ser alterada depois,
+no painel:
+
+| Configuração da chave | O que acontece |
+|---|---|
+| **Ativada** | Consulta a base em toda pergunta, inclusive quando você manda `system` próprio |
+| **Desativada** | Nunca consulta a base |
+| **Automático** | Regra antiga: consulta só quando a requisição **não** traz `system` próprio. É o estado das chaves criadas antes dessa opção existir |
+
+Ative em integrações e automações (n8n, atendimento). Em ferramentas de código, prefira
+desativar: o trecho recuperado muda a cada pergunta e desfaz o cache de contexto da sessão,
+deixando as respostas mais lentas.
+
+A regra completa do `system`, incluindo o caso sem conteúdo:
 
 | O que você envia | O que vale |
 |---|---|
-| Nenhuma mensagem `system` | System prompt + RAG configurados na sua stack |
-| `system` com conteúdo | O seu conteúdo (a configuração da stack e o RAG não entram) |
-| `system` vazio, ou sem nenhuma parte de texto | System prompt + RAG da stack — um `system` sem instrução não substitui nada |
+| Nenhuma mensagem `system` | System prompt configurado na sua stack (e a base, conforme a chave) |
+| `system` com conteúdo | O seu conteúdo (a configuração da stack não entra; a base entra se a chave estiver com ela ativada) |
+| `system` vazio, ou sem nenhuma parte de texto | System prompt da stack (e a base, conforme a chave) — um `system` sem instrução não substitui nada |
 
 O `content` do `system` pode ser string ou lista de partes
 (`[{"type": "text", "text": "..."}]`); os dois formatos são lidos igualmente. Partes que
@@ -520,8 +535,9 @@ convertido internamente para o mesmo formato acima.
 
 Por ser a rota de chat, vale a mesma regra de `system`/RAG explicada em
 ["Limites e comportamento"](#limites-e-comportamento) acima: sem mensagem
-`system`, o system prompt da sua stack (e o RAG) são aplicados; com `system`,
-o seu substitui os dois. Saída estruturada (`response_format` com JSON
+`system`, o system prompt da sua stack é aplicado; com `system`, o seu
+substitui. A base de conhecimento segue a configuração da chave, nos dois
+casos. Saída estruturada (`response_format` com JSON
 Schema) também funciona aqui — a diferença para o endpoint dedicado de
 ["extração de imagem"](#extração-estruturada-de-imagem-jpegpngwebp--json) é
 que ali o texto é extraído por OCR no próprio gateway antes de chegar ao

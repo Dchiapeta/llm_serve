@@ -19,6 +19,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { CreateKeyDialog, type KeyQuota } from "@/components/accounts/create-key-dialog"
+import { KnowledgeBaseToggle } from "@/components/accounts/knowledge-base-toggle"
 import { RegisterLoraDialog } from "@/components/accounts/register-lora-dialog"
 import { RevokeKeyButton } from "@/components/accounts/revoke-key-button"
 
@@ -117,13 +118,14 @@ export default async function AccountsPage() {
                 <TableHead>Status</TableHead>
                 <TableHead>Criada em</TableHead>
                 <TableHead>Último uso</TableHead>
+                <TableHead>Base de conhecimento</TableHead>
                 <TableHead className="w-24" />
               </TableRow>
             </TableHeader>
             <TableBody>
               {keys.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={7} className="text-center text-muted-foreground">
+                  <TableCell colSpan={8} className="text-center text-muted-foreground">
                     Nenhuma chave gerada.
                   </TableCell>
                 </TableRow>
@@ -158,6 +160,22 @@ export default async function AccountsPage() {
                     {k.last_used_at
                       ? new Date(k.last_used_at).toLocaleDateString("pt-BR")
                       : "nunca usada"}
+                  </TableCell>
+                  <TableCell>
+                    {/* Chave revogada não faz request nenhum: configurar o RAG
+                        dela não muda nada e só convidaria a um clique inútil.
+                        Playground também fica de fora — é a chave interna que
+                        sustenta o teste do modelo (migration 0044), e mexer no
+                        RAG dela pela tabela de chaves do cliente seria mudar,
+                        sem querer, o comportamento de uma ferramenta nossa. */}
+                    {k.status === "active" && k.purpose !== "playground" ? (
+                      <KnowledgeBaseToggle
+                        keyId={k.id}
+                        initial={k.enable_knowledge_base}
+                      />
+                    ) : (
+                      <span className="text-xs text-muted-foreground">—</span>
+                    )}
                   </TableCell>
                   <TableCell>
                     {k.status === "active" && (

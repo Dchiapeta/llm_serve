@@ -58,8 +58,26 @@ cliente → gateway (:8080) → agent do pod (:8000) → vLLM (:8001)
   da CHAVE quando ela tem `use_custom_prompt` ligado (migration 0053) e da
   STACK caso contrário — ver `key_prompt.py`. Nos dois casos vale só quando a
   request não traz `system` próprio: CLI e assistentes de código mandam o
-  deles e continuam intocados. O RAG não acompanha essa escolha (a base de
-  conhecimento é da stack e vale sempre).
+  deles e continuam intocados. O RAG não acompanha essa escolha de ORIGEM (a
+  base de conhecimento é sempre a da stack, nunca a da chave), mas tem
+  interruptor próprio na chave — `api_keys.enable_knowledge_base` (migration
+  0065), com três estados:
+  - **`NULL` (legado)**: consulta só quando a request **não** traz
+    `system`/`instructions`. É o comportamento de sempre, e o que toda chave
+    criada antes da 0065 continua tendo.
+  - **`true`**: consulta **sempre**, inclusive com `system` do cliente — o
+    contexto é concatenado **depois** da instrução dele, numa única mensagem
+    `system` no índice 0 (o chat template do Qwen exige uma só, e a parte
+    variável no fim preserva o prefix cache do pod). O `system_prompt`
+    configurado continua **não** sendo injetado nesse caso: o que entra é só
+    o bloco de RAG.
+  - **`false`**: nunca consulta, nem sem `system` do cliente.
+
+  Sem o interruptor, qualquer cliente que mandasse um `system` perdia o RAG em
+  silêncio — foi o que fez a base de conhecimento nunca funcionar pelo n8n,
+  cujo nó de LLM sempre manda um System Message. A escolha é da chave, e não
+  da stack, porque a mesma stack serve a integração que precisa do acervo e a
+  CLI que não pode ter o prompt contaminado.
 
 ## Limitação aceita: réplica única
 
@@ -295,7 +313,11 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
     `Retry-After: PROVISION_RETRY_AFTER_S` (maior que o do wake — criar+subir
     pode incluir pull de imagem e download de pesos do zero num host novo).
     A máquina fica `running` depois de saudável — o retry do cliente precisa
-    dela de pé.
+    dela de pé. **Ignora o interruptor** (`ignore_switch=True` em
+    `try_provision_for_request`): criar chave nunca aloca máquina (é o uso
+    que aloca — `/api/keys` no painel grava a chave com `machine_id` null),
+    então este é o único ponto em que a primeira request de uma stack nova
+    vira pod. Cooldown e trava por plano continuam valendo.
   - **Proativa** (`ensure_capacity_once`, mais um passo do
     `machine_lifecycle_loop` a cada `CONSOLIDATION_INTERVAL_S`): por plano,
     soma os slots livres de TODAS as máquinas não-terminadas (running +

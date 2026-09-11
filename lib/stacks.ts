@@ -40,11 +40,11 @@ export type InsertStackResult = {
  * uma superfície pública extra.
  *
  * A separação "linha de stack" vs. "máquina + chave" é o que permite o
- * checkout responder em milissegundos: a alocação de GPU já é lazy em três
- * caminhos independentes (ensureStackMachine no painel, place_base_stack e
- * resolve_base_machine no gateway), então uma stack com machine_id NULL é um
- * estado normal e testado — é o mesmo em que o idle reaper deixa qualquer
- * stack ociosa.
+ * checkout responder em milissegundos: a alocação de GPU é lazy e acontece
+ * só no gateway, na primeira request (place_base_stack e resolve_base_machine),
+ * então uma stack com machine_id NULL é um estado normal e testado — é o mesmo
+ * em que o idle reaper deixa qualquer stack ociosa. Emitir chave (/api/keys,
+ * Playground) também não aloca.
  */
 export async function insertStack(input: InsertStackInput): Promise<InsertStackResult> {
   const { db, accountId, plan, provisioningRef } = input

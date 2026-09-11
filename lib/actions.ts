@@ -1178,76 +1178,6 @@ async function allocateMachineForTemplate(
   throw new Error(`Falha ao provisionar máquina: ${lastError}`)
 }
 
-// Garante que a stack tenha uma máquina vinculada, resolvendo sozinho quando
-// stacks.machine_id está null — idle reaper de modelo base liberou a vaga
-// (ver comentário em getOrCreatePlaygroundKey), ou a stack nunca foi homeada.
-// Espelha, no painel, a mesma resolução lazy que o gateway faz em runtime
-// (resolve_base_machine → place_base_stack em docker/gateway/main.py): quem
-// chama não precisa saber ou escolher onde a stack mora.
-export async function ensureStackMachine(stackId: string): Promise<string> {
-  const db = createSupabaseAdmin()
-  const { data: stack } = await db
-    .from("stacks")
-    .select("id, plan, category, machine_id")
-    .eq("id", stackId)
-    .single<{ id: string; plan: TemplatePlan; category: ProductCategory; machine_id: string | null }>()
-  if (!stack) throw new Error("Stack não encontrada")
-  if (stack.machine_id) return stack.machine_id
-
-  // Reaproveita o histórico de uma chave "customer" já emitida — mesmo
-  // machine_id que getOrCreatePlaygroundKey usa e que nunca decide rota.
-  const { data: customerKey } = await db
-    .from("api_keys")
-    .select("machine_id")
-    .eq("stack_id", stackId)
-    .eq("purpose", "customer")
-    .eq("status", "active")
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle<{ machine_id: string }>()
-  if (customerKey?.machine_id) {
-    const { data: historicalMachine } = await db
-      .from("machines")
-      .select("template_id")
-      .eq("id", customerKey.machine_id)
-      .maybeSingle<Pick<Machine, "template_id">>()
-    const { data: historicalTemplate } = historicalMachine?.template_id
-      ? await db
-          .from("templates")
-          .select("is_enabled, is_test, plan, category")
-          .eq("id", historicalMachine.template_id)
-          .maybeSingle<
-            TemplateAvailability & Pick<Template, "plan" | "category">
-          >()
-      : { data: null }
-    // O pin histórico só pode virar uma NOVA casa se continuar pertencendo
-    // ao mesmo produto. Isso evita que um upgrade de Go/LLM para Go/Image
-    // recoloque a stack na máquina antiga apontada pela chave do cliente.
-    const historicalCategory = historicalTemplate?.category ?? "llm"
-    const sameProduct =
-      historicalTemplate?.plan === stack.plan && historicalCategory === stack.category
-    if (
-      historicalTemplate &&
-      sameProduct &&
-      !userAllocationBlockedReason(historicalTemplate)
-    ) {
-      return customerKey.machine_id
-    }
-  }
-
-  // Stack nunca homeada e sem chave anterior: aloca de vez, com a mesma
-  // cascata de createStack (running com vaga → pausada com vaga → nova).
-  const tpl = await getDefaultTemplateForPlan(db, stack.plan, stack.category)
-  if (!tpl) throw new Error(`Nenhum produto configurado para o plano ${stack.plan}`)
-  const alloc = await allocateMachineForTemplate(db, tpl)
-  const { error } = await db
-    .from("stacks")
-    .update({ machine_id: alloc.machineId })
-    .eq("id", stackId)
-  if (error) throw new Error(error.message)
-  return alloc.machineId
-}
-
 // pelo admin (machine_id do form), ou numa recém-provisionada com o
 // template selecionado (nome = llm-stack-N, GPU = primeira compatível). A
 // stack nasce SEM chave de cliente: quem emite é o cliente no painel dele
@@ -1408,9 +1338,10 @@ export async function getOrCreatePlaygroundKey(stackId: string): Promise<{ plain
   // devolve qualquer stack ociosa a esse estado. Emitir a chave assim mesmo
   // é o que faz o Playground funcionar na PRIMEIRA mensagem — o gateway
   // homeia a stack nesse request (place_base_stack) e o rebind_stack_keys
-  // que vem junto preenche este campo sozinho. Alocar máquina aqui, como
-  // /api/keys faz pra chave "customer", estouraria o teto de 15s do
-  // panelFetch quando precisasse provisionar pod.
+  // que vem junto preenche este campo sozinho. A chave "customer" emitida
+  // por /api/keys segue exatamente a mesma regra: criar chave nunca aloca
+  // máquina (estouraria o teto de 15s do panelFetch e faria falta de GPU no
+  // RunPod virar erro na emissão); é o primeiro uso que aloca.
   let machineId = stack.machine_id
   if (!machineId) {
     const { data: customerKey } = await db
@@ -1749,6 +1680,12 @@ export async function migrateStack(input: {
         accountId: stack.account_id,
         machineId: targetMachineId,
         stackId: stack.id,
+        // Explícito, e não o `null` (legado) do default: esta é uma chave
+        // "customer" de produção, substituindo uma que o cliente já usava. Sem
+        // isto, realocar a stack de quem usa n8n devolveria o bug que a 0065
+        // resolve — a chave nova cairia no legado e a base de conhecimento
+        // pararia de ser consultada, sem erro nenhum.
+        enableKnowledgeBase: true,
       })
       plainKey = created.plainKey
     }
@@ -1836,10 +1773,13 @@ async function assertKeyQuota(
 // Retorna a chave em texto puro UMA única vez.
 export async function createKey(input: {
   accountId: string
-  // null só é aceito para purpose "playground": a chave nasce sem pin e o
-  // gateway a vincula à máquina no primeiro request (place_base_stack →
-  // rebind_stack_keys). Chave "customer" exige máquina resolvida antes —
-  // ver o guard logo abaixo e ensureStackMachine em /api/keys.
+  // null é aceito para qualquer purpose: a chave nasce sem pin e o gateway a
+  // vincula à máquina no primeiro request (place_base_stack →
+  // rebind_stack_keys). Criar chave nunca aloca nem provisiona máquina — é o
+  // uso que aloca. Sem máquina o backstop de capacidade POR MÁQUINA abaixo não
+  // roda; a lotação real é garantida pelo gateway na hora de homear a stack
+  // (pick_running_machine_with_stack_slot), e o teto de chaves POR STACK
+  // (assertKeyQuota) roda do mesmo jeito.
   machineId: string | null
   stackId?: string | null
   name?: string | null
@@ -1853,16 +1793,18 @@ export async function createKey(input: {
   // cliente, isenta de slot e de cota (ver migration 0044 e
   // docker/gateway/main.py:check_token_quota).
   purpose?: "customer" | "playground"
+  // Política de RAG da chave (migration 0065): true = sempre consulta a base
+  // de conhecimento da stack, false = nunca.
+  //
+  // Omitido grava null DE PROPÓSITO, e não um default nosso: null é o
+  // comportamento legado (a base entra só quando a request não traz system
+  // próprio), então chamador não atualizado — chave de playground, scripts —
+  // continua exatamente como estava. Quem tem interface (CreateKeyDialog aqui,
+  // painel do cliente via POST /api/keys) sempre manda true/false explícito.
+  enableKnowledgeBase?: boolean | null
 }): Promise<{ plainKey: string }> {
   const purpose = input.purpose ?? "customer"
   const db = createSupabaseAdmin()
-
-  // Sem máquina o backstop de capacidade abaixo não tem como rodar, e uma
-  // chave "customer" passaria por cima dele em silêncio. Só a de playground
-  // (isenta de slot por definição, migration 0044) pode nascer sem pin.
-  if (!input.machineId && purpose !== "playground") {
-    throw new Error("Chave de cliente exige uma máquina resolvida")
-  }
 
   const { data: m } = input.machineId
     ? await db.from("machines").select("*").eq("id", input.machineId).single<Machine>()
@@ -1960,6 +1902,7 @@ export async function createKey(input: {
     status: "active",
     expires_at: input.expiresAt ?? null,
     purpose,
+    enable_knowledge_base: input.enableKnowledgeBase ?? null,
   })
   if (error) throw new Error(error.message)
 
@@ -2101,6 +2044,46 @@ export async function revokeKey(keyId: string) {
     revalidatePath("/accounts")
     if (key.machine_id) revalidatePath(`/machines/${key.machine_id}`)
   }
+}
+
+// Liga/desliga a consulta à base de conhecimento (RAG da stack) de UMA chave
+// — migration 0065.
+//
+// Só aceita boolean: null existe no banco como estado LEGADO das chaves
+// anteriores à migration (a base entra apenas quando a request não traz system
+// próprio) e o painel nunca o escreve de volta. Na prática, a primeira vez que
+// o admin mexe no interruptor de uma chave antiga, ela vira explícita.
+//
+// Checa sessão no corpo pelo mesmo motivo de deleteAccount: Server Action é um
+// endpoint POST próprio e o gate do layout do dashboard não roda numa
+// invocação direta.
+// `null` é aceito de propósito: é o estado LEGADO (consulta só quando a request
+// não traz `system` próprio), e sem ele não haveria como devolver uma chave ao
+// comportamento antigo depois de fixá-la — o painel do cliente tem essa volta
+// (desligar o override no dialog), e o admin precisa da mesma.
+export async function setKeyKnowledgeBase(keyId: string, enabled: boolean | null) {
+  await requireAdminSession()
+  if (enabled !== null && typeof enabled !== "boolean") {
+    throw new Error("Configuração de base de conhecimento inválida")
+  }
+  const db = createSupabaseAdmin()
+  const { data, error } = await db
+    .from("api_keys")
+    .update({ enable_knowledge_base: enabled })
+    .eq("id", keyId)
+    .select("id, machine_id")
+    .maybeSingle<Pick<ApiKey, "id" | "machine_id">>()
+  if (error) throw new Error(error.message)
+  if (!data) throw new Error("Chave não encontrada")
+  // Obrigatório, não best-effort de fachada: o gateway guarda a config da
+  // chave em cache por até KEY_CACHE_TTL_S (60s), então sem o flush ele
+  // continuaria consultando (ou ignorando) a base pelo valor antigo por até um
+  // minuto depois do clique — e o admin veria a UI já mudada.
+  await flushGatewayKeyCache().catch((e) =>
+    console.error("Configuração salva; cache será renovado pelo TTL:", e)
+  )
+  revalidatePath("/accounts")
+  if (data.machine_id) revalidatePath(`/machines/${data.machine_id}`)
 }
 
 // ---------- Ambientes conectados (stack_clients, migration 0051) ----------

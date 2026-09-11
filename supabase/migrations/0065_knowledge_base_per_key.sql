@@ -1,0 +1,55 @@
+-- A base de conhecimento deixa de depender de o cliente NÃO mandar `system`.
+--
+-- Até aqui não havia configuração nenhuma: o RAG rodava dentro de
+-- build_stack_system_message, e validate_body (docker/gateway/main.py) só
+-- chamava essa função quando a request NÃO trazia `system`/`instructions`. O
+-- bypass foi escrito para as ferramentas BYOE (Cursor, Codex, Claude Code),
+-- que embutem o próprio system prompt e não podem ter a personalidade
+-- trocada por baixo — mas o efeito colateral era pegar QUALQUER cliente que
+-- mandasse uma instrução. O caso que motiva esta coluna é o n8n: o nó de
+-- LLM sempre manda um System Message (default "You are a helpful
+-- assistant"), então para quem integra por lá o RAG nunca funcionou uma vez
+-- sequer — sem erro, sem log de falha, só sem contexto na resposta.
+--
+-- NULL é LEGADO, não "desligado". Uma coluna `not null default false`
+-- desligaria a base para todas as chaves que hoje funcionam (as que não
+-- mandam `system`), e um `default true` passaria a injetar contexto em toda
+-- CLI, que é justamente o que o bypass existe para evitar. Só o terceiro
+-- estado preserva as duas metades: quem não foi configurado continua com a
+-- regra antiga ("consulta quando a request não traz instrução própria"), e a
+-- migração é chave a chave. Chave nova nasce explícita — quem cria pelo
+-- painel escolhe, e o legado tende a sumir sozinho.
+--
+-- Só em api_keys, sem par em `stacks` (ao contrário de 0064, que tem as
+-- duas): a base de conhecimento CONTINUA sendo da stack — é o acervo, e não
+-- muda de dono aqui. O que esta coluna decide é se ESTA integração consulta o
+-- acervo, e isso é propriedade de quem chama, não do acervo: a mesma stack
+-- serve o widget de atendimento (que precisa do contexto) e o Claude Code do
+-- time (que não pode ter o system prompt contaminado). Um default de stack
+-- não teria como separar os dois, e o valor herdado seria sempre errado para
+-- metade das chaves.
+--
+-- A precedência do SYSTEM PROMPT não muda: com `system` do cliente, o
+-- `system_prompt` de chave/stack continua NÃO sendo injetado (key_prompt.py).
+-- O que passa a entrar, e só com a flag ligada, é o bloco de contexto
+-- recuperado — concatenado DEPOIS da instrução do cliente, nunca no lugar
+-- dela.
+--
+-- ATENÇÃO ordem de deploy (mesmo aviso da 0053/0055/0063/0064):
+-- find_active_key (docker/gateway/supa.py) passa a pedir esta coluna no
+-- select de api_keys, e coluna inexistente vira PostgREST 400 dentro de um
+-- raise_for_status — 500 em 100% do tráfego, não só nas requests com RAG.
+-- Esta migration tem que estar aplicada ANTES do deploy do gateway.
+--
+-- E é pré-requisito de uma migration do OUTRO repositório: o grant
+-- coluna-a-coluna para `authenticated` mora no TryStac
+-- (0040_api_keys_knowledge_base_policy.sql), e um grant sobre coluna
+-- inexistente falha com `42703 column "enable_knowledge_base" of relation
+-- "api_keys" does not exist`. A dependência cruza os dois repos, então a
+-- numeração de lá não a revela e os históricos de migration não se enxergam
+-- (ver supabase/SHARED_SCHEMA.md). Mesmo par que 0063/0039 e 0055/0032.
+alter table public.api_keys
+  add column if not exists enable_knowledge_base boolean;
+
+comment on column public.api_keys.enable_knowledge_base is
+  'NULL = legado (consulta só quando a request não traz system/instructions); false = nunca consulta; true = consulta sempre. Chave nova nasce explícita.';
