@@ -78,6 +78,25 @@ DEFAULT_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 # disso o custo de decode+OCR passa de "uma página" pra vários segundos de
 # CPU só pra abrir o arquivo.
 MAX_IMAGE_MEGAPIXELS = 20_000_000
+
+# Arquivos por requisição. É o eixo que decide se "vários documentos numa
+# chamada" existe para o plano: Go continua em 1 (contrato original, um
+# `file`), e a partir do Pro a mesma requisição aceita vários — os tetos de
+# bytes e de páginas acima passam a valer sobre a SOMA dos arquivos, não por
+# arquivo, senão "vários arquivos" viraria uma porta pra furar o teto de CPU
+# do OCR (N arquivos no limite = N× o custo que o plano pagou).
+#
+# Default 1 pelo mesmo motivo dos outros tetos: plano novo nunca herda o
+# multi-arquivo por esquecimento. Vale para PDF e imagem (é contagem, o custo
+# de cada arquivo já é policiado pelos eixos próprios de cada tipo).
+MAX_FILES_PER_REQUEST = {
+    "Go": 1,
+    "VibeCoder": 1,
+    "Pro": 5,
+    "Max": 10,
+    "Enterprise": 20,
+}
+DEFAULT_MAX_FILES_PER_REQUEST = 1
 # Formatos que o Pillow/pytesseract leem sem plugin externo e que cobrem o
 # caso de uso real (foto de celular, print de tela, scan avulso).
 SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP"}
@@ -98,6 +117,14 @@ class DocumentError(Exception):
 
 class DocumentTooLarge(DocumentError):
     """Excedeu o teto do plano (bytes ou páginas)."""
+
+
+class TooManyFiles(DocumentError):
+    """Mais arquivos numa requisição do que o plano aceita.
+
+    Separada de DocumentTooLarge porque a ação do cliente é outra: não é
+    "mande um arquivo menor", é "mande um por requisição ou suba de plano". O
+    handler mapeia pro mesmo 413 dos tetos de plano."""
 
 
 class UnreadableDocument(DocumentError):
@@ -165,52 +192,129 @@ def check_image_size(size: int, plan: str | None) -> None:
         )
 
 
+def limit_files(plan: str | None) -> int:
+    return MAX_FILES_PER_REQUEST.get(plan or "", DEFAULT_MAX_FILES_PER_REQUEST)
+
+
+def max_limit_files() -> int:
+    """Maior teto de arquivos entre os planos — corte grosso antes de conhecer
+    o plano, mesmo papel de max_limit_bytes()."""
+    return max([*MAX_FILES_PER_REQUEST.values(), DEFAULT_MAX_FILES_PER_REQUEST])
+
+
+def check_file_count(count: int, plan: str | None) -> None:
+    """Teto de arquivos por requisição. Checado ANTES de ler qualquer upload
+    pra memória: se o plano não aceita a quantidade, nada dela deve ser
+    processado. A mensagem diz o teto do plano E que existe plano com mais,
+    porque no Go a resposta certa pro cliente é "faça uma requisição por
+    arquivo ou suba de plano" — não "arquivo grande demais"."""
+    ceiling = limit_files(plan)
+    if count > ceiling:
+        if ceiling == 1:
+            raise TooManyFiles(
+                f"este plano aceita 1 arquivo por requisição (recebidos {count}); "
+                "envie um arquivo por requisição ou use um plano a partir do Pro"
+            )
+        raise TooManyFiles(
+            f"este plano aceita até {ceiling} arquivos por requisição (recebidos {count})"
+        )
+
+
 def extract_text(pdf_bytes: bytes, plan: str | None) -> tuple[str, int, bool]:
-    """Devolve (texto, número de páginas, se usou OCR).
+    """Devolve (texto, número de páginas, se usou OCR) de UM PDF.
+
+    Atalho de extract_text_many para o caso de um arquivo — mesmo contrato
+    de sempre, mantido porque o caminho de um arquivo é o de todo plano Go e
+    de quase toda requisição dos outros."""
+    results, pages, ocr_used = _extract_many_labeled([("", pdf_bytes)], plan)
+    return results[0][1], pages, ocr_used
+
+
+def extract_text_many(
+    documents: list[tuple[str, bytes]], plan: str | None
+) -> tuple[list[tuple[str, str]], int, bool]:
+    """Devolve ([(nome, texto), ...], total de páginas, se usou OCR) de VÁRIOS
+    PDFs da mesma requisição, na ordem enviada.
 
     BLOQUEANTE por design (fitz e pytesseract são síncronos e usam CPU).
     Chamar SEMPRE via asyncio.to_thread — ver o cabeçalho do módulo.
 
-    O OCR é decidido por PÁGINA, não pelo documento: PDF misto (uma capa
-    escaneada seguida de páginas digitais) é comum, e rodar OCR nas páginas
-    que já têm texto embutido seria desperdiçar CPU e piorar o resultado (o
-    texto embutido é sempre mais fiel que o reconhecido)."""
+    O teto de páginas vale sobre a SOMA: todos os PDFs são abertos (barato —
+    fitz.open só lê a estrutura, não renderiza nada) e as páginas contadas
+    ANTES de qualquer OCR de qualquer um deles. Checar por arquivo deixaria N
+    arquivos no limite custarem N× o CPU que o plano pagou; checar depois já
+    teria pago o custo. Mesma disciplina de extract_text, só que o "documento"
+    passou a ser o conjunto.
+
+    Documento vazio (sem texto embutido nem por OCR) aborta a requisição
+    inteira, nomeando o arquivo: seguir sem ele faria o modelo preencher o
+    schema a partir dos outros e o cliente não teria como saber que um deles
+    nunca foi lido — pior que a falha explícita."""
+    return _extract_many_labeled(documents, plan)
+
+
+def _extract_many_labeled(
+    documents: list[tuple[str, bytes]], plan: str | None
+) -> tuple[list[tuple[str, str]], int, bool]:
     try:
         import fitz  # pymupdf
     except ImportError as e:  # pragma: no cover - ambiente sem a dependência
         raise DocumentError("suporte a PDF indisponível no servidor") from e
 
+    opened = []
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception as e:
-        raise UnreadableDocument("não foi possível ler o PDF (arquivo inválido ou protegido)") from e
+        for name, pdf_bytes in documents:
+            try:
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            except Exception as e:
+                raise UnreadableDocument(
+                    f"não foi possível ler o PDF{_label(name)} (arquivo inválido ou protegido)"
+                ) from e
+            opened.append((name, doc))
 
-    with doc:
-        pages = doc.page_count
         # ANTES de qualquer OCR: é o que torna o teto de páginas uma defesa de
         # CPU de verdade. Checar no fim (ou por página) já teria pago o custo.
+        pages = sum(doc.page_count for _, doc in opened)
         ceiling = limit_pages(plan)
         if pages > ceiling:
+            if len(opened) == 1:
+                raise DocumentTooLarge(
+                    f"documento tem {pages} páginas, o limite deste plano é {ceiling}"
+                )
             raise DocumentTooLarge(
-                f"documento tem {pages} páginas, o limite deste plano é {ceiling}"
+                f"os {len(opened)} documentos somam {pages} páginas, "
+                f"o limite deste plano é {ceiling} por requisição"
             )
 
-        parts: list[str] = []
+        results: list[tuple[str, str]] = []
         ocr_used = False
-        for page in doc:
-            text = page.get_text().strip()
-            if text:
-                parts.append(text)
-                continue
-            parts.append(_ocr_page(page))
-            ocr_used = True
+        for name, doc in opened:
+            parts: list[str] = []
+            for page in doc:
+                text = page.get_text().strip()
+                if text:
+                    parts.append(text)
+                    continue
+                parts.append(_ocr_page(page))
+                ocr_used = True
+            full = "\n\n".join(p for p in parts if p).strip()
+            if not full:
+                raise EmptyDocument(
+                    f"nenhum texto foi extraído do documento{_label(name)} "
+                    "(PDF sem texto e ilegível por OCR)"
+                )
+            results.append((name, full))
+    finally:
+        for _, doc in opened:
+            doc.close()
 
-    full = "\n\n".join(p for p in parts if p).strip()
-    if not full:
-        raise EmptyDocument(
-            "nenhum texto foi extraído do documento (PDF sem texto e ilegível por OCR)"
-        )
-    return full, pages, ocr_used
+    return results, pages, ocr_used
+
+
+def _label(name: str) -> str:
+    """' "nota.pdf"' pra mensagem de erro, ou '' quando o upload veio sem
+    nome — o nome é do cliente e só serve pra ele se localizar."""
+    return f' "{name}"' if name else ""
 
 
 def _ocr_page(page) -> str:
@@ -297,6 +401,31 @@ def extract_text_from_image(image_bytes: bytes, plan: str | None) -> tuple[str, 
     return text, True
 
 
+def extract_text_from_images(
+    images: list[tuple[str, bytes]], plan: str | None
+) -> tuple[list[tuple[str, str]], bool]:
+    """Devolve ([(nome, texto), ...], ocr_used=True) de VÁRIAS imagens da
+    mesma requisição, na ordem enviada. Irmã de extract_text_many.
+
+    BLOQUEANTE por design — chamar via asyncio.to_thread.
+
+    Aqui não há "somar antes": o custo de cada imagem é policiado pelo teto
+    de megapixels (por imagem, dentro de extract_text_from_image) e a
+    quantidade pelo teto de arquivos do plano (check_file_count, no handler,
+    antes de ler qualquer upload). Imagem sem texto aborta a requisição
+    nomeando o arquivo, pelo mesmo motivo de extract_text_many."""
+    results: list[tuple[str, str]] = []
+    for name, image_bytes in images:
+        try:
+            text, _ = extract_text_from_image(image_bytes, plan)
+        except EmptyDocument as e:
+            raise EmptyDocument(f"{e}{_label(name)}") from e
+        except UnreadableDocument as e:
+            raise UnreadableDocument(f"{e}{_label(name)}") from e
+        results.append((name, text))
+    return results, True
+
+
 # Instrução que acompanha o texto extraído. Explícita sobre "só o JSON" mesmo
 # com guided decoding ligado (default do vLLM 0.24, ver migration 0048): a
 # gramática garante a FORMA da saída, não que o modelo tenha entendido a
@@ -328,10 +457,30 @@ USER_INSTRUCTION_BLOCK = "\n\nContexto adicional informado por quem enviou o doc
 
 DOCUMENT_BLOCK = "\n\n--- DOCUMENTO ---\n{text}\n--- FIM DO DOCUMENTO ---"
 
+# Com mais de um arquivo na requisição, cada um vai num bloco próprio,
+# numerado e com o nome que o cliente deu — é o que permite ao modelo (e ao
+# `user` do cliente, que pode dizer "o total está na fatura, não no recibo")
+# distinguir de onde veio cada valor. Um único bloco com os textos colados
+# faria o segundo documento parecer continuação do primeiro.
+MULTI_DOCUMENT_NOTE = (
+    "\n\nEsta requisição contém {n} documentos, numerados abaixo. Considere "
+    "todos eles ao preencher o schema: um campo pode estar em qualquer um."
+)
+MULTI_DOCUMENT_BLOCK = (
+    "\n\n--- DOCUMENTO {i} DE {n}{name} ---\n{text}\n--- FIM DO DOCUMENTO {i} ---"
+)
 
-def build_messages(text: str, user_instruction: str | None = None) -> list[dict]:
+
+def build_messages(
+    text: "str | list[tuple[str, str]]", user_instruction: str | None = None
+) -> list[dict]:
     """Mensagem `user` da extração: instrução padrão + (contexto do cliente) +
-    documento.
+    documento(s).
+
+    `text` aceita a string de um documento (contrato original) ou a lista
+    [(nome, texto), ...] de extract_text_many/extract_text_from_images. Lista
+    de um elemento vira o bloco único de sempre — o modelo não precisa saber
+    que a rota aceita vários quando só veio um.
 
     O `user_instruction` COMPÕE, nunca substitui — ao contrário do `system`,
     que troca a configuração da stack. A assimetria é proposital e segue a
@@ -342,5 +491,21 @@ def build_messages(text: str, user_instruction: str | None = None) -> list[dict]
     parts = [EXTRACTION_PROMPT]
     if user_instruction and user_instruction.strip():
         parts.append(USER_INSTRUCTION_BLOCK.format(user=user_instruction.strip()))
-    parts.append(DOCUMENT_BLOCK.format(text=text))
+    parts.append(_document_blocks(text))
     return [{"role": "user", "content": "".join(parts)}]
+
+
+def _document_blocks(text: "str | list[tuple[str, str]]") -> str:
+    if isinstance(text, str):
+        return DOCUMENT_BLOCK.format(text=text)
+    if len(text) == 1:
+        return DOCUMENT_BLOCK.format(text=text[0][1])
+    n = len(text)
+    blocks = [MULTI_DOCUMENT_NOTE.format(n=n)]
+    for i, (name, body) in enumerate(text, start=1):
+        blocks.append(
+            MULTI_DOCUMENT_BLOCK.format(
+                i=i, n=n, name=f" ({name})" if name else "", text=body
+            )
+        )
+    return "".join(blocks)

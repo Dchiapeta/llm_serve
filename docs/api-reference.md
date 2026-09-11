@@ -163,11 +163,14 @@ Content-Type: multipart/form-data
 
 | Campo | Obrigatório | Descrição |
 |---|---|---|
-| `file` | sim | O PDF |
+| `file` | sim* | O PDF |
+| `files` | sim* | Vários PDFs na mesma requisição (a partir do Pro) — pode repetir o campo |
 | `schema` | sim | JSON Schema (como string) descrevendo os campos a extrair |
 | `system` | não | Substitui o system prompt configurado (o da chave ou o da stack) |
 | `user` | não | Contexto adicional sobre este documento — **soma** à instrução de extração |
 | `max_tokens` | não | Teto da resposta. Default 4000, máximo 16000 |
+
+\* Pelo menos um arquivo, em `file` ou em `files`. Os dois se combinam, na ordem enviada.
 
 ### Request mínima
 
@@ -221,6 +224,51 @@ user:   <instrução padrão de extração — não invente, use null se não ac
         --- DOCUMENTO --- <texto do PDF> --- FIM DO DOCUMENTO ---
 ```
 
+### Com vários arquivos — um JSON a partir de mais de um documento (Pro em diante)
+
+Quando os dados que você quer estão espalhados em mais de um documento (a fatura e o
+recibo, o contrato e o aditivo), envie todos na mesma requisição pelo campo `files`. O
+modelo recebe cada um num bloco numerado, com o nome do arquivo, e devolve **um JSON só**.
+
+```bash
+curl -X POST https://api.trystac.com/v1/documents/extract \
+  -H "Authorization: Bearer $STACK_API_KEY" \
+  -F files=@fatura.pdf \
+  -F files=@recibo.pdf \
+  -F 'schema={
+        "type": "object",
+        "properties": {
+          "numero_fatura": {"type": "string"},
+          "valor_pago":    {"type": ["number", "null"]}
+        },
+        "required": ["numero_fatura", "valor_pago"]
+      }' \
+  -F 'user=O número está na fatura; o valor pago, no recibo.'
+```
+
+O modelo recebe:
+
+```
+user:   <instrução padrão de extração>
+        Contexto adicional informado por quem enviou o documento: ...
+        Esta requisição contém 2 documentos, numerados abaixo. ...
+        --- DOCUMENTO 1 DE 2 (fatura.pdf) --- <texto> --- FIM DO DOCUMENTO 1 ---
+        --- DOCUMENTO 2 DE 2 (recibo.pdf) --- <texto> --- FIM DO DOCUMENTO 2 ---
+```
+
+Regras:
+
+- **Go aceita 1 arquivo por requisição.** Um segundo arquivo (em `files`, ou repetindo
+  `file`) devolve `413` explicando isso — não é descartado em silêncio. Para vários
+  documentos no Go, faça uma requisição por arquivo.
+- **Os tetos do plano valem sobre a soma.** Tamanho (bytes) e páginas são contados
+  somando todos os arquivos da requisição — cinco PDFs de 15 páginas no Pro passam do
+  teto de 30 e são recusados antes de qualquer OCR.
+- **Um documento vazio aborta a requisição inteira** (`400`, nomeando o arquivo). Seguir
+  sem ele faria o modelo preencher o schema só com os outros, e você não teria como saber.
+- Se você quer **um JSON por arquivo**, continue fazendo uma requisição por arquivo — o
+  multi-arquivo é para quando os campos vêm de documentos diferentes.
+
 ### Com `system` — substituindo a configuração da plataforma
 
 Use quando esta requisição precisa de regras diferentes das configuradas na plataforma.
@@ -260,12 +308,15 @@ campo com dado que não está no seu PDF.
 {
   "data": { "numero_nota": "12345", "cnpj_emitente": "11.222.333/0001-44", "valor_total": 1500.0 },
   "pages": 3,
+  "files": 1,
   "ocr_used": false,
   "usage": { "prompt_tokens": 2104, "completion_tokens": 48 }
 }
 ```
 
 - `data`: seu JSON, já validado contra o `schema`.
+- `pages`: total de páginas — somado, quando há mais de um arquivo.
+- `files`: quantos arquivos entraram nesta extração (1 no caso comum).
 - `ocr_used`: `true` se alguma página precisou de OCR (PDF escaneado) — vale conferir
   o resultado com mais atenção nesse caso.
 
@@ -277,10 +328,11 @@ ou pode omitir o campo em silêncio (campo fora de `required`). Detalhes em
 
 **Limites:**
 
-| Limite | Go | Pro |
-|---|---|---|
-| Tamanho do arquivo | 8 MB | 15 MB |
-| Páginas por requisição | 15 | 30 |
+| Limite | Go | Pro | Max |
+|---|---|---|---|
+| Arquivos por requisição | 1 | 5 | 10 |
+| Tamanho (soma dos arquivos) | 8 MB | 15 MB | 25 MB |
+| Páginas (soma dos arquivos) | 15 | 30 | 50 |
 
 Schema até 64 KB. Timeout do servidor: 240s (dimensione o timeout do seu cliente
 acima disso — documentos escaneados com várias páginas podem levar minutos).
@@ -290,8 +342,8 @@ acima disso — documentos escaneados com várias páginas podem levar minutos).
 | Status | Significado |
 |---|---|
 | `400` | PDF ilegível/corrompido, sem texto extraível, schema inválido, ou documento grande demais para a janela do plano |
-| `413` | Arquivo, número de páginas ou schema acima do limite |
-| `422` | `max_tokens` fora da faixa aceita |
+| `413` | Arquivo, número de arquivos, número de páginas ou schema acima do limite do plano |
+| `422` | `max_tokens` fora da faixa aceita, ou nenhum arquivo enviado |
 | `502` | Modelo não devolveu JSON aderente ao schema (resposta inclui `raw_output` para diagnóstico) |
 
 ---
@@ -313,7 +365,8 @@ Content-Type: multipart/form-data
 
 | Campo | Obrigatório | Descrição |
 |---|---|---|
-| `file` | sim | A imagem, em JPEG, PNG ou WEBP |
+| `file` | sim* | A imagem, em JPEG, PNG ou WEBP |
+| `files` | sim* | Várias imagens na mesma requisição (a partir do Pro) — mesma regra do PDF |
 | `schema` | sim | JSON Schema (como string) descrevendo os campos a extrair |
 | `system` | não | Substitui o system prompt configurado (o da chave ou o da stack) |
 | `user` | não | Contexto adicional sobre esta imagem — **soma** à instrução de extração |
@@ -340,22 +393,26 @@ curl -X POST https://api.trystac.com/v1/images/extract \
 {
   "data": { "numero_nota": "12345", "cnpj_emitente": "11.222.333/0001-44", "valor_total": 1500.0 },
   "pages": 1,
+  "files": 1,
   "ocr_used": true,
   "usage": { "prompt_tokens": 612, "completion_tokens": 48 }
 }
 ```
 
-Diferente do PDF, aqui `pages` é sempre `1` e `ocr_used` é sempre `true`: não existe
-"texto embutido" numa imagem solta, toda imagem passa por OCR. A mesma regra de schema
+Diferente do PDF, aqui `pages` é o número de imagens (`1` no caso comum) e `ocr_used` é
+sempre `true`: não existe "texto embutido" numa imagem solta, toda imagem passa por OCR.
+Várias imagens na mesma requisição seguem as mesmas regras do PDF (a partir do Pro, teto
+de bytes sobre a soma, um JSON só). A mesma regra de schema
 (campo em `required` **e** anulável quando puder faltar) vale igual — ver
 [integracao.md](integracao.md#o-ponto-mais-importante-declare-os-campos-que-podem-faltar).
 
 **Limites:**
 
-| Limite | Go | Pro |
-|---|---|---|
-| Tamanho do arquivo | 5 MB | 10 MB |
-| Resolução | 20 megapixels | 20 megapixels |
+| Limite | Go | Pro | Max |
+|---|---|---|---|
+| Arquivos por requisição | 1 | 5 | 10 |
+| Tamanho (soma dos arquivos) | 5 MB | 10 MB | 15 MB |
+| Resolução (por imagem) | 20 megapixels | 20 megapixels | 20 megapixels |
 
 Schema até 64 KB. Timeout do servidor: 240s.
 

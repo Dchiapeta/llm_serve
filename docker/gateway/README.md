@@ -213,8 +213,10 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
 ## Endpoints
 
 - `POST /v1/...` — proxy OpenAI-compatible (Bearer HEX do cliente)
-- `POST /v1/documents/extract` — PDF → JSON via schema (OCR quando escaneado)
-- `POST /v1/images/extract` — imagem solta → JSON via schema (sempre via OCR)
+- `POST /v1/documents/extract` — PDF → JSON via schema (OCR quando escaneado). Vários
+  PDFs na mesma requisição a partir do Pro (campo `files`; tetos somados)
+- `POST /v1/images/extract` — imagem solta → JSON via schema (sempre via OCR). Mesma
+  regra de vários arquivos
 - `POST /v1/documents/generate` — HTML → PDF (direto ou por instrução ao modelo)
 - `POST /v1/images/generations` — text-to-image (Go/category=image). Corpo JSON,
   resposta `b64_json`. A imagem é gravada no bucket antes da resposta sair

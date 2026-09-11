@@ -568,7 +568,8 @@ Content-Type: multipart/form-data
 
 | Campo | Obrigatório | Descrição |
 |---|---|---|
-| `file` | sim | O PDF |
+| `file` | sim* | O PDF |
+| `files` | sim* | Vários PDFs na mesma requisição (a partir do Pro) — pode repetir o campo |
 | `schema` | sim | JSON Schema (como string) descrevendo os campos a extrair |
 | `system` | não | Substitui o system prompt configurado na sua stack (mesma regra do chat) |
 | `user` | não | Contexto adicional sobre este documento — **soma** à instrução de extração |
@@ -595,13 +596,17 @@ Resposta:
 {
   "data": { "numero_nota": "12345", "cnpj_emitente": "11.222.333/0001-44", "valor_total": 1500.0 },
   "pages": 3,
+  "files": 1,
   "ocr_used": false,
   "usage": { "prompt_tokens": 2104, "completion_tokens": 48 }
 }
 ```
 
+\* Pelo menos um arquivo, em `file` ou em `files`; os dois se combinam, na ordem enviada.
+
 `data` é o seu JSON, **já validado contra o schema** — se ele voltar, adere ao formato que
-você pediu. `ocr_used` indica se alguma página precisou de OCR (PDF escaneado): quando
+você pediu. `pages` é a soma das páginas e `files` quantos arquivos entraram na extração
+(1 no caso comum). `ocr_used` indica se alguma página precisou de OCR (PDF escaneado): quando
 `true`, vale conferir o resultado com mais atenção, porque a qualidade depende da imagem.
 
 ### O ponto mais importante: declare os campos que podem faltar
@@ -679,12 +684,38 @@ A base de conhecimento (RAG) **não** é usada neste endpoint, de propósito: aq
 relevante é o documento que você enviou, e trechos de outros documentos aumentariam o
 risco de um campo ser preenchido com dado que não está no seu PDF.
 
+### Vários arquivos numa requisição (Pro em diante)
+
+Quando os campos que você quer estão espalhados em mais de um documento (a fatura e o
+recibo, o contrato e o aditivo), envie todos pelo campo `files` e receba **um JSON só**:
+
+```bash
+curl -X POST https://SEU-GATEWAY/v1/documents/extract \
+  -H "Authorization: Bearer $STAC_API_KEY" \
+  -F files=@fatura.pdf \
+  -F files=@recibo.pdf \
+  -F 'schema={...}' \
+  -F 'user=O número está na fatura; o valor pago, no recibo.'
+```
+
+Cada arquivo chega ao modelo num bloco numerado com o nome do arquivo (`--- DOCUMENTO 1
+DE 2 (fatura.pdf) ---`), então o `user` pode dizer onde procurar cada campo.
+
+- **Go aceita 1 arquivo por requisição.** Um segundo (em `files`, ou repetindo `file`)
+  devolve `413` explicando isso — nunca é descartado em silêncio.
+- **Os tetos valem sobre a soma**: bytes e páginas são contados somando todos os arquivos,
+  e a recusa acontece antes de qualquer OCR.
+- **Um documento vazio aborta a requisição inteira** (`400`, nomeando o arquivo) — seguir
+  sem ele faria o modelo preencher o schema só com os outros, sem você saber.
+- Para **um JSON por arquivo**, continue fazendo uma requisição por arquivo.
+
 ### Limites
 
-| Limite | Go | Pro |
-|---|---|---|
-| Tamanho do arquivo | 8 MB | 15 MB |
-| Páginas por requisição | 15 | 30 |
+| Limite | Go | Pro | Max |
+|---|---|---|---|
+| Arquivos por requisição | 1 | 5 | 10 |
+| Tamanho (soma dos arquivos) | 8 MB | 15 MB | 25 MB |
+| Páginas (soma dos arquivos) | 15 | 30 | 50 |
 
 O schema em si tem teto de 64 KB. Documento muito grande é recusado com `400` explicando
 quantos tokens ele ocupou — nesse caso, divida o PDF e envie por partes.
@@ -694,8 +725,8 @@ quantos tokens ele ocupou — nesse caso, divida o PDF e envie por partes.
 | Status | Significado |
 |---|---|
 | `400` | PDF ilegível/corrompido, sem texto extraível, schema inválido, ou documento grande demais para a janela do plano |
-| `413` | Arquivo, número de páginas ou schema acima do limite |
-| `422` | `max_tokens` fora da faixa aceita (precisa ser maior que 0 e no máximo 16000) |
+| `413` | Arquivo, número de arquivos, número de páginas ou schema acima do limite do plano |
+| `422` | `max_tokens` fora da faixa aceita (precisa ser maior que 0 e no máximo 16000), ou nenhum arquivo enviado |
 | `502` | O modelo não devolveu JSON aderente ao schema (a resposta inclui `raw_output` para diagnóstico) |
 
 Um `502` com `raw_output` **truncado no meio** costuma significar que a resposta não caberia
@@ -721,7 +752,8 @@ Content-Type: multipart/form-data
 
 | Campo | Obrigatório | Descrição |
 |---|---|---|
-| `file` | sim | A imagem, em JPEG, PNG ou WEBP |
+| `file` | sim* | A imagem, em JPEG, PNG ou WEBP |
+| `files` | sim* | Várias imagens na mesma requisição (a partir do Pro) — mesma regra do PDF |
 | `schema` | sim | JSON Schema (como string) descrevendo os campos a extrair |
 | `system` | não | Substitui o system prompt configurado na sua stack (mesma regra do chat) |
 | `user` | não | Contexto adicional sobre esta imagem — **soma** à instrução de extração |
@@ -748,15 +780,18 @@ Resposta:
 {
   "data": { "numero_nota": "12345", "cnpj_emitente": "11.222.333/0001-44", "valor_total": 1500.0 },
   "pages": 1,
+  "files": 1,
   "ocr_used": true,
   "usage": { "prompt_tokens": 612, "completion_tokens": 48 }
 }
 ```
 
 Contrato de resposta idêntico ao de PDF (mesmo `data`, mesmo `usage`), com duas
-diferenças fixas por não haver conceito de "página" numa imagem solta: `pages` é sempre
-`1` e `ocr_used` é sempre `true` — ao contrário do PDF, aqui **toda** imagem passa por
-OCR, não há "texto embutido" a extrair primeiro.
+diferenças por não haver conceito de "página" numa imagem solta: `pages` é o número de
+imagens enviadas (`1` no caso comum) e `ocr_used` é sempre `true` — ao contrário do PDF,
+aqui **toda** imagem passa por OCR, não há "texto embutido" a extrair primeiro. Várias
+imagens na mesma requisição seguem as mesmas regras do PDF (a partir do Pro, teto de
+bytes sobre a soma, um JSON só).
 
 `system` e `user` seguem exatamente a mesma regra do endpoint de PDF (ver seção acima) —
 o mesmo vale para a orientação sobre **declarar campos anuláveis** no schema, para evitar
@@ -764,10 +799,11 @@ que o modelo invente um valor quando a informação não está na imagem.
 
 ### Limites
 
-| Limite | Go | Pro |
-|---|---|---|
-| Tamanho do arquivo | 5 MB | 10 MB |
-| Resolução | 20 megapixels | 20 megapixels |
+| Limite | Go | Pro | Max |
+|---|---|---|---|
+| Arquivos por requisição | 1 | 5 | 10 |
+| Tamanho (soma dos arquivos) | 5 MB | 10 MB | 15 MB |
+| Resolução (por imagem) | 20 megapixels | 20 megapixels | 20 megapixels |
 
 O schema em si tem o mesmo teto de 64 KB do endpoint de PDF.
 

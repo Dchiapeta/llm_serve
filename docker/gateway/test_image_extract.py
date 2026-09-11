@@ -154,3 +154,26 @@ def test_check_image_size_usa_o_teto_do_plano():
 def test_plano_desconhecido_cai_no_default_conservador():
     assert limit_image_bytes("PlanoInexistente") == DEFAULT_MAX_IMAGE_BYTES
     assert limit_image_bytes(None) == DEFAULT_MAX_IMAGE_BYTES
+
+
+# ---------- várias imagens por requisição ----------
+
+
+def test_extract_text_from_images_preserva_ordem_e_nomeia_erros(monkeypatch):
+    import document_extract
+    from document_extract import extract_text_from_images
+
+    monkeypatch.setattr(
+        document_extract, "extract_text_from_image",
+        lambda data, plan: (data.decode(), True),
+    )
+    docs, ocr_used = extract_text_from_images([("a.png", b"AAA"), ("b.png", b"BBB")], "Pro")
+    assert docs == [("a.png", "AAA"), ("b.png", "BBB")]
+    assert ocr_used is True
+
+    def falha(data, plan):
+        raise EmptyDocument("nenhum texto foi encontrado na imagem")
+
+    monkeypatch.setattr(document_extract, "extract_text_from_image", falha)
+    with pytest.raises(EmptyDocument, match='"b.png"'):
+        extract_text_from_images([("b.png", b"x")], "Pro")

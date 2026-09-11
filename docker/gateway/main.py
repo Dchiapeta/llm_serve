@@ -48,6 +48,7 @@ import jsonschema
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, Field
 
 import demo
@@ -876,7 +877,9 @@ async def reject_oversized_upload(request: Request, call_next):
             # margem sobre o teto de bytes do documento: o corpo multipart
             # carrega também o schema (até MAX_SCHEMA_BYTES) e o overhead das
             # boundaries, então comparar cru contra o teto do arquivo recusaria
-            # upload legítimo no limite.
+            # upload legítimo no limite. Com vários arquivos na requisição o
+            # teto do plano vale sobre a SOMA (_read_uploads), então o maior
+            # teto entre os planos continua sendo o corte certo aqui.
             ceiling = document_extract.max_limit_bytes() + MAX_SCHEMA_BYTES + 65536
             if int(declared) > ceiling:
                 return JSONResponse(
@@ -4240,7 +4243,7 @@ async def _authenticate_for_extraction(
 
 async def _run_extraction_pipeline(
     *,
-    text: str,
+    documents: list[tuple[str, str]],
     pages: int,
     ocr_used: bool,
     parsed_schema: dict,
@@ -4258,12 +4261,15 @@ async def _run_extraction_pipeline(
 ) -> dict:
     """Monta o prompt, chama o pod e valida a saída — a parte IDÊNTICA entre
     /v1/documents/extract e /v1/images/extract, a partir do momento em que já
-    se tem (texto, páginas, ocr_used) em mãos. O que muda entre as duas rotas
-    é só COMO chegar até esses três valores (parsing do upload + extração)."""
+    se tem ([(nome, texto)...], páginas, ocr_used) em mãos. O que muda entre
+    as duas rotas é só COMO chegar até esses três valores (parsing do upload +
+    extração). `documents` tem um item por arquivo enviado — com mais de um,
+    build_messages numera os blocos pra que o modelo saiba de onde veio cada
+    valor."""
     # `user` COMPÕE com a instrução padrão (ver build_messages): o cliente
     # acrescenta contexto do documento sem poder remover o "não invente,
     # use null", que é a garantia contra campo fabricado.
-    messages = document_extract.build_messages(text, user)
+    messages = document_extract.build_messages(documents, user)
 
     # `system` segue EXATAMENTE a regra do chat: com conteúdo, substitui o
     # prompt configurado; ausente ou vazio, vale o da chave (migration 0053)
@@ -4331,11 +4337,12 @@ async def _run_extraction_pipeline(
         # "página(s)" só entra pro caminho de PDF: imagem sempre tem pages=1
         # fixo, e citar "1 página" nesse caso seria um detalhe sem sentido
         # pra quem mandou uma imagem solta.
-        content_desc = (
-            f"o documento tem {pages} página(s) e ocupa"
-            if path_label == "documents/extract"
-            else "o conteúdo enviado ocupa"
-        )
+        if path_label != "documents/extract":
+            content_desc = "o conteúdo enviado ocupa"
+        elif len(documents) > 1:
+            content_desc = f"os {len(documents)} documentos somam {pages} página(s) e ocupam"
+        else:
+            content_desc = f"o documento tem {pages} página(s) e ocupa"
         raise ContextWindowExceeded(
             f"{content_desc} ~{est_tokens} tokens, o que não deixa espaço "
             f"para a resposta na janela de contexto deste plano "
@@ -4448,15 +4455,94 @@ async def _run_extraction_pipeline(
     return {
         "data": data,
         "pages": pages,
+        # quantos arquivos entraram nesta extração. Sempre presente (1 no caso
+        # comum) pra quem integra não precisar tratar a chave como opcional.
+        "files": len(documents),
         "ocr_used": ocr_used,
         "usage": usage,
     }
 
 
+async def _collect_uploads(request: Request) -> list[UploadFile]:
+    """Todos os arquivos do multipart, na ordem enviada, vindos do campo
+    `file` (contrato original) e/ou `files` (vários por requisição).
+
+    Lê o form direto em vez de confiar só no parâmetro `file: UploadFile` do
+    endpoint por um motivo concreto: com dois `-F file=@...` o FastAPI fica
+    com o ÚLTIMO e descarta o primeiro em silêncio — o cliente recebe um JSON
+    válido extraído de metade do que mandou, sem erro nenhum. Aqui os dois
+    aparecem, e o teto de arquivos do plano decide o que fazer com eles.
+    request.form() é cacheado pelo Starlette, então isto não parseia o corpo
+    duas vezes."""
+    form = await request.form()
+    uploads: list[UploadFile] = []
+    for field in ("file", "files"):
+        for value in form.getlist(field):
+            if isinstance(value, StarletteUploadFile):
+                uploads.append(value)
+    if not uploads:
+        # 422 como o FastAPI devolvia quando `file` era obrigatório: quem já
+        # trata esse status por "campo faltando" continua tratando.
+        raise HTTPException(
+            status_code=422,
+            detail="envie o arquivo no campo `file` (ou vários em `files`)",
+        )
+    if len(uploads) > document_extract.max_limit_files():
+        # corte grosso antes do plano: nenhum plano aceita isto, então não
+        # vale a ida ao banco do resolve_route (que pode até religar um pod)
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"a requisição tem {len(uploads)} arquivos; o máximo do serviço é "
+                f"{document_extract.max_limit_files()} por requisição"
+            ),
+        )
+    return uploads
+
+
+async def _read_uploads(
+    uploads: list[UploadFile], plan: str | None, *, image: bool
+) -> list[tuple[str, bytes]]:
+    """Aplica os tetos do PLANO (quantidade e bytes somados) e só então lê os
+    uploads pra memória. A ordem importa: quantidade primeiro, porque é a
+    checagem mais barata e a que no Go vai recusar a maioria das requisições
+    multi-arquivo; bytes depois, e SOMADOS — o teto de bytes do plano é da
+    requisição, não de cada arquivo, senão N arquivos no limite custariam N×
+    o que o plano pagou (memória aqui, CPU no OCR logo adiante)."""
+    try:
+        document_extract.check_file_count(len(uploads), plan)
+    except document_extract.TooManyFiles as e:
+        raise HTTPException(status_code=413, detail=str(e))
+
+    check = document_extract.check_image_size if image else document_extract.check_size
+    declared = sum(u.size or 0 for u in uploads)
+    try:
+        # pelo `size` do parser antes de ler: recusa sem carregar em RAM
+        check(declared, plan)
+    except document_extract.DocumentTooLarge as e:
+        raise HTTPException(status_code=413, detail=str(e))
+
+    documents: list[tuple[str, bytes]] = []
+    total = 0
+    for upload in uploads:
+        data = await upload.read()
+        total += len(data)
+        try:
+            check(total, plan)
+        except document_extract.DocumentTooLarge as e:
+            raise HTTPException(status_code=413, detail=str(e))
+        documents.append((upload.filename or "", data))
+    return documents
+
+
 @app.post("/v1/documents/extract")
 async def extract_document(
     request: Request,
-    file: UploadFile = File(...),
+    # `file` (um) e `files` (vários, a partir do Pro) — os dois declarados
+    # pra aparecerem no OpenAPI, mas quem lê os uploads de verdade é
+    # _collect_uploads, direto do form (ver o porquê lá).
+    file: UploadFile | None = File(None),
+    files: list[UploadFile] | None = File(None),
     schema: str = Form(...),
     # mesmos papéis do /v1/chat/completions, só que em multipart (tem um
     # arquivo junto, então não dá pra ser JSON). A semântica é idêntica de
@@ -4466,7 +4552,10 @@ async def extract_document(
     max_tokens: int | None = Form(None, gt=0, le=DOCUMENT_MAX_TOKENS_CEILING),
     authorization: str | None = Header(None),
 ):
-    """Recebe um PDF e devolve o JSON aderente ao schema que o cliente mandou.
+    """Recebe um ou mais PDFs e devolve UM JSON aderente ao schema que o
+    cliente mandou. Um arquivo é o contrato original (todo plano); vários na
+    mesma requisição é a partir do Pro (document_extract.MAX_FILES_PER_REQUEST),
+    com os tetos de bytes e páginas valendo sobre a soma.
 
     É um dos dois endpoints do gateway que fazem trabalho de CPU próprio antes
     de chamar o pod (extração/OCR, ver document_extract.py e a rota irmã
@@ -4490,25 +4579,23 @@ async def extract_document(
         authorization, schema, request.headers, DOCUMENT_PATH
     )
 
-    # Corte grosso ANTES de qualquer coisa cara: `file.size` vem do parser
+    uploads = await _collect_uploads(request)
+
+    # Corte grosso ANTES de qualquer coisa cara: `size` vem do parser
     # multipart do Starlette (que já fez spool em disco), então dá pra recusar
-    # um upload absurdo sem carregá-lo em RAM com file.read() e sem pagar o
+    # um upload absurdo sem carregá-lo em RAM com read() e sem pagar o
     # resolve_route (ida ao banco, e que pode até religar um pod). O teto exato
     # do plano vem depois — aqui só barramos o que nenhum plano aceitaria.
-    if file.size is not None and file.size > document_extract.max_limit_bytes():
+    if sum(u.size or 0 for u in uploads) > document_extract.max_limit_bytes():
         raise HTTPException(status_code=413, detail="documento excede o limite do serviço")
 
-    # o teto de bytes é do PLANO, e o plano confiável vem de resolve_route
-    # (key_plan resolvido dentro de _authenticate_for_extraction é só o da
-    # chave, pode não ter stack resolvida)
+    # os tetos de quantidade e de bytes são do PLANO, e o plano confiável vem
+    # de resolve_route (key_plan resolvido dentro de
+    # _authenticate_for_extraction é só o da chave, pode não ter stack resolvida)
     machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
     await maybe_touch(stack_id, machine["id"])
 
-    pdf_bytes = await file.read()
-    try:
-        document_extract.check_size(len(pdf_bytes), effective_plan)
-    except document_extract.DocumentTooLarge as e:
-        raise HTTPException(status_code=413, detail=str(e))
+    pdfs = await _read_uploads(uploads, effective_plan, image=False)
 
     flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
@@ -4526,8 +4613,8 @@ async def extract_document(
             # to_thread: o OCR é síncrono e pesado — ver o cabeçalho de
             # document_extract.py. Sem isso, uma página escaneada segura o
             # event loop e todo chat concorrente no gateway espera com ela.
-            text, pages, ocr_used = await asyncio.to_thread(
-                document_extract.extract_text, pdf_bytes, effective_plan
+            documents, pages, ocr_used = await asyncio.to_thread(
+                document_extract.extract_text_many, pdfs, effective_plan
             )
         except document_extract.DocumentTooLarge as e:
             log_gateway_request(**log_ctx, status_code=413, stream=False)
@@ -4541,7 +4628,7 @@ async def extract_document(
             raise HTTPException(status_code=500, detail=str(e))
 
         return await _run_extraction_pipeline(
-            text=text, pages=pages, ocr_used=ocr_used, parsed_schema=parsed_schema,
+            documents=documents, pages=pages, ocr_used=ocr_used, parsed_schema=parsed_schema,
             user=user, system=system, entry=entry, stack_id=stack_id, machine=machine,
             rewrite_model=rewrite_model, max_tokens=max_tokens, authorization=authorization,
             flight_key=flight_key, log_ctx=log_ctx, path_label="documents/extract",
@@ -4555,21 +4642,23 @@ async def extract_document(
 @app.post("/v1/images/extract")
 async def extract_image(
     request: Request,
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    files: list[UploadFile] | None = File(None),
     schema: str = Form(...),
     system: str | None = Form(None),
     user: str | None = Form(None),
     max_tokens: int | None = Form(None, gt=0, le=DOCUMENT_MAX_TOKENS_CEILING),
     authorization: str | None = Header(None),
 ):
-    """Recebe uma imagem (JPEG/PNG/WEBP) e devolve o JSON aderente ao schema
-    que o cliente mandou. Irmã de /v1/documents/extract: mesmo contrato de
-    resposta, mesma disciplina de OCR bloqueante em thread — ver
+    """Recebe uma ou mais imagens (JPEG/PNG/WEBP) e devolve UM JSON aderente
+    ao schema que o cliente mandou. Irmã de /v1/documents/extract: mesmo
+    contrato de resposta, mesma regra de vários arquivos (a partir do Pro,
+    bytes somados), mesma disciplina de OCR bloqueante em thread — ver
     document_extract.py e _run_extraction_pipeline acima.
 
     Ao contrário de PDF, aqui não existe "texto embutido" a extrair: a imagem
     inteira sempre passa por OCR (pytesseract), por isso `ocr_used` é sempre
-    True e `pages` é sempre 1 na resposta. Não usa modelo vision/multimodal —
+    True e `pages` é o número de imagens (1 no caso comum). Não usa modelo vision/multimodal —
     o OCR roda no gateway (CPU), e o pod só recebe texto, exatamente como no
     caminho de PDF."""
     started = time.monotonic()
@@ -4578,18 +4667,16 @@ async def extract_image(
         authorization, schema, request.headers, IMAGE_PATH
     )
 
+    uploads = await _collect_uploads(request)
+
     # mesmo corte grosso do PDF, teto próprio de imagem (ver document_extract.py)
-    if file.size is not None and file.size > document_extract.max_limit_image_bytes():
+    if sum(u.size or 0 for u in uploads) > document_extract.max_limit_image_bytes():
         raise HTTPException(status_code=413, detail="imagem excede o limite do serviço")
 
     machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
     await maybe_touch(stack_id, machine["id"])
 
-    image_bytes = await file.read()
-    try:
-        document_extract.check_image_size(len(image_bytes), effective_plan)
-    except document_extract.DocumentTooLarge as e:
-        raise HTTPException(status_code=413, detail=str(e))
+    images = await _read_uploads(uploads, effective_plan, image=True)
 
     flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
@@ -4606,8 +4693,8 @@ async def extract_image(
         try:
             # to_thread: mesmo motivo do PDF — OCR é síncrono e pesado, não
             # pode travar o event loop compartilhado com o tráfego de chat.
-            text, ocr_used = await asyncio.to_thread(
-                document_extract.extract_text_from_image, image_bytes, effective_plan
+            documents, ocr_used = await asyncio.to_thread(
+                document_extract.extract_text_from_images, images, effective_plan
             )
         except document_extract.DocumentTooLarge as e:
             log_gateway_request(**log_ctx, status_code=413, stream=False)
@@ -4621,10 +4708,11 @@ async def extract_image(
             raise HTTPException(status_code=500, detail=str(e))
 
         return await _run_extraction_pipeline(
-            text=text, pages=1, ocr_used=ocr_used, parsed_schema=parsed_schema,
-            user=user, system=system, entry=entry, stack_id=stack_id, machine=machine,
-            rewrite_model=rewrite_model, max_tokens=max_tokens, authorization=authorization,
-            flight_key=flight_key, log_ctx=log_ctx, path_label="images/extract",
+            documents=documents, pages=len(documents), ocr_used=ocr_used,
+            parsed_schema=parsed_schema, user=user, system=system, entry=entry,
+            stack_id=stack_id, machine=machine, rewrite_model=rewrite_model,
+            max_tokens=max_tokens, authorization=authorization, flight_key=flight_key,
+            log_ctx=log_ctx, path_label="images/extract",
         )
     finally:
         release_flight(flight_key)

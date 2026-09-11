@@ -181,3 +181,87 @@ def test_prompt_manda_usar_null_em_vez_de_inventar():
     instrução o modelo preenche o schema com valores plausíveis e o resultado
     passa em qualquer validação sendo falso."""
     assert "null" in build_messages("x")[0]["content"]
+
+
+# ---------- vários arquivos por requisição ----------
+
+
+def test_teto_de_arquivos_por_plano():
+    """Go continua em 1 (contrato original); Pro em diante aceita vários;
+    plano desconhecido nunca herda multi-arquivo por esquecimento."""
+    from document_extract import (
+        DEFAULT_MAX_FILES_PER_REQUEST,
+        TooManyFiles,
+        check_file_count,
+        limit_files,
+    )
+
+    assert limit_files("Go") == 1
+    assert limit_files("Pro") == 5
+    assert limit_files("PlanoInexistente") == DEFAULT_MAX_FILES_PER_REQUEST == 1
+    check_file_count(1, "Go")
+    check_file_count(5, "Pro")
+    with pytest.raises(TooManyFiles, match="1 arquivo por requisição"):
+        check_file_count(2, "Go")
+    with pytest.raises(TooManyFiles, match="até 5 arquivos"):
+        check_file_count(6, "Pro")
+
+
+def test_extract_text_many_preserva_ordem_e_soma_paginas():
+    from document_extract import extract_text_many
+
+    docs, pages, ocr_used = extract_text_many(
+        [("a.pdf", _pdf("AAA", "AA2")), ("b.pdf", _pdf("BBB"))], "Pro"
+    )
+    assert [name for name, _ in docs] == ["a.pdf", "b.pdf"]
+    assert "AAA" in docs[0][1] and "BBB" in docs[1][1]
+    assert pages == 3
+    assert ocr_used is False
+
+
+def test_extract_text_many_teto_de_paginas_e_sobre_a_soma_e_antes_do_ocr(monkeypatch):
+    """Dois PDFs escaneados de 10 páginas no Go (teto 15): recusados pela
+    SOMA, e sem ter rodado OCR em nenhum dos dois — checar por arquivo
+    deixaria cada um passar e o CPU pago seria 2× o do plano."""
+    import document_extract
+    from document_extract import extract_text_many
+
+    chamadas = []
+    monkeypatch.setattr(
+        document_extract, "_ocr_page", lambda page: chamadas.append(1) or ""
+    )
+    dez_escaneadas = _pdf(*["" for _ in range(10)])
+    with pytest.raises(DocumentTooLarge, match="somam 20 páginas"):
+        extract_text_many([("a.pdf", dez_escaneadas), ("b.pdf", dez_escaneadas)], "Go")
+    assert not chamadas, "OCR rodou antes da checagem do teto somado"
+
+
+def test_extract_text_many_documento_vazio_nomeia_o_arquivo():
+    from document_extract import extract_text_many
+
+    with pytest.raises(EmptyDocument, match='"vazio.pdf"'):
+        extract_text_many([("ok.pdf", _pdf("TEXTO")), ("vazio.pdf", _pdf(""))], "Pro")
+
+
+def test_extract_text_many_pdf_invalido_nomeia_o_arquivo():
+    from document_extract import extract_text_many
+
+    with pytest.raises(UnreadableDocument, match='"lixo.pdf"'):
+        extract_text_many([("ok.pdf", _pdf("TEXTO")), ("lixo.pdf", b"nao e pdf")], "Pro")
+
+
+def test_build_messages_numera_blocos_com_varios_documentos():
+    content = build_messages(
+        [("fatura.pdf", "FAT"), ("recibo.pdf", "REC")], "o total está na fatura"
+    )[0]["content"]
+    assert "contém 2 documentos" in content
+    assert "--- DOCUMENTO 1 DE 2 (fatura.pdf) ---" in content
+    assert "--- DOCUMENTO 2 DE 2 (recibo.pdf) ---" in content
+    assert content.index("FAT") < content.index("REC")
+    # garantias do prompt continuam ANTES dos documentos
+    assert content.index("nunca invente") < content.index("o total está na fatura") < content.index("FAT")
+
+
+def test_build_messages_lista_de_um_documento_e_o_bloco_de_sempre():
+    """O modelo não precisa saber que a rota aceita vários quando só veio um."""
+    assert build_messages([("nota.pdf", "DOC")]) == build_messages("DOC")

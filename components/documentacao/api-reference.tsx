@@ -76,6 +76,7 @@ export function ApiReference() {
   const documentoResposta = `{
   "data": { "numero_nota": "12345", "cnpj_emitente": "11.222.333/0001-44", "valor_total": 1500.0 },
   "pages": 3,
+  "files": 1,
   "ocr_used": false,
   "usage": { "prompt_tokens": 2104, "completion_tokens": 48 }
 }`
@@ -231,11 +232,17 @@ export function ApiReference() {
           </code>{" "}
           (<code className="font-mono text-xs">multipart/form-data</code>).
           Recebe um PDF — inclusive escaneado, faz OCR internamente — e
-          devolve um JSON validado contra o schema que você define.
+          devolve um JSON validado contra o schema que você define. A partir
+          do Pro, aceita vários PDFs na mesma requisição (campo{" "}
+          <code className="font-mono text-xs">files</code>) e devolve um JSON
+          só, com cada arquivo num bloco numerado para o modelo.
         </p>
         <ul className="list-disc space-y-1.5 pl-5 marker:text-muted-foreground">
           <Field name="file" required>
-            o PDF
+            o PDF (ou vários em{" "}
+            <code className="font-mono text-xs">files</code>, repetindo o
+            campo — a partir do Pro; no Go um segundo arquivo devolve 413, não
+            é descartado em silêncio)
           </Field>
           <Field name="schema" required>
             JSON Schema (como string) descrevendo os campos a extrair
@@ -250,6 +257,9 @@ export function ApiReference() {
         <p>
           <code className="font-mono text-xs">data</code>: seu JSON já
           validado contra o schema.{" "}
+          <code className="font-mono text-xs">pages</code> e{" "}
+          <code className="font-mono text-xs">files</code>: páginas (somadas)
+          e arquivos que entraram na extração.{" "}
           <code className="font-mono text-xs">ocr_used</code>:{" "}
           <code className="font-mono text-xs">true</code> se alguma página
           precisou de OCR — vale conferir o resultado com mais atenção nesse
@@ -276,18 +286,27 @@ export function ApiReference() {
                 <th className="px-3 py-2 font-medium">Limite</th>
                 <th className="px-3 py-2 font-medium">Go</th>
                 <th className="px-3 py-2 font-medium">Pro</th>
+                <th className="px-3 py-2 font-medium">Max</th>
               </tr>
             </thead>
             <tbody>
               <tr className="border-b">
-                <td className="px-3 py-2">Tamanho do arquivo</td>
+                <td className="px-3 py-2">Arquivos por requisição</td>
+                <td className="px-3 py-2">1</td>
+                <td className="px-3 py-2">5</td>
+                <td className="px-3 py-2">10</td>
+              </tr>
+              <tr className="border-b">
+                <td className="px-3 py-2">Tamanho (soma dos arquivos)</td>
                 <td className="px-3 py-2">8 MB</td>
                 <td className="px-3 py-2">15 MB</td>
+                <td className="px-3 py-2">25 MB</td>
               </tr>
               <tr>
-                <td className="px-3 py-2">Páginas por requisição</td>
+                <td className="px-3 py-2">Páginas (soma dos arquivos)</td>
                 <td className="px-3 py-2">15</td>
                 <td className="px-3 py-2">30</td>
+                <td className="px-3 py-2">50</td>
               </tr>
             </tbody>
           </table>
@@ -317,7 +336,8 @@ export function ApiReference() {
               <tr className="border-b">
                 <td className="px-3 py-2 font-mono">413</td>
                 <td className="px-3 py-2">
-                  Arquivo, número de páginas ou schema acima do limite
+                  Arquivo, número de arquivos, número de páginas ou schema
+                  acima do limite do plano
                 </td>
               </tr>
               <tr className="border-b">
