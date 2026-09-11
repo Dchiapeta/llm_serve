@@ -332,8 +332,33 @@ def validate_seed(raw) -> int | None:
     return value
 
 
-def ensure_seed(value: int | None) -> int:
-    """Seed efetiva da geração: a do cliente, ou uma sorteada aqui.
+def parse_default_seed(raw: str | None) -> int | None:
+    """IMAGE_DEFAULT_SEED -> seed fixa do pod, ou None para sortear.
+
+    Vazio, ausente e "random" significam a mesma coisa (sortear) porque um
+    template sem a variável e um template com a variável em branco chegam aqui
+    indistinguíveis, e "random" é o jeito de desligar a seed fixa sem editar a
+    lista de env do RunPod.
+    """
+    text = (raw or "").strip().lower()
+    if not text or text == "random":
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        raise SystemExit(
+            f"[policy] IMAGE_DEFAULT_SEED inválida: {raw!r}. "
+            "Use um inteiro em [0, 2^64-1], 'random' ou deixe em branco."
+        ) from None
+    if value < 0 or value > SEED_MAX:
+        raise SystemExit(
+            f"[policy] IMAGE_DEFAULT_SEED fora da faixa [0, 2^64-1]: {value}"
+        )
+    return value
+
+
+def ensure_seed(value: int | None, default: int | None = None) -> int:
+    """Seed efetiva da geração: a do cliente, a fixa do pod, ou uma sorteada.
 
     Sortear NESTE nível, em vez de deixar o torch decidir sozinho quando o
     generator é None, é o que torna a geração descritível: a resposta passa a
@@ -341,11 +366,20 @@ def ensure_seed(value: int | None) -> int:
     reproduzi-la. Enquanto o sorteio ficava implícito lá dentro, toda requisição
     sem `seed` produzia uma imagem que ninguém — nem nós — sabia repetir.
 
+    `default` existe porque no try-on a seed NÃO é um detalhe de reprodução: ela
+    decide se a pessoa da foto sobrevive. Medido em 10/09/2026, ~30% das seeds
+    descartam a foto-alvo inteira e devolvem a modelo da imagem de referência —
+    rosto, corpo e cenário — e nenhum prompt impede. Sortear por requisição
+    entrega esse colapso a 3 de cada 10 clientes; uma seed fixa e validada troca
+    a loteria por um resultado repetível, que dá para inspecionar e trocar.
+
     random e não secrets: seed de imagem é um identificador de resultado, não um
     segredo. Previsibilidade aqui não abre risco nenhum.
     """
     if value is not None:
         return value
+    if default is not None:
+        return default
     return random.getrandbits(64)
 
 

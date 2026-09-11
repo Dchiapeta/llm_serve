@@ -72,7 +72,8 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// Same trusted external integration as key creation. Null inherits the stack.
+// Mesma integração externa confiável do POST (checkSecret), porque quem
+// configura a chave é o painel do cliente. null volta a herdar a stack.
 export async function PATCH(req: NextRequest) {
   const unauthorized = checkSecret(req)
   if (unauthorized) return unauthorized

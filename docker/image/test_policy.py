@@ -133,6 +133,39 @@ def test_seed_acima_do_teto_do_torch_e_400_e_nao_500():
     assert e.value.status_code == 400
 
 
+def test_seed_do_cliente_ganha_da_fixa_do_pod():
+    # a fixa é um DEFAULT, não uma trava: quem manda seed quer aquela seed
+    assert policy.ensure_seed(7, default=31337) == 7
+    assert policy.ensure_seed(0, default=31337) == 0
+
+
+def test_sem_seed_do_cliente_a_fixa_do_pod_vale_e_repete():
+    # o ponto da seed fixa é justamente não variar: é o que impede o colapso de
+    # identidade do try-on de acontecer em 3 de cada 10 requisições
+    assert {policy.ensure_seed(None, default=31337) for _ in range(20)} == {31337}
+
+
+def test_sem_seed_e_sem_fixa_continua_sorteando():
+    assert len({policy.ensure_seed(None) for _ in range(20)}) > 1
+
+
+def test_default_seed_em_branco_ou_random_significa_sortear():
+    # template sem a variável e template com a variável vazia chegam iguais aqui
+    for raw in (None, "", "   ", "random", "RANDOM"):
+        assert policy.parse_default_seed(raw) is None
+
+
+def test_default_seed_valida_no_boot_em_vez_de_por_requisicao():
+    assert policy.parse_default_seed("31337") == 31337
+    assert policy.parse_default_seed(" 0 ") == 0
+    assert policy.parse_default_seed(str(policy.SEED_MAX)) == policy.SEED_MAX
+    # SystemExit e não ImageRequestError: env errada é erro de OPERAÇÃO, e falhar
+    # no boot mostra o problema no log do pod em vez de em cada 400 do cliente
+    for raw in ("abc", "-1", str(policy.SEED_MAX + 1), "31337.5"):
+        with pytest.raises(SystemExit):
+            policy.parse_default_seed(raw)
+
+
 # ---------------------------------------------------------------------------
 # prompt: corpo do cliente vs. configurado na chave
 # ---------------------------------------------------------------------------

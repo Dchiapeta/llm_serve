@@ -119,6 +119,17 @@ const TEMPLATE = {
     IMAGE_GUIDANCE_SCALE: "1.0",
     IMAGE_MAX_SEQUENCE_LENGTH: "512",
 
+    // Seed FIXA quando o cliente não manda uma. Não é preferência de
+    // reprodutibilidade: no try-on a seed decide se a foto da cliente
+    // sobrevive. Medido em 10/09/2026, ~30% das seeds descartam a foto-alvo e
+    // devolvem a modelo da imagem de referência — rosto, corpo e cenário — e
+    // nenhum prompt impede. Sortear por requisição entregaria esse colapso a 3
+    // de cada 10 clientes. A 31337 passou nas 4 condições testadas (foto
+    // original, espelhada e recortada), enquanto a 1234 passava na original e
+    // colapsava nas outras duas — não existe seed provada, existe seed
+    // validada, e trocar é editar esta linha. `random` volta ao sorteio.
+    IMAGE_DEFAULT_SEED: "31337",
+
     IMAGE_DEFAULT_SIZE: "1024x1024",
     IMAGE_ALLOWED_SIZES: "1024x1024,1536x1024,1024x1536",
     IMAGE_IMAGES_PER_REQUEST_MAX: "1",

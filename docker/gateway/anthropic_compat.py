@@ -224,6 +224,14 @@ def anthropic_to_openai_request(body: dict) -> tuple[dict, str]:
     if body.get("stop_sequences"):
         openai_body["stop"] = body["stop_sequences"]
 
+    # Repassa intacto: quem valida suporte do modelo e conflito entre
+    # parâmetros é a política compartilhada (thinking_policy), não a conversão.
+    # Engolir aqui um budget não suportado faria o cliente pedir raciocínio e
+    # receber silêncio — melhor o 400 explícito lá na frente.
+    for field in ("thinking", "chat_template_kwargs", "reasoning_effort"):
+        if field in body:
+            openai_body[field] = body[field]
+
     tools = body.get("tools")
     if isinstance(tools, list) and tools:
         openai_body["tools"] = [

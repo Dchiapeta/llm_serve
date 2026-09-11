@@ -358,6 +358,7 @@ Do `env` do template (ver `scripts/_tmp-create-image-template.mjs`):
 | `IMAGE_STEPS` / `IMAGE_STEPS_MAX` | `4` / `8` | o checkpoint é distilled (`is_distilled: true`) |
 | `IMAGE_GUIDANCE_SCALE` | `1.0` | `guidance_embeds: false` no transformer |
 | `IMAGE_MAX_SEQUENCE_LENGTH` | `512` | |
+| `IMAGE_DEFAULT_SEED` | sorteia | seed usada quando o cliente não manda uma; no try-on a seed decide se a foto da cliente sobrevive (~30% das seeds devolvem a modelo da referência), então sortear é entregar o colapso a parte dos usuários. `random` ou vazio volta ao sorteio |
 | `IMAGE_DEFAULT_SIZE` / `IMAGE_ALLOWED_SIZES` | `1024x1024` / 3 resoluções | allowlist fechada: resolução é custo de VRAM e de tempo |
 | `IMAGE_IMAGES_PER_REQUEST_MAX` | `1` | teto do `n` |
 | `IMAGE_OUTPUT_FORMAT` | `png` | |

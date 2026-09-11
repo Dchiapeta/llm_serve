@@ -78,6 +78,10 @@ DTYPE = _DTYPES[_DTYPE_NAME]
 STEPS = int(os.environ.get("IMAGE_STEPS", "4"))
 STEPS_MAX = int(os.environ.get("IMAGE_STEPS_MAX", "8"))
 GUIDANCE_SCALE = float(os.environ.get("IMAGE_GUIDANCE_SCALE", "1.0"))
+# Seed fixa do pod quando o cliente não manda uma. Ver policy.ensure_seed:
+# no try-on a seed decide se a foto do cliente sobrevive, então sortear é
+# entregar um colapso de identidade a parte dos usuários.
+DEFAULT_SEED = policy.parse_default_seed(os.environ.get("IMAGE_DEFAULT_SEED"))
 MAX_SEQUENCE_LENGTH = int(os.environ.get("IMAGE_MAX_SEQUENCE_LENGTH", "512"))
 DEFAULT_SIZE = os.environ.get("IMAGE_DEFAULT_SIZE", "1024x1024")
 ALLOWED_SIZES = policy.parse_size_list(
@@ -757,7 +761,7 @@ async def images_generations(request: Request):
                 body.get("guidance_scale"), default=GUIDANCE_SCALE
             ),
             n=policy.validate_n(body.get("n"), maximum=IMAGES_PER_REQUEST_MAX),
-            seed=policy.ensure_seed(policy.validate_seed(body.get("seed"))),
+            seed=policy.ensure_seed(policy.validate_seed(body.get("seed")), default=DEFAULT_SEED),
         )
     )
 
@@ -845,7 +849,7 @@ async def images_edits(request: Request):
                 form.get("guidance_scale"), default=GUIDANCE_SCALE
             ),
             n=policy.validate_n(form.get("n"), maximum=IMAGES_PER_REQUEST_MAX),
-            seed=policy.ensure_seed(policy.validate_seed(form.get("seed"))),
+            seed=policy.ensure_seed(policy.validate_seed(form.get("seed")), default=DEFAULT_SEED),
             references=references,
         )
     )
