@@ -113,6 +113,11 @@ from reasoning_filter import (
 )
 from stream_watchdog import UpstreamStreamTimeout, aiter_bytes_watchdog
 from supa import SupaClient
+from generation_trace import request_trace_id, trace_decision
+from rag_policy import is_isolated_greeting
+from thinking_policy import (
+    ThinkingPolicyError, apply_thinking_policy, resolve_thinking_policy,
+)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -821,6 +826,18 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Authorization", "x-api-key", "Content-Type", "anthropic-version"],
 )
+
+
+@app.middleware("http")
+async def correlate_generation_request(request: Request, call_next):
+    trace_id = str(uuid.uuid4())
+    token = request_trace_id.set(trace_id)
+    try:
+        response = await call_next(request)
+        response.headers["X-Stac-Request-Id"] = trace_id
+        return response
+    finally:
+        request_trace_id.reset(token)
 
 
 @app.middleware("http")
@@ -3053,6 +3070,12 @@ async def validate_body(
     pop esquecido mandaria campo desconhecido pro vLLM."""
     pin_model(body_json, stack_id, rewrite_model, machine)
 
+    if "max_completion_tokens" in body_json:
+        value = body_json.pop("max_completion_tokens")
+        if "max_tokens" in body_json and body_json["max_tokens"] != value:
+            raise HTTPException(status_code=400, detail="limites de saída conflitantes")
+        body_json["max_tokens"] = value
+
     # Overrides de sampling da CHAVE (migration 0055) — chamado antes de
     # qualquer outra coisa neste corpo pra que um valor de chave já esteja
     # em body_json quando o piso/teto de max_tokens e o default de STACK
@@ -3069,6 +3092,12 @@ async def validate_body(
     # presence_penalty, por isso os checks são "not in body_json", não
     # isinstance/truthy.
     apply_stack_sampling_defaults(body_json, entry)
+
+    stack, _ = resolve_key_stack(entry)
+    try:
+        thinking = resolve_thinking_policy(body_json, entry, stack, machine)
+    except ThinkingPolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # vLLM só manda "usage" no chunk final do SSE quando o pedido inclui
     # stream_options.include_usage (spec OpenAI) — sem isso, tokens_in/
@@ -3089,7 +3118,7 @@ async def validate_body(
         # cliente não mandou nada — piso de sempre, thinking fica ligado
         # (comportamento inalterado, ver comentário de MIN_MAX_TOKENS acima)
         body_json["max_tokens"] = MIN_MAX_TOKENS
-    elif current_max_tokens < MIN_MAX_TOKENS:
+    elif current_max_tokens < MIN_MAX_TOKENS and thinking.enabled is None:
         # cliente pediu um teto baixo de propósito — respeita o valor (não
         # promove mais pro piso) e desliga o thinking pra esse teto não
         # truncar o raciocínio no meio, mesmo padrão já usado em
@@ -3101,6 +3130,11 @@ async def validate_body(
         body_json["chat_template_kwargs"] = chat_kwargs
     elif current_max_tokens > MAX_MAX_TOKENS:
         body_json["max_tokens"] = MAX_MAX_TOKENS
+
+    apply_thinking_policy(body_json, thinking)
+    trace_decision("thinking", entry, source=thinking.source,
+                   enabled=(body_json.get("chat_template_kwargs") or {}).get("enable_thinking"),
+                   max_tokens=body_json.get("max_tokens"))
 
     # n>1 multiplica o custo de GPU por resposta — sem valor pro caso de uso
     # BYOE (ferramentas de código pedem 1 completion) e sem teto era um vetor
@@ -3174,6 +3208,8 @@ async def validate_body(
     # colocava nada no lugar.
     if client_system_text:
         messages.insert(0, {"role": "system", "content": client_system_text})
+        trace_decision("rag", entry, policy="greeting_gate_v1", reason="client_system",
+                       retrieved_chunks=0, inserted_chunks=0)
     else:
         system_message = await build_stack_system_message(messages, entry)
         if system_message:
@@ -3240,24 +3276,40 @@ async def build_stack_system_message(messages: list, entry: dict) -> dict | None
     last_user = next(
         (m for m in reversed(messages) if m.get("role") == "user"), None
     )
-    if last_user and isinstance(last_user.get("content"), str):
-        embedding = await embed_query(last_user["content"])
-        if embedding:
-            chunks = await supa.match_knowledge_chunks(
-                entry["account_id"],
-                stack["id"] if stack else None,
-                embedding,
-                RAG_TOP_K,
-            )
-            if chunks:
-                system_parts.append(
-                    "Contexto relevante da base de conhecimento:\n"
-                    + "\n---\n".join(chunks)
-                )
+    user_text = last_user.get("content") if last_user else None
+    context = await retrieve_stack_context(entry, stack, user_text)
+    if context:
+        system_parts.append(context)
 
     if not system_parts:
         return None
     return {"role": "system", "content": "\n\n---\n\n".join(system_parts)}
+
+
+async def retrieve_stack_context(entry: dict, stack: dict | None, user_text) -> str | None:
+    """Porta única de recuperação documental, compartilhada por chat e
+    Responses. Antes cada caminho tinha sua própria cópia da busca, e qualquer
+    regra nova (como a saudação) teria que ser escrita duas vezes — com o risco
+    de divergirem. Devolve o bloco pronto pro system, ou None."""
+    chunks = []
+    if not isinstance(user_text, str) or not user_text.strip():
+        reason = "no_user_text"
+    elif is_isolated_greeting(user_text):
+        reason = "isolated_greeting"
+    else:
+        embedding = await embed_query(user_text)
+        if embedding:
+            chunks = await supa.match_knowledge_chunks(
+                entry["account_id"], stack["id"] if stack else None, embedding, RAG_TOP_K
+            )
+            reason = "retrieved" if chunks else "no_results"
+        else:
+            reason = "embedding_unavailable"
+    trace_decision("rag", entry, policy="greeting_gate_v1", reason=reason,
+                   retrieved_chunks=len(chunks), inserted_chunks=len(chunks))
+    if not chunks:
+        return None
+    return "Contexto relevante da base de conhecimento:\n" + "\n---\n".join(chunks)
 
 
 async def build_stack_instructions(entry: dict, last_user_text: str | None) -> str | None:
@@ -3271,20 +3323,9 @@ async def build_stack_instructions(entry: dict, last_user_text: str | None) -> s
     if system_prompt:
         system_parts.append(system_prompt)
 
-    if last_user_text:
-        embedding = await embed_query(last_user_text)
-        if embedding:
-            chunks = await supa.match_knowledge_chunks(
-                entry["account_id"],
-                stack["id"] if stack else None,
-                embedding,
-                RAG_TOP_K,
-            )
-            if chunks:
-                system_parts.append(
-                    "Contexto relevante da base de conhecimento:\n"
-                    + "\n---\n".join(chunks)
-                )
+    context = await retrieve_stack_context(entry, stack, last_user_text)
+    if context:
+        system_parts.append(context)
 
     if not system_parts:
         return None
@@ -3340,16 +3381,28 @@ async def validate_responses_body(
     # que já existia pra overrides por chave.
     apply_stack_sampling_defaults(body_json, entry, max_tokens_field="max_output_tokens")
 
+    stack, _ = resolve_key_stack(entry)
+    try:
+        thinking = resolve_thinking_policy(body_json, entry, stack, machine)
+    except ThinkingPolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # nunca persistir a resposta recuperável por outro tenant via
     # GET /v1/responses/{id} — esse subpath nem está na allowlist, mas
     # store=false garante que não sobra nada pra recuperar de qualquer jeito
     body_json["store"] = False
 
     max_output_tokens = body_json.get("max_output_tokens")
-    if not isinstance(max_output_tokens, int) or max_output_tokens < MIN_MAX_TOKENS:
+    if not isinstance(max_output_tokens, int) or (
+        max_output_tokens < MIN_MAX_TOKENS and thinking.enabled is None
+    ):
         body_json["max_output_tokens"] = MIN_MAX_TOKENS
     elif max_output_tokens > MAX_MAX_TOKENS:
         body_json["max_output_tokens"] = MAX_MAX_TOKENS
+
+    apply_thinking_policy(body_json, thinking)
+    trace_decision("thinking", entry, source=thinking.source,
+                   enabled=thinking.enabled, max_tokens=body_json.get("max_output_tokens"))
 
     for param, lo, hi in (("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)):
         value = body_json.get(param)
@@ -3401,6 +3454,9 @@ async def validate_responses_body(
         )
         if instructions:
             body_json["instructions"] = instructions
+    else:
+        trace_decision("rag", entry, policy="greeting_gate_v1", reason="client_instructions",
+                       retrieved_chunks=0, inserted_chunks=0)
 
     # mesmo clamp dinâmico do validate_body, no campo da Responses API; o
     # "input" pode ser string ou lista de itens — json.dumps cobre os dois.

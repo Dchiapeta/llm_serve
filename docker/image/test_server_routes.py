@@ -835,6 +835,38 @@ def test_seed_sorteada_muda_entre_requisicoes(client):
     assert len(seeds) > 1, "seed sorteada não deveria repetir sempre"
 
 
+def test_default_seed_do_pod_vale_nas_duas_rotas(client, monkeypatch):
+    """A seed fixa precisa pegar no `edits` também — é lá que o try-on roda.
+
+    Vale para `generations` de graça (mesma linha de código), mas as duas rotas
+    montam o GenPayload separadamente e já divergiram antes; se só uma honrasse
+    o default, o produto que depende disso é justamente o que ficaria de fora.
+    """
+    monkeypatch.setattr(server, "DEFAULT_SEED", 31337)
+
+    r = client.post("/v1/images/generations", json={"prompt": "x"})
+    assert r.status_code == 200, r.text
+    assert r.json()["meta"]["seed"] == 31337
+    assert client.chamadas[-1].seed == 31337
+
+    r = client.post(
+        "/v1/images/edits",
+        files=[("image", ("a.png", PNG_BYTES, "image/png"))],
+        data={"prompt": "x"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["meta"]["seed"] == 31337
+    assert client.chamadas[-1].seed == 31337
+
+    # e o cliente continua podendo escolher outra
+    r = client.post(
+        "/v1/images/edits",
+        files=[("image", ("a.png", PNG_BYTES, "image/png"))],
+        data={"prompt": "x", "seed": "42"},
+    )
+    assert r.json()["meta"]["seed"] == 42
+
+
 def test_meta_nao_desloca_o_contrato_de_data(client):
     # `meta` é campo EXTRA: cliente OpenAI ignora desconhecidos, mas `data`
     # precisa continuar exatamente como estava

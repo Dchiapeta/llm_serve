@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Check, Copy, Plus, RefreshCw, Server, TriangleAlert } from "lucide-react"
+import { Check, Plus, RefreshCw, Server, TriangleAlert } from "lucide-react"
 import { toast } from "sonner"
 
 import { createStack } from "@/lib/actions"
@@ -94,7 +94,6 @@ function machineCapacity(
 type StackResult = {
   slug: string
   machineCreated: boolean
-  plainKey: string
 }
 
 export function CreateStackDialog({
@@ -115,7 +114,6 @@ export function CreateStackDialog({
   const [machineId, setMachineId] = React.useState("")
   const [slug, setSlug] = React.useState(generateStackSlug)
   const [result, setResult] = React.useState<StackResult | null>(null)
-  const [copied, setCopied] = React.useState(false)
   const [pending, startTransition] = React.useTransition()
   const formRef = React.useRef<HTMLFormElement>(null)
   // O popup do autocomplete precisa ser portalizado para dentro do dialog:
@@ -172,7 +170,6 @@ export function CreateStackDialog({
       setMachineId("")
       setSlug(generateStackSlug())
       setResult(null)
-      setCopied(false)
     }
   }
 
@@ -207,13 +204,6 @@ export function CreateStackDialog({
     })
   }
 
-  async function copyKey() {
-    if (!result) return
-    await navigator.clipboard.writeText(result.plainKey)
-    setCopied(true)
-    toast.success("Chave copiada")
-  }
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogTrigger asChild>
@@ -233,24 +223,17 @@ export function CreateStackDialog({
         {phase === "done" && result ? (
           <div className="flex flex-col gap-4">
             <Alert>
-              <TriangleAlert />
-              <AlertTitle>Guarde esta chave agora</AlertTitle>
+              <Check />
+              <AlertTitle>Stack criada</AlertTitle>
               <AlertDescription>
-                Ela não será exibida novamente — armazenamos apenas o hash.
+                Nenhuma chave de API foi emitida. O cliente gera a dele no
+                painel, ou você emite uma pela conta.
               </AlertDescription>
             </Alert>
-            <div className="flex items-center gap-2">
-              <code className="flex-1 break-all rounded-lg border bg-muted p-3 font-mono text-xs">
-                {result.plainKey}
-              </code>
-              <Button variant="outline" size="icon" onClick={copyKey}>
-                {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
-              </Button>
-            </div>
             <p className="text-xs text-muted-foreground">
               Stack <code className="font-mono">{result.slug}</code> criada.
               {result.machineCreated &&
-                " A máquina está subindo — a chave será sincronizada quando o pod ficar pronto."}
+                " A máquina está subindo — fica pronta em ~1 min."}
             </p>
             <Button onClick={() => setOpen(false)}>Concluir</Button>
           </div>

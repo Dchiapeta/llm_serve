@@ -119,11 +119,11 @@ class SupaClient:
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,purpose,"
-                "use_custom_prompt,system_prompt,"
+                "use_custom_prompt,system_prompt,default_enable_thinking,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
                 "default_image_size,default_image_steps,default_image_guidance_scale,"
                 "accounts(name,"
-                "stacks(id,machine_id,plan,category,slug,created_at,system_prompt,"
+                "stacks(id,machine_id,plan,category,slug,created_at,system_prompt,default_enable_thinking,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
                 "default_image_size,default_image_steps,default_image_guidance_scale,"
                 "billing_status,past_due_since))",
@@ -146,6 +146,7 @@ class SupaClient:
             "purpose": row.get("purpose", "customer"),
             "use_custom_prompt": row.get("use_custom_prompt", False),
             "system_prompt": row.get("system_prompt"),
+            "default_enable_thinking": row.get("default_enable_thinking"),
             "default_temperature": row.get("default_temperature"),
             "default_top_p": row.get("default_top_p"),
             "default_max_tokens": row.get("default_max_tokens"),

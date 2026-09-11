@@ -4,7 +4,7 @@ import * as React from "react"
 import { TriangleAlert } from "lucide-react"
 import { toast } from "sonner"
 
-import { updateStackSystemPrompt } from "@/lib/actions"
+import { updateStackGenerationConfig } from "@/lib/generation-config"
 import type { Stack } from "@/lib/types"
 import { Button } from "@/components/ui/button"
 import {
@@ -16,17 +16,21 @@ import {
 } from "@/components/ui/dialog"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
+import { NativeSelect } from "@/components/ui/native-select"
 
 export function EditAccountConfigDialog({
   stack,
   open,
   onOpenChange,
 }: {
-  stack: Pick<Stack, "id" | "slug" | "system_prompt">
+  stack: Pick<Stack, "id" | "slug" | "system_prompt" | "default_enable_thinking">
   open: boolean
   onOpenChange: (open: boolean) => void
 }) {
   const [systemPrompt, setSystemPrompt] = React.useState(stack.system_prompt ?? "")
+  const [thinking, setThinking] = React.useState(
+    stack.default_enable_thinking == null ? "inherit" : stack.default_enable_thinking ? "on" : "off"
+  )
   const [pending, startTransition] = React.useTransition()
 
   function onSave() {
@@ -35,7 +39,8 @@ export function EditAccountConfigDialog({
         const formData = new FormData()
         formData.set("stack_id", stack.id)
         formData.set("system_prompt", systemPrompt)
-        await updateStackSystemPrompt(formData)
+        formData.set("thinking", thinking)
+        await updateStackGenerationConfig(formData)
         toast.success("Configuração atualizada")
         onOpenChange(false)
       } catch (e) {
@@ -48,14 +53,27 @@ export function EditAccountConfigDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>System prompt — {stack.slug}</DialogTitle>
+          <DialogTitle>Comportamento — {stack.slug}</DialogTitle>
           <DialogDescription>
-            O system prompt configurado aqui é injetado pelo gateway em toda
-            chamada de chat completions desta stack.
+            Configure as instruções e o raciocínio da stack. Instruções de sistema
+            enviadas pelo cliente têm prioridade sobre o prompt abaixo.
           </DialogDescription>
         </DialogHeader>
 
         <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="thinking-mode">Raciocínio</Label>
+            <NativeSelect id="thinking-mode" value={thinking} onChange={(e) => setThinking(e.target.value)}>
+              <option value="inherit">Herdar comportamento atual</option>
+              <option value="off">Desligado — respostas diretas</option>
+              <option value="on">Ligado — tarefas complexas</option>
+            </NativeSelect>
+            <p className="text-muted-foreground text-xs">
+              Disponível em modelos com alternância de raciocínio. Uma escolha
+              explícita na requisição ou na chave tem prioridade. Ligado pode
+              aumentar o tempo e os tokens de geração.
+            </p>
+          </div>
           <div className="flex flex-col gap-2">
             <Label htmlFor="system-prompt">System prompt</Label>
             <Textarea

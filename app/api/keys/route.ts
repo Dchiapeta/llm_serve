@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "crypto"
 import { NextRequest, NextResponse } from "next/server"
 
-import { createKey, ensureStackMachine } from "@/lib/actions"
+import { createKey, ensureStackMachine, flushGatewayKeyCache } from "@/lib/actions"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 
 function secretsMatch(a: string, b: string): boolean {
@@ -70,4 +70,26 @@ export async function POST(req: NextRequest) {
       { status: 400 }
     )
   }
+}
+
+// Mesma integração externa confiável do POST (checkSecret), porque quem
+// configura a chave é o painel do cliente. null volta a herdar a stack.
+export async function PATCH(req: NextRequest) {
+  const unauthorized = checkSecret(req)
+  if (unauthorized) return unauthorized
+  const body = await req.json().catch(() => null)
+  if (typeof body?.api_key_id !== "string" || !body.api_key_id ||
+      !(body.default_enable_thinking === null || typeof body.default_enable_thinking === "boolean")) {
+    return NextResponse.json({ error: "informe api_key_id e default_enable_thinking (boolean ou null)" }, { status: 400 })
+  }
+  const db = createSupabaseAdmin()
+  const { data, error } = await db.from("api_keys")
+    .update({ default_enable_thinking: body.default_enable_thinking })
+    .eq("id", body.api_key_id).select("id").maybeSingle()
+  if (error) return NextResponse.json({ error: error.message }, { status: 400 })
+  if (!data) return NextResponse.json({ error: "Chave não encontrada" }, { status: 404 })
+  await flushGatewayKeyCache().catch((error) =>
+    console.error("Configuração salva; cache será renovado pelo TTL:", error)
+  )
+  return NextResponse.json({ ok: true, default_enable_thinking: body.default_enable_thinking })
 }

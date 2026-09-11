@@ -80,7 +80,7 @@ export function StackRowActions({
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setConfigOpen(true)}>
             <Settings className="size-4" />
-            System prompt
+            Comportamento
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => setKnowledgeOpen(true)}>
             <BookOpen className="size-4" />
