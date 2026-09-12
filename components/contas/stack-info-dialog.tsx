@@ -144,7 +144,7 @@ export function StackInfoDialog({
                         }
                         size="sm"
                       >
-                        {key.status}
+                        {key.status === "deleted" ? "excluída" : key.status}
                       </Badge>
                     </li>
                   ))}
