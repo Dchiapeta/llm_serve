@@ -334,7 +334,11 @@ export default async function CrmDetailPage({
                     <Badge
                       variant={k.status === "active" ? "success-light" : "outline"}
                     >
-                      {k.status === "active" ? "Ativa" : "Revogada"}
+                      {k.status === "active"
+                        ? "Ativa"
+                        : k.status === "deleted"
+                          ? "Excluída"
+                          : "Revogada"}
                     </Badge>
                   </TableCell>
                   <TableCell className="text-sm">
