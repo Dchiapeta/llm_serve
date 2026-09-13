@@ -87,3 +87,21 @@ def test_reposicao_proativa_percorre_plano_e_categoria_de_producao():
     assert path == "/templates"
     assert params["is_enabled"] == "eq.true"
     assert params["is_test"] == "eq.false"
+
+
+def test_maquinas_subindo_por_produto_excluem_teste_e_desabilitado():
+    # base do 'waking' de wake_some_machine_for_plan: uma máquina 'creating'
+    # (recém-criada ou religada pelo auto-wake) segura a cascata pra não
+    # religar/provisionar outra por cima do boot — mas só se for de produção
+    client = client_with_rest([{"id": "m-boot"}])
+
+    result = asyncio.run(client.list_creating_machines_for_plan("Pro", "llm"))
+
+    assert result == [{"id": "m-boot"}]
+    path, params = client._rest.calls[0]
+    assert path == "/machines"
+    assert params["status"] == "eq.creating"
+    assert params["runpod_pod_id"] == "not.is.null"
+    assert params["templates.plan"] == "eq.Pro"
+    assert params["templates.category"] == "eq.llm"
+    assert_production_filters(params)

@@ -94,7 +94,8 @@ export function TemplateRowActions({
             <AlertDialogTitle>Apagar template?</AlertDialogTitle>
             <AlertDialogDescription>
               O template “{template.name}” será removido do painel e do RunPod.
-              Máquinas já criadas não são afetadas.
+              Só é possível apagar um produto sem máquinas ativas: máquinas
+              sem template somem do roteamento e não podem ser recriadas.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -105,7 +106,11 @@ export function TemplateRowActions({
                 e.preventDefault()
                 startTransition(async () => {
                   try {
-                    await deleteTemplate(template.id)
+                    const result = await deleteTemplate(template.id)
+                    if (result && "error" in result) {
+                      toast.error(result.error)
+                      return
+                    }
                     toast.success("Produto apagado")
                     setDeleteOpen(false)
                   } catch (err) {

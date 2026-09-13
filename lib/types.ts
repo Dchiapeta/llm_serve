@@ -175,6 +175,9 @@ export type Machine = {
   cost_per_hr: number | null
   public_url: string | null
   max_users: number | null
+  // relógio de ociosidade (migration 0015): tocado pelo gateway a cada request
+  // servida; base da auto-pausa e da guarda de "em uso" do stopMachine
+  last_activity_at: string | null
   created_at: string
 }
 

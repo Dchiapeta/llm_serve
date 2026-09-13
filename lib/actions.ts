@@ -8,7 +8,7 @@ import { randomBytes } from "crypto"
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { allowedDomainsLabel, isAllowedAdminEmail } from "./auth-admin"
 import { requireAdminSession } from "./auth-admin-server"
-import { computeCapacity, stackWeight, vramSlots } from "./capacity"
+import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
 import { vllmFlagsFromTemplate } from "./machines"
 import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
@@ -436,8 +436,26 @@ export async function updateTemplate(formData: FormData) {
   revalidatePath("/templates")
 }
 
-export async function deleteTemplate(id: string) {
+// Erro devolvido em vez de lançado (mesmo motivo de deleteAccount): em
+// produção o Next redige a mensagem de exceções de Server Action.
+export async function deleteTemplate(id: string): Promise<{ error: string } | void> {
   const db = createSupabaseAdmin()
+  // A FK machines.template_id é ON DELETE SET NULL (migration 0001): apagar o
+  // template NÃO deixa as máquinas "como estão" — sem template elas somem dos
+  // pools do gateway (list_*_machines_for_plan faz join !inner em templates),
+  // não podem mais ser recriadas (recreateMachine exige o template) e a
+  // capacidade cai nos defaults inventados de 16 GB/2 GB. Só apaga sem
+  // máquina viva; o admin encerra ou migra antes.
+  const { count: liveMachines } = await db
+    .from("machines")
+    .select("id", { count: "exact", head: true })
+    .eq("template_id", id)
+    .neq("status", "terminated")
+  if (liveMachines) {
+    return {
+      error: `O produto ainda tem ${liveMachines} máquina(s) não encerrada(s) — encerre ou migre as stacks antes de apagá-lo.`,
+    }
+  }
   const { data: tpl } = await db.from("templates").select("*").eq("id", id).single()
   if (tpl?.runpod_template_id) {
     try {
@@ -497,6 +515,29 @@ function podInputFromTemplate(input: {
         ? { DISABLE_PREFIX_CACHING: "true" }
         : {}),
     },
+  }
+}
+
+// A RunPod devolve o pod recém-criado parado (EXITED); sem um start
+// explícito ele nunca sai do "pausado" — o painel o mantém em "creating" e o
+// reconciler do gateway (com a mesma guarda) não o rebaixa, então ninguém o
+// religaria. Diferente de um pod pausado antigo (cujo host pode ter cedido a
+// GPU), o host do pod recém-criado ainda tem a GPU reservada, então o start
+// sobe. Best-effort: o pod já existe, então uma falha aqui não aborta a
+// criação/recriação — a máquina fica em "creating" e a sonda de /health cobre.
+// Um lugar só, usado por provisionMachine e recreateMachine (antes só a
+// recriação fazia isso, e a criação dependia do rebaixamento acidental a
+// "stopped" + auto-wake do gateway pra subir).
+async function startFreshPodIfNeeded(
+  pod: Awaited<ReturnType<typeof runpod.createPod>>,
+  machineId: string
+) {
+  if (pod.desiredStatus === "RUNNING") return
+  try {
+    await runpod.startPod(pod.id)
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    await logEvent(machineId, "error", `Start do pod recém-criado ${pod.id} falhou: ${msg}`)
   }
 }
 
@@ -600,6 +641,8 @@ async function provisionMachine(input: {
       error: `Falha ao salvar a máquina no banco: ${error.message}${orphanNote}`,
     }
   }
+
+  await startFreshPodIfNeeded(pod, machine.id)
 
   await logEvent(machine.id, "created", `Máquina "${name}" criada (${gpu?.displayName ?? gpuTypeId})`)
   revalidatePath("/machines")
@@ -730,10 +773,16 @@ export async function refreshMachineStatus(machineId: string) {
     // subir — não a rebaixamos para "stopped" (senão apareceria pausada durante
     // o boot). Só RUNNING a promove e TERMINATED a encerra.
     const status = m.status === "creating" && mapped === "stopped" ? "creating" : mapped
+    // compare-and-set no status (mesma guarda do reconcileMachineStatuses):
+    // o status foi decidido a partir de m.status + snapshot do RunPod; se
+    // uma recriação ou o reconcile do gateway mudou a linha nesse meio-tempo,
+    // não sobrescreve — senão um clique em "Atualizar" gravava 'running' por
+    // cima de 'creating' com o cost_per_hr do pod antigo
     await db
       .from("machines")
       .update({ status, cost_per_hr: pod.costPerHr ?? m.cost_per_hr })
       .eq("id", machineId)
+      .eq("status", m.status)
     // Pod acabou de ficar pronto: empurra chaves emitidas durante o boot
     // (createStack pode criar a chave com a máquina ainda em "creating").
     // status "running" aqui é o desiredStatus do RunPod (container subiu),
@@ -749,12 +798,23 @@ export async function refreshMachineStatus(machineId: string) {
   } catch (e) {
     const msg = String(e)
     if (msg.includes("404")) {
-      await db.from("machines").update({ status: "terminated" }).eq("id", machineId)
+      await db
+        .from("machines")
+        .update({ status: "terminated" })
+        .eq("id", machineId)
+        .eq("status", m.status)
     }
   }
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
 }
+
+// Janela em que uma stack de modelo base conta como "em uso" pra guarda do
+// stop manual: o gateway toca stacks.last_activity_at (migration 0033) e
+// machines.last_activity_at (0015) a cada request servida, então atividade
+// nos últimos minutos = requisições em andamento ou logo em seguida. Mesma
+// granularidade do "pessoas agora" (PEOPLE_NOW_WINDOW_MS).
+const STOP_ACTIVE_WINDOW_MS = 5 * 60_000
 
 export async function stopMachine(
   machineId: string,
@@ -765,23 +825,45 @@ export async function stopMachine(
   if (!m?.runpod_pod_id) throw new Error("Máquina sem pod associado")
   // Ao contrário da auto-pausa (que só para máquina ociosa, com flip+grace+
   // recheck no gateway), o stop manual cortaria streams em voo. Bloqueia se há
-  // rota ativa (conta com adapter carregado/migrando) na máquina, a menos que
-  // o admin confirme com force. O in-flight real (stream em voo) só vive na
-  // memória do gateway; aqui checamos as rotas persistidas em routing_state.
+  // uso ativo na máquina, a menos que o admin confirme com force. O in-flight
+  // real (stream em voo) só vive na memória do gateway; aqui checamos o que
+  // está persistido: rotas LoRA em routing_state E stacks de modelo base
+  // (Go/Pro) com atividade recente — estas não têm rota nenhuma, só
+  // stacks.machine_id, e a guarda antiga (só rotas) deixava pausar um pod Pro
+  // com 15 usuários ativos sem o diálogo de confirmação.
   if (!opts?.force) {
     const routes = await listRoutesByMachine(machineId)
-    const active = routes.filter((r) =>
+    const activeRoutes = routes.filter((r) =>
       ["loading", "loaded", "migrating"].includes(r.lora_status)
     )
-    if (active.length > 0) {
+    const sinceMs = Date.now() - STOP_ACTIVE_WINDOW_MS
+    const { count: activeStacks } = await db
+      .from("stacks")
+      .select("id", { count: "exact", head: true })
+      .eq("machine_id", machineId)
+      .gte("last_activity_at", new Date(sinceMs).toISOString())
+    // por Date, não por string: o PostgREST devolve "+00:00" e o toISOString
+    // devolve "Z", e a comparação lexical entre os dois formatos mente
+    const machineActive =
+      !!m.last_activity_at && new Date(m.last_activity_at).getTime() >= sinceMs
+    const active = activeRoutes.length + (activeStacks ?? 0)
+    if (active > 0 || machineActive) {
+      const what =
+        active > 0
+          ? `${active} conta(s) ativa(s)`
+          : "requisições servidas nos últimos minutos"
       return {
-        error: `A máquina "${m.name}" tem ${active.length} conta(s) ativa(s) — pausar agora corta as requisições em andamento.`,
+        error: `A máquina "${m.name}" tem ${what} — pausar agora corta as requisições em andamento.`,
         code: "in_use",
       }
     }
   }
   await runpod.stopPod(m.runpod_pod_id)
-  await db.from("machines").update({ status: "stopped" }).eq("id", machineId)
+  const { error: stopErr } = await db
+    .from("machines")
+    .update({ status: "stopped" })
+    .eq("id", machineId)
+  if (stopErr) return { error: `Pod pausado, mas falhou ao gravar o status: ${stopErr.message}` }
   await logEvent(machineId, "stopped", `Máquina "${m.name}" pausada`)
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
@@ -807,16 +889,20 @@ export async function startMachine(
     }
     return { error: `Falha ao iniciar a máquina: ${msg}` }
   }
-  // last_activity_at junto: o relógio de ociosidade do gateway conta a partir
-  // do religamento — sem isso a auto-pausa derruba a máquina no ciclo seguinte
-  await db
+  // "creating", não "running": o pod religa com o vLLM ainda carregando o
+  // modelo; em "creating" a máquina fica invisível ao reaper de ociosidade e
+  // aos picks do gateway, e o reconcile do gateway a promove a "running" quando
+  // o /health reporta vllm_ready (mesmo caminho de uma máquina recém-criada;
+  // ver auto-wake em docker/gateway/main.py). last_activity_at junto: é o
+  // relógio de ociosidade e a base da tolerância a EXITED do reconcile.
+  const { error: startErr } = await db
     .from("machines")
-    .update({ status: "running", last_activity_at: new Date().toISOString() })
+    .update({ status: "creating", last_activity_at: new Date().toISOString() })
     .eq("id", machineId)
+  if (startErr) return { error: `Pod iniciado, mas falhou ao gravar o status: ${startErr.message}` }
   await logEvent(machineId, "started", `Máquina "${m.name}" iniciada`)
-  // O pod religa com o agent zerado (chaves só em memória) e o status já foi
-  // pra "running" aqui em cima — o sync pós-boot do refreshMachineStatus
-  // nunca veria a transição. O gateway espera o vLLM subir e reenvia.
+  // O pod religa com o agent zerado (chaves só em memória). O gateway espera o
+  // vLLM subir e reenvia.
   after(() =>
     scheduleGatewayKeySync(machineId).catch((e) =>
       console.error("Agendamento do sync pós-religada falhou (o upsert lazy do gateway cobre):", e)
@@ -857,6 +943,27 @@ export async function recreateMachine(
   const gpus = await listGpuTypes()
   const gpu = gpus.find((g) => g.displayName === gpuName)
   if (!gpu) return { error: `GPU "${gpuName}" não encontrada no RunPod` }
+
+  // O pod novo sobe com o template ATUAL (gpu_count, footprint, modelo podem
+  // ter mudado desde o provisionamento) — re-deriva os campos denormalizados
+  // que dependem dele, e valida o teto de usuários contra a VRAM nova ANTES
+  // de terminar o pod antigo. Sem isto, gpu_count 1→2 subia um pod de 2 GPUs
+  // com vram_gb/gpu_type da configuração antiga e a capacidade era calculada
+  // pela metade.
+  const gpuCount = tpl.gpu_count ?? 1
+  const totalVramGb = gpu.memoryInGb != null ? gpu.memoryInGb * gpuCount : null
+  if (m.max_users !== null && totalVramGb != null) {
+    const cap = vramSlots({
+      vramGb: totalVramGb,
+      modelFootprintGb: tpl.model_footprint_gb,
+      kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
+    })
+    if (m.max_users > cap) {
+      return {
+        error: `Com o template atual, ${gpu.displayName}${gpuCount > 1 ? ` ×${gpuCount}` : ""} comporta no máximo ${cap} usuário(s) — a máquina tem teto ${m.max_users}. Ajuste o template ou o teto antes de recriar.`,
+      }
+    }
+  }
 
   if (m.runpod_pod_id) {
     try {
@@ -902,26 +1009,9 @@ export async function recreateMachine(
     }
   }
 
-  // A RunPod devolve o pod recém-criado parado (EXITED); sem um start
-  // explícito ele nunca sai do "pausado" e o reconciler o marcaria como
-  // stopped. Diferente de um pod pausado antigo (cujo host pode ter cedido a
-  // GPU), o host do pod recém-criado ainda tem a GPU reservada, então o start
-  // sobe. Best-effort: o pod já existe, então uma falha aqui não aborta a
-  // recriação — a máquina fica em "creating" e a sonda de /health cobre.
-  if (pod.desiredStatus !== "RUNNING") {
-    try {
-      await runpod.startPod(pod.id)
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      await logEvent(
-        machineId,
-        "error",
-        `Start pós-recriação do pod ${pod.id} falhou: ${msg}`
-      )
-    }
-  }
+  await startFreshPodIfNeeded(pod, machineId)
 
-  await db
+  const { error: recreateErr } = await db
     .from("machines")
     .update({
       runpod_pod_id: pod.id,
@@ -932,6 +1022,10 @@ export async function recreateMachine(
       // provisionamento — re-deriva as flags do vLLM ou o gateway continua
       // operando com os valores do pod antigo (ver vllmFlagsFromTemplate)
       ...vllmFlagsFromTemplate(tpl),
+      // idem para o que a capacidade e o roteamento leem da máquina
+      model_name: tpl.model_name,
+      vram_gb: totalVramGb,
+      gpu_type: gpuCount > 1 ? `${gpu.displayName} ×${gpuCount}` : gpu.displayName,
       // reseta o relógio de ociosidade a partir da recriação (mesmo motivo do
       // startMachine): sem isso o last_activity_at fica velho e o reaper do
       // gateway auto-pausa a máquina minutos depois de ela subir, antes de
@@ -939,6 +1033,11 @@ export async function recreateMachine(
       last_activity_at: new Date().toISOString(),
     })
     .eq("id", machineId)
+  if (recreateErr) {
+    return {
+      error: `Pod ${pod.id} criado, mas falhou ao gravar a máquina no banco: ${recreateErr.message}`,
+    }
+  }
   await logEvent(
     machineId,
     "recreated",
@@ -976,8 +1075,31 @@ export async function terminateMachine(machineId: string) {
     .from("machines")
     .update({ status: "terminated", runpod_pod_id: null, public_url: null })
     .eq("id", machineId)
-  await logEvent(machineId, "terminated", `Máquina "${m?.name}" apagada`)
+  // Libera a "casa" das stacks hospedadas (mesmo efeito do release_base_stack
+  // do gateway): a máquina não existe mais, então stacks.machine_id apontando
+  // pra ela é ocupação fantasma — machine_stack_load conta pela FK sem olhar o
+  // status — e uma stack dormente ficaria "hospedada" numa máquina morta até
+  // alguém usá-la. Sem máquina, o gateway re-homeia no primeiro request
+  // (place_base_stack) e religa as chaves (rebind_stack_keys); chave sem
+  // machine_id é estado normal (ver createKey).
+  const { data: released } = await db
+    .from("stacks")
+    .update({ machine_id: null })
+    .eq("machine_id", machineId)
+    .select("id")
+  await db.from("api_keys").update({ machine_id: null }).eq("machine_id", machineId)
+  const releasedCount = released?.length ?? 0
+  await logEvent(
+    machineId,
+    "terminated",
+    `Máquina "${m?.name}" apagada` +
+      (releasedCount > 0 ? ` — ${releasedCount} stack(s) liberada(s) para re-alocação` : "")
+  )
+  await flushGatewayKeyCache().catch((e) =>
+    console.error("Flush do cache do gateway após apagar máquina falhou:", e)
+  )
   revalidatePath("/machines")
+  revalidatePath("/stacks")
   redirect("/machines")
 }
 
@@ -1000,11 +1122,11 @@ async function nextStackMachineName(
   return data as string
 }
 
-// Slots de uma máquina com ocupação PONDERADA pela classe de uso das stacks
-// hospedadas (machine_stack_load, migration 0032): um usuário "high"
-// (contexto longo, ex.: Claude Code) pesa 3.0 slots, "medium" 1.5, "low" 1.0
-// — máquina só de lows tem a mesma capacidade da contagem antiga. Retorna
-// null se a máquina não existir; slotsMax 0 = capacidade desconhecida.
+// Slots de uma máquina em CABEÇAS: ocupação = contagem de stacks hospedadas
+// (machine_stack_load, migration 0037 — que reverteu a ponderação por classe
+// da 0032). Retorna null se a máquina não existir; slotsMax 0 = capacidade
+// desconhecida. A restrição de MISTURA (quantas 'high' coexistem) é
+// independente e vive em machineAdmitsUsageClass.
 async function machineStackCapacity(
   db: ReturnType<typeof createSupabaseAdmin>,
   machineId: string
@@ -1034,6 +1156,26 @@ async function machineStackCapacity(
     occupied: Number(load ?? 0),
     maxUsers: m.max_users,
   })
+}
+
+// Teto de stacks 'high' por máquina (machine_high_cap / machine_high_count,
+// migration 0037) — espelho do machine_admits do gateway, que já recusava o
+// que o painel deixava passar. Sub-teto, não reserva: só stacks 'high' são
+// limitadas; NULL no template = sem teto (fail-open, igual ao gateway).
+// Retorna o motivo do bloqueio ou null.
+async function machineHighCapBlockedReason(
+  db: ReturnType<typeof createSupabaseAdmin>,
+  machineId: string,
+  usageClass: Stack["usage_class"]
+): Promise<string | null> {
+  if (usageClass !== "high") return null
+  const { data: cap } = await db.rpc("machine_high_cap", { p_machine_id: machineId })
+  if (cap == null) return null
+  const { data: count } = await db.rpc("machine_high_count", { p_machine_id: machineId })
+  if (Number(count ?? 0) >= Number(cap)) {
+    return `A máquina já está no teto de ${cap} stack(s) de uso alto`
+  }
+  return null
 }
 
 // GPUs do template que comportam o max_users configurado — validação feita
@@ -1110,6 +1252,10 @@ async function getDefaultTemplateForPlan(
 // excludeMachineId: usado pelo migrateStack (alvo null = "realoque essa
 // stack") pra nunca devolver a própria máquina de origem — sem isso, uma
 // origem ainda com vaga faria a "migração" virar um no-op silencioso.
+//
+// usageClass: classe da stack que vai ocupar a vaga — 'low' para stack nova;
+// migrateStack passa a classe real da stack migrada. Uma stack ocupa SEMPRE 1
+// cabeça (0037); a classe só importa pro teto de 'high' da máquina.
 async function allocateMachineForTemplate(
   db: ReturnType<typeof createSupabaseAdmin>,
   tpl: Pick<
@@ -1117,9 +1263,7 @@ async function allocateMachineForTemplate(
     "id" | "is_enabled" | "is_test" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
   >,
   excludeMachineId?: string,
-  // peso da stack que vai ocupar a vaga (0032): 1 = low (default de stack
-  // nova); migrateStack passa o peso real da classe da stack migrada
-  requiredWeight = 1
+  usageClass: Stack["usage_class"] = "low"
 ): Promise<{ machineId: string; created: boolean }> {
   const blocked = userAllocationBlockedReason(tpl)
   if (blocked) throw new Error(blocked)
@@ -1134,11 +1278,9 @@ async function allocateMachineForTemplate(
   const { data: running } = await runningQuery
   for (const m of (running ?? []) as Pick<Machine, "id">[]) {
     const cap = await machineStackCapacity(db, m.id)
-    // folga ponderada (0032, pode ser fracionária) precisa comportar o PESO
-    // do entrante — 0.5 de folga não comporta nem um low (peso 1.0)
-    if (!cap || cap.slotsMax === 0 || cap.slotsFree >= requiredWeight) {
-      return { machineId: m.id, created: false }
-    }
+    if (cap && cap.slotsMax > 0 && cap.slotsFree < 1) continue
+    if (await machineHighCapBlockedReason(db, m.id, usageClass)) continue
+    return { machineId: m.id, created: false }
   }
 
   let stoppedQuery = db
@@ -1155,12 +1297,35 @@ async function allocateMachineForTemplate(
     // apontando pra ela) — checa vaga ANTES de religar, senão desperdiça um
     // startPod numa máquina que já está cheia.
     const cap = await machineStackCapacity(db, m.id)
-    if (cap && cap.slotsMax > 0 && cap.slotsFree < requiredWeight) continue
+    if (cap && cap.slotsMax > 0 && cap.slotsFree < 1) continue
+    if (await machineHighCapBlockedReason(db, m.id, usageClass)) continue
     // startMachine devolve void em sucesso (falsy) e {error} em falha —
     // ver definição acima; !result só é true no caso de sucesso.
     const result = await startMachine(m.id)
     if (!result) return { machineId: m.id, created: false }
     // startMachine falhou (ex.: host sem GPU livre) — tenta a próxima pausada
+  }
+
+  // Máquina do template ainda SUBINDO (creating) com vaga: reaproveita em vez
+  // de criar outra. Duas stacks criadas durante o boot de uma máquina nova
+  // geravam duas máquinas — a stack fica apontando pra ela e é servida assim
+  // que o vLLM ficar pronto (mesmo estado de uma stack criada junto com a
+  // máquina). Espelha o dedup do provisionMachineForPlan, que a cascata do
+  // painel não tinha.
+  let creatingQuery = db
+    .from("machines")
+    .select("id")
+    .eq("template_id", tpl.id)
+    .eq("status", "creating")
+    .not("runpod_pod_id", "is", null)
+    .order("created_at", { ascending: true })
+  if (excludeMachineId) creatingQuery = creatingQuery.neq("id", excludeMachineId)
+  const { data: creating } = await creatingQuery
+  for (const m of (creating ?? []) as Pick<Machine, "id">[]) {
+    const cap = await machineStackCapacity(db, m.id)
+    if (cap && cap.slotsMax > 0 && cap.slotsFree < 1) continue
+    if (await machineHighCapBlockedReason(db, m.id, usageClass)) continue
+    return { machineId: m.id, created: false }
   }
 
   const viableGpuIds = await viableGpuIdsForTemplate(tpl)
@@ -1546,12 +1711,11 @@ export async function migrateStack(input: {
       Pick<Stack, "id" | "account_id" | "machine_id" | "plan" | "category" | "slug" | "usage_class">
     >()
   if (!stack) throw new Error("Stack não encontrada")
-  // peso real da stack que chega ao destino (0032): um high custa 3 slots —
-  // validar com peso 1 deixaria migrar usuário pesado pra máquina quase
-  // cheia. Limitação conhecida: pesos DEFAULT, sem o override de
-  // templates.usage_class_config (só divergiria com "weights" custom no
-  // template, que nenhum usa hoje)
-  const requiredWeight = stackWeight(stack.usage_class)
+  // Uma stack ocupa 1 cabeça no destino, seja qual for a classe (0037). O que
+  // a classe restringe é o teto de 'high' da máquina (machineHighCapBlockedReason)
+  // — o código antigo comparava o PESO da 0032 (high = 3) com vagas em
+  // cabeças e recusava/aceitava migrações pela régua errada.
+  const usageClass = stack.usage_class ?? "low"
 
   const fromMachineId = stack.machine_id
   if (input.targetMachineId && input.targetMachineId === fromMachineId) {
@@ -1607,18 +1771,20 @@ export async function migrateStack(input: {
     if (target.template_id !== templateId) {
       throw new Error("A máquina de destino não usa o mesmo produto da stack")
     }
-    // Lotação por stacks PONDERADA pela classe de uso — a checagem de
-    // createKey não cobre stacks da mesma conta, que reutilizam a chave.
+    // Lotação por stacks (cabeças) — a checagem de createKey não cobre
+    // stacks da mesma conta, que reutilizam a chave. E o teto de 'high'.
     const cap = await machineStackCapacity(db, targetMachineId)
-    if (cap && cap.slotsMax > 0 && cap.slotsFree < requiredWeight) {
+    if (cap && cap.slotsMax > 0 && cap.slotsFree < 1) {
       throw new Error(
-        `A máquina de destino não comporta esta stack (${cap.slotsUsed}/${cap.slotsMax} slots ocupados; a stack pesa ${requiredWeight})`
+        `A máquina de destino está lotada (${cap.slotsUsed}/${cap.slotsMax} slots ocupados)`
       )
     }
+    const highBlocked = await machineHighCapBlockedReason(db, targetMachineId, usageClass)
+    if (highBlocked) throw new Error(highBlocked)
   } else {
     try {
       const alloc = await allocateMachineForTemplate(
-        db, targetTemplate, fromMachineId ?? undefined, requiredWeight
+        db, targetTemplate, fromMachineId ?? undefined, usageClass
       )
       targetMachineId = alloc.machineId
       machineCreated = alloc.created
@@ -1696,6 +1862,12 @@ export async function migrateStack(input: {
     .update({ machine_id: targetMachineId })
     .eq("id", stack.id)
   if (error) throw new Error(error.message)
+  // O gateway guarda a stack (com machine_id) e a chave (com machine_id) no
+  // key_cache por KEY_CACHE_TTL_S — sem o flush, roteava pra origem por até
+  // 60 s depois da migração. Best-effort, como nos outros chamadores.
+  await flushGatewayKeyCache().catch((e) =>
+    console.error("Flush do cache do gateway após migração falhou (TTL cobre):", e)
+  )
 
   await logEvent(
     targetMachineId,
