@@ -34,8 +34,10 @@ class LifecycleManager:
         drain_timeout_s: float,
         lora_load_timeout_s: float,
         machine_free_slots=None,
+        pool_free_slots=None,
         runpod=None,
         machine_idle_stop_minutes: float = 0.0,
+        creating_grace_s: float = 900.0,
         consolidation_max_origin_routes: int = 2,
         stop_recheck_grace_s: float = 5.0,
         try_provision_for_pool=None,
@@ -55,8 +57,15 @@ class LifecycleManager:
         self.lora_load_timeout_s = lora_load_timeout_s
         # capacidade injetada por main.py (mesma conta do pick_machine_with_free_slot)
         self.machine_free_slots = machine_free_slots
+        # vaga na conta do POOL do plano (stacks base para Go/Pro, LoRA para o
+        # resto) — usada só pela reposição proativa. None → cai em
+        # machine_free_slots (conta LoRA), que é o que a consolidação usa.
+        self.pool_free_slots = pool_free_slots
         self.runpod = runpod
         self.machine_idle_stop_minutes = machine_idle_stop_minutes
+        # janela em que uma máquina 'creating' cujo pod reporta EXITED NÃO é
+        # rebaixada a 'stopped' pelo reconcile (ver reconcile_statuses_once)
+        self.creating_grace_s = creating_grace_s
         self.consolidation_max_origin_routes = consolidation_max_origin_routes
         self.stop_recheck_grace_s = stop_recheck_grace_s
         # reposição proativa (ensure_capacity_once) — callbacks injetados por
@@ -442,6 +451,21 @@ class LifecycleManager:
                 new_status = "terminated"
             else:
                 new_status = self.POD_STATUS_MAP.get(pod.get("desiredStatus"), m["status"])
+                # A RunPod devolve o pod recém-criado EXITED por instantes (às
+                # vezes minutos) até o contêiner subir; o painel dá o startPod
+                # e mantém 'creating' (lib/machines.ts, mesma guarda). Rebaixar
+                # a 'stopped' aqui fazia a máquina virar candidata a auto-wake
+                # e recriação em cima de um pod que já está subindo, e fechava
+                # o intervalo 'creating' de custo como se o boot fosse de graça.
+                # A guarda tem prazo: passado creating_grace_s sem sair de
+                # EXITED, o pod não subiu mesmo, e o rebaixamento (que o wake
+                # sob demanda sabe religar) volta a valer.
+                if (
+                    new_status == "stopped"
+                    and m["status"] == "creating"
+                    and self._within_creating_grace(m)
+                ):
+                    continue
             if new_status == m["status"]:
                 continue
             if new_status == "running":
@@ -497,6 +521,16 @@ class LifecycleManager:
             changed.append((m["id"], new_status))
             logger.info("reconcile: máquina %s %s → %s", m["id"], m["status"], new_status)
         return changed
+
+    def _within_creating_grace(self, m: dict) -> bool:
+        raw = m.get("last_activity_at") or m.get("created_at")
+        if not raw or self.creating_grace_s <= 0:
+            return False
+        try:
+            since = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return datetime.now(timezone.utc) - since < timedelta(seconds=self.creating_grace_s)
 
     # ---------- Auto-pausa de máquinas ociosas ----------
 
@@ -563,7 +597,11 @@ class LifecycleManager:
         fica bem acima do watermark, então não dispara outra criação — sem
         precisar de um teto numérico separado de "quantas máquinas".
         """
-        if self.try_provision_for_pool is None or self.machine_free_slots is None:
+        # conta do POOL (stacks base em Go/Pro) — ver main.machine_pool_free_slots;
+        # a conta LoRA de machine_free_slots devolvia "8 livres" pra máquina
+        # com 18/18 stacks e a reserva nunca era criada
+        free_slots_fn = self.pool_free_slots or self.machine_free_slots
+        if self.try_provision_for_pool is None or free_slots_fn is None:
             return []
         if self.auto_provision_enabled is not None and not await self.auto_provision_enabled():
             return []
@@ -576,7 +614,7 @@ class LifecycleManager:
                 stopped = await self.supa.list_stopped_machines_for_plan(plan, category)
                 free_slots_total = 0
                 for m in running + stopped:
-                    free_slots_total += await self.machine_free_slots(m)
+                    free_slots_total += await free_slots_fn(m)
                 if free_slots_total >= self.pool_watermark_slots:
                     continue
                 reason = (

@@ -29,12 +29,11 @@ export async function POST(req: NextRequest) {
 
   const body = await req.json().catch(() => null)
   const plan = body?.plan
-  // Image é aceito apenas nesta API interna durante o rollout 0060→0061: o
-  // gateway novo já separa por category, mas o contract do banco ainda pode
-  // não ter convertido o plano legado para Go.
+  // "Image" deixou de ser plano na 0060/0061 (virou Go + category=image);
+  // aceitá-lo aqui só produzia um 404 "Nenhum produto Image" disfarçado de
+  // falta de capacidade, porque nenhum template tem esse plano.
   const validPlan =
-    typeof plan === "string" &&
-    (TEMPLATE_PLANS.includes(plan as TemplatePlan) || plan === "Image")
+    typeof plan === "string" && TEMPLATE_PLANS.includes(plan as TemplatePlan)
   if (!validPlan) {
     return NextResponse.json({ error: "plan inválido" }, { status: 400 })
   }
