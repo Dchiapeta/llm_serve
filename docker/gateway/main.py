@@ -1422,6 +1422,54 @@ async def check_vllm_health(machine: dict) -> dict | None:
         return None
 
 
+def build_usage_metric_rows(
+    *,
+    machine_id: str,
+    window_start: str,
+    per_key: dict[str, dict],
+    stack_by_key: dict[str, str | None] | None,
+    concurrent_peak: int,
+) -> list[dict]:
+    """Monta as linhas de usage_metrics de uma coleta. Pura — separada de
+    collect_usage_metrics_once pra ser testável sem agent nem Supabase.
+
+    `stack_by_key` é o resultado de supa.stack_ids_for_keys: só contém as
+    chaves que EXISTEM em api_keys (órfã entra com stack_id None; chave
+    apagada não entra). Uma chave que o agent ainda contabiliza mas que já
+    saiu do banco (o painel do cliente apagou, e o key_cache/agent seguem
+    aceitando-a até o TTL/próximo sync) NÃO pode ir com o id dela: a FK
+    usage_metrics.api_key_id recusa o insert, e o POST é um lote só por
+    máquina — uma linha inválida derrubava a janela INTEIRA de todas as
+    outras chaves da máquina, cujos contadores o agent já tinha zerado na
+    leitura. Vai com api_key_id nulo: o uso continua contando, sem dono.
+
+    `stack_by_key` None significa que a resolução FALHOU (Supabase fora), não
+    que nenhuma chave existe — aí não dá pra saber quem sumiu, e todas seguem
+    com o id que o agent mandou, como antes."""
+    rows = []
+    for api_key_id, v in per_key.items():
+        known = stack_by_key is None or api_key_id in stack_by_key
+        if not known:
+            logger.warning(
+                "coleta de métricas: chave %s não existe mais em api_keys; "
+                "gravando uso da janela sem api_key_id (máquina %s)",
+                api_key_id, machine_id,
+            )
+        rows.append(
+            {
+                "api_key_id": api_key_id if known else None,
+                "machine_id": machine_id,
+                "stack_id": (stack_by_key or {}).get(api_key_id),
+                "window_start": window_start,
+                "requests": v.get("requests", 0),
+                "tokens_in": v.get("tokens_in", 0),
+                "tokens_out": v.get("tokens_out", 0),
+                "concurrent_peak": concurrent_peak,
+            }
+        )
+    return rows
+
+
 async def collect_usage_metrics_once() -> None:
     """Único escritor de usage_metrics: puxa os contadores acumulados do
     agent de cada máquina running (zerando-os na leitura) e grava o delta
@@ -1460,20 +1508,14 @@ async def collect_usage_metrics_once() -> None:
                 "coleta de métricas: falha ao resolver stack_id das chaves da máquina %s (%s)",
                 machine["id"], e,
             )
-            stack_by_key = {}
-        rows = [
-            {
-                "api_key_id": api_key_id,
-                "machine_id": machine["id"],
-                "stack_id": stack_by_key.get(api_key_id),
-                "window_start": window_start,
-                "requests": v.get("requests", 0),
-                "tokens_in": v.get("tokens_in", 0),
-                "tokens_out": v.get("tokens_out", 0),
-                "concurrent_peak": snap.get("concurrent_peak", 0),
-            }
-            for api_key_id, v in active.items()
-        ]
+            stack_by_key = None
+        rows = build_usage_metric_rows(
+            machine_id=machine["id"],
+            window_start=window_start,
+            per_key=active,
+            stack_by_key=stack_by_key,
+            concurrent_peak=snap.get("concurrent_peak", 0),
+        )
         try:
             await supa.insert_usage_metrics(rows)
         except Exception as e:

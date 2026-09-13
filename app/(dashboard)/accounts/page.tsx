@@ -150,7 +150,9 @@ export default async function AccountsPage() {
                     {k.status === "active" ? (
                       <Badge variant="secondary">ativa</Badge>
                     ) : (
-                      <Badge variant="outline">revogada</Badge>
+                      <Badge variant="outline">
+                        {k.status === "deleted" ? "excluída" : "revogada"}
+                      </Badge>
                     )}
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
