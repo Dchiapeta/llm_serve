@@ -9,6 +9,7 @@ import {
   type Granularity,
   type RuntimeInterval,
 } from "@/lib/billing"
+import { fetchAll, type PagedQuery } from "@/lib/paged-query"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type { Machine } from "@/lib/types"
 import {
@@ -78,32 +79,43 @@ export async function FinanceiroBody({
   // Máquinas terminadas entram: elas gastaram dinheiro dentro da janela e a
   // linha da tabela precisa do nome. Quem decide o que conta é o status do
   // intervalo, não o status atual da máquina.
-  const machinesQuery = db.from("machines").select("*")
-
-  const intervalsQuery = db
-    .from("machine_runtime_intervals")
-    .select("*")
-    .order("started_at", { ascending: true })
-
-  const [{ data: machinesData }, { data: intervalsData }] = await Promise.all([
-    machinesQuery,
-    windowFrom
-      ? intervalsQuery
-          .lte("started_at", new Date(to).toISOString())
-          .or(`ended_at.is.null,ended_at.gte.${new Date(windowFrom).toISOString()}`)
-      : intervalsQuery,
+  // Paginadas (lib/paged-query.ts): o teto de 1000 linhas do PostgREST vale
+  // para qualquer select, e o trigger de intervalos grava uma linha a cada
+  // mudança de status OU de cost_per_hr — passando de 1000 na janela, só as
+  // linhas mais antigas chegavam e o gasto recente sumia do relatório (o CRM
+  // já pagina a mesma tabela pelo mesmo motivo).
+  const [machinesResult, intervalsResult] = await Promise.all([
+    fetchAll<Machine>(
+      () => db.from("machines").select("*").order("id") as unknown as PagedQuery
+    ),
+    fetchAll<RuntimeInterval>(() => {
+      const q = db.from("machine_runtime_intervals").select("*").order("id")
+      return (
+        windowFrom
+          ? q
+              .lte("started_at", new Date(to).toISOString())
+              .or(`ended_at.is.null,ended_at.gte.${new Date(windowFrom).toISOString()}`)
+          : q
+      ) as unknown as PagedQuery
+    }),
   ])
 
-  const machines = (machinesData ?? []) as Machine[]
-  const intervals = (intervalsData ?? []) as RuntimeInterval[]
+  const machines = machinesResult.rows
+  const intervals = intervalsResult.rows
+  const dataIncomplete =
+    machinesResult.failed ||
+    machinesResult.truncated ||
+    intervalsResult.failed ||
+    intervalsResult.truncated
 
-  // "total" começa no primeiro registro que existe (a lista vem ordenada);
-  // sem histórico, uma janela de 24h só para o gráfico não nascer vazio.
-  const from =
-    windowFrom ??
-    (intervals.length > 0
-      ? new Date(intervals[0].started_at).getTime()
-      : to - PERIOD_MS["24h"]!)
+  // "total" começa no primeiro registro que existe (ordenação por id, então
+  // o mais antigo é o menor started_at, não o primeiro da lista); sem
+  // histórico, uma janela de 24h só para o gráfico não nascer vazio.
+  const earliestStart = intervals.reduce<number | null>((min, i) => {
+    const t = new Date(i.started_at).getTime()
+    return min === null || t < min ? t : min
+  }, null)
+  const from = windowFrom ?? earliestStart ?? to - PERIOD_MS["24h"]!
 
   const summary = summarizeCost(intervals, machines, from, to)
   const buckets = bucketizeCost(intervals, from, to, granularity)
@@ -140,6 +152,13 @@ export async function FinanceiroBody({
 
   return (
     <>
+      {dataIncomplete && (
+        <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          Os números abaixo estão incompletos: a leitura do histórico de custo
+          falhou ou passou do teto de paginação. Recarregue a página; se
+          persistir, o total está subestimado.
+        </p>
+      )}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {kpis.map((kpi) => (
           <Card key={kpi.label}>

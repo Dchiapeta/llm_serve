@@ -631,6 +631,13 @@ last_stack_touch: dict[str, float] = {}
 # última tentativa de auto-wake por máquina — evita tempestade de startPod
 # com requests concorrentes ou falhas repetidas (ex.: host sem GPU livre)
 last_wake_attempt: dict[str, float] = {}
+# resultado da última tentativa ('woke' | 'failed'): dentro do cooldown, só
+# uma tentativa que DEU CERTO justifica dizer ao cliente "sua máquina está
+# subindo". Sem isto, um startPod que falhou (RunPod 500, pod inválido) virava
+# 'cooldown' → 'waking' por WAKE_COOLDOWN_S, e a cascata nunca chegava ao
+# provisionamento — o cliente ficava em loop de 503 "sendo iniciada" com nada
+# subindo.
+last_wake_outcome: dict[str, str] = {}
 
 # chaves já garantidas no agent: (key_hash, machine_id) -> expira_em.
 # Invalidado por máquina a cada religada (o agent volta sem chaves).
@@ -756,8 +763,10 @@ async def lifespan(app: FastAPI):
         drain_timeout_s=MIGRATION_DRAIN_TIMEOUT_S,
         lora_load_timeout_s=LORA_LOAD_TIMEOUT_S,
         machine_free_slots=machine_free_slots,
+        pool_free_slots=machine_pool_free_slots,
         runpod=runpod_client,
         machine_idle_stop_minutes=MACHINE_IDLE_STOP_MINUTES,
+        creating_grace_s=MACHINE_HEALTH_TIMEOUT_S,
         consolidation_max_origin_routes=CONSOLIDATION_MAX_ORIGIN_ROUTES,
         stop_recheck_grace_s=STOP_RECHECK_GRACE_S,
         try_provision_for_pool=try_provision_for_pool,
@@ -1413,6 +1422,54 @@ async def check_vllm_health(machine: dict) -> dict | None:
         return None
 
 
+def build_usage_metric_rows(
+    *,
+    machine_id: str,
+    window_start: str,
+    per_key: dict[str, dict],
+    stack_by_key: dict[str, str | None] | None,
+    concurrent_peak: int,
+) -> list[dict]:
+    """Monta as linhas de usage_metrics de uma coleta. Pura — separada de
+    collect_usage_metrics_once pra ser testável sem agent nem Supabase.
+
+    `stack_by_key` é o resultado de supa.stack_ids_for_keys: só contém as
+    chaves que EXISTEM em api_keys (órfã entra com stack_id None; chave
+    apagada não entra). Uma chave que o agent ainda contabiliza mas que já
+    saiu do banco (o painel do cliente apagou, e o key_cache/agent seguem
+    aceitando-a até o TTL/próximo sync) NÃO pode ir com o id dela: a FK
+    usage_metrics.api_key_id recusa o insert, e o POST é um lote só por
+    máquina — uma linha inválida derrubava a janela INTEIRA de todas as
+    outras chaves da máquina, cujos contadores o agent já tinha zerado na
+    leitura. Vai com api_key_id nulo: o uso continua contando, sem dono.
+
+    `stack_by_key` None significa que a resolução FALHOU (Supabase fora), não
+    que nenhuma chave existe — aí não dá pra saber quem sumiu, e todas seguem
+    com o id que o agent mandou, como antes."""
+    rows = []
+    for api_key_id, v in per_key.items():
+        known = stack_by_key is None or api_key_id in stack_by_key
+        if not known:
+            logger.warning(
+                "coleta de métricas: chave %s não existe mais em api_keys; "
+                "gravando uso da janela sem api_key_id (máquina %s)",
+                api_key_id, machine_id,
+            )
+        rows.append(
+            {
+                "api_key_id": api_key_id if known else None,
+                "machine_id": machine_id,
+                "stack_id": (stack_by_key or {}).get(api_key_id),
+                "window_start": window_start,
+                "requests": v.get("requests", 0),
+                "tokens_in": v.get("tokens_in", 0),
+                "tokens_out": v.get("tokens_out", 0),
+                "concurrent_peak": concurrent_peak,
+            }
+        )
+    return rows
+
+
 async def collect_usage_metrics_once() -> None:
     """Único escritor de usage_metrics: puxa os contadores acumulados do
     agent de cada máquina running (zerando-os na leitura) e grava o delta
@@ -1451,20 +1508,14 @@ async def collect_usage_metrics_once() -> None:
                 "coleta de métricas: falha ao resolver stack_id das chaves da máquina %s (%s)",
                 machine["id"], e,
             )
-            stack_by_key = {}
-        rows = [
-            {
-                "api_key_id": api_key_id,
-                "machine_id": machine["id"],
-                "stack_id": stack_by_key.get(api_key_id),
-                "window_start": window_start,
-                "requests": v.get("requests", 0),
-                "tokens_in": v.get("tokens_in", 0),
-                "tokens_out": v.get("tokens_out", 0),
-                "concurrent_peak": snap.get("concurrent_peak", 0),
-            }
-            for api_key_id, v in active.items()
-        ]
+            stack_by_key = None
+        rows = build_usage_metric_rows(
+            machine_id=machine["id"],
+            window_start=window_start,
+            per_key=active,
+            stack_by_key=stack_by_key,
+            concurrent_peak=snap.get("concurrent_peak", 0),
+        )
         try:
             await supa.insert_usage_metrics(rows)
         except Exception as e:
@@ -1562,13 +1613,23 @@ async def relocate_stack_for_balance(stack: dict, reason: str) -> dict | None:
     old_id = stack.get("machine_id")
     if not old_id:
         return None
-    async with realloc_locks[plan]:
+    # mesma chave de lock e mesmo pool (plano + categoria) do reallocate_stack
+    # e do place_base_stack: com chaves diferentes ("Pro" x "Pro:llm") o
+    # rebalanceador e o caminho de request não se excluíam, e os dois podiam
+    # escolher a mesma máquina de destino e repontar por cima da vaga um do
+    # outro — exatamente o que este lock existe pra impedir
+    category = stack.get("category") or LLM_CATEGORY
+    pool_key = product_pool_key(plan, category)
+    async with realloc_locks[pool_key]:
         fresh = await supa.get_stack(stack["id"])
         if not fresh or fresh.get("machine_id") != old_id:
             return None  # request concorrente já moveu; a próxima passada reavalia
         usage_class = fresh.get("usage_class") or "low"
         target = await pick_running_machine_with_stack_slot(
-            plan, exclude_machine_id=old_id, usage_class=usage_class
+            plan,
+            exclude_machine_id=old_id,
+            usage_class=usage_class,
+            category=category,
         )
         if not target:
             return None
@@ -1622,8 +1683,13 @@ async def rebalance_high_caps_once(retry_budget: int = HIGH_CAP_MAX_RETRIES) -> 
     Só planos de pod compartilhado: Max/Enterprise têm pod dedicado, onde
     "mistura de perfis" não existe."""
     retry_needed = False
-    for plan in SHARED_POD_PLANS:
-        for machine in await supa.list_running_machines_for_plan(plan):
+    # por PRODUTO (plano + categoria), não só por plano: Go existe em llm e
+    # image, e cada pool tem as próprias máquinas — a cascata de wake/provision
+    # lá embaixo precisa da categoria pra não religar/criar pod do pool errado
+    for plan, category in await supa.list_distinct_products():
+        if plan not in SHARED_POD_PLANS:
+            continue
+        for machine in await supa.list_running_machines_for_plan(plan, category):
             cap = await supa.machine_high_cap(machine["id"])
             if cap is None:
                 continue  # template sem teto configurado: fail-open
@@ -1645,12 +1711,13 @@ async def rebalance_high_caps_once(retry_budget: int = HIGH_CAP_MAX_RETRIES) -> 
                 # máquina nasce pra receber esta stack, não pro pool.
                 # As travas de custo (interruptor auto_provision_enabled,
                 # cooldown e lock por plano) vivem dentro dessas funções.
-                outcome = await wake_some_machine_for_plan(plan)
+                outcome = await wake_some_machine_for_plan(plan, category)
                 if outcome == "none":
                     await _try_provision_machine_for_plan(
                         plan,
                         f"rebalanceamento de uso alto: {reason}",
                         pause_when_healthy=False,
+                        category=category,
                     )
                 retry_needed = True
                 try:
@@ -1836,7 +1903,36 @@ async def machine_free_slots(machine: dict) -> int:
     by_vram = await supa.machine_lora_slots(machine["id"])
     slots = MAX_LORAS_PER_MACHINE if by_vram is None else min(by_vram, MAX_LORAS_PER_MACHINE)
     used = await supa.count_active_routes(machine["id"])
-    return slots - used
+    # nunca negativo: uma máquina sobrecarregada (rota contada na origem e no
+    # destino durante uma migração) não pode "anular" a vaga de outra quando o
+    # chamador soma as máquinas do pool (ensure_capacity_once)
+    return max(slots - used, 0)
+
+
+async def machine_pool_free_slots(machine: dict) -> int:
+    """Vagas livres da máquina NA CONTA QUE O POOL DO PLANO USA — base da
+    reposição proativa (lifecycle.ensure_capacity_once).
+
+    Plano de pod compartilhado (Go/Pro, SHARED_POD_PLANS): a ocupação é de
+    STACKS de modelo base (stacks.machine_id, machine_stack_load) contra
+    machine_stack_slots — a mesma conta de machine_admits, que é quem de fato
+    recusa a próxima stack. Stack base não cria linha em routing_state, então
+    a conta LoRA de machine_free_slots devolvia sempre "8 livres" para uma
+    máquina com 18/18 stacks e o watermark nunca disparava a reserva.
+
+    Demais planos (pod dedicado / adapters LoRA) seguem na conta LoRA.
+    Capacidade desconhecida (slots 0/None) também cai na conta antiga — um
+    "0 livre" inventado aqui dispararia provisionamento com custo real.
+    """
+    template = machine.get("templates")
+    plan = template.get("plan") if isinstance(template, dict) else None
+    if plan not in SHARED_POD_PLANS:
+        return await machine_free_slots(machine)
+    slots = await supa.machine_stack_slots(machine["id"])
+    if not slots:
+        return await machine_free_slots(machine)
+    load = await supa.machine_stack_load(machine["id"])
+    return max(int(slots - load), 0)
 
 
 def _forget_machine_upserts(machine_id: str) -> None:
@@ -1927,9 +2023,17 @@ async def wake_machine(machine: dict, reason: str) -> str:
         return "failed"
     now = time.time()
     if now - last_wake_attempt.get(machine["id"], 0) < WAKE_COOLDOWN_S:
-        return "cooldown"
+        # 'cooldown' só quando a tentativa recente DEU CERTO (o pod está
+        # subindo de verdade). Depois de uma falha, o cooldown continua
+        # segurando o startPod (sem martelar a RunPod), mas o chamador precisa
+        # saber que não há nada subindo — senão devolve waking_503 mentiroso e
+        # nunca cai no fallback/provisionamento.
+        if last_wake_outcome.get(machine["id"]) == "woke":
+            return "cooldown"
+        return "failed"
     # marca a tentativa antes do primeiro await — atômico dentro do event loop
     last_wake_attempt[machine["id"]] = now
+    last_wake_outcome[machine["id"]] = "failed"
     try:
         await runpod_client.start_pod(machine["runpod_pod_id"])
     except Exception as e:
@@ -1948,11 +2052,19 @@ async def wake_machine(machine: dict, reason: str) -> str:
             return "no_gpu"
         logger.warning("auto-wake: startPod de %s falhou (%s)", machine["id"], e)
         return "failed"
+    last_wake_outcome[machine["id"]] = "woke"
     try:
         await supa.touch_machine_activity(machine["id"])
     except Exception:
         pass
-    await supa.set_machine_status(machine["id"], "running")
+    # 'creating', não 'running': o pod religa com o vLLM ainda carregando o
+    # modelo (minutos). Gravar 'running' aqui furava o gate de prontidão do
+    # reconcile (lifecycle.reconcile_statuses_once) — a máquina entrava em
+    # list_running_machines_for_plan e recebia requests que morriam no agent,
+    # e o reaper de ociosidade (que só olha running) podia pausá-la no meio do
+    # boot se ele passasse de MACHINE_IDLE_STOP_MINUTES. Em 'creating' ela é
+    # invisível ao reaper e aos picks; o reconcile promove quando vllm_ready.
+    await supa.set_machine_status(machine["id"], "creating")
     # o pod reinicia com o agent zerado — invalida o cache de upserts e
     # agenda o reenvio das chaves assim que o vLLM ficar de pé
     _forget_machine_upserts(machine["id"])
@@ -1980,6 +2092,12 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
       - 'waking'    : há pausada subindo (cooldown de um wake recente bem
                       encaminhado), cliente reintenta;
       - 'none'      : não há pausada nenhuma (chamador decide provisionar)."""
+    # máquina já subindo (religada por um request anterior, ou recém-criada
+    # pelo painel/provisionamento): conta como 'waking' — sem isto, com o wake
+    # gravando 'creating', o pool parecia vazio e a cascata religava uma 2ª
+    # pausada ou provisionava por cima de um boot em andamento
+    if await supa.list_creating_machines_for_plan(plan, category):
+        return "waking"
     stopped = await supa.list_stopped_machines_for_plan(plan, category)
     if not stopped:
         return "none"
@@ -1996,8 +2114,11 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
             if await try_recreate_machine(m, "host sem GPU pra religar sob demanda"):
                 recreating = True
         elif outcome == "cooldown":
-            # tentativa recente; se não caiu em recreate, tratamos como subindo
+            # tentativa recente BEM-SUCEDIDA (wake_machine só devolve
+            # 'cooldown' depois de um 'woke') — o pod está subindo
             waking = True
+        # 'failed': nada subindo nesta máquina — segue pra próxima pausada e,
+        # se nenhuma servir, devolve 'none' pro chamador provisionar
     if recreating:
         return "recreating"
     return "waking" if waking else "none"
@@ -2655,9 +2776,13 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
             )
             moved = True
 
-    # stack é o mesmo objeto guardado no key_cache — mutar in place mantém o
-    # cache coerente pelo resto do TTL sem flush
+    # stack é o mesmo objeto guardado no key_cache — mutar in place mantém a
+    # entrada DESTA chave coerente. As outras chaves da mesma stack (uma conta
+    # pode ter várias) têm entradas próprias com o dict antigo, e seguiriam
+    # roteando pra origem por até KEY_CACHE_TTL_S — daí o evict das demais.
     stack["machine_id"] = target["id"]
+    if moved:
+        _evict_key_cache_for_stack(stack["id"])
     agent_key_upserts.pop((entry["key_hash"], old_machine["id"]), None)
     await ensure_key_on_machine(entry, target)
     if moved:
@@ -2720,9 +2845,11 @@ async def place_base_stack(entry: dict, stack: dict) -> dict | None:
             return None
         await supa.rebind_stack_keys(entry["account_id"], target["id"], stack["id"])
 
-    # stack é o mesmo objeto do key_cache — mutar in place mantém o cache
-    # coerente pelo resto do TTL sem flush (igual ao reallocate_stack)
+    # stack é o mesmo objeto do key_cache — mutar in place mantém a entrada
+    # desta chave coerente; as irmãs da mesma stack são derrubadas (igual ao
+    # reallocate_stack)
     stack["machine_id"] = target["id"]
+    _evict_key_cache_for_stack(stack["id"])
     await ensure_key_on_machine(entry, target)
     try:
         await supa.log_machine_event(

@@ -175,6 +175,9 @@ export type Machine = {
   cost_per_hr: number | null
   public_url: string | null
   max_users: number | null
+  // relógio de ociosidade (migration 0015): tocado pelo gateway a cada request
+  // servida; base da auto-pausa e da guarda de "em uso" do stopMachine
+  last_activity_at: string | null
   created_at: string
 }
 
@@ -274,7 +277,7 @@ export type ApiKey = {
   // Chave em texto puro, para cópia posterior pelo painel. Chaves criadas
   // antes da migration 0014 ficam null (só o prefixo é recuperável).
   plain_key: string | null
-  status: "active" | "revoked"
+  status: "active" | "revoked" | "deleted"
   purpose: ApiKeyPurpose
   created_at: string
   expires_at: string | null

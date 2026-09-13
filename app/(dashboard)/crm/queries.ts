@@ -14,6 +14,7 @@ import {
   type ChargefySubscription,
 } from "@/lib/chargefy"
 import { summarizeCost, costWindow, type RuntimeInterval } from "@/lib/billing"
+import { fetchAll, type PagedQuery } from "@/lib/paged-query"
 import {
   worstBillingStatus,
   sortPlans,
@@ -72,48 +73,6 @@ export function parsePeriod(value?: string | null): CrmPeriod {
 const RATE_FROM_ENV = Number(process.env.USD_BRL_RATE)
 export const USD_BRL_RATE =
   Number.isFinite(RATE_FROM_ENV) && RATE_FROM_ENV > 0 ? RATE_FROM_ENV : 5.4
-
-// O PostgREST devolve no máximo 1000 linhas por resposta. usage_metrics cresce
-// ~1 linha por chave a cada 2 min: agregar com um select simples truncaria em
-// silêncio e o CRM passaria a subnotificar tokens sem nenhum erro visível.
-const PAGE = 1000
-const MAX_PAGES = 50
-
-type PagedQuery = {
-  range: (
-    from: number,
-    to: number
-  ) => PromiseLike<{ data: unknown[] | null; error: { message: string } | null }>
-}
-
-/**
- * Paginação completa de uma query.
- *
- * A query passada precisa estar ordenada por uma coluna ÚNICA (id). Ordenar por
- * algo repetido — `window_start`, que se repete a cada janela de 2 min — deixa a
- * ordem indefinida entre linhas empatadas, e aí o Postgres pode devolver a mesma
- * linha em duas páginas e pular outra: os totais de token ficariam errados sem
- * nenhum sinal.
- *
- * Erro NÃO é tratado como fim dos dados: sem checar `error`, uma falha devolve
- * data=null, o laço interpreta como "acabou" e a página exibe 0 tokens com o
- * aviso de truncamento desligado — o pior resultado possível, que é mentir
- * calado.
- */
-async function fetchAll<T>(
-  build: () => PagedQuery
-): Promise<{ rows: T[]; truncated: boolean; failed: boolean }> {
-  const rows: T[] = []
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const from = page * PAGE
-    const { data, error } = await build().range(from, from + PAGE - 1)
-    if (error) return { rows, truncated: false, failed: true }
-    const batch = (data ?? []) as T[]
-    rows.push(...batch)
-    if (batch.length < PAGE) return { rows, truncated: false, failed: false }
-  }
-  return { rows, truncated: true, failed: false }
-}
 
 type StackRecord = {
   id: string

@@ -355,7 +355,9 @@ export default async function MachineDetailPage({
                           {k.status === "active" ? (
                             <Badge variant="secondary">ativa</Badge>
                           ) : (
-                            <Badge variant="outline">revogada</Badge>
+                            <Badge variant="outline">
+                              {k.status === "deleted" ? "excluída" : "revogada"}
+                            </Badge>
                           )}
                         </TableCell>
                         <TableCell>{(u?.requests ?? 0).toLocaleString("pt-BR")}</TableCell>

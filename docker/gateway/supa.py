@@ -387,6 +387,31 @@ class SupaClient:
         r.raise_for_status()
         return r.json()
 
+    async def list_creating_machines_for_plan(
+        self, plan: str, category: str = "llm"
+    ) -> list[dict]:
+        """Máquinas SUBINDO (creating) do plano/categoria — recém-criadas ou
+        religadas pelo auto-wake, que passa a gravar 'creating' e deixa o
+        reconcile promover a 'running' quando o vLLM reporta pronto. O
+        chamador (wake_some_machine_for_plan) as trata como "há uma subindo"
+        pra não religar outra pausada nem provisionar em cima."""
+        r = await self._rest.get(
+            "/machines",
+            params={
+                "status": "eq.creating",
+                "public_url": "not.is.null",
+                "runpod_pod_id": "not.is.null",
+                "select": "*,templates!inner(plan,category,is_enabled,is_test)",
+                "templates.plan": f"eq.{plan}",
+                "templates.category": f"eq.{category}",
+                "templates.is_enabled": "eq.true",
+                "templates.is_test": "eq.false",
+                "order": "created_at.asc",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
     async def list_machines_with_pod(self) -> list[dict]:
         """Máquinas não-terminadas com pod associado — alvo da reconciliação
         de status do lifecycle (espelho do reconcileMachineStatuses do painel)."""
@@ -395,7 +420,9 @@ class SupaClient:
             params={
                 "status": "in.(creating,running,stopped)",
                 "runpod_pod_id": "not.is.null",
-                "select": "id,status,runpod_pod_id,public_url",
+                # created_at/last_activity_at: janela de tolerância do
+                # reconcile pra pod recém-criado que reporta EXITED
+                "select": "id,status,runpod_pod_id,public_url,created_at,last_activity_at",
             },
         )
         r.raise_for_status()
@@ -764,7 +791,11 @@ class SupaClient:
                 headers={"Prefer": "count=exact"},
             )
             r.raise_for_status()
-            return len(r.json() or [])
+            # total do content-range (mesmo padrão do count_stacks_on_machine),
+            # não o tamanho da página devolvida — len(json) parava no max-rows
+            # do PostgREST e subcontava
+            content_range = r.headers.get("content-range", "/0")
+            return int(content_range.split("/")[-1])
 
     async def machine_high_cap(self, machine_id: str) -> int | None:
         """Teto de stacks 'high' da máquina (migration 0037), de
