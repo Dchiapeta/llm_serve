@@ -98,6 +98,7 @@ from lifecycle import LifecycleManager, MigrationError
 from recovery import (
     is_no_gpu_error,
     lock_active,
+    machine_boot_stalled,
     machine_was_lost,
     spawn_tracked,
     template_allows_automatic_creation,
@@ -503,6 +504,15 @@ RECREATE_RETRY_AFTER_S = float(os.environ.get("RECREATE_RETRY_AFTER_S", "120"))
 MACHINE_POOL_WATERMARK_SLOTS = float(os.environ.get("MACHINE_POOL_WATERMARK_SLOTS", "5"))
 MACHINE_HEALTH_TIMEOUT_S = float(os.environ.get("MACHINE_HEALTH_TIMEOUT_S", "900"))
 MACHINE_HEALTH_POLL_INTERVAL_S = float(os.environ.get("MACHINE_HEALTH_POLL_INTERVAL_S", "10"))
+# idade a partir da qual uma máquina 'creating' deixa de segurar a cascata de
+# recuperação (wake_some_machine_for_plan). FOLGADAMENTE maior que o boot mais
+# lento observado (o 1º pod do Pro 2×A40 passou de 30 min) pra nunca ignorar um
+# boot legítimo; passado isso a máquina não está subindo, está presa, e deixá-la
+# barrar o auto-wake/provisionamento do plano é um 503 eterno. Ver
+# recovery.machine_boot_stalled.
+CREATING_STALE_AFTER_S = float(
+    os.environ.get("CREATING_STALE_AFTER_S", str(MACHINE_HEALTH_TIMEOUT_S * 2))
+)
 # TTL das travas em memória (recreating/provisioning/key_sync): rede de
 # segurança contra trava presa. Se a task que deveria liberar a trava morre
 # antes do `finally` (GC, exceção fora do try, processo travado), a trava fica
@@ -2095,8 +2105,21 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
     # máquina já subindo (religada por um request anterior, ou recém-criada
     # pelo painel/provisionamento): conta como 'waking' — sem isto, com o wake
     # gravando 'creating', o pool parecia vazio e a cascata religava uma 2ª
-    # pausada ou provisionava por cima de um boot em andamento
-    if await supa.list_creating_machines_for_plan(plan, category):
+    # pausada ou provisionava por cima de um boot em andamento.
+    # Só conta quem ainda PODE estar subindo: uma 'creating' velha demais está
+    # presa, não subindo, e deixá-la responder 'waking' aqui barra o auto-wake e
+    # o provisionamento do plano inteiro pra sempre (503 eterno). O reconcile é
+    # quem conserta o status; este filtro só evita que a disponibilidade do plano
+    # dependa disso (ver recovery.machine_boot_stalled).
+    subindo = await supa.list_creating_machines_for_plan(plan, category)
+    presas = [m for m in subindo if machine_boot_stalled(m, CREATING_STALE_AFTER_S)]
+    if presas:
+        logger.warning(
+            "auto-wake: %d máquina(s) presa(s) em 'creating' no plano %s/%s (%s) — "
+            "ignoradas na cascata",
+            len(presas), plan, category, ", ".join(str(m.get("id")) for m in presas),
+        )
+    if len(subindo) > len(presas):
         return "waking"
     stopped = await supa.list_stopped_machines_for_plan(plan, category)
     if not stopped:
@@ -3983,6 +4006,36 @@ async def anthropic_messages(
         release_flight(flight_key)
         raise
 
+    async def _reenviar_sem_thinking(stream: bool):
+        """Mesmo corpo já validado, thinking desligado — o retry de resposta vazia
+        por raciocínio esgotado (anthropic_compat: retry_without_thinking). None
+        em qualquer falha: quem chama devolve o erro original, nunca um segundo
+        erro por cima. Não passa por validate_body de novo: o corpo é o mesmo que
+        acabou de ser admitido, só o chat template muda."""
+        corpo = dict(openai_body)
+        kwargs = dict(corpo.get("chat_template_kwargs") or {})
+        kwargs["enable_thinking"] = False
+        kwargs.pop("reasoning_effort", None)
+        corpo["chat_template_kwargs"] = kwargs
+        corpo.pop("reasoning_effort", None)
+        corpo["stream"] = stream
+        req = proxy_client.build_request(
+            "POST",
+            f"{machine['public_url']}/v1/chat/completions",
+            content=json.dumps(corpo).encode(),
+            headers={"Authorization": bearer_header, "Content-Type": "application/json"},
+            timeout=upstream_timeout,
+        )
+        try:
+            novo = await proxy_client.send(req, stream=True)
+        except httpx.HTTPError as e:
+            logger.warning("anthropic proxy: retry sem thinking falhou em %s (%s)", flight_key, e)
+            return None
+        if novo.status_code >= 400:
+            await novo.aclose()
+            return None
+        return novo
+
     if is_stream:
         if upstream.status_code >= 400:
             # o upstream (vLLM) recusou a request antes de gerar qualquer chunk
@@ -4026,6 +4079,7 @@ async def anthropic_messages(
                 # do body JÁ processado por validate_body — é lá que o gateway
                 # força enable_thinking=False quando max_tokens < MIN_MAX_TOKENS
                 thinking_esperado=thinking_esperado_de(openai_body),
+                retry_without_thinking=lambda: _reenviar_sem_thinking(True),
             ),
             status_code=upstream.status_code,
             media_type="text/event-stream",
@@ -4057,6 +4111,30 @@ async def anthropic_messages(
             thinking_esperado=thinking_esperado_de(openai_body),
             input_tokens_estimate=input_tokens_estimate,
         )
+        if (
+            status_logico == 502 and upstream.status_code < 400
+            and thinking_esperado_de(openai_body)
+        ):
+            # resposta vazia por raciocínio esgotado — mesmo retry único sem
+            # thinking do caminho streaming (ver anthropic_compat)
+            novo = await _reenviar_sem_thinking(False)
+            if novo is not None:
+                logger.warning(
+                    "anthropic proxy: resposta vazia por raciocínio em %s — refazendo sem thinking",
+                    flight_key,
+                )
+                try:
+                    raw2 = await novo.aread()
+                    status_logico, corpo, usage = anthropic_nonstreaming_body(
+                        raw2,
+                        status_code=novo.status_code,
+                        requested_model=requested_model,
+                        filter_reasoning=filter_reasoning,
+                        thinking_esperado=False,
+                        input_tokens_estimate=input_tokens_estimate,
+                    )
+                finally:
+                    await novo.aclose()
     finally:
         await upstream.aclose()
         release_flight(flight_key)

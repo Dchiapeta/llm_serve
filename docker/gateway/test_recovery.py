@@ -5,14 +5,20 @@ docker/gateway/:
 """
 
 import time
+from datetime import datetime, timedelta, timezone
 
 from recovery import (
     _NO_GPU_ERROR_PATTERNS,
     is_no_gpu_error,
     lock_active,
+    machine_boot_stalled,
     machine_was_lost,
     template_allows_automatic_creation,
 )
+
+
+def iso(delta_s):
+    return (datetime.now(timezone.utc) - timedelta(seconds=delta_s)).isoformat()
 
 
 # ---------- is_no_gpu_error ----------
@@ -158,3 +164,56 @@ def test_status_desconhecido_nao_recria():
     automática de GPU por omissão."""
     assert machine_was_lost({"status": "algo_novo", "runpod_pod_id": "abc"}) is False
     assert machine_was_lost({}) is False
+
+
+# ---------- machine_boot_stalled ----------
+
+
+def test_creating_recente_nao_esta_presa():
+    """Boot em andamento continua segurando a cascata — é pra isso que a guarda
+    do 'waking' existe."""
+    assert machine_boot_stalled({"last_activity_at": iso(60)}, 1800) is False
+
+
+def test_creating_velha_esta_presa():
+    """Passado o dobro do timeout de health, não é boot: é máquina presa. Se ela
+    seguisse contando como 'waking', o plano inteiro ficava em 503 eterno."""
+    assert machine_boot_stalled({"last_activity_at": iso(3600)}, 1800) is True
+
+
+def test_usa_created_at_quando_nao_ha_last_activity():
+    """Máquina criada pelo painel/provisionamento nunca foi tocada pelo gateway;
+    o relógio é o created_at (mesma precedência de _within_creating_grace)."""
+    assert machine_boot_stalled({"created_at": iso(3600)}, 1800) is True
+    assert machine_boot_stalled({"created_at": iso(60)}, 1800) is False
+
+
+def test_last_activity_tem_precedencia_sobre_created_at():
+    """Máquina antiga religada agora pelo auto-wake (que toca last_activity_at
+    antes de gravar 'creating') está subindo, não presa."""
+    m = {"created_at": iso(86400), "last_activity_at": iso(60)}
+    assert machine_boot_stalled(m, 1800) is False
+
+
+def test_timestamp_ausente_ou_ilegivel_nao_conta_como_presa():
+    """Fail-closed: sem relógio confiável mantém o comportamento antigo (a
+    máquina segura a cascata) em vez de liberar provisionamento por engano."""
+    assert machine_boot_stalled({}, 1800) is False
+    assert machine_boot_stalled({"created_at": None}, 1800) is False
+    assert machine_boot_stalled({"created_at": "nao-e-data"}, 1800) is False
+
+
+def test_timeout_zero_ou_negativo_desliga_o_filtro():
+    """Escotilha de emergência via env: CREATING_STALE_AFTER_S=0 volta ao
+    comportamento de antes, sem redeploy de código."""
+    assert machine_boot_stalled({"created_at": iso(999999)}, 0) is False
+    assert machine_boot_stalled({"created_at": iso(999999)}, -1) is False
+
+
+def test_timestamp_sem_timezone_e_tratado_como_utc():
+    """O Postgres pode devolver timestamp sem offset; comparar naive com aware
+    levantaria TypeError e derrubaria a cascata inteira."""
+    naive = (datetime.now(timezone.utc) - timedelta(seconds=3600)).replace(
+        tzinfo=None
+    ).isoformat()
+    assert machine_boot_stalled({"created_at": naive}, 1800) is True

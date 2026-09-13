@@ -563,3 +563,144 @@ def test_tool_call_depois_de_reasoning_content_abre_o_bloco_certo():
     starts = [e for e in events if e.get("type") == "content_block_start"]
     assert [s["content_block"]["type"] for s in starts] == ["tool_use"]
     assert starts[0]["content_block"]["name"] == "grep"
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat pelo último byte ENVIADO e retry sem thinking (13/09/2026)
+# ---------------------------------------------------------------------------
+
+
+class SlowReasoningUpstream(FakeUpstream):
+    """Raciocínio que chega sem parar, um chunk a cada `gap` segundos, sem
+    nunca emitir texto — o padrão que deixava a conexão muda: havia sempre um
+    chunk novo antes de o ping disparar, e nada visível para emitir."""
+
+    def __init__(self, chunks: list[bytes], gap: float):
+        super().__init__(chunks)
+        self._gap = gap
+
+    async def aiter_bytes(self):
+        for c in self._chunks:
+            await asyncio.sleep(self._gap)
+            yield c
+
+
+def test_ping_continua_durante_raciocinio_filtrado():
+    """Durante raciocínio filtrado o vLLM nunca fica calado, mas o CLIENTE fica
+    sem um byte — por minutos, num raciocínio longo. O heartbeat tem que medir o
+    silêncio do lado do cliente, não do upstream."""
+    chunks = [_chunk(reasoning=f"pensando {i}") for i in range(12)]
+    chunks += [_chunk(content="pronto"), _usage_chunk(10, 12), b"data: [DONE]\n\n"]
+    events = _collect(
+        [], filter_reasoning=True,
+        upstream=SlowReasoningUpstream(chunks, gap=0.005),
+        ttft_timeout_s=5.0, idle_timeout_s=5.0, ping_interval_s=0.02,
+    )
+    tipos = _types(events)
+    assert tipos.count("ping") >= 2, "conexão ficou muda durante o raciocínio"
+    # e os pings vêm ANTES do primeiro texto visível, que só chega no fim
+    assert tipos.index("ping") < tipos.index("content_block_delta")
+    assert _texts(events) == ["pronto"]
+
+
+def test_ping_nao_dispara_quando_o_cliente_esta_recebendo_texto():
+    """Texto fluindo é heartbeat suficiente — ping no meio só gasta bytes."""
+    chunks = [_chunk(content=f"t{i} ") for i in range(12)]
+    chunks += [_usage_chunk(10, 12), b"data: [DONE]\n\n"]
+    events = _collect(
+        [], filter_reasoning=False,
+        upstream=SlowReasoningUpstream(chunks, gap=0.005),
+        ttft_timeout_s=5.0, idle_timeout_s=5.0, ping_interval_s=0.5,
+    )
+    assert _types(events).count("ping") == 0
+
+
+def _collect_with_retry(chunks, retry_chunks, *, thinking_esperado=True):
+    """Roda o conversor com um retry_without_thinking que devolve `retry_chunks`
+    (ou None se retry_chunks for None). Devolve (eventos, chamadas_on_done,
+    upstreams)."""
+    first = FakeUpstream(chunks)
+    second = FakeUpstream(retry_chunks) if retry_chunks is not None else None
+    calls: list[tuple] = []
+    retries: list[int] = []
+
+    async def retry():
+        retries.append(1)
+        return second
+
+    async def run():
+        out = []
+        gen = anthropic_sse_from_openai_stream(
+            first, "claude-x", on_done=lambda u, s: calls.append((u, s)),
+            filter_reasoning=True, input_tokens_estimate=7,
+            thinking_esperado=thinking_esperado, retry_without_thinking=retry,
+        )
+        async for raw in gen:
+            for line in raw.decode().split("\n"):
+                if line.startswith("data:"):
+                    out.append(json.loads(line[5:]))
+        return out
+
+    return asyncio.run(run()), calls, retries, first, second
+
+
+_SO_RACIOCINIO_ATE_O_TETO = [
+    _chunk(reasoning="pensando muito"),
+    b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+    _usage_chunk(10, 8000),
+    b"data: [DONE]\n\n",
+]
+
+
+def test_raciocinio_que_esgota_max_tokens_e_refeito_sem_thinking():
+    """O modo de falha que mata a compactação do Claude Code (issue #85499):
+    resposta vazia com finish_reason length. Em vez de `error`, refaz uma vez
+    sem thinking e entrega o turno — com UM message_start só."""
+    events, calls, retries, first, second = _collect_with_retry(
+        _SO_RACIOCINIO_ATE_O_TETO,
+        [_chunk(content="resposta "), _chunk(content="direta"),
+         b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+         _usage_chunk(10, 3), b"data: [DONE]\n\n"],
+    )
+    tipos = _types(events)
+    assert retries == [1]
+    assert tipos.count("message_start") == 1
+    assert "error" not in tipos
+    assert _texts(events) == ["resposta ", "direta"]
+    assert tipos[-2:] == ["message_delta", "message_stop"]
+    delta = [e for e in events if e["type"] == "message_delta"][0]
+    assert delta["delta"]["stop_reason"] == "end_turn"
+    assert delta["usage"]["output_tokens"] == 3
+    # on_done UMA vez, com o usage e o status do stream que entregou
+    assert calls == [({"prompt_tokens": 10, "completion_tokens": 3}, 200)]
+    assert first.closed and second.closed
+
+
+def test_retry_que_falha_cai_no_erro_original():
+    events, calls, retries, *_ = _collect_with_retry(_SO_RACIOCINIO_ATE_O_TETO, None)
+    assert retries == [1]
+    erros = [e for e in events if e.get("type") == "error"]
+    assert len(erros) == 1 and "sem texto visível" in erros[0]["error"]["message"]
+    assert calls[0][1] == 502
+
+
+def test_sem_thinking_esperado_nao_ha_retry():
+    """Com thinking já desligado, resposta vazia é resposta vazia — refazer
+    igual só dobraria o custo."""
+    chunks = [
+        b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+    _, _, retries, *_ = _collect_with_retry(chunks, [], thinking_esperado=False)
+    assert retries == []
+
+
+def test_stream_normal_nao_dispara_retry():
+    events, calls, retries, *_ = _collect_with_retry(
+        [_chunk(reasoning="curto"), _chunk(content="ok"),
+         b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+         _usage_chunk(10, 2), b"data: [DONE]\n\n"],
+        [],
+    )
+    assert retries == []
+    assert _texts(events) == ["ok"]

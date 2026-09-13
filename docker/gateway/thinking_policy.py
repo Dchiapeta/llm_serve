@@ -19,10 +19,20 @@ class ThinkingPolicyError(ValueError):
     pass
 
 
+# Níveis do chat template do Qwen3.8 (low/medium/xhigh, default xhigh). O
+# protocolo OpenAI fala low/medium/high; o "high" do cliente vira o topo real
+# do template. O vLLM 0.24 só usa o reasoning_effort top-level para ligar/
+# desligar o thinking — o nível em si ele NÃO repassa ao template, por isso
+# apply_thinking_policy o copia para chat_template_kwargs.
+EFFORT_TO_TEMPLATE = {"high": "xhigh"}
+
+
 @dataclass(frozen=True)
 class ThinkingPolicy:
     enabled: bool | None
     source: str
+    # nível pedido pelo cliente (low/medium/high); None = default do template
+    effort: str | None = None
 
 
 def supports_thinking_switch(machine: dict) -> bool:
@@ -46,6 +56,7 @@ def supports_thinking_switch(machine: dict) -> bool:
 def resolve_thinking_policy(body: dict, entry: dict, stack: dict | None,
                             machine: dict) -> ThinkingPolicy:
     requested = []
+    effort_pedido = None
     kwargs = body.get("chat_template_kwargs")
     if kwargs is not None and not isinstance(kwargs, dict):
         raise ThinkingPolicyError("chat_template_kwargs deve ser um objeto")
@@ -63,6 +74,8 @@ def resolve_thinking_policy(body: dict, entry: dict, stack: dict | None,
             if effort not in ("none", "low", "medium", "high"):
                 raise ThinkingPolicyError("reasoning effort suportado: none, low, medium ou high")
             requested.append(effort != "none")
+            if effort != "none":
+                effort_pedido = effort
 
     # anthropic_compat repassa este campo intacto para a validação em vez de
     # tratá-lo na conversão: assim o erro sai pelo tratamento HTTP que o
@@ -78,7 +91,7 @@ def resolve_thinking_policy(body: dict, entry: dict, stack: dict | None,
     if requested:
         if any(value != requested[0] for value in requested):
             raise ThinkingPolicyError("parâmetros de thinking conflitantes na requisição")
-        policy = ThinkingPolicy(requested[0], "request")
+        policy = ThinkingPolicy(requested[0], "request", effort_pedido if requested[0] else None)
     else:
         policy = ThinkingPolicy(None, "legacy")
         for source, config in (("key", entry), ("stack", stack or {})):
@@ -98,6 +111,10 @@ def apply_thinking_policy(body: dict, policy: ThinkingPolicy) -> None:
         return
     kwargs = dict(body.get("chat_template_kwargs") or {})
     kwargs["enable_thinking"] = policy.enabled
+    if policy.enabled and policy.effort and "reasoning_effort" not in kwargs:
+        # o nível só faz sentido com thinking ligado; um reasoning_effort já
+        # explícito em chat_template_kwargs é do cliente e vence
+        kwargs["reasoning_effort"] = EFFORT_TO_TEMPLATE.get(policy.effort, policy.effort)
     body["chat_template_kwargs"] = kwargs
     # Tudo converge para a chave que o chat template realmente lê. É isto que
     # thinking_esperado_de e o filtro de <think> passam a ler depois — a

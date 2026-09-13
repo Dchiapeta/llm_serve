@@ -420,8 +420,9 @@ class SupaClient:
             params={
                 "status": "in.(creating,running,stopped)",
                 "runpod_pod_id": "not.is.null",
-                # created_at/last_activity_at: janela de tolerância do
-                # reconcile pra pod recém-criado que reporta EXITED
+                # created_at/last_activity_at: janela de tolerância do reconcile
+                # pra pod recém-criado — tanto o que reporta EXITED quanto o que
+                # ainda não apareceu na listagem (os dois ramos têm prazo)
                 "select": "id,status,runpod_pod_id,public_url,created_at,last_activity_at",
             },
         )

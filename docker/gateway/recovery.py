@@ -8,6 +8,7 @@ Rodar de docker/gateway/:  python3 -m pytest test_recovery.py
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 
 # ---------- Tasks fire-and-forget ----------
 
@@ -119,3 +120,38 @@ def machine_was_lost(machine: dict) -> bool:
     if status == "error":
         return True
     return status == "terminated" and bool(machine.get("runpod_pod_id"))
+
+
+# ---------- Máquina presa em 'creating' ----------
+
+
+def machine_boot_stalled(machine: dict, max_age_s: float) -> bool:
+    """A máquina está em 'creating' há mais tempo do que qualquer boot real
+    levaria? Segunda linha de defesa do 503 eterno.
+
+    wake_some_machine_for_plan devolve 'waking' se existe QUALQUER máquina
+    'creating' no plano — guarda necessária pra não religar/provisionar em cima
+    de um boot em andamento, mas que confia no status sem olhar a idade. Se algo
+    prende uma máquina em 'creating' (o caso conhecido era o reconcile pulando
+    pod ausente sem prazo, corrigido em lifecycle.reconcile_statuses_once), essa
+    casca barra o auto-wake E o provisionamento do plano inteiro, pra sempre.
+
+    Aqui o wake ignora a 'creating' velha demais e segue pra cascata. O reconcile
+    continua sendo quem conserta o STATUS; este filtro só impede que uma máquina
+    presa, por qualquer motivo futuro, derrube a disponibilidade do plano.
+
+    Fail-CLOSED por omissão: sem timestamp legível a máquina NÃO é considerada
+    presa (continua segurando a cascata), que é o comportamento de antes.
+    """
+    if max_age_s <= 0:
+        return False
+    raw = machine.get("last_activity_at") or machine.get("created_at")
+    if not raw:
+        return False
+    try:
+        since = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - since > timedelta(seconds=max_age_s)

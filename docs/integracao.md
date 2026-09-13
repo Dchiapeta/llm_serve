@@ -326,7 +326,10 @@ export ANTHROPIC_MODEL="pro-base"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW=104000
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8000
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 claude
 ```
 
@@ -342,6 +345,14 @@ reservado para duas coisas — a resposta do modelo e uma folga para o turno seg
 porque entre a decisão de compactar e a próxima mensagem cabe um arquivo grande
 inteiro (um `Read` de 60 KB são ~18 mil tokens).
 
+As outras três variáveis completam a conta. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` informa a
+janela real do modelo: como o Claude Code não reconhece o nome `pro-base`, sem ela a
+status line e a compactação trabalham sobre os 200k que ele assume. O Claude Code
+também **desconta a reserva de saída da janela de compactação** (20 mil tokens por
+padrão); `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8000`, que é o mínimo de saída que o gateway
+garante, devolve 12 mil tokens de contexto útil antes de compactar. E
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` corta as chamadas de fundo que não são suas.
+
 Esses `export` valem só para a sessão de terminal em que você os rodou. Para não
 depender disso, ponha o mesmo conteúdo em `~/.claude/settings.json`:
 
@@ -355,7 +366,10 @@ depender disso, ponha o mesmo conteúdo em `~/.claude/settings.json`:
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "pro-base",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "pro-base",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "pro-base",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "104000"
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "104000",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   }
 }
 ```

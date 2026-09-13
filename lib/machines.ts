@@ -160,6 +160,19 @@ export async function machineDisplayStatus(m: Machine): Promise<MachineDisplaySt
   }
 }
 
+// Janela em que uma máquina "creating" cujo pod não aparece na API ainda é
+// tratada como "só não apareceu ainda". Espelha MACHINE_HEALTH_TIMEOUT_S do
+// gateway (900s): é o prazo que o provisionamento espera o vLLM ficar pronto.
+const CREATING_GRACE_MS = 900_000
+
+function withinCreatingGrace(m: Machine): boolean {
+  const raw = m.last_activity_at ?? m.created_at
+  if (!raw) return false
+  const since = Date.parse(raw)
+  if (Number.isNaN(since)) return false
+  return Date.now() - since < CREATING_GRACE_MS
+}
+
 // Mapeia o desiredStatus do RunPod para o status interno da máquina.
 const POD_STATUS_MAP: Record<string, Machine["status"]> = {
   RUNNING: "running",
@@ -193,9 +206,12 @@ export async function reconcileMachineStatuses(
     const pod = podById.get(m.runpod_pod_id)
 
     // Máquina ainda subindo pode não aparecer na API por instantes; não a
-    // marcamos como terminada para evitar falso positivo.
+    // marcamos como terminada para evitar falso positivo. A guarda TEM PRAZO:
+    // a RunPod não lista pod terminado, então "sumiu" é o desfecho normal de um
+    // boot que falhou, e sem prazo a máquina ficava "creating" para sempre.
+    // Espelha reconcile_statuses_once do gateway (docker/gateway/lifecycle.py).
     if (!pod) {
-      if (m.status === "creating") return m
+      if (m.status === "creating" && withinCreatingGrace(m)) return m
       return { ...m, status: "terminated" as const }
     }
 
@@ -203,8 +219,12 @@ export async function reconcileMachineStatuses(
     // Máquina recém-criada pode reportar EXITED por instantes antes de o
     // container subir — não a rebaixamos para "stopped" (apareceria pausada
     // durante o boot). Só RUNNING a promove e TERMINATED a encerra; espelha o
-    // guard do pod ausente acima.
-    const status = m.status === "creating" && mapped === "stopped" ? "creating" : mapped
+    // guard do pod ausente acima, prazo incluído: passado o grace o pod não
+    // subiu mesmo, e "stopped" é recuperável (o auto-wake religa).
+    const status =
+      m.status === "creating" && mapped === "stopped" && withinCreatingGrace(m)
+        ? "creating"
+        : mapped
     const cost = pod.costPerHr ?? m.cost_per_hr
     return { ...m, status, cost_per_hr: cost }
   })
