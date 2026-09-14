@@ -2645,7 +2645,8 @@ def apply_key_sampling_defaults(
 
 
 def apply_key_image_defaults(body_json: dict, entry: dict) -> None:
-    """Aplica os defaults de imagem da própria CHAVE (migration 0063) quando o
+    """Aplica os defaults de imagem da própria CHAVE (migration 0063; seed desde
+    a 0068) quando o
     cliente não mandou o parâmetro — mesma mecânica de
     apply_stack_image_defaults, um nível ACIMA dela na precedência.
 
@@ -2667,11 +2668,15 @@ def apply_key_image_defaults(body_json: dict, entry: dict) -> None:
         and entry.get("default_image_guidance_scale") is not None
     ):
         body_json["guidance_scale"] = entry["default_image_guidance_scale"]
+    # `is not None`, como os demais: seed 0 é uma seed válida, não "sem valor".
+    if "seed" not in body_json and entry.get("default_image_seed") is not None:
+        body_json["seed"] = entry["default_image_seed"]
 
 
 def apply_stack_image_defaults(body_json: dict, entry: dict) -> None:
     """Aplica default_image_size/default_image_steps/
-    default_image_guidance_scale da stack (migration 0062) quando o cliente não
+    default_image_guidance_scale (migration 0062) e default_image_seed
+    (migration 0068) da stack quando o cliente não
     mandou o parâmetro — o par, para o produto de imagem, do que
     apply_stack_sampling_defaults faz para o de texto.
 
@@ -2679,8 +2684,8 @@ def apply_stack_image_defaults(body_json: dict, entry: dict) -> None:
     opinou ainda", e só aí o default da stack entra. Roda DEPOIS de
     apply_key_image_defaults, que já terá preenchido o que a chave define — a
     ordem das duas chamadas é a precedência. Abaixo desta só restam os defaults
-    do pod (IMAGE_DEFAULT_SIZE/IMAGE_STEPS/IMAGE_GUIDANCE_SCALE em
-    docker/image/server.py).
+    do pod (IMAGE_DEFAULT_SIZE/IMAGE_STEPS/IMAGE_GUIDANCE_SCALE/IMAGE_DEFAULT_SEED
+    em docker/image/server.py).
 
     Não valida faixa: os CHECKs da 0062 já garantem que o que está gravado é
     aceitável, e o pod revalida tudo de qualquer jeito (validate_size,
@@ -2705,6 +2710,8 @@ def apply_stack_image_defaults(body_json: dict, entry: dict) -> None:
         and stack.get("default_image_guidance_scale") is not None
     ):
         body_json["guidance_scale"] = stack["default_image_guidance_scale"]
+    if "seed" not in body_json and stack.get("default_image_seed") is not None:
+        body_json["seed"] = stack["default_image_seed"]
 
 
 async def machine_admits(machine_id: str, usage_class: str = "low") -> bool:
