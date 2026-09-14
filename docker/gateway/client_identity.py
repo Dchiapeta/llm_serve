@@ -4,12 +4,10 @@ O plano já limitava capacidade (slots de máquina), vazão (RATE_LIMIT_RPM) e
 volume (DAILY_TOKEN_BUDGET), mas nada impedia colar a mesma chave em 20
 máquinas: uma assinatura Go valia por uma equipe inteira.
 
-São DUAS camadas, e esta é a mais fraca:
-
-  1. Chaves ativas por stack (MAX_KEYS_BY_PLAN, lib/types.ts) — o CONTRATO.
-     Exato, sem adivinhação, aplicado na emissão da chave pelo painel.
-  2. Ambientes distintos (este módulo) — o DETECTOR de quem furou o contrato
-     usando uma única chave em todo canto.
+Este módulo conta ambientes distintos — o DETECTOR de quem usa uma única
+chave em todo canto. Não existe teto de chaves por plano: a stack emite
+quantas quiser, e o único freio na emissão é o max_users da máquina
+(capacidade de VRAM, lib/actions.ts).
 
 ## Por que o fingerprint é aproximado
 
@@ -32,7 +30,6 @@ Os dois sinais são headers controlados pelo cliente. Quem bater no domínio do
 Railway direto, sem passar pelo Cloudflare, forja o bloco de rede à vontade.
 Este limite tem exatamente a mesma força do User-Agent em
 lib/request-origin.ts: telemetria acionável, jamais controle de segurança.
-Quem sustenta o contrato comercial é a camada 1.
 
 ## Bloco de rede, não IP
 

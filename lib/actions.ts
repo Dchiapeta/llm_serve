@@ -15,7 +15,7 @@ import { getClientLocation, listRoutesByMachine, setClientLocation } from "./rou
 import { insertStack } from "./stacks"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import { CLIENT_WINDOW_DAYS, MAX_KEYS_BY_PLAN, MAX_KNOWLEDGE_FILE_SIZE_BYTES, PRODUCT_CATEGORIES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type Account, type ApiKey, type LoraAdapter, type Machine, type ProductCategory, type Stack, type StackClient, type Template, type TemplatePlan } from "./types"
+import { CLIENT_WINDOW_DAYS, MAX_KNOWLEDGE_FILE_SIZE_BYTES, PRODUCT_CATEGORIES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type Account, type ApiKey, type LoraAdapter, type Machine, type ProductCategory, type Stack, type StackClient, type Template, type TemplatePlan } from "./types"
 
 // Janela de deduplicação do provisionamento: um retry do gateway dentro desse
 // intervalo reusa a máquina 'creating' recém-criada em vez de criar outra.
@@ -1900,47 +1900,6 @@ export async function updateStackSystemPrompt(formData: FormData) {
   revalidatePath("/accounts")
 }
 
-// Barra a emissão de uma chave nova quando a stack já está no teto do plano.
-//
-// Esta é a camada EXATA do limite de "quantos lugares o plano conecta": ou a
-// chave existe, ou não existe. A outra camada (ambientes distintos, tabela
-// stack_clients) é aproximada e mora no gateway — ver
-// docker/gateway/client_identity.py.
-//
-// Conta por STACK e não por conta: plano é propriedade da stack desde a
-// migration 0027. Chave de Playground é isenta, mesmo critério do backstop de
-// capacidade e de check_token_quota no gateway — é ferramenta interna do
-// admin, não um lugar do cliente.
-async function assertKeyQuota(
-  db: ReturnType<typeof createSupabaseAdmin>,
-  stackId: string
-) {
-  const { data: stack, error: stackErr } = await db
-    .from("stacks")
-    .select("plan")
-    .eq("id", stackId)
-    .single<{ plan: TemplatePlan }>()
-  if (stackErr || !stack) throw new Error("Stack não encontrada")
-
-  const limit = MAX_KEYS_BY_PLAN[stack.plan]
-  if (limit === null || limit === undefined) return
-
-  const { count, error } = await db
-    .from("api_keys")
-    .select("id", { count: "exact", head: true })
-    .eq("stack_id", stackId)
-    .eq("status", "active")
-    .eq("purpose", "customer")
-  if (error) throw new Error(error.message)
-
-  if ((count ?? 0) >= limit) {
-    throw new Error(
-      `Limite de ${limit} chave(s) do plano ${stack.plan} atingido. ` +
-        "Revogue uma chave para emitir outra."
-    )
-  }
-}
-
 // Gera uma chave HEX para uma conta numa máquina.
 // Retorna a chave em texto puro UMA única vez.
 export async function createKey(input: {
@@ -1950,8 +1909,7 @@ export async function createKey(input: {
   // rebind_stack_keys). Criar chave nunca aloca nem provisiona máquina — é o
   // uso que aloca. Sem máquina o backstop de capacidade POR MÁQUINA abaixo não
   // roda; a lotação real é garantida pelo gateway na hora de homear a stack
-  // (pick_running_machine_with_stack_slot), e o teto de chaves POR STACK
-  // (assertKeyQuota) roda do mesmo jeito.
+  // (pick_running_machine_with_stack_slot). Não há teto de chaves por plano.
   machineId: string | null
   stackId?: string | null
   name?: string | null
@@ -2052,15 +2010,9 @@ export async function createKey(input: {
     }
   }
 
-  // Depois da resolução do stackId, porque o teto é POR STACK (o plano é dela)
-  // — e depois do backstop de capacidade acima, que é por máquina. As duas
-  // checagens são independentes: uma protege a VRAM do pod, esta protege o
-  // contrato do plano. Mesma corrida check-then-insert do backstop, aceitável
-  // pelo mesmo motivo.
-  if (purpose === "customer" && stackId) {
-    await assertKeyQuota(db, stackId)
-  }
-
+  // Não há teto de chaves por plano: o único freio na emissão é o backstop de
+  // capacidade da máquina acima. Quem detecta uma chave espalhada em vários
+  // lugares é o teto de ambientes do gateway (client_identity.py).
   const plainKey = generateHexKey()
 
   const { error } = await db.from("api_keys").insert({

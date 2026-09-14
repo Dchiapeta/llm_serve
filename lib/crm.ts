@@ -91,7 +91,6 @@ export type CrmRow = {
   requests: number
 
   activeKeys: number
-  keyLimit: number | null
   envs: number
   envLimit: number | null
 

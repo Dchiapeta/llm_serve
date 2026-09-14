@@ -32,7 +32,6 @@ import { createSupabaseAdmin } from "@/lib/supabase/server"
 import {
   CLIENT_WINDOW_DAYS,
   MAX_CLIENTS_BY_PLAN,
-  MAX_KEYS_BY_PLAN,
   type Account,
   type BillingStatus,
   type Machine,
@@ -626,11 +625,11 @@ export const getCrmData = cache(async function getCrmData(
         ? "sem_contratacao"
         : "cliente"
 
-    // MAX_KEYS_BY_PLAN e MAX_CLIENTS_BY_PLAN são tetos POR STACK, e a linha é
-    // por conta: comparar a soma da conta com o teto de um único plano faria
-    // duas stacks Go em dia aparecerem como "6/3", inventando uma violação.
-    // Somar os tetos de cada stack é o equivalente correto no nível da conta;
-    // uma stack Enterprise (sem teto) torna o total ilimitado.
+    // MAX_CLIENTS_BY_PLAN é teto POR STACK, e a linha é por conta: comparar a
+    // soma da conta com o teto de um único plano faria duas stacks Go em dia
+    // aparecerem como "10/5", inventando uma violação. Somar os tetos de cada
+    // stack é o equivalente correto no nível da conta; uma stack Enterprise
+    // (sem teto) torna o total ilimitado.
     const sumLimits = (
       table: Record<TemplatePlan, number | null>
     ): number | null => {
@@ -643,7 +642,6 @@ export const getCrmData = cache(async function getCrmData(
       }
       return total
     }
-    const keyLimit = sumLimits(MAX_KEYS_BY_PLAN)
     const envLimit = sumLimits(MAX_CLIENTS_BY_PLAN)
 
     return {
@@ -695,7 +693,6 @@ export const getCrmData = cache(async function getCrmData(
       images: stackRows.reduce((acc, s) => acc + s.images, 0),
       requests: stackRows.reduce((acc, s) => acc + s.requests, 0),
       activeKeys: stackRows.reduce((acc, s) => acc + s.activeKeys, 0),
-      keyLimit,
       envs: stackRows.reduce((acc, s) => acc + s.envs, 0),
       envLimit,
       gpuCostUsd,

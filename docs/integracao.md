@@ -485,23 +485,20 @@ configuração viaja junto automaticamente.
 
 ### Quantos lugares o seu plano conecta
 
-O plano define em quantos lugares distintos a sua stack pode ser usada, medido de duas
-formas ao mesmo tempo:
+O plano define em quantos lugares distintos a sua stack pode ser usada:
 
 | | Go | Pro | Max | Enterprise |
 |---|---|---|---|---|
-| Chaves ativas | 3 | 25 | 50 | sem limite |
 | Ambientes simultâneos | 5 | 25 | 50 | sem limite |
 
-**Chaves** você controla no painel: emitir a 4ª chave num plano Go só é possível depois
-de revogar uma das três.
+**Chaves** você emite e revoga à vontade no painel — não há teto de chaves por plano.
 
 **Ambiente** é um lugar de onde a stack é usada — a combinação da ferramenta (Claude
 Code, Cursor, Codex, SDK…) com a rede de onde ela sai. O mesmo desenvolvedor usando
 Claude Code em casa e no escritório ocupa dois ambientes; uma equipe inteira na mesma
-rede do escritório ocupa um. Isso vale independentemente de quantas chaves você usa: as
-duas contagens existem para que uma única chave espalhada por vinte máquinas não
-substitua o plano contratado.
+rede do escritório ocupa um. Isso vale independentemente de quantas chaves você usa: a
+contagem existe para que uma única chave espalhada por vinte máquinas não substitua o
+plano contratado.
 
 A vaga de um ambiente é liberada sozinha depois de **14 dias** sem uso, então trocar de
 máquina não exige fazer nada. Para liberar na hora — trocou de notebook hoje e quer usar

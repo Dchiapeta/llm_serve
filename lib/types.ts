@@ -68,28 +68,14 @@ export const RAG_FILE_LIMIT_BY_PLAN: Record<TemplatePlan, number | null> = {
   Image: 0,
 }
 
-// Quantos LUGARES o plano pode conectar. São duas constantes porque são duas
-// camadas com garantias diferentes:
-//
-//   MAX_KEYS_BY_PLAN    — o CONTRATO. Chaves ativas (purpose 'customer') por
-//     stack, aplicado na emissão (assertKeyQuota em lib/actions.ts). Exato e
-//     sem falso positivo: ou a chave existe, ou não.
-//   MAX_CLIENTS_BY_PLAN — o DETECTOR de quem furou o contrato usando UMA
-//     chave em todo canto. Conta ambientes distintos (ferramenta + bloco de
-//     rede) vistos nos últimos CLIENT_WINDOW_DAYS, e é APROXIMADO por
-//     construção — ver o docstring de docker/gateway/client_identity.py.
+// Quantos LUGARES o plano pode conectar: ambientes distintos (ferramenta +
+// bloco de rede) vistos nos últimos CLIENT_WINDOW_DAYS. É APROXIMADO por
+// construção — ver o docstring de docker/gateway/client_identity.py. Não há
+// teto de chaves por plano: a stack emite quantas chaves quiser, e o único
+// freio na emissão é o max_users da máquina (capacidade de VRAM).
 //
 // null = sem limite, mesma convenção de RAG_FILE_LIMIT_BY_PLAN.
-export const MAX_KEYS_BY_PLAN: Record<TemplatePlan, number | null> = {
-  Go: 3,
-  Pro: 25,
-  Max: 50,
-  Enterprise: null,
-  // Compatibilidade com linhas legadas até a migration 0060 convertê-las para
-  // plan=Go/category=image.
-  Image: 3,
-}
-
+//
 // ATENÇÃO: espelha MAX_CLIENTS_BY_PLAN de docker/gateway/client_identity.py,
 // que é quem de fato aplica o teto e aceita override por env
 // (MAX_CLIENTS_GO/PRO/MAX). Divergir faz a UI mentir sobre o número que corta

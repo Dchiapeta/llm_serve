@@ -267,9 +267,6 @@ export function CrmTable({
                 </TableCell>
                 <TableCell className="text-right font-mono text-sm tabular-nums">
                   {row.activeKeys}
-                  {row.keyLimit !== null && (
-                    <span className="text-muted-foreground">/{row.keyLimit}</span>
-                  )}
                 </TableCell>
                 <TableCell className="text-right font-mono text-sm tabular-nums">
                   {row.envs}

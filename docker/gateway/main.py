@@ -1041,9 +1041,8 @@ def _client_limit_detail(plan: str | None, cap: int | None) -> str:
 async def enforce_client_limit(entry: dict, stack: dict, plan: str | None, headers) -> None:
     """Teto de LUGARES distintos conectados à stack (migration 0051).
 
-    Complementa o teto de CHAVES por stack aplicado na emissão pelo painel
-    (MAX_KEYS_BY_PLAN em lib/types.ts): aquele é o contrato, este pega quem
-    usa uma única chave em toda a equipe. Ver o docstring de
+    Não há teto de chaves por plano; este é o único limite de "lugares" e
+    pega quem usa uma única chave em toda a equipe. Ver o docstring de
     client_identity.py para o que o fingerprint acerta e o que ele erra.
 
     Custo no caminho quente: zero. Ambiente conhecido dentro do throttle sai
