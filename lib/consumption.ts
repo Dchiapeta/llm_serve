@@ -1,18 +1,23 @@
-// Unidade de consumo compartilhada entre LLM (tokens) e imagem (imagens
-// geradas). Sem I/O — importável por Server e Client Components, mesmo
-// padrão de lib/crm.ts.
+// Unidade de consumo compartilhada entre LLM e imagem: TOKENS, com a contagem
+// de imagens geradas como detalhe. Sem I/O — importável por Server e Client
+// Components, mesmo padrão de lib/crm.ts.
 //
 // ---------------------------------------------------------------------------
-// Por que existe
+// Por que tokens valem para imagem também
 // ---------------------------------------------------------------------------
-// Geração de imagem não produz token nenhum: gateway_requests.tokens_in/out
-// fica NULL de propósito nas rotas de imagem, e usage_metrics grava
-// requests>0 com tokens zerados. Toda superfície que somava
-// `tokens_in + tokens_out` como "o" consumo mostrava 0 para uma stack de
-// imagem, indistinguível na tela de "este cliente não usa o produto". O dado
-// certo mora em image_generations (lido via a view image_usage_rollup,
-// migration 0067) — este módulo é só a forma comum de somar e exibir as duas
-// unidades juntas.
+// Difusão não gera texto, mas o transformer do FLUX.2 processa uma sequência
+// de tokens como qualquer outro: o prompt mais um token por patch latente de
+// 16×16 px de cada imagem (gerada ou de referência). Desde a imagem 0.1.6 o
+// pod devolve essa conta num bloco `usage` no formato do vLLM, o agent a soma
+// em usage_metrics e o gateway a grava em gateway_requests.tokens_in/out —
+// pelos MESMOS caminhos das rotas de texto (docker/image/policy.usage_block).
+// Uma stack de imagem, portanto, tem consumo em tokens como qualquer outra;
+// `images` (image_usage_rollup, migration 0067) continua existindo porque
+// "quantas imagens" é uma pergunta que tokens não respondem.
+//
+// Pod anterior à 0.1.6 não manda `usage`: tokens ficam nulos e a stack volta
+// a aparecer só com o número de imagens — é o sinal de que a máquina ainda
+// não foi recriada com a imagem nova.
 //
 // ---------------------------------------------------------------------------
 // Por que um produto ({tokens, images, requests}), não uma união marcada
@@ -25,9 +30,6 @@
 // acontece uma vez, em `formatConsumption`, na hora de renderizar.
 
 import { formatTokens } from "./crm"
-import type { ProductCategory } from "./types"
-
-export type ConsumptionUnit = "tokens" | "images"
 
 export type Consumption = {
   tokens: number
@@ -49,32 +51,10 @@ export function addConsumption(a: Consumption, b: Consumption): Consumption {
   }
 }
 
-/**
- * Unidade de consumo nativa da categoria. Fail-open para "tokens" em
- * categoria nula/desconhecida — mesma disciplina de outros pontos do painel
- * que ramificam por `category` (ex.: sectionsForCategory).
- */
-export function unitForCategory(
-  category: ProductCategory | string | null
-): ConsumptionUnit {
-  return category === "image" ? "images" : "tokens"
-}
-
-/**
- * Unidades com valor > 0 num consumo agregado. Vazio = sem uso nenhum no
- * período; duas = conta/máquina/período com stack de LLM e de imagem juntas.
- */
-export function unitsPresent(c: Consumption): ConsumptionUnit[] {
-  const units: ConsumptionUnit[] = []
-  if (c.tokens > 0) units.push("tokens")
-  if (c.images > 0) units.push("images")
-  return units
-}
-
 // Mesmas faixas de formatTokens (lib/crm.ts): números de imagem hoje são
 // ordens de grandeza menores, mas a faixa alta existe para não quebrar se um
 // cliente gerar milhões.
-function formatImageCount(value: number): string {
+export function formatImageCount(value: number): string {
   if (value >= 1e9) return `${(value / 1e9).toFixed(1)}B`
   if (value >= 1e6) return `${(value / 1e6).toFixed(1)}M`
   if (value >= 1e3) return `${(value / 1e3).toFixed(1)}k`
@@ -83,39 +63,31 @@ function formatImageCount(value: number): string {
 
 /**
  * Formata um consumo agregado para exibição numa coluna/rótulo genérico
- * ("Consumo"), onde o cabeçalho não pode mais implicar uma unidade só.
+ * ("Consumo").
  *
- * Sem `unit` explícito, deriva de `unitsPresent`: uma unidade presente vira
- * "1,2M tokens" ou "87 imagens"; as duas juntas (conta mista) viram
- * "1,2M tokens · 87 imagens"; nenhuma vira "—" — nunca "0", que afirmaria uma
- * medição que não houve.
+ * Tokens são a manchete, sempre: é a unidade que as duas categorias produzem
+ * e a que a cota diária e o rateio de custo usam. Imagens entram como sufixo
+ * quando existem — "1,2M tokens · 87 imagens" — porque contam algo que os
+ * tokens não contam. Sem nada dos dois vira "—", nunca "0", que afirmaria
+ * uma medição que não houve. O caso "0 tokens · 87 imagens" é legítimo e
+ * proposital: é a cara de uma máquina de imagem que ainda roda um pod
+ * anterior à 0.1.6.
  *
- * `formatConsumption(c, "tokens")` delega em `formatTokens` (lib/crm.ts): a
- * bucketização/arredondamento do número nunca duplica lógica entre os dois
- * módulos, e o caminho de LLM continua vendo os mesmos números de sempre —
- * só ganha a palavra "tokens" ao lado, necessária porque o cabeçalho genérico
- * não a implica mais.
+ * Delega em `formatTokens` (lib/crm.ts): a bucketização/arredondamento do
+ * número nunca duplica lógica entre os dois módulos.
  */
-export function formatConsumption(
-  c: Consumption,
-  unit?: ConsumptionUnit
-): string {
-  if (unit === "tokens") return `${formatTokens(c.tokens)} tokens`
-  if (unit === "images") return `${formatImageCount(c.images)} imagens`
-
-  const present = unitsPresent(c)
-  if (present.length === 0) return "—"
-  if (present.length === 1) return formatConsumption(c, present[0])
-  return `${formatTokens(c.tokens)} tokens · ${formatImageCount(c.images)} imagens`
+export function formatConsumption(c: Consumption): string {
+  if (c.tokens <= 0 && c.images <= 0) return "—"
+  const parts = [`${formatTokens(c.tokens)} tokens`]
+  if (c.images > 0) parts.push(`${formatImageCount(c.images)} imagens`)
+  return parts.join(" · ")
 }
 
 /**
- * Único escalar comparável entre as duas unidades — usar para ordenação onde
- * hoje se ordenava por tokens. Não é `tokens + images`: somar as duas
- * grandezas produziria um número sem significado (1 imagem custa muito mais
- * GPU que 1 token). `requests` é o que as duas unidades produzem com a mesma
- * semântica.
+ * Escalar para ordenação onde se ordena por consumo. Tokens, porque é a
+ * unidade em que as duas categorias custam GPU — `images` só desempata uma
+ * máquina de imagem em pod antigo, que não conta tokens.
  */
 export function consumptionSortKey(c: Consumption): number {
-  return c.requests
+  return c.tokens > 0 ? c.tokens : c.images
 }

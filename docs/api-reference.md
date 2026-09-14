@@ -472,9 +472,19 @@ Resposta:
     "width": 1024, "height": 1024, "steps": 4,
     "guidance_scale": 1.0, "seed": 42, "n": 1,
     "model": "flux2-klein-4b"
+  },
+  "usage": {
+    "prompt_tokens": 12, "completion_tokens": 4096, "total_tokens": 4108,
+    "prompt_tokens_details": { "text_tokens": 12, "image_tokens": 0 }
   }
 }
 ```
+
+`usage` é o consumo em tokens, no mesmo formato das rotas de chat: um token
+por patch latente de 16×16 px — a imagem gerada em `completion_tokens`
+(1024×1024 = 4.096), cada imagem de referência em `prompt_tokens` — mais os
+tokens de texto do prompt. É o número que aparece em "Uso" e que a cota diária
+de tokens usa, igual ao texto.
 
 `meta` traz os parâmetros **efetivos** da geração. O campo mais útil ali é a
 `seed`: quando você não manda uma, o servidor sorteia — e é esse valor que

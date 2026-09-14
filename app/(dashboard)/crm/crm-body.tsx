@@ -327,10 +327,11 @@ export async function CrmBody({
 
       <p className="text-xs text-muted-foreground">
         Tokens e requisições vêm de <code>usage_metrics</code>, a mesma fonte que
-        o gateway usa para aplicar a cota diária. Imagens vêm de{" "}
-        <code>image_usage_rollup</code>, um rollup sobre{" "}
-        <code>image_generations</code> — geração de imagem não produz token, e
-        as duas fontes se somam por stack sem se sobrepor. A aba de Requisições
+        o gateway usa para aplicar a cota diária — inclusive para stack de
+        imagem, cujo pod conta patches latentes + prompt como tokens (imagem
+        0.1.6+). Imagens vêm de <code>image_usage_rollup</code>, um rollup
+        sobre <code>image_generations</code>: a contagem de imagens ao lado dos
+        tokens. A aba de Requisições
         usa <code>gateway_requests</code> (uma linha por request) e os totais
         não batem por construção. Cobrança vem da API da Chargefy ao vivo — o
         espelho no banco (<code>chargefy_subscriptions</code>) está vazio,

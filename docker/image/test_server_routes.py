@@ -110,9 +110,10 @@ def client(monkeypatch):
 
     def fake_run(payload: server.GenPayload):
         chamadas.append(payload)
-        # decodifica de verdade: é assim que um byte inválido vira 400 e não 500
-        for data in payload.references:
-            server._decode_reference(data)
+        # decodifica de verdade (é assim que um byte inválido vira 400 e não
+        # 500) pelo mesmo helper do worker real, que também registra as
+        # dimensões que o bloco `usage` conta
+        server._prepare_references(payload)
         return ["QUlP"] * payload.n
 
     monkeypatch.setattr(server, "READY", True)
@@ -1132,3 +1133,97 @@ def test_pad_replica_a_borda_em_vez_de_tarjar(monkeypatch):
     assert padded.size == (fit.padded_width, fit.padded_height)
     assert padded.getpixel((0, 15)) == (200, 0, 0)
     assert padded.getpixel((padded.width - 1, 15)) == (0, 0, 200)
+
+
+# ---------------------------------------------------------------------------
+# usage: consumo em tokens
+# ---------------------------------------------------------------------------
+
+
+def test_generations_devolve_usage_em_tokens(client):
+    """O agent lê `usage` na raiz de qualquer resposta JSON e soma em
+    usage_metrics; o gateway grava tokens_in/out a partir do mesmo bloco. Sem
+    ele, uma stack de imagem aparece com consumo zero em todo painel."""
+    r = client.post("/v1/images/generations", json={"prompt": "um gato", "size": "1024x1024"})
+    assert r.status_code == 200, r.text
+    usage = r.json()["usage"]
+    # 1024×1024 → 64×64 patches latentes de 16 px
+    assert usage["completion_tokens"] == 4096
+    # sem tokenizer no stub, o texto cai na heurística de chars/4 ("um gato" → 2)
+    assert usage["prompt_tokens_details"] == {"text_tokens": 2, "image_tokens": 0}
+    assert usage["prompt_tokens"] == 2
+    assert usage["total_tokens"] == 4098
+
+
+def test_usage_usa_o_tokenizer_do_pipeline_quando_existe(client, monkeypatch):
+    """Com o pipeline real, o prompt é contado como o encoder o vê: chat
+    template incluído e truncado no teto."""
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, **kw):
+            assert messages == [{"role": "user", "content": "um gato"}]
+            assert kw["add_generation_prompt"] is True and kw["enable_thinking"] is False
+            return "<|im_start|>user\num gato<|im_end|>\n<|im_start|>assistant\n"
+
+        def __call__(self, text, *, truncation, max_length):
+            assert truncation is True and max_length == server.MAX_SEQUENCE_LENGTH
+            return {"input_ids": list(range(11))}
+
+    monkeypatch.setattr(server, "PIPE", types.SimpleNamespace(tokenizer=FakeTokenizer()))
+    r = client.post("/v1/images/generations", json={"prompt": "um gato"})
+    assert r.json()["usage"]["prompt_tokens_details"]["text_tokens"] == 11
+
+
+def test_usage_de_edits_conta_as_referencias_como_entrada(client):
+    """Cada referência ocupa (h/16)×(w/16) tokens na sequência do transformer,
+    nas dimensões com que ENTROU — a primeira já com o padding do encaixe."""
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "x" * 40, "size": "1024x1024"},
+        files=[("image[]", ("a.png", _png((64, 64)), "image/png")),
+               ("image[]", ("b.png", _png((128, 64)), "image/png"))],
+    )
+    assert r.status_code == 200, r.text
+    usage = r.json()["usage"]
+    assert client.chamadas[-1].reference_sizes == [(64, 64), (128, 64)]
+    assert usage["prompt_tokens_details"] == {"text_tokens": 10, "image_tokens": 16 + 32}
+    assert usage["prompt_tokens"] == 10 + 48
+    assert usage["completion_tokens"] == 4096
+
+
+def test_usage_conta_a_referencia_paddada_e_o_canvas_inteiro(client):
+    """Com encaixe de proporção a foto entra maior (padding) e a saída sai
+    menor (recorte) — o custo é o da foto paddada e do CANVAS, não do que o
+    cliente recebe."""
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "x"},
+        files=[("image[]", ("a.png", _png((506, 1164)), "image/png"))],
+    )
+    assert r.status_code == 200, r.text
+    payload = client.chamadas[-1]
+    assert payload.fit is not None
+    padded = (payload.fit.padded_width, payload.fit.padded_height)
+    assert payload.reference_sizes == [padded]
+    usage = r.json()["usage"]
+    assert usage["prompt_tokens_details"]["image_tokens"] == policy.reference_latent_tokens(*padded)
+    assert usage["completion_tokens"] == policy.latent_tokens(payload.width, payload.height)
+    meta = r.json()["meta"]
+    assert usage["completion_tokens"] > policy.latent_tokens(meta["width"], meta["height"])
+
+
+def test_erro_do_pod_nao_devolve_usage(client, monkeypatch):
+    """Tokens de uma imagem que não saiu seriam custo inventado."""
+
+    class _Explode:
+        completed = depth = in_flight = overlaps = 0
+        alive = True
+        worker_error = None
+
+        async def submit(self, _p):
+            raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(server, "QUEUE", _Explode())
+    r = client.post("/v1/images/generations", json={"prompt": "x"})
+    assert r.status_code == 500
+    assert "usage" not in r.json()

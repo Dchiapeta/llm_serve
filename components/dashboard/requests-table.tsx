@@ -230,14 +230,13 @@ export function RequestsTable({ rows }: { rows: RequestRow[] }) {
                 )}
               </TableCell>
               <TableCell className="text-right font-mono text-xs tabular-nums">
-                {isImagePath(r.path) ? (
-                  // Geração de imagem não produz token: null aqui é a
-                  // ausência da contagem, não uma medição zerada (ver
-                  // docker/gateway/main.py, _relay_image_response). "— / —"
-                  // seria indistinguível de "não medimos" para um caso onde,
-                  // na verdade, a medição não se aplica — daí o rótulo
-                  // explícito em vez do traço duplo.
-                  <span className="text-muted-foreground">n/a · imagem</span>
+                {isImagePath(r.path) && r.tokens_in == null && r.tokens_out == null ? (
+                  // Rota de imagem SEM contagem: pod anterior à 0.1.6, que
+                  // não devolvia `usage`. A partir dela o pod conta patches
+                  // latentes + prompt e a linha cai no ramo de baixo como
+                  // qualquer chat. O rótulo explícito existe porque "— / —"
+                  // seria indistinguível de "não medimos".
+                  <span className="text-muted-foreground">n/a · pod antigo</span>
                 ) : (
                   <>
                     {r.tokens_in ?? "—"} / {r.tokens_out ?? "—"}

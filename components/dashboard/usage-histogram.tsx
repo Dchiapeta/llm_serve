@@ -9,9 +9,10 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart"
 
-// Duas séries no config (não uma): a geração de imagem não produz token, então
-// um período com tráfego dos dois tipos precisa das duas cores disponíveis
-// mesmo mostrando uma barra por vez — ver `unit` abaixo.
+// Duas séries no config (não uma): tokens (das duas categorias — o pod de
+// imagem conta patches latentes + prompt) e imagens geradas, que é a outra
+// pergunta que se faz a uma máquina de imagem. Uma barra por vez — ver
+// `unit` abaixo.
 const CONFIG: ChartConfig = {
   tokens: { label: "Tokens", color: "var(--chart-1)" },
   images: { label: "Imagens", color: "var(--chart-2)" },

@@ -11,7 +11,7 @@ import {
 } from "@/lib/machines"
 import { runpod, runpodConsoleUrl } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
-import { formatConsumption, unitForCategory } from "@/lib/consumption"
+import { formatConsumption, formatImageCount } from "@/lib/consumption"
 import type { Account, ApiKey, Machine, Template, UsageMetric } from "@/lib/types"
 import { Badge } from "@/components/ui/badge"
 import {
@@ -305,17 +305,17 @@ export default async function MachineDetailPage({
           </CardHeader>
           <CardContent>
             <p className="text-xs text-muted-foreground">
-              {/* Máquina nunca mistura categoria (template.category é fixo
-                  por máquina) — a unidade certa é uma decisão só, aqui, e o
-                  texto muda de propósito (concordância: "geradas", não
-                  "processados") em vez de compor um sufixo genérico. */}
-              {template?.category === "image"
-                ? `${imageUsage
-                    .reduce((s, u) => s + u.images, 0)
-                    .toLocaleString("pt-BR")} imagens geradas`
-                : `${usage
-                    .reduce((s, u) => s + u.tokens_in + u.tokens_out, 0)
-                    .toLocaleString("pt-BR")} tokens processados`}
+              {/* Tokens para as duas categorias: o pod de imagem conta
+                  patches latentes + prompt no `usage` (lib/consumption.ts).
+                  Máquina de imagem ganha a contagem de imagens ao lado —
+                  é o que tokens não dizem. */}
+              {`${usage
+                .reduce((s, u) => s + u.tokens_in + u.tokens_out, 0)
+                .toLocaleString("pt-BR")} tokens processados`}
+              {template?.category === "image" &&
+                ` · ${formatImageCount(
+                  imageUsage.reduce((s, u) => s + u.images, 0)
+                )} imagens geradas`}
             </p>
           </CardContent>
         </Card>
@@ -387,14 +387,11 @@ export default async function MachineDetailPage({
                         </TableCell>
                         <TableCell>{(u?.requests ?? 0).toLocaleString("pt-BR")}</TableCell>
                         <TableCell>
-                          {formatConsumption(
-                            {
-                              tokens: (u?.tokensIn ?? 0) + (u?.tokensOut ?? 0),
-                              images: imagesByKey.get(k.id) ?? 0,
-                              requests: u?.requests ?? 0,
-                            },
-                            unitForCategory(template?.category ?? null)
-                          )}
+                          {formatConsumption({
+                            tokens: (u?.tokensIn ?? 0) + (u?.tokensOut ?? 0),
+                            images: imagesByKey.get(k.id) ?? 0,
+                            requests: u?.requests ?? 0,
+                          })}
                         </TableCell>
                         <TableCell className="text-xs text-muted-foreground">
                           {new Date(k.created_at).toLocaleDateString("pt-BR")}

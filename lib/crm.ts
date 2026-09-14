@@ -42,8 +42,7 @@ export type CrmStackRow = {
   lastActivityAt: string | null
   tokens: number
   /** Imagens geradas (image_usage_rollup, migration 0067) — 0 para stack de
-   *  LLM, sempre. Ver lib/consumption.ts para a forma de somar/exibir junto
-   *  com tokens. */
+   *  LLM. Tokens valem para as duas categorias; ver lib/consumption.ts. */
   images: number
   requests: number
   activeKeys: number

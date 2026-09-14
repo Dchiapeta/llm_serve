@@ -11,7 +11,7 @@ import {
 } from "lucide-react"
 
 import { formatRelativeDay, type CrmRow } from "@/lib/crm"
-import { formatConsumption } from "@/lib/consumption"
+import { consumptionSortKey, formatConsumption } from "@/lib/consumption"
 import { BILLING_BADGE, graceRemaining } from "@/lib/billing-status"
 import { formatMoney } from "@/lib/chargefy-format"
 import { formatUsd } from "@/lib/billing"
@@ -89,11 +89,7 @@ export function CrmTable({
           cmp = a.monthlyNetCents - b.monthlyNetCents
           break
         case "consumo":
-          // requests, não tokens: é o único escalar comparável entre uma
-          // stack de LLM e uma de imagem (lib/consumption.ts,
-          // consumptionSortKey) — por tokens, toda stack de imagem empataria
-          // em 0.
-          cmp = a.requests - b.requests
+          cmp = consumptionSortKey(a) - consumptionSortKey(b)
           break
         case "requests":
           cmp = a.requests - b.requests

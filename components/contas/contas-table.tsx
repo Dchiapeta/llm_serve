@@ -103,7 +103,8 @@ export type StackInfo = Stack & {
     tokensIn: number
     tokensOut: number
     requests: number
-    /** image_usage_rollup (migration 0067) — 0 para stack de LLM, sempre. */
+    /** Imagens geradas (image_usage_rollup, migration 0067) — 0 para stack
+     *  de LLM. Tokens valem para as duas categorias (lib/consumption.ts). */
     images: number
   }
 }

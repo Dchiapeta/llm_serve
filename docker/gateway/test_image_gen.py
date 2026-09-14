@@ -258,3 +258,19 @@ def test_um_item_ruim_derruba_o_lote_inteiro():
 def test_resposta_que_nao_e_objeto_e_recusada():
     with pytest.raises(image_gen.MalformedImageResponse):
         image_gen.plan_persistence([1, 2, 3], now=NOW, **CTX)
+
+
+# ---------------------------------------------------------------------------
+# usage
+# ---------------------------------------------------------------------------
+
+
+def test_usage_of_devolve_o_bloco_do_pod_cru():
+    usage = {"prompt_tokens": 12, "completion_tokens": 4096, "total_tokens": 4108}
+    assert image_gen.usage_of({"data": [], "usage": usage}) == usage
+
+
+def test_usage_of_e_none_para_pod_antigo_ou_bloco_invalido():
+    assert image_gen.usage_of({"data": []}) is None
+    assert image_gen.usage_of({"data": [], "usage": "4096"}) is None
+    assert image_gen.usage_of(None) is None

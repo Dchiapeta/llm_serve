@@ -86,9 +86,9 @@ export async function DashboardBody({
     : await usageQuery
 
   // image_usage_rollup (migration 0067): mesma janela do usage_metrics acima,
-  // para os dois somarem o mesmo período — geração de imagem não produz
-  // token, e sem isto uma máquina de imagem apareceria sempre com "0 tokens"
-  // nesta página, igual ao bug que a view existe para consertar.
+  // para os dois somarem o mesmo período. Tokens já incluem imagem (o pod
+  // conta patches latentes + prompt); isto é a contagem de imagens, que
+  // tokens não dizem.
   const imageUsageQuery = db
     .from("image_usage_rollup")
     .select("machine_id, window_start, images")

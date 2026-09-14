@@ -22,7 +22,12 @@ import {
   type CrmStackRow,
   type MatchSource,
 } from "@/lib/crm"
-import { EMPTY_CONSUMPTION, type Consumption } from "@/lib/consumption"
+import {
+  EMPTY_CONSUMPTION,
+  addConsumption,
+  consumptionSortKey,
+  type Consumption,
+} from "@/lib/consumption"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import {
   CLIENT_WINDOW_DAYS,
@@ -380,7 +385,6 @@ export const getCrmData = cache(async function getCrmData(
 
   const gpuCostByStack = new Map<string, number>()
   const stacksByMachine = new Map<string, StackRecord[]>()
-  const categoryByStackId = new Map(stacks.map((s) => [s.id, s.category]))
   for (const s of stacks) {
     if (!s.machine_id) continue
     const list = stacksByMachine.get(s.machine_id) ?? []
@@ -392,39 +396,19 @@ export const getCrmData = cache(async function getCrmData(
     if (row.spent <= 0) continue
     const perStack = usageByMachineStack.get(row.machineId)
 
-    // A máquina rateia na unidade NATIVA das stacks que ela hospeda — tokens
-    // para uma máquina de LLM, imagens para uma de imagem. Verificado com
-    // dados reais: hoje nenhuma máquina mistura categoria (lib/actions.ts
-    // recusa migrar uma stack para máquina de categoria diferente), então o
-    // rateio proporcional dentro de uma máquina é sempre entre grandezas da
-    // mesma unidade — antes deste fix, uma máquina de imagem sempre lia
-    // tokens=0 aqui e todo o custo dela caía no ramo "sem uso no período",
-    // dividido igualmente entre as stacks hospedadas (correto por acidente,
-    // não por desenho).
-    //
-    // Se essa premissa quebrar um dia (dado sujo, stack legada apontando pra
-    // máquina errada), cair para `requests` — o único número que as duas
-    // unidades produzem com a mesma semântica — em vez de deixar uma unidade
-    // "vencer" e levar todo o custo da outra.
-    const categories = new Set(
-      [...(perStack?.keys() ?? [])]
-        .map((id) => categoryByStackId.get(id))
-        .filter((c): c is ProductCategory => c != null)
-    )
-    const mixed = categories.size > 1
-    if (mixed) {
-      console.warn(
-        `CRM: máquina ${row.machineId} hospeda stacks de categorias ` +
-          "diferentes no mesmo período — rateio de custo caiu para " +
-          "requisições. Isso não deveria acontecer; investigar."
-      )
-    }
+    // Rateio por TOKENS, a unidade em que as duas categorias custam GPU: o
+    // pod de imagem conta patches latentes + prompt no `usage`
+    // (lib/consumption.ts), então uma máquina de imagem soma tokens como uma
+    // de LLM. Cascata de fallback para máquina de imagem que ainda roda pod
+    // anterior à 0.1.6 (tokens zerados): imagens, e por fim `requests`, o
+    // único número que toda máquina produz — em vez de deixar o custo cair
+    // no ramo "sem uso no período" e ser dividido em partes iguais.
+    const totals = perStack
+      ? [...perStack.values()].reduce(addConsumption, EMPTY_CONSUMPTION)
+      : EMPTY_CONSUMPTION
     const quantityOf = (c: Consumption): number =>
-      mixed ? c.requests : categories.has("image") ? c.images : c.tokens
-
-    const total = perStack
-      ? [...perStack.values()].reduce((sum, c) => sum + quantityOf(c), 0)
-      : 0
+      totals.tokens > 0 ? c.tokens : totals.images > 0 ? c.images : c.requests
+    const total = quantityOf(totals)
 
     if (perStack && total > 0) {
       // Rateio por consumo: quem gastou mais GPU carrega mais custo.
@@ -719,11 +703,14 @@ export const getCrmData = cache(async function getCrmData(
     }
   })
 
-  // Desempate por `requests`, não por `tokens`: é o único escalar que tokens e
-  // imagens produzem com a mesma semântica (lib/consumption.ts,
-  // consumptionSortKey) — por tokens, toda stack de imagem empataria em 0 e
-  // cairia para a ordem de chegada.
-  rows.sort((a, b) => b.monthlyNetCents - a.monthlyNetCents || b.requests - a.requests)
+  // Desempate por consumo (lib/consumption.ts, consumptionSortKey): tokens,
+  // que as duas categorias produzem — imagens só desempatam uma stack de
+  // imagem em pod anterior à 0.1.6.
+  rows.sort(
+    (a, b) =>
+      b.monthlyNetCents - a.monthlyNetCents ||
+      consumptionSortKey(b) - consumptionSortKey(a)
+  )
 
   return {
     rows,

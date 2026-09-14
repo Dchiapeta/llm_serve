@@ -5243,9 +5243,15 @@ async def _authorize_image_request(
     # garantidamente não-None neste ponto: _require_image_product já barrou a
     # ausência de uma stack da categoria image.
     check_image_rate_limit(rate_bucket_for_stack(key_stack["id"]), key_plan)
-    # Não aplica check_token_quota: imagem não produz tokens e o orçamento do
-    # Go/LLM é outro produto. Uma conta que esgotou texto não pode bloquear uma
-    # stack Go/image independente.
+    # Cota diária de tokens, como nas rotas de texto: o pod devolve `usage` em
+    # tokens (patches latentes + prompt, ver docker/image/policy.usage_block) e
+    # o agent os soma em usage_metrics, que é de onde a cota lê. Até a 0.1.5 o
+    # pod não contava nada e esta chamada não existia — "imagem não produz
+    # token" deixou de ser verdade no dia em que passamos a contar a sequência
+    # que o transformer processa. A cota continua por CONTA e por plano
+    # (DAILY_TOKEN_BUDGET), então uma conta com stack de texto e de imagem
+    # divide o mesmo teto — hoje 0 (sem teto) para todos os planos.
+    await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
 
     machine, _rewrite_model, effective_plan, stack_id = await resolve_route(
         account_id, entry
@@ -5359,7 +5365,23 @@ async def _compensate_uploads(batch_id: str, storage_paths: list[str]) -> None:
         logger.warning("images: compensação do batch %s falhou (%s)", batch_id, e)
 
 
-async def _persist_images(raw: bytes, log_ctx: dict, fallback_meta: dict) -> None:
+def _parse_image_payload(raw: bytes) -> dict:
+    """Corpo 200 do pod como JSON. Parseado UMA vez no relay e compartilhado
+    entre a persistência (data[].b64_json, meta) e o log (usage): um corpo de
+    ~1,7 MB por imagem não merece dois json.loads."""
+    try:
+        payload = json.loads(raw)
+    except ValueError as e:
+        # 200 com corpo não-JSON. Vira MalformedImageResponse para o chamador
+        # responder "formato inesperado" em vez de "falha ao armazenar": a
+        # segunda mensagem mandaria o cliente investigar o lado errado.
+        raise image_gen.MalformedImageResponse(f"resposta 200 não é JSON: {e}")
+    if not isinstance(payload, dict):
+        raise image_gen.MalformedImageResponse("resposta do pod não é um objeto JSON")
+    return payload
+
+
+async def _persist_images(payload: dict, log_ctx: dict, fallback_meta: dict) -> None:
     """Sobe as imagens da resposta e grava as linhas de image_generations.
 
     Síncrono no caminho da requisição de propósito: uma resposta 200 desta rota
@@ -5370,14 +5392,6 @@ async def _persist_images(raw: bytes, log_ctx: dict, fallback_meta: dict) -> Non
     Levanta em falha confirmada; quem chama traduz para 502.
     """
     batch_id = str(uuid.uuid4())
-    try:
-        payload = json.loads(raw)
-    except ValueError as e:
-        # 200 com corpo não-JSON. Vira MalformedImageResponse para o chamador
-        # responder "formato inesperado" em vez de "falha ao armazenar": a
-        # segunda mensagem mandaria o cliente investigar o lado errado.
-        raise image_gen.MalformedImageResponse(f"resposta 200 não é JSON: {e}")
-
     pending = image_gen.plan_persistence(
         payload,
         batch_id=batch_id,
@@ -5416,11 +5430,20 @@ async def _relay_image_response(
     O corpo do cliente é o do pod, byte a byte: o contrato da rota continua sendo
     `b64_json`, e a persistência é invisível para quem chama.
 
-    `usage=None` sempre: difusão não produz tokens. tokens_in/out ficam nulos em
-    gateway_requests, e é essa a informação correta — zero seria uma contagem,
-    null é a ausência dela."""
+    `usage` vem do próprio pod (`usage` na raiz da resposta, formato chat:
+    patches latentes de 16×16 px de cada imagem + tokens do prompt — ver
+    docker/image/policy.usage_block) e vai para tokens_in/out de
+    gateway_requests pelo mesmo log_gateway_request das rotas de texto. É a
+    MESMA contagem que o agent soma em usage_metrics, então as duas tabelas
+    concordam por construção. Pod anterior à 0.1.6 não manda o bloco: aí fica
+    None, como sempre ficou — null é a ausência da contagem, zero seria uma
+    contagem. Não há fallback calculado aqui de propósito: o gateway até
+    saberia estimar os patches pelas dimensões gravadas, mas usage_metrics não
+    receberia o mesmo número, e as duas fontes divergiriam justo na janela em
+    que alguém estivesse comparando as duas."""
     status_code = upstream.status_code
     headers: dict[str, str] = {}
+    usage: dict | None = None
     try:
         try:
             raw = await upstream.aread()
@@ -5439,7 +5462,9 @@ async def _relay_image_response(
 
         if status_code == 200:
             try:
-                await _persist_images(raw, log_ctx, fallback_meta or {})
+                payload = _parse_image_payload(raw)
+                usage = image_gen.usage_of(payload)
+                await _persist_images(payload, log_ctx, fallback_meta or {})
             except image_gen.MalformedImageResponse as e:
                 # o pod respondeu 200 com um corpo que não reconhecemos. Não dá
                 # pra guardar nem pra prometer que guardamos.
@@ -5463,7 +5488,7 @@ async def _relay_image_response(
         await upstream.aclose()
         release_flight(flight_key)
 
-    log_gateway_request(**log_ctx, status_code=status_code, stream=False, usage=None)
+    log_gateway_request(**log_ctx, status_code=status_code, stream=False, usage=usage)
     return Response(
         content=raw,
         status_code=status_code,

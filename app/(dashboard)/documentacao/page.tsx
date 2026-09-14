@@ -418,12 +418,17 @@ export default function DocumentacaoPage() {
                   </li>
                   <li>
                     <span className="font-medium text-foreground">
-                      Sem cota de tokens
+                      Consumo em tokens
                     </span>{" "}
-                    — difusão não produz tokens, então{" "}
-                    <code>tokens_in</code>/<code>tokens_out</code> ficam nulos
-                    em <code>gateway_requests</code> e o orçamento diário não se
-                    aplica. O que limita é 10 submissões/min por stack.
+                    — desde a imagem 0.1.6 o pod devolve <code>usage</code>:
+                    um token por patch latente de 16×16 px (a imagem gerada em{" "}
+                    <code>tokens_out</code>, as referências em{" "}
+                    <code>tokens_in</code>) mais os tokens do prompt. O agent
+                    soma em <code>usage_metrics</code> e o gateway grava em{" "}
+                    <code>gateway_requests</code>, então o orçamento diário
+                    vale como no texto (hoje sem teto). Pod anterior deixa os
+                    tokens nulos. O freio de submissão continua sendo 10/min
+                    por stack.
                   </li>
                   <li>
                     <span className="font-medium text-foreground">

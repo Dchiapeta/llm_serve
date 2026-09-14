@@ -988,3 +988,102 @@ class GenerationQueue:
                     self._running -= 1
             finally:
                 self._queue.task_done()
+
+
+# ---------------------------------------------------------------------------
+# Contabilidade em tokens
+# ---------------------------------------------------------------------------
+#
+# Difusão não gera texto, mas o transformer do FLUX.2 Klein processa uma
+# sequência de tokens como qualquer outro: o prompt (Qwen3, até
+# `max_sequence_length`) mais um token por patch latente de cada imagem — a
+# gerada e cada referência. É essa sequência que custa GPU, e é ela que o
+# bloco `usage` da resposta conta, no mesmo formato do vLLM
+# (prompt_tokens / completion_tokens / total_tokens), para que o agent, o
+# gateway e os painéis somem imagem e texto na mesma unidade sem ramificar.
+#
+# As constantes abaixo espelham o pipeline do diffusers (Flux2KleinPipeline,
+# confirmado no código em 14/09/2026):
+#
+#   - um token latente cobre 16×16 px: o VAE reduz 8× e o pipeline agrupa os
+#     latentes em patches 2×2 (`_patchify_latents`) antes do transformer;
+#   - a imagem gerada tem (height // 16) × (width // 16) tokens
+#     (`prepare_latents`), nas dimensões do CANVAS — o recorte do encaixe de
+#     proporção acontece depois e não devolve custo nenhum;
+#   - cada referência passa por `_resize_to_target_area` (escala uniforme
+#     quando a área excede 1024×1024, nunca amplia) e pelo piso a múltiplo de
+#     16 em cada lado, e só então vira (h // 16) × (w // 16) tokens.
+#
+# Se o pipeline mudar de VAE ou de patch, é AQUI que a conta muda — o server
+# só monta o bloco.
+
+LATENT_PATCH_PX = 16
+REFERENCE_MAX_AREA = 1024 * 1024
+
+
+def latent_tokens(width: int, height: int) -> int:
+    """Tokens latentes de uma imagem de `width`×`height` no transformer."""
+    if width <= 0 or height <= 0:
+        return 0
+    return (height // LATENT_PATCH_PX) * (width // LATENT_PATCH_PX)
+
+
+def reference_latent_tokens(width: int, height: int) -> int:
+    """Tokens que uma referência de `width`×`height` ocupa DEPOIS do
+    pré-processamento do pipeline (teto de área + piso a múltiplo de 16).
+
+    A conta reproduz o pipeline em vez de medir o tensor porque o tensor só
+    existe dentro do `PIPE(...)`, e sair de lá com ele exigiria reimplementar
+    o `__call__`. Reproduzir três linhas de aritmética é o custo menor.
+    """
+    if width <= 0 or height <= 0:
+        return 0
+    if width * height > REFERENCE_MAX_AREA:
+        scale = math.sqrt(REFERENCE_MAX_AREA / (width * height))
+        width = int(width * scale)
+        height = int(height * scale)
+    width = (width // LATENT_PATCH_PX) * LATENT_PATCH_PX
+    height = (height // LATENT_PATCH_PX) * LATENT_PATCH_PX
+    return latent_tokens(width, height)
+
+
+def estimate_text_tokens(prompt: str, max_sequence_length: int) -> int:
+    """Fallback quando o tokenizer não está à mão (~4 chars/token, mesma
+    heurística do gateway), limitado pelo teto do encoder — o pipeline trunca
+    em `max_sequence_length`, então contar além dele afirmaria tokens que o
+    modelo nunca viu."""
+    if not prompt:
+        return 0
+    return min(max_sequence_length, max(1, math.ceil(len(prompt) / 4)))
+
+
+def usage_block(
+    *,
+    text_tokens: int,
+    reference_sizes: list[tuple[int, int]],
+    width: int,
+    height: int,
+    n: int,
+) -> dict:
+    """Bloco `usage` da resposta, no formato chat do vLLM.
+
+    `prompt_tokens` = texto + patches das referências (o que entra);
+    `completion_tokens` = patches da(s) imagem(ns) gerada(s) (o que sai).
+    `prompt_tokens_details` separa texto de imagem pelo mesmo motivo que a
+    OpenAI o faz no gpt-image-1: um prompt de 40 tokens com quatro referências
+    de 4096 cada é 99% imagem, e quem olha só o total não descobre isso.
+    Não carrega `cached_tokens`: não há prefix cache em difusão, e o
+    normalize_usage do agent/gateway lê a chave ausente como zero.
+    """
+    image_tokens = sum(reference_latent_tokens(w, h) for w, h in reference_sizes)
+    prompt_tokens = text_tokens + image_tokens
+    completion_tokens = max(0, n) * latent_tokens(width, height)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": {
+            "text_tokens": text_tokens,
+            "image_tokens": image_tokens,
+        },
+    }

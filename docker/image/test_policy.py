@@ -973,3 +973,58 @@ def test_crop_box_degenerado_devolve_a_imagem_inteira():
     frente, no encode."""
     fit = policy.AspectFit(600, 600, 0, 0, 1000, 1000)
     assert fit.crop_box(100, 100) == (0, 0, 100, 100)
+
+
+# ---------------------------------------------------------------------------
+# contabilidade em tokens
+# ---------------------------------------------------------------------------
+
+
+def test_um_token_latente_cobre_16x16_px():
+    # 1024×1024 → 64×64 patches: é o image_seq_len que o pipeline calcula
+    assert policy.latent_tokens(1024, 1024) == 4096
+    assert policy.latent_tokens(1536, 1024) == 6144
+    # resto abaixo de 16 px não vira token — o pipeline pisa a múltiplo de 16
+    assert policy.latent_tokens(1030, 1030) == 4096
+    assert policy.latent_tokens(0, 1024) == 0
+
+
+def test_referencia_pequena_conta_pelas_proprias_dimensoes():
+    # 512×512 não é ampliada (o pipeline nunca faz upscale): 32×32
+    assert policy.reference_latent_tokens(512, 512) == 1024
+    # 506×1164 → piso a 496×1152 → 31×72
+    assert policy.reference_latent_tokens(506, 1164) == 31 * 72
+
+
+def test_referencia_grande_e_reduzida_a_1024x1024_de_area():
+    # 2048×2048 → escala 0,5 → 1024×1024 → 4096, e não 16384
+    assert policy.reference_latent_tokens(2048, 2048) == 4096
+    # 3000×2000 → escala sqrt(1048576/6e6)=0,418 → 1254×836 → piso 1248×832 → 78×52
+    assert policy.reference_latent_tokens(3000, 2000) == 78 * 52
+
+
+def test_estimativa_de_texto_respeita_o_teto_do_encoder():
+    assert policy.estimate_text_tokens("", 512) == 0
+    assert policy.estimate_text_tokens("gato", 512) == 1
+    assert policy.estimate_text_tokens("x" * 40, 512) == 10
+    # prompt maior que o teto conta só o que o modelo vê
+    assert policy.estimate_text_tokens("x" * 10_000, 512) == 512
+
+
+def test_usage_block_separa_entrada_de_saida():
+    usage = policy.usage_block(
+        text_tokens=12, reference_sizes=[(512, 512), (1024, 1024)],
+        width=1024, height=1536, n=1,
+    )
+    assert usage["prompt_tokens_details"] == {"text_tokens": 12, "image_tokens": 1024 + 4096}
+    assert usage["prompt_tokens"] == 12 + 1024 + 4096
+    assert usage["completion_tokens"] == 64 * 96
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    # sem cached_tokens: não há prefix cache em difusão
+    assert "cached_tokens" not in usage["prompt_tokens_details"]
+
+
+def test_usage_block_multiplica_a_saida_por_n():
+    usage = policy.usage_block(text_tokens=1, reference_sizes=[], width=1024, height=1024, n=2)
+    assert usage["completion_tokens"] == 2 * 4096
+    assert usage["prompt_tokens"] == 1

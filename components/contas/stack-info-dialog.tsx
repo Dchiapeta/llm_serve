@@ -6,7 +6,7 @@ import { Copy, ExternalLink, Info } from "lucide-react"
 import { toast } from "sonner"
 
 import { PLAN_BADGE_VARIANT } from "@/lib/plan-badge"
-import { formatConsumption } from "@/lib/consumption"
+import { formatImageCount } from "@/lib/consumption"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
@@ -156,27 +156,21 @@ export function StackInfoDialog({
             <div className="text-sm">
               <p className="text-muted-foreground mb-1">Uso ({periodLabel})</p>
               <dl className="grid grid-cols-2 gap-y-2">
-                {stack.category === "image" ? (
-                  // Geração de imagem não produz token — tokensIn/Out ficam
-                  // sempre 0 pra esta categoria (ver docker/gateway/main.py,
-                  // _relay_image_response). O que a stack realmente consome é
-                  // imagem (image_usage_rollup, migration 0067).
+                {/* Tokens valem para as duas categorias: numa stack de
+                    imagem, entrada = prompt + patches das referências e
+                    saída = patches da imagem gerada (docker/image/policy.py,
+                    usage_block). A contagem de imagens entra como linha a
+                    mais — é o que tokens não dizem. */}
+                <dt className="text-muted-foreground">Tokens (entrada)</dt>
+                <dd>{stack.usage.tokensIn.toLocaleString("pt-BR")}</dd>
+
+                <dt className="text-muted-foreground">Tokens (saída)</dt>
+                <dd>{stack.usage.tokensOut.toLocaleString("pt-BR")}</dd>
+
+                {stack.category === "image" && (
                   <>
                     <dt className="text-muted-foreground">Imagens geradas</dt>
-                    <dd>
-                      {formatConsumption(
-                        { tokens: 0, images: stack.usage.images, requests: 0 },
-                        "images"
-                      )}
-                    </dd>
-                  </>
-                ) : (
-                  <>
-                    <dt className="text-muted-foreground">Tokens (entrada)</dt>
-                    <dd>{stack.usage.tokensIn.toLocaleString("pt-BR")}</dd>
-
-                    <dt className="text-muted-foreground">Tokens (saída)</dt>
-                    <dd>{stack.usage.tokensOut.toLocaleString("pt-BR")}</dd>
+                    <dd>{formatImageCount(stack.usage.images)}</dd>
                   </>
                 )}
 
