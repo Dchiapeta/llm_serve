@@ -5387,13 +5387,17 @@ def _parse_image_payload(raw: bytes) -> dict:
     return payload
 
 
-async def _persist_images(payload: dict, log_ctx: dict, fallback_meta: dict) -> None:
+async def _persist_images(payload: dict, log_ctx: dict, fallback_meta: dict) -> str:
     """Sobe as imagens da resposta e grava as linhas de image_generations.
 
     Síncrono no caminho da requisição de propósito: uma resposta 200 desta rota
     significa "a imagem está guardada". Fire-and-forget daria latência menor mas
     não daria essa garantia — a task pode morrer no restart do gateway, e não há
     de onde reconstruir a imagem depois que o corpo foi entregue.
+
+    Devolve o `batch_id` do lote (a coluna de mesmo nome em image_generations):
+    é o que sai no header `X-Stac-Image-Batch`, para o painel reabrir as imagens
+    de uma execução sem guardar os bytes do outro lado.
 
     Levanta em falha confirmada; quem chama traduz para 502.
     """
@@ -5420,6 +5424,7 @@ async def _persist_images(payload: dict, log_ctx: dict, fallback_meta: dict) -> 
     except Exception:
         await _compensate_uploads(batch_id, uploaded)
         raise
+    return batch_id
 
 
 async def _relay_image_response(
@@ -5470,7 +5475,11 @@ async def _relay_image_response(
             try:
                 payload = _parse_image_payload(raw)
                 usage = image_gen.usage_of(payload)
-                await _persist_images(payload, log_ctx, fallback_meta or {})
+                # O corpo segue byte a byte o do pod; o elo com o bucket vai
+                # só no header, que um cliente comum pode ignorar.
+                headers["X-Stac-Image-Batch"] = await _persist_images(
+                    payload, log_ctx, fallback_meta or {}
+                )
             except image_gen.MalformedImageResponse as e:
                 # o pod respondeu 200 com um corpo que não reconhecemos. Não dá
                 # pra guardar nem pra prometer que guardamos.
