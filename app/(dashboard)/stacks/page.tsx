@@ -29,6 +29,7 @@ export default async function ContasPage() {
     { data: lorasData },
     { data: keysData },
     { data: usageData },
+    { data: imageUsageData },
     { data: knowledgeData },
     { data: stacksData },
     { data: templatesData },
@@ -43,6 +44,14 @@ export default async function ContasPage() {
     db
       .from("usage_metrics")
       .select("api_key_id, tokens_in, tokens_out, requests, window_start")
+      .gte("window_start", periodStart),
+    // image_usage_rollup (migration 0067) já vem com stack_id direto — sem a
+    // indirection por chave que usage_metrics precisa (chave legada sem
+    // stack_id): toda linha de image_generations é gravada com a stack já
+    // resolvida no momento da requisição.
+    db
+      .from("image_usage_rollup")
+      .select("stack_id, images")
       .gte("window_start", periodStart),
     db.from("knowledge_chunks").select("stack_id, storage_path"),
     db.from("stacks").select("*").order("created_at"),
@@ -68,6 +77,10 @@ export default async function ContasPage() {
     tokens_out: number
     requests: number
     window_start: string
+  }[]
+  const imageUsage = (imageUsageData ?? []) as {
+    stack_id: string | null
+    images: number
   }[]
   const knowledgeChunks = (knowledgeData ?? []) as {
     stack_id: string | null
@@ -129,6 +142,13 @@ export default async function ContasPage() {
     usageByKeyId.set(u.api_key_id, agg)
   }
 
+  // image_usage_rollup já vem por stack_id — sem indirection por chave.
+  const imagesByStackId = new Map<string, number>()
+  for (const u of imageUsage) {
+    if (!u.stack_id) continue
+    imagesByStackId.set(u.stack_id, (imagesByStackId.get(u.stack_id) ?? 0) + u.images)
+  }
+
   const templateById = new Map(templates.map((t) => [t.id, t]))
 
   const readyAdapterStacks = new Set(
@@ -183,7 +203,12 @@ export default async function ContasPage() {
       const stackKeys = keys.filter((k) =>
         k.stack_id ? k.stack_id === s.id : k.account_id === account.id && k.machine_id === s.machine_id
       )
-      const stackUsage = { tokensIn: 0, tokensOut: 0, requests: 0 }
+      const stackUsage = {
+        tokensIn: 0,
+        tokensOut: 0,
+        requests: 0,
+        images: imagesByStackId.get(s.id) ?? 0,
+      }
       for (const k of stackKeys) {
         const agg = usageByKeyId.get(k.id)
         if (!agg) continue
@@ -235,7 +260,8 @@ export default async function ContasPage() {
         <div>
           <h1 className="text-2xl font-semibold">Stacks</h1>
           <p className="text-sm text-muted-foreground">
-            Stacks contratadas, alocação de máquina e consumo de tokens
+            Stacks contratadas, alocação de máquina e consumo (tokens ou
+            imagens, conforme a categoria)
           </p>
         </div>
         <CreateStackDialog

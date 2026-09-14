@@ -326,7 +326,10 @@ export ANTHROPIC_MODEL="pro-base"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW=104000
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8000
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 claude
 ```
 
@@ -342,6 +345,14 @@ reservado para duas coisas — a resposta do modelo e uma folga para o turno seg
 porque entre a decisão de compactar e a próxima mensagem cabe um arquivo grande
 inteiro (um `Read` de 60 KB são ~18 mil tokens).
 
+As outras três variáveis completam a conta. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` informa a
+janela real do modelo: como o Claude Code não reconhece o nome `pro-base`, sem ela a
+status line e a compactação trabalham sobre os 200k que ele assume. O Claude Code
+também **desconta a reserva de saída da janela de compactação** (20 mil tokens por
+padrão); `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8000`, que é o mínimo de saída que o gateway
+garante, devolve 12 mil tokens de contexto útil antes de compactar. E
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` corta as chamadas de fundo que não são suas.
+
 Esses `export` valem só para a sessão de terminal em que você os rodou. Para não
 depender disso, ponha o mesmo conteúdo em `~/.claude/settings.json`:
 
@@ -355,7 +366,10 @@ depender disso, ponha o mesmo conteúdo em `~/.claude/settings.json`:
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "pro-base",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "pro-base",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "pro-base",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "104000"
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "104000",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   }
 }
 ```
@@ -471,23 +485,20 @@ configuração viaja junto automaticamente.
 
 ### Quantos lugares o seu plano conecta
 
-O plano define em quantos lugares distintos a sua stack pode ser usada, medido de duas
-formas ao mesmo tempo:
+O plano define em quantos lugares distintos a sua stack pode ser usada:
 
 | | Go | Pro | Max | Enterprise |
 |---|---|---|---|---|
-| Chaves ativas | 3 | 25 | 50 | sem limite |
 | Ambientes simultâneos | 5 | 25 | 50 | sem limite |
 
-**Chaves** você controla no painel: emitir a 4ª chave num plano Go só é possível depois
-de revogar uma das três.
+**Chaves** você emite e revoga à vontade no painel — não há teto de chaves por plano.
 
 **Ambiente** é um lugar de onde a stack é usada — a combinação da ferramenta (Claude
 Code, Cursor, Codex, SDK…) com a rede de onde ela sai. O mesmo desenvolvedor usando
 Claude Code em casa e no escritório ocupa dois ambientes; uma equipe inteira na mesma
-rede do escritório ocupa um. Isso vale independentemente de quantas chaves você usa: as
-duas contagens existem para que uma única chave espalhada por vinte máquinas não
-substitua o plano contratado.
+rede do escritório ocupa um. Isso vale independentemente de quantas chaves você usa: a
+contagem existe para que uma única chave espalhada por vinte máquinas não substitua o
+plano contratado.
 
 A vaga de um ambiente é liberada sozinha depois de **14 dias** sem uso, então trocar de
 máquina não exige fazer nada. Para liberar na hora — trocou de notebook hoje e quer usar

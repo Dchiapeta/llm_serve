@@ -5,7 +5,7 @@ import { Check, Copy, KeyRound, TriangleAlert } from "lucide-react"
 import { toast } from "sonner"
 
 import { createKey } from "@/lib/actions"
-import type { Account, Machine, TemplatePlan } from "@/lib/types"
+import type { Account, Machine } from "@/lib/types"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
@@ -26,23 +26,14 @@ import {
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 
-// Uso do teto de chaves do plano por par conta+máquina, montado no server
-// (app/(dashboard)/accounts/page.tsx). limit null = plano sem teto.
-export type KeyQuota = { plan: TemplatePlan; used: number; limit: number | null }
-
 export function CreateKeyDialog({
   accounts,
   machines,
   fixedMachineId,
-  quotas,
 }: {
   accounts: Account[]
   machines: Machine[]
   fixedMachineId?: string
-  // Opcional: sem isto o dialog só descobre o limite pelo erro da action, que
-  // continua sendo a checagem que vale. É a mesma relação de
-  // RAG_FILE_LIMIT_BY_PLAN entre knowledge-files-dialog e assertKnowledgeFileQuota.
-  quotas?: Record<string, KeyQuota>
 }) {
   const [open, setOpen] = React.useState(false)
   const [accountId, setAccountId] = React.useState<string>("")
@@ -77,10 +68,6 @@ export function CreateKeyDialog({
       }
     })
   }
-
-  const quota =
-    accountId && machineId ? quotas?.[`${accountId}:${machineId}`] : undefined
-  const atLimit = quota != null && quota.limit !== null && quota.used >= quota.limit
 
   async function copy() {
     if (!plainKey) return
@@ -189,23 +176,9 @@ export function CreateKeyDialog({
                 disabled={pending}
               />
             </div>
-            {quota && (
-              <p
-                className={
-                  atLimit ? "text-sm text-destructive" : "text-sm text-muted-foreground"
-                }
-              >
-                {quota.used}
-                {quota.limit === null ? "" : ` / ${quota.limit}`} chave(s) ativa(s)
-                {quota.limit === null
-                  ? ` — plano ${quota.plan} não tem limite`
-                  : ` do plano ${quota.plan}`}
-                {atLimit && ". Revogue uma chave para emitir outra."}
-              </p>
-            )}
             <Button
               onClick={onGenerate}
-              disabled={pending || !accountId || !machineId || atLimit}
+              disabled={pending || !accountId || !machineId}
             >
               {pending ? "Gerando…" : "Gerar chave HEX"}
             </Button>

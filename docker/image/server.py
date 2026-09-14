@@ -103,6 +103,25 @@ QUEUE_WAIT_TIMEOUT_S = float(os.environ.get("IMAGE_QUEUE_WAIT_TIMEOUT_S", "60"))
 WARMUP_RUNS = int(os.environ.get("IMAGE_WARMUP_RUNS", "2"))
 ALLOW_TF32 = os.environ.get("IMAGE_ALLOW_TF32", "true").lower() == "true"
 
+# Encaixe de proporção em /v1/images/edits quando o cliente não manda `size`.
+#
+# Ligado por default porque o comportamento antigo (esticar a foto até o
+# canvas) é o que faz o modelo devolver outra pessoa. A env existe como
+# kill-switch: se o encaixe der problema em produção, desligar é reiniciar o
+# pod, não republicar imagem.
+ASPECT_FIT = os.environ.get("IMAGE_ASPECT_FIT", "true").lower() == "true"
+
+# Grade da referência igual à da saída, no mesmo caminho do encaixe (sem `size`).
+#
+# O pipeline reduz toda referência acima de 1 MP e nunca amplia as menores, e a
+# posição (RoPE) de referência e saída começa em 0 na mesma escala de 16 px por
+# token. Com canvas 1024×1536 e a foto entrando a ~768×1152, o modelo via a
+# cliente numa grade 48×72 desenhando numa 64×96 — e redesenhava o corpo maior
+# e mais largo. Medido em 14/09/2026 (5 seeds): com as duas grades iguais, corpo,
+# altura e acessórios voltaram perto do original. O template oficial do ComfyUI
+# faz o mesmo (saída no tamanho da imagem 1 escalada a 1 MP).
+MATCH_REFERENCE_GRID = os.environ.get("IMAGE_MATCH_REFERENCE_GRID", "true").lower() == "true"
+
 DEVICE = os.environ.get("IMAGE_DEVICE", "cuda")
 
 GENERATIONS_PATH = "images/generations"
@@ -166,11 +185,29 @@ class GenPayload:
     # loop — 4 referências de 5 MiB são trabalho de CPU suficiente para
     # travar o /health se fosse feito aqui.
     references: list[bytes] = field(default_factory=list)
+    # Encaixe de proporção da PRIMEIRA referência no canvas (width × height).
+    # None quando não se aplica: `generations` (não há foto), `size` explícito
+    # do cliente, ou foto que já casa com o canvas.
+    #
+    # `width`/`height` continuam sendo o CANVAS — é o que o pipeline recebe e o
+    # que determina custo de GPU e VRAM, logo é o que o /metrics deve indexar.
+    # O que o cliente recebe sai menor, e quem sabe disso é o `fit`.
+    fit: policy.AspectFit | None = None
+    # A primeira referência (já paddada, se houver `fit`) é redimensionada para
+    # exatamente width × height antes do pipeline. Independe do `fit`: uma foto
+    # que já casa com a proporção do canvas também precisa entrar na grade dele.
+    # Ver MATCH_REFERENCE_GRID.
+    match_canvas: bool = False
     # Preenchido em DOIS lugares: `queue_wait_s` pela fila (policy.py, no
     # momento em que o worker pega o job) e o resto por _run. É o payload que
     # os carrega porque ele é a única coisa que atravessa os dois — a fila
     # devolve o resultado da geração, não um par (resultado, medições).
     timings: policy.Timings = field(default_factory=policy.Timings)
+    # Dimensões de cada referência COMO ENTROU no pipeline (a primeira já com o
+    # padding do encaixe de proporção). Preenchido por _prepare_references, no
+    # worker; é o que o bloco `usage` da resposta usa para contar os patches de
+    # entrada — o payload carrega porque é a única coisa que atravessa a fila.
+    reference_sizes: list[tuple[int, int]] = field(default_factory=list)
 
 
 def _decode_reference(data: bytes) -> Image.Image:
@@ -190,6 +227,35 @@ def _decode_reference(data: bytes) -> Image.Image:
             code="undecodable_image",
         ) from None
     return img.convert("RGB")
+
+
+def _pad_to_canvas(img: Image.Image, fit: policy.AspectFit) -> Image.Image:
+    """Completa a foto até a proporção do canvas REPLICANDO as bordas.
+
+    Replicar a coluna/linha da borda, e não preencher com preto ou branco: uma
+    tarja sólida é conteúdo que o modelo vê e tenta interpretar — ele preenche a
+    faixa com cenário inventado, ou pior, reenquadra o sujeito para "caber" nela.
+    A borda esticada continua sendo o fundo que já existia, que é o que o
+    modelo deve ignorar.
+    """
+    width, height = img.size
+    canvas = Image.new("RGB", (fit.padded_width, fit.padded_height))
+    canvas.paste(img, (fit.pad_left, fit.pad_top))
+    if fit.pad_left:
+        canvas.paste(img.crop((0, 0, 1, height)).resize((fit.pad_left, height)), (0, fit.pad_top))
+    if fit.pad_right:
+        canvas.paste(
+            img.crop((width - 1, 0, width, height)).resize((fit.pad_right, height)),
+            (fit.pad_left + width, fit.pad_top),
+        )
+    if fit.pad_top:
+        canvas.paste(img.crop((0, 0, width, 1)).resize((width, fit.pad_top)), (fit.pad_left, 0))
+    if fit.pad_bottom:
+        canvas.paste(
+            img.crop((0, height - 1, width, height)).resize((width, fit.pad_bottom)),
+            (fit.pad_left, fit.pad_top + height),
+        )
+    return canvas
 
 
 def _encode_output(img: Image.Image) -> str:
@@ -252,6 +318,63 @@ def _vram_peak_bytes() -> int | None:
     return peak
 
 
+def _prepare_references(payload: GenPayload) -> list[Image.Image]:
+    """Decodifica as referências e aplica o padding do encaixe de proporção.
+
+    O padding vale para a PRIMEIRA referência só. Nas rotas de edição ela é a
+    imagem que está sendo editada; as demais são material (a peça de roupa, um
+    objeto), e completá-las com as próprias bordas não faria sentido nenhum —
+    elas entram como conteúdo, não como enquadramento a preservar.
+
+    Registra em `payload.reference_sizes` as dimensões com que cada uma segue
+    para o pipeline: é depois do padding que a conta de tokens vale, porque é a
+    imagem paddada que o VAE codifica.
+    """
+    references = [_decode_reference(d) for d in payload.references]
+    if payload.fit is not None and references:
+        references[0] = _pad_to_canvas(references[0], payload.fit)
+    if payload.match_canvas and references:
+        canvas = (payload.width, payload.height)
+        if references[0].size != canvas:
+            references[0] = references[0].resize(canvas, Image.LANCZOS)
+    payload.reference_sizes = [img.size for img in references]
+    return references
+
+
+def _count_text_tokens(prompt: str) -> int:
+    """Tokens de texto que o encoder realmente vê para `prompt`.
+
+    Reproduz os dois passos de `Flux2KleinPipeline._get_qwen3_prompt_embeds`:
+    o prompt vai envolvido no chat template do Qwen3 (os tokens do template
+    contam no orçamento) e é truncado em MAX_SEQUENCE_LENGTH. O pipeline em si
+    não expõe a contagem — ele preenche até o teto com padding, e o padding não
+    é uso de ninguém.
+
+    Roda no event loop, não no worker: o tokenizer rápido do Qwen leva
+    microssegundos num prompt limitado pelo teto de corpo da rota, e assim o
+    bloco `usage` sai inteiro de um lugar só (_dispatch), inclusive quando o
+    worker é um dublê de teste. Sem tokenizer (pipeline ainda carregando num
+    caminho que não deveria chegar aqui, ou stub), cai na heurística de
+    chars/4 — nunca em zero, que diria "prompt vazio".
+    """
+    tokenizer = getattr(PIPE, "tokenizer", None)
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        return policy.estimate_text_tokens(prompt, MAX_SEQUENCE_LENGTH)
+    try:
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        ids = tokenizer(text, truncation=True, max_length=MAX_SEQUENCE_LENGTH)["input_ids"]
+        return len(ids)
+    except Exception as e:  # tokenizer é dependência externa: contar errado é
+        # melhor que derrubar uma geração que já aconteceu
+        log(f"usage: tokenizer falhou ({type(e).__name__}: {e}); usando heurística")
+        return policy.estimate_text_tokens(prompt, MAX_SEQUENCE_LENGTH)
+
+
 def _run(payload: GenPayload) -> list[str]:
     """Geração. SÍNCRONA e sempre executada em to_thread pela GenerationQueue.
 
@@ -265,7 +388,7 @@ def _run(payload: GenPayload) -> list[str]:
     worker_started = time.monotonic()
 
     started = time.monotonic()
-    references = [_decode_reference(d) for d in payload.references]
+    references = _prepare_references(payload)
     t.decode_s = time.monotonic() - started
 
     # sempre com generator explícito: a seed já vem resolvida (ensure_seed), e é
@@ -296,7 +419,12 @@ def _run(payload: GenPayload) -> list[str]:
     t.gpu_s = time.monotonic() - started
 
     started = time.monotonic()
-    encoded = [_encode_output(img) for img in out.images]
+    images = out.images
+    if payload.fit is not None:
+        # Desfaz na saída o que foi acrescentado na entrada. Sem isto o cliente
+        # receberia a faixa de borda replicada como se fosse parte da foto.
+        images = [img.crop(payload.fit.crop_box(*img.size)) for img in images]
+    encoded = [_encode_output(img) for img in images]
     t.encode_s = time.monotonic() - started
     t.worker_s = time.monotonic() - worker_started
 
@@ -620,6 +748,23 @@ def _note_success() -> None:
     CONSECUTIVE_FAILURES = 0
 
 
+def _size_meta(payload: GenPayload) -> dict:
+    """`width`/`height` do que foi entregue, mais o canvas quando diferem.
+
+    Sem encaixe de proporção os dois são a mesma coisa e o meta sai idêntico ao
+    de sempre — nenhum cliente vê campo novo por nada.
+    """
+    if payload.fit is None:
+        return {"width": payload.width, "height": payload.height}
+    out_w, out_h = payload.fit.output_size(payload.width, payload.height)
+    return {
+        "width": out_w,
+        "height": out_h,
+        "canvas_width": payload.width,
+        "canvas_height": payload.height,
+    }
+
+
 async def _dispatch(payload: GenPayload) -> JSONResponse:
     reason = _unhealthy_reason()
     if not READY or QUEUE is None or reason is not None:
@@ -670,10 +815,29 @@ async def _dispatch(payload: GenPayload) -> JSONResponse:
             },
         )
     _note_success()
+    # Contado DEPOIS da geração, com as dimensões que de fato entraram
+    # (payload.reference_sizes vem do worker). Um erro no meio não produz
+    # usage nenhum: o agent contabiliza a requisição de qualquer jeito, e
+    # tokens de uma imagem que não saiu seriam custo inventado.
+    usage = policy.usage_block(
+        text_tokens=_count_text_tokens(payload.prompt),
+        reference_sizes=payload.reference_sizes,
+        width=payload.width,
+        height=payload.height,
+        n=payload.n,
+    )
     return JSONResponse(
         content={
             "created": int(time.time()),
             "data": [{"b64_json": b} for b in images],
+            # Consumo em tokens, no formato chat do vLLM. Difusão não gera
+            # texto, mas o transformer processa uma sequência de tokens como
+            # qualquer outro — prompt + um por patch latente de 16×16 px de
+            # cada imagem, gerada ou de referência (ver policy.usage_block).
+            # É o que faz o agent somar isto em usage_metrics e o gateway
+            # gravar tokens_in/out sem nenhum ramo especial para imagem: os
+            # dois já leem `usage` na raiz de qualquer resposta JSON.
+            "usage": usage,
             # Parâmetros EFETIVOS da geração — não os que o cliente pediu.
             #
             # Existe por causa de quem guarda a imagem: o gateway persiste cada
@@ -693,8 +857,15 @@ async def _dispatch(payload: GenPayload) -> JSONResponse:
             # que ele já não tenha.
             "meta": {
                 "prompt": payload.prompt,
-                "width": payload.width,
-                "height": payload.height,
+                # Dimensões da imagem ENTREGUE, que com encaixe de proporção
+                # não são as do canvas. É o gateway que depende disto: ele
+                # grava cada geração no bucket e registra o tamanho, e
+                # registrar o canvas descreveria uma imagem que ninguém tem.
+                #
+                # O canvas continua exposto, mas em `canvas_width`/
+                # `canvas_height`, e só quando difere — é número de custo (GPU
+                # e VRAM saem dele), não de conteúdo.
+                **_size_meta(payload),
                 "steps": payload.steps,
                 "guidance_scale": payload.guidance_scale,
                 "seed": payload.seed,
@@ -823,8 +994,9 @@ async def images_edits(request: Request):
 
     policy.validate_model(form.get("model"), served=SERVED_MODEL_NAME, also_accept=MODEL_ALIASES)
     policy.validate_response_format(form.get("response_format"))
+    requested_size = form.get("size")
     width, height = policy.validate_size(
-        form.get("size"), default=DEFAULT_SIZE, allowed=ALLOWED_SIZES
+        requested_size, default=DEFAULT_SIZE, allowed=ALLOWED_SIZES
     )
 
     references: list[bytes] = []
@@ -839,11 +1011,46 @@ async def images_edits(request: Request):
         )
         references.append(data)
 
+    # Encaixe de proporção: SÓ quando o cliente não pediu `size`.
+    #
+    # Quem manda `size` está escolhendo o formato da saída e recebe exatamente
+    # ele, como sempre recebeu — mudar isso quebraria quem já integrou. Quem
+    # NÃO manda não está pedindo um quadrado de 1024: está mandando uma foto
+    # para editar, e a resposta certa tem a proporção dela. Até aqui o default
+    # esticava essa foto até o canvas, que é o que faz o modelo trocar a pessoa
+    # (ver policy.AspectFit).
+    fit = None
+    match_canvas = False
+    if ASPECT_FIT and requested_size is None and references:
+        # Só o header do arquivo, não os pixels: `Image.open` é preguiçoso e o
+        # `.load()` que custa fica no worker, onde já estava. É por isso que
+        # decidir o canvas aqui não devolve ao event loop o trabalho que o
+        # _decode_reference foi mandado fazer noutra thread.
+        try:
+            with Image.open(io.BytesIO(references[0])) as probe:
+                ref_size = probe.size
+        except Exception:
+            # Ilegível aqui é ilegível no worker também, e lá o erro já tem
+            # mensagem própria (`undecodable_image`). Seguir sem encaixe mantém
+            # um caminho só para essa falha.
+            ref_size = None
+        if ref_size:
+            # Com a grade casada, só canvas que o pipeline não reduz (≤ 1 MP):
+            # num 1024×1536 a referência seria reduzida de novo e a grade
+            # voltaria a divergir.
+            max_area = policy.REFERENCE_MAX_AREA if MATCH_REFERENCE_GRID else None
+            width, height = policy.pick_canvas(*ref_size, ALLOWED_SIZES, max_area=max_area)
+            planned = policy.plan_aspect_fit(*ref_size, width, height)
+            fit = None if planned.is_noop else planned
+            match_canvas = MATCH_REFERENCE_GRID
+
     return await _dispatch(
         GenPayload(
             prompt=prompt,
             width=width,
             height=height,
+            fit=fit,
+            match_canvas=match_canvas,
             steps=policy.validate_steps(form.get("steps"), default=STEPS, maximum=STEPS_MAX),
             guidance_scale=policy.validate_guidance_scale(
                 form.get("guidance_scale"), default=GUIDANCE_SCALE

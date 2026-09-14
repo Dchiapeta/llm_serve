@@ -99,7 +99,14 @@ export type StackInfo = Stack & {
     status: ApiKey["status"]
     created_at: string
   }[]
-  usage: { tokensIn: number; tokensOut: number; requests: number }
+  usage: {
+    tokensIn: number
+    tokensOut: number
+    requests: number
+    /** Imagens geradas (image_usage_rollup, migration 0067) — 0 para stack
+     *  de LLM. Tokens valem para as duas categorias (lib/consumption.ts). */
+    images: number
+  }
 }
 
 export type StackRow = {

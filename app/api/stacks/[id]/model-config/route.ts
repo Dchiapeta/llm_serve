@@ -77,7 +77,8 @@ function parseImageSizeOrNull(value: unknown): string | null | typeof INVALID {
 //
 // Desde a migration 0062 a mesma rota configura os defaults de GERAÇÃO DE
 // IMAGEM (default_image_size/default_image_steps/
-// default_image_guidance_scale), aplicados pelo gateway em
+// default_image_guidance_scale, e default_image_seed desde a 0068), aplicados
+// pelo gateway em
 // apply_stack_image_defaults. Uma rota só, e não duas, porque os dois conjuntos
 // respondem à mesma pergunta ("o que a stack usa quando o cliente não diz") e
 // vêm da mesma tela do TryStac — a de Comportamento, que só troca quais campos
@@ -179,13 +180,26 @@ export async function PATCH(
     }
     update.default_image_guidance_scale = v
   }
+  if ("default_image_seed" in body) {
+    // Teto 2^53-1 e não o 2^64-1 do pod: acima disso o número já chega aqui
+    // arredondado pelo JSON.parse, e o bigint signed do Postgres nem comporta
+    // 2^64-1 (migration 0068).
+    const v = parseBoundedIntegerOrNull(body.default_image_seed, 0, Number.MAX_SAFE_INTEGER)
+    if (v === INVALID) {
+      return NextResponse.json(
+        { error: `default_image_seed deve ser um inteiro entre 0 e ${Number.MAX_SAFE_INTEGER}, ou null` },
+        { status: 400 }
+      )
+    }
+    update.default_image_seed = v
+  }
   if (Object.keys(update).length === 0) {
     return NextResponse.json(
       {
         error:
           "informe ao menos um de: default_temperature, default_top_p, " +
           "default_max_tokens, default_presence_penalty, default_enable_thinking, default_image_size, " +
-          "default_image_steps, default_image_guidance_scale",
+          "default_image_steps, default_image_guidance_scale, default_image_seed",
       },
       { status: 400 }
     )

@@ -19,10 +19,27 @@ class ThinkingPolicyError(ValueError):
     pass
 
 
+# Níveis do chat template do Qwen3.8 (low/medium/xhigh, default xhigh). O
+# protocolo OpenAI fala low/medium/high, e o "high" do cliente vira o topo real
+# do template.
+#
+# O campo top-level NÃO pode sobreviver à tradução. Medido em produção
+# (13/09/2026): com `reasoning_effort: "high"` no corpo, o template respondeu
+# 400 "Unexpected reasoning effort high. Supported types are xhigh (default),
+# medium, and low" — o valor cru chega ao jinja e vence o que estiver em
+# chat_template_kwargs. `low` e `medium` passavam por coincidência de
+# vocabulário, então o bug só aparecia no `high`. Por isso apply_thinking_policy
+# traduz para chat_template_kwargs E REMOVE o top-level: o on/off já está em
+# enable_thinking (explícito), e o nível, no kwarg traduzido.
+EFFORT_TO_TEMPLATE = {"high": "xhigh"}
+
+
 @dataclass(frozen=True)
 class ThinkingPolicy:
     enabled: bool | None
     source: str
+    # nível pedido pelo cliente (low/medium/high); None = default do template
+    effort: str | None = None
 
 
 def supports_thinking_switch(machine: dict) -> bool:
@@ -46,6 +63,7 @@ def supports_thinking_switch(machine: dict) -> bool:
 def resolve_thinking_policy(body: dict, entry: dict, stack: dict | None,
                             machine: dict) -> ThinkingPolicy:
     requested = []
+    effort_pedido = None
     kwargs = body.get("chat_template_kwargs")
     if kwargs is not None and not isinstance(kwargs, dict):
         raise ThinkingPolicyError("chat_template_kwargs deve ser um objeto")
@@ -63,6 +81,8 @@ def resolve_thinking_policy(body: dict, entry: dict, stack: dict | None,
             if effort not in ("none", "low", "medium", "high"):
                 raise ThinkingPolicyError("reasoning effort suportado: none, low, medium ou high")
             requested.append(effort != "none")
+            if effort != "none":
+                effort_pedido = effort
 
     # anthropic_compat repassa este campo intacto para a validação em vez de
     # tratá-lo na conversão: assim o erro sai pelo tratamento HTTP que o
@@ -78,7 +98,7 @@ def resolve_thinking_policy(body: dict, entry: dict, stack: dict | None,
     if requested:
         if any(value != requested[0] for value in requested):
             raise ThinkingPolicyError("parâmetros de thinking conflitantes na requisição")
-        policy = ThinkingPolicy(requested[0], "request")
+        policy = ThinkingPolicy(requested[0], "request", effort_pedido if requested[0] else None)
     else:
         policy = ThinkingPolicy(None, "legacy")
         for source, config in (("key", entry), ("stack", stack or {})):
@@ -98,10 +118,18 @@ def apply_thinking_policy(body: dict, policy: ThinkingPolicy) -> None:
         return
     kwargs = dict(body.get("chat_template_kwargs") or {})
     kwargs["enable_thinking"] = policy.enabled
+    if policy.enabled and policy.effort and "reasoning_effort" not in kwargs:
+        # o nível só faz sentido com thinking ligado; um reasoning_effort já
+        # explícito em chat_template_kwargs é do cliente e vence
+        kwargs["reasoning_effort"] = EFFORT_TO_TEMPLATE.get(policy.effort, policy.effort)
     body["chat_template_kwargs"] = kwargs
+    # o top-level sai SEMPRE que a política foi materializada (ver
+    # EFFORT_TO_TEMPLATE): deixá-lo aí faz o valor cru do protocolo chegar ao
+    # chat template e derrubar a request com 400. `reasoning` (objeto da
+    # Responses API) não é tocado — é outro campo, servido nativamente pelo vLLM.
+    body.pop("reasoning_effort", None)
     # Tudo converge para a chave que o chat template realmente lê. É isto que
     # thinking_esperado_de e o filtro de <think> passam a ler depois — a
     # decisão materializada no corpo, não a política solta. `thinking` sai
-    # porque é campo Anthropic e o vLLM recusaria; reasoning_effort fica, que
-    # há modelo que usa os dois.
+    # porque é campo Anthropic e o vLLM recusaria.
     body.pop("thinking", None)

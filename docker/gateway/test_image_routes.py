@@ -236,7 +236,54 @@ def test_requisicao_bem_sucedida_e_registrada(ctx):
     _post_generation(ctx)
     assert ctx.logged[-1]["status_code"] == 200
     assert ctx.logged[-1]["path"] == "images/generations"
-    # difusão não produz tokens: null é a informação correta, zero seria contagem
+    # pod sem bloco `usage` (anterior à 0.1.6): null é a ausência da contagem,
+    # zero seria uma contagem — e o gateway não inventa uma por conta própria
+    assert ctx.logged[-1]["usage"] is None
+
+
+USAGE = {
+    "prompt_tokens": 4108, "completion_tokens": 4096, "total_tokens": 8204,
+    "prompt_tokens_details": {"text_tokens": 12, "image_tokens": 4096},
+}
+
+
+def test_usage_do_pod_vai_para_o_log_como_nas_rotas_de_texto(ctx):
+    """tokens_in/out de gateway_requests saem do `usage` que o pod devolve
+    (patches latentes + prompt) — o mesmo bloco que o agent soma em
+    usage_metrics, então as duas tabelas concordam por construção."""
+    ctx.state["response"] = lambda request: httpx.Response(
+        200, json={"created": 1, "data": [{"b64_json": PNG_B64}], "usage": USAGE}
+    )
+    r = _post_generation(ctx)
+    assert r.status_code == 200
+    assert ctx.logged[-1]["usage"] == USAGE
+    # o corpo do cliente continua sendo o do pod, usage incluído
+    assert r.json()["usage"] == USAGE
+
+
+def test_usage_de_edits_tambem_e_registrado(ctx):
+    ctx.state["response"] = lambda request: httpx.Response(
+        200, json={"created": 1, "data": [{"b64_json": PNG_B64}], "usage": USAGE}
+    )
+    ctx.client.post(
+        "/v1/images/edits",
+        files={"image": ("ref.png", PNG, "image/png")},
+        headers={"Authorization": "Bearer sk-teste"},
+    )
+    assert ctx.logged[-1]["path"] == "images/edits"
+    assert ctx.logged[-1]["usage"] == USAGE
+
+
+def test_usage_nao_e_registrado_quando_a_persistencia_falha(ctx):
+    """O cliente recebe 502 e não tem a imagem: contabilizar os tokens dela
+    cobraria (na cota e nos painéis) por algo que não foi entregue."""
+    ctx.state["response"] = lambda request: httpx.Response(
+        200, json={"created": 1, "data": [{"b64_json": PNG_B64}], "usage": USAGE}
+    )
+    ctx.supa.insert_error = RuntimeError("insert falhou")
+    r = _post_generation(ctx)
+    assert r.status_code == 502
+    assert ctx.logged[-1]["status_code"] == 502
     assert ctx.logged[-1]["usage"] is None
 
 
@@ -571,9 +618,11 @@ def test_go_image_usa_as_3_vagas_da_fila_sem_reserva_de_llm(admissao):
     assert len(admissao["upstream"]) == 1
 
 
-def test_go_image_nao_herda_quota_diaria_de_tokens_do_llm(admissao):
+def test_go_image_aplica_a_quota_diaria_de_tokens(admissao):
+    """O pod devolve `usage` em tokens e o agent os soma em usage_metrics —
+    a cota diária lê de lá, então vale para imagem como vale para texto."""
     assert _gen(admissao).status_code == 200
-    assert admissao["quota"] == []
+    assert admissao["quota"] == [("acc-1", admissao["plan"], "customer")]
 
 
 def test_go_llm_continua_reservando_vagas_em_pod_compartilhado():

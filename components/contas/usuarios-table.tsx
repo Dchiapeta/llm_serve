@@ -10,6 +10,7 @@ import {
   type ProductCategory,
   type TemplatePlan,
 } from "@/lib/types"
+import { formatConsumption } from "@/lib/consumption"
 import { Button } from "@/components/ui/button"
 import {
   InputGroup,
@@ -56,11 +57,15 @@ export type UsuarioRow = {
   stacks: number
   stackList: ContaStackSummary[]
   tokens: number
+  /** image_usage_rollup (migration 0067) — 0 para conta sem stack de imagem.
+   *  Uma conta pode ter tokens>0 E images>0 ao mesmo tempo (upsell: stack de
+   *  LLM e de imagem na mesma conta) — ver lib/consumption.ts. */
+  images: number
   requests: number
   createdAt: string
 }
 
-type SortKey = "name" | "email" | "stacks" | "tokens" | "requests" | "createdAt"
+type SortKey = "name" | "email" | "stacks" | "consumo" | "requests" | "createdAt"
 type SortDir = "asc" | "desc"
 
 const ALL = "__all__"
@@ -74,14 +79,16 @@ const NUMERIC: Record<SortKey, boolean> = {
   name: false,
   email: false,
   stacks: true,
-  tokens: true,
+  consumo: true,
   requests: true,
   createdAt: true,
 }
 
 export function UsuariosTable({ rows }: { rows: UsuarioRow[] }) {
-  // Começa ordenado por uso de token (maior primeiro), o foco da página.
-  const [sortKey, setSortKey] = React.useState<SortKey>("tokens")
+  // Começa ordenada por consumo (maior primeiro), o foco da página. requests
+  // e não tokens: é o único escalar comparável entre conta de LLM e de
+  // imagem — ver lib/consumption.ts, consumptionSortKey.
+  const [sortKey, setSortKey] = React.useState<SortKey>("consumo")
   const [sortDir, setSortDir] = React.useState<SortDir>("desc")
   const [query, setQuery] = React.useState("")
   const [planFilter, setPlanFilter] = React.useState<string>(ALL)
@@ -120,6 +127,9 @@ export function UsuariosTable({ rows }: { rows: UsuarioRow[] }) {
           break
         case "createdAt":
           cmp = a.createdAt.localeCompare(b.createdAt)
+          break
+        case "consumo":
+          cmp = a.requests - b.requests
           break
         default:
           cmp = (a[sortKey] as number) - (b[sortKey] as number)
@@ -176,7 +186,7 @@ export function UsuariosTable({ rows }: { rows: UsuarioRow[] }) {
             <SortableHead label="Nome" col="name" {...headProps} />
             <SortableHead label="E-mail" col="email" {...headProps} />
             <SortableHead label="Stacks" col="stacks" {...headProps} />
-            <SortableHead label="Tokens" col="tokens" {...headProps} />
+            <SortableHead label="Consumo" col="consumo" {...headProps} />
             <SortableHead label="Requests" col="requests" {...headProps} />
             <SortableHead label="Criada em" col="createdAt" {...headProps} />
             <TableHead className="w-10" />
@@ -206,7 +216,11 @@ export function UsuariosTable({ rows }: { rows: UsuarioRow[] }) {
               </TableCell>
               <TableCell className="text-sm tabular-nums">{u.stacks}</TableCell>
               <TableCell className="text-sm tabular-nums">
-                {u.tokens.toLocaleString("pt-BR")}
+                {formatConsumption({
+                  tokens: u.tokens,
+                  images: u.images,
+                  requests: u.requests,
+                })}
               </TableCell>
               <TableCell className="text-sm tabular-nums">
                 {u.requests.toLocaleString("pt-BR")}

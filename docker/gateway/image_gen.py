@@ -184,6 +184,19 @@ def _pod_meta(payload: dict) -> dict[str, Any]:
     }
 
 
+def usage_of(payload: Any) -> dict[str, Any] | None:
+    """Bloco `usage` da resposta do pod, se houver e se for um objeto.
+
+    Devolvido cru: quem grava (log_gateway_request) já normaliza pelo
+    usage_norm.py, o mesmo caminho das respostas do vLLM. Aqui só se decide
+    "existe ou não" — um pod anterior à 0.1.6 não manda o bloco, e o log fica
+    com None como sempre ficou."""
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
 def _merge(pod: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
     """Campo a campo, o do pod ganha quando não é None (ver docstring)."""
     return {k: (pod.get(k) if pod.get(k) is not None else fallback.get(k))

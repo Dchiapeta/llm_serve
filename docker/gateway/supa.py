@@ -113,7 +113,8 @@ class SupaClient:
         chave sobrevive.
 
         `default_image_size`/`default_image_steps`/
-        `default_image_guidance_scale` são o par disso para o produto de
+        `default_image_guidance_scale`/`default_image_seed` (esta desde a
+        migration 0068) são o par disso para o produto de
         imagem, e vêm em DUAS alturas do select, como os de sampling: os da
         própria CHAVE (migration 0063, aplicados em apply_key_image_defaults) e
         os da STACK (migration 0062, dentro de `stacks` abaixo, aplicados em
@@ -129,11 +130,11 @@ class SupaClient:
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,purpose,"
                 "use_custom_prompt,system_prompt,default_enable_thinking,enable_knowledge_base,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
-                "default_image_size,default_image_steps,default_image_guidance_scale,"
+                "default_image_size,default_image_steps,default_image_guidance_scale,default_image_seed,"
                 "accounts(name,"
                 "stacks(id,machine_id,plan,category,slug,created_at,system_prompt,default_enable_thinking,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
-                "default_image_size,default_image_steps,default_image_guidance_scale,"
+                "default_image_size,default_image_steps,default_image_guidance_scale,default_image_seed,"
                 "billing_status,past_due_since))",
                 "limit": "1",
             },
@@ -163,6 +164,7 @@ class SupaClient:
             "default_image_size": row.get("default_image_size"),
             "default_image_steps": row.get("default_image_steps"),
             "default_image_guidance_scale": row.get("default_image_guidance_scale"),
+            "default_image_seed": row.get("default_image_seed"),
             "account_name": account.get("name", "?"),
             "stacks": account.get("stacks") or [],
         }
@@ -420,8 +422,9 @@ class SupaClient:
             params={
                 "status": "in.(creating,running,stopped)",
                 "runpod_pod_id": "not.is.null",
-                # created_at/last_activity_at: janela de tolerância do
-                # reconcile pra pod recém-criado que reporta EXITED
+                # created_at/last_activity_at: janela de tolerância do reconcile
+                # pra pod recém-criado — tanto o que reporta EXITED quanto o que
+                # ainda não apareceu na listagem (os dois ramos têm prazo)
                 "select": "id,status,runpod_pod_id,public_url,created_at,last_activity_at",
             },
         )

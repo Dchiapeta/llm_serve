@@ -209,3 +209,44 @@ def test_chave_com_override_e_stack_sem_nada():
     body = {"prompt": "x"}
     _apply_all(body, entry)
     assert body["steps"] == 5
+
+
+# ---------- 5. seed (migration 0068) ----------
+
+
+def test_seed_da_stack_preenche_campo_ausente():
+    entry = _entry(stack=_stack(default_image_seed=1234))
+    body = {"prompt": "x"}
+    _apply_all(body, entry)
+    assert body["seed"] == 1234
+
+
+def test_seed_do_cliente_ganha_de_chave_e_stack():
+    entry = _entry(stack=_stack(default_image_seed=1), default_image_seed=2)
+    body = {"prompt": "x", "seed": 3}
+    _apply_all(body, entry)
+    assert body["seed"] == 3
+
+
+def test_seed_da_chave_ganha_da_stack():
+    entry = _entry(stack=_stack(default_image_seed=1), default_image_seed=2)
+    body = {"prompt": "x"}
+    _apply_all(body, entry)
+    assert body["seed"] == 2
+
+
+def test_seed_zero_na_chave_ganha_da_stack():
+    """0 é uma seed válida: um guard `if not valor` deixaria a stack vencer."""
+    entry = _entry(stack=_stack(default_image_seed=99), default_image_seed=0)
+    body = {"prompt": "x"}
+    _apply_all(body, entry)
+    assert body["seed"] == 0
+
+
+def test_sem_seed_configurada_o_corpo_fica_sem_seed():
+    """Nenhuma camada define: o campo não é inventado e o pod decide
+    (IMAGE_DEFAULT_SEED ou sorteio)."""
+    entry = _entry(stack=_stack(default_image_seed=None), default_image_seed=None)
+    body = {"prompt": "x"}
+    _apply_all(body, entry)
+    assert "seed" not in body

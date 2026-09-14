@@ -98,6 +98,7 @@ from lifecycle import LifecycleManager, MigrationError
 from recovery import (
     is_no_gpu_error,
     lock_active,
+    machine_boot_stalled,
     machine_was_lost,
     spawn_tracked,
     template_allows_automatic_creation,
@@ -503,6 +504,15 @@ RECREATE_RETRY_AFTER_S = float(os.environ.get("RECREATE_RETRY_AFTER_S", "120"))
 MACHINE_POOL_WATERMARK_SLOTS = float(os.environ.get("MACHINE_POOL_WATERMARK_SLOTS", "5"))
 MACHINE_HEALTH_TIMEOUT_S = float(os.environ.get("MACHINE_HEALTH_TIMEOUT_S", "900"))
 MACHINE_HEALTH_POLL_INTERVAL_S = float(os.environ.get("MACHINE_HEALTH_POLL_INTERVAL_S", "10"))
+# idade a partir da qual uma máquina 'creating' deixa de segurar a cascata de
+# recuperação (wake_some_machine_for_plan). FOLGADAMENTE maior que o boot mais
+# lento observado (o 1º pod do Pro 2×A40 passou de 30 min) pra nunca ignorar um
+# boot legítimo; passado isso a máquina não está subindo, está presa, e deixá-la
+# barrar o auto-wake/provisionamento do plano é um 503 eterno. Ver
+# recovery.machine_boot_stalled.
+CREATING_STALE_AFTER_S = float(
+    os.environ.get("CREATING_STALE_AFTER_S", str(MACHINE_HEALTH_TIMEOUT_S * 2))
+)
 # TTL das travas em memória (recreating/provisioning/key_sync): rede de
 # segurança contra trava presa. Se a task que deveria liberar a trava morre
 # antes do `finally` (GC, exceção fora do try, processo travado), a trava fica
@@ -1031,9 +1041,8 @@ def _client_limit_detail(plan: str | None, cap: int | None) -> str:
 async def enforce_client_limit(entry: dict, stack: dict, plan: str | None, headers) -> None:
     """Teto de LUGARES distintos conectados à stack (migration 0051).
 
-    Complementa o teto de CHAVES por stack aplicado na emissão pelo painel
-    (MAX_KEYS_BY_PLAN em lib/types.ts): aquele é o contrato, este pega quem
-    usa uma única chave em toda a equipe. Ver o docstring de
+    Não há teto de chaves por plano; este é o único limite de "lugares" e
+    pega quem usa uma única chave em toda a equipe. Ver o docstring de
     client_identity.py para o que o fingerprint acerta e o que ele erra.
 
     Custo no caminho quente: zero. Ambiente conhecido dentro do throttle sai
@@ -2095,8 +2104,21 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
     # máquina já subindo (religada por um request anterior, ou recém-criada
     # pelo painel/provisionamento): conta como 'waking' — sem isto, com o wake
     # gravando 'creating', o pool parecia vazio e a cascata religava uma 2ª
-    # pausada ou provisionava por cima de um boot em andamento
-    if await supa.list_creating_machines_for_plan(plan, category):
+    # pausada ou provisionava por cima de um boot em andamento.
+    # Só conta quem ainda PODE estar subindo: uma 'creating' velha demais está
+    # presa, não subindo, e deixá-la responder 'waking' aqui barra o auto-wake e
+    # o provisionamento do plano inteiro pra sempre (503 eterno). O reconcile é
+    # quem conserta o status; este filtro só evita que a disponibilidade do plano
+    # dependa disso (ver recovery.machine_boot_stalled).
+    subindo = await supa.list_creating_machines_for_plan(plan, category)
+    presas = [m for m in subindo if machine_boot_stalled(m, CREATING_STALE_AFTER_S)]
+    if presas:
+        logger.warning(
+            "auto-wake: %d máquina(s) presa(s) em 'creating' no plano %s/%s (%s) — "
+            "ignoradas na cascata",
+            len(presas), plan, category, ", ".join(str(m.get("id")) for m in presas),
+        )
+    if len(subindo) > len(presas):
         return "waking"
     stopped = await supa.list_stopped_machines_for_plan(plan, category)
     if not stopped:
@@ -2622,7 +2644,8 @@ def apply_key_sampling_defaults(
 
 
 def apply_key_image_defaults(body_json: dict, entry: dict) -> None:
-    """Aplica os defaults de imagem da própria CHAVE (migration 0063) quando o
+    """Aplica os defaults de imagem da própria CHAVE (migration 0063; seed desde
+    a 0068) quando o
     cliente não mandou o parâmetro — mesma mecânica de
     apply_stack_image_defaults, um nível ACIMA dela na precedência.
 
@@ -2644,11 +2667,15 @@ def apply_key_image_defaults(body_json: dict, entry: dict) -> None:
         and entry.get("default_image_guidance_scale") is not None
     ):
         body_json["guidance_scale"] = entry["default_image_guidance_scale"]
+    # `is not None`, como os demais: seed 0 é uma seed válida, não "sem valor".
+    if "seed" not in body_json and entry.get("default_image_seed") is not None:
+        body_json["seed"] = entry["default_image_seed"]
 
 
 def apply_stack_image_defaults(body_json: dict, entry: dict) -> None:
     """Aplica default_image_size/default_image_steps/
-    default_image_guidance_scale da stack (migration 0062) quando o cliente não
+    default_image_guidance_scale (migration 0062) e default_image_seed
+    (migration 0068) da stack quando o cliente não
     mandou o parâmetro — o par, para o produto de imagem, do que
     apply_stack_sampling_defaults faz para o de texto.
 
@@ -2656,8 +2683,8 @@ def apply_stack_image_defaults(body_json: dict, entry: dict) -> None:
     opinou ainda", e só aí o default da stack entra. Roda DEPOIS de
     apply_key_image_defaults, que já terá preenchido o que a chave define — a
     ordem das duas chamadas é a precedência. Abaixo desta só restam os defaults
-    do pod (IMAGE_DEFAULT_SIZE/IMAGE_STEPS/IMAGE_GUIDANCE_SCALE em
-    docker/image/server.py).
+    do pod (IMAGE_DEFAULT_SIZE/IMAGE_STEPS/IMAGE_GUIDANCE_SCALE/IMAGE_DEFAULT_SEED
+    em docker/image/server.py).
 
     Não valida faixa: os CHECKs da 0062 já garantem que o que está gravado é
     aceitável, e o pod revalida tudo de qualquer jeito (validate_size,
@@ -2682,6 +2709,8 @@ def apply_stack_image_defaults(body_json: dict, entry: dict) -> None:
         and stack.get("default_image_guidance_scale") is not None
     ):
         body_json["guidance_scale"] = stack["default_image_guidance_scale"]
+    if "seed" not in body_json and stack.get("default_image_seed") is not None:
+        body_json["seed"] = stack["default_image_seed"]
 
 
 async def machine_admits(machine_id: str, usage_class: str = "low") -> bool:
@@ -3983,6 +4012,36 @@ async def anthropic_messages(
         release_flight(flight_key)
         raise
 
+    async def _reenviar_sem_thinking(stream: bool):
+        """Mesmo corpo já validado, thinking desligado — o retry de resposta vazia
+        por raciocínio esgotado (anthropic_compat: retry_without_thinking). None
+        em qualquer falha: quem chama devolve o erro original, nunca um segundo
+        erro por cima. Não passa por validate_body de novo: o corpo é o mesmo que
+        acabou de ser admitido, só o chat template muda."""
+        corpo = dict(openai_body)
+        kwargs = dict(corpo.get("chat_template_kwargs") or {})
+        kwargs["enable_thinking"] = False
+        kwargs.pop("reasoning_effort", None)
+        corpo["chat_template_kwargs"] = kwargs
+        corpo.pop("reasoning_effort", None)
+        corpo["stream"] = stream
+        req = proxy_client.build_request(
+            "POST",
+            f"{machine['public_url']}/v1/chat/completions",
+            content=json.dumps(corpo).encode(),
+            headers={"Authorization": bearer_header, "Content-Type": "application/json"},
+            timeout=upstream_timeout,
+        )
+        try:
+            novo = await proxy_client.send(req, stream=True)
+        except httpx.HTTPError as e:
+            logger.warning("anthropic proxy: retry sem thinking falhou em %s (%s)", flight_key, e)
+            return None
+        if novo.status_code >= 400:
+            await novo.aclose()
+            return None
+        return novo
+
     if is_stream:
         if upstream.status_code >= 400:
             # o upstream (vLLM) recusou a request antes de gerar qualquer chunk
@@ -4026,6 +4085,7 @@ async def anthropic_messages(
                 # do body JÁ processado por validate_body — é lá que o gateway
                 # força enable_thinking=False quando max_tokens < MIN_MAX_TOKENS
                 thinking_esperado=thinking_esperado_de(openai_body),
+                retry_without_thinking=lambda: _reenviar_sem_thinking(True),
             ),
             status_code=upstream.status_code,
             media_type="text/event-stream",
@@ -4057,6 +4117,30 @@ async def anthropic_messages(
             thinking_esperado=thinking_esperado_de(openai_body),
             input_tokens_estimate=input_tokens_estimate,
         )
+        if (
+            status_logico == 502 and upstream.status_code < 400
+            and thinking_esperado_de(openai_body)
+        ):
+            # resposta vazia por raciocínio esgotado — mesmo retry único sem
+            # thinking do caminho streaming (ver anthropic_compat)
+            novo = await _reenviar_sem_thinking(False)
+            if novo is not None:
+                logger.warning(
+                    "anthropic proxy: resposta vazia por raciocínio em %s — refazendo sem thinking",
+                    flight_key,
+                )
+                try:
+                    raw2 = await novo.aread()
+                    status_logico, corpo, usage = anthropic_nonstreaming_body(
+                        raw2,
+                        status_code=novo.status_code,
+                        requested_model=requested_model,
+                        filter_reasoning=filter_reasoning,
+                        thinking_esperado=False,
+                        input_tokens_estimate=input_tokens_estimate,
+                    )
+                finally:
+                    await novo.aclose()
     finally:
         await upstream.aclose()
         release_flight(flight_key)
@@ -5165,9 +5249,15 @@ async def _authorize_image_request(
     # garantidamente não-None neste ponto: _require_image_product já barrou a
     # ausência de uma stack da categoria image.
     check_image_rate_limit(rate_bucket_for_stack(key_stack["id"]), key_plan)
-    # Não aplica check_token_quota: imagem não produz tokens e o orçamento do
-    # Go/LLM é outro produto. Uma conta que esgotou texto não pode bloquear uma
-    # stack Go/image independente.
+    # Cota diária de tokens, como nas rotas de texto: o pod devolve `usage` em
+    # tokens (patches latentes + prompt, ver docker/image/policy.usage_block) e
+    # o agent os soma em usage_metrics, que é de onde a cota lê. Até a 0.1.5 o
+    # pod não contava nada e esta chamada não existia — "imagem não produz
+    # token" deixou de ser verdade no dia em que passamos a contar a sequência
+    # que o transformer processa. A cota continua por CONTA e por plano
+    # (DAILY_TOKEN_BUDGET), então uma conta com stack de texto e de imagem
+    # divide o mesmo teto — hoje 0 (sem teto) para todos os planos.
+    await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
 
     machine, _rewrite_model, effective_plan, stack_id = await resolve_route(
         account_id, entry
@@ -5281,7 +5371,23 @@ async def _compensate_uploads(batch_id: str, storage_paths: list[str]) -> None:
         logger.warning("images: compensação do batch %s falhou (%s)", batch_id, e)
 
 
-async def _persist_images(raw: bytes, log_ctx: dict, fallback_meta: dict) -> None:
+def _parse_image_payload(raw: bytes) -> dict:
+    """Corpo 200 do pod como JSON. Parseado UMA vez no relay e compartilhado
+    entre a persistência (data[].b64_json, meta) e o log (usage): um corpo de
+    ~1,7 MB por imagem não merece dois json.loads."""
+    try:
+        payload = json.loads(raw)
+    except ValueError as e:
+        # 200 com corpo não-JSON. Vira MalformedImageResponse para o chamador
+        # responder "formato inesperado" em vez de "falha ao armazenar": a
+        # segunda mensagem mandaria o cliente investigar o lado errado.
+        raise image_gen.MalformedImageResponse(f"resposta 200 não é JSON: {e}")
+    if not isinstance(payload, dict):
+        raise image_gen.MalformedImageResponse("resposta do pod não é um objeto JSON")
+    return payload
+
+
+async def _persist_images(payload: dict, log_ctx: dict, fallback_meta: dict) -> None:
     """Sobe as imagens da resposta e grava as linhas de image_generations.
 
     Síncrono no caminho da requisição de propósito: uma resposta 200 desta rota
@@ -5292,14 +5398,6 @@ async def _persist_images(raw: bytes, log_ctx: dict, fallback_meta: dict) -> Non
     Levanta em falha confirmada; quem chama traduz para 502.
     """
     batch_id = str(uuid.uuid4())
-    try:
-        payload = json.loads(raw)
-    except ValueError as e:
-        # 200 com corpo não-JSON. Vira MalformedImageResponse para o chamador
-        # responder "formato inesperado" em vez de "falha ao armazenar": a
-        # segunda mensagem mandaria o cliente investigar o lado errado.
-        raise image_gen.MalformedImageResponse(f"resposta 200 não é JSON: {e}")
-
     pending = image_gen.plan_persistence(
         payload,
         batch_id=batch_id,
@@ -5338,11 +5436,20 @@ async def _relay_image_response(
     O corpo do cliente é o do pod, byte a byte: o contrato da rota continua sendo
     `b64_json`, e a persistência é invisível para quem chama.
 
-    `usage=None` sempre: difusão não produz tokens. tokens_in/out ficam nulos em
-    gateway_requests, e é essa a informação correta — zero seria uma contagem,
-    null é a ausência dela."""
+    `usage` vem do próprio pod (`usage` na raiz da resposta, formato chat:
+    patches latentes de 16×16 px de cada imagem + tokens do prompt — ver
+    docker/image/policy.usage_block) e vai para tokens_in/out de
+    gateway_requests pelo mesmo log_gateway_request das rotas de texto. É a
+    MESMA contagem que o agent soma em usage_metrics, então as duas tabelas
+    concordam por construção. Pod anterior à 0.1.6 não manda o bloco: aí fica
+    None, como sempre ficou — null é a ausência da contagem, zero seria uma
+    contagem. Não há fallback calculado aqui de propósito: o gateway até
+    saberia estimar os patches pelas dimensões gravadas, mas usage_metrics não
+    receberia o mesmo número, e as duas fontes divergiriam justo na janela em
+    que alguém estivesse comparando as duas."""
     status_code = upstream.status_code
     headers: dict[str, str] = {}
+    usage: dict | None = None
     try:
         try:
             raw = await upstream.aread()
@@ -5361,7 +5468,9 @@ async def _relay_image_response(
 
         if status_code == 200:
             try:
-                await _persist_images(raw, log_ctx, fallback_meta or {})
+                payload = _parse_image_payload(raw)
+                usage = image_gen.usage_of(payload)
+                await _persist_images(payload, log_ctx, fallback_meta or {})
             except image_gen.MalformedImageResponse as e:
                 # o pod respondeu 200 com um corpo que não reconhecemos. Não dá
                 # pra guardar nem pra prometer que guardamos.
@@ -5385,7 +5494,7 @@ async def _relay_image_response(
         await upstream.aclose()
         release_flight(flight_key)
 
-    log_gateway_request(**log_ctx, status_code=status_code, stream=False, usage=None)
+    log_gateway_request(**log_ctx, status_code=status_code, stream=False, usage=usage)
     return Response(
         content=raw,
         status_code=status_code,

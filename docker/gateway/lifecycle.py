@@ -445,8 +445,20 @@ class LifecycleManager:
             pod = pod_by_id.get(m["runpod_pod_id"])
             if pod is None:
                 # pod sumiu da API → terminada; em 'creating' pode só não ter
-                # aparecido ainda (mesma cautela do painel) — não marca
-                if m["status"] == "creating":
+                # aparecido ainda (mesma cautela do painel) — não marca.
+                # A guarda TEM PRAZO (mesmo creating_grace_s do ramo EXITED
+                # abaixo): a RunPod não lista pod terminado, então "sumiu" é o
+                # desfecho NORMAL de um boot que falhou (crash-loop, host que
+                # recolheu a instância, delete pelo console durante o boot).
+                # Sem prazo a máquina ficava 'creating' para sempre — e como
+                # wake_some_machine_for_plan devolve 'waking' se existe
+                # QUALQUER 'creating' no plano, uma única máquina podre barrava
+                # o auto-wake E o provisionamento do plano inteiro: 503 eterno.
+                # Passado o prazo vira 'terminated' COM o runpod_pod_id intacto,
+                # que é como machine_was_lost/process_pending_recreates_once
+                # reconhecem "máquina perdida" e a recriam (rebaixar a 'stopped'
+                # aqui mandaria o auto-wake dar startPod num pod inexistente).
+                if m["status"] == "creating" and self._within_creating_grace(m):
                     continue
                 new_status = "terminated"
             else:

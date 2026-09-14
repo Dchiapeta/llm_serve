@@ -22,9 +22,9 @@ cliente → gateway (:8080) → agent do pod (:8000) → vLLM (:8001)
   não fura o teto. Caminho quente é zero I/O (cache `client_seen`, throttle de
   `CLIENT_TOUCH_THROTTLE_S`); falha de I/O é fail-open. Nasce em modo
   observação (`CLIENT_LIMIT_ENFORCE=0`). O fingerprint tem a mesma força do
-  User-Agent — telemetria com dente, nunca controle de segurança: quem
-  sustenta o contrato é o teto de CHAVES por stack, aplicado na emissão pelo
-  painel (`MAX_KEYS_BY_PLAN`). Ver `client_identity.py`.
+  User-Agent — telemetria com dente, nunca controle de segurança. Não há teto
+  de chaves por plano; o único freio na emissão é o `max_users` da máquina.
+  Ver `client_identity.py`.
 - **Roteamento**: rota com `machine_id` e status `loaded`/`migrating` → proxy
   direto (durante migração a origem continua servindo até o flip). `loading`
   → espera curta (`LOAD_WAIT_TIMEOUT_S`, default 20s) e 503 + `Retry-After`

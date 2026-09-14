@@ -2,7 +2,7 @@
 
 import { CodeBlock } from "@/components/ui/code-block"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { autoCompactWindow } from "@/lib/context-window"
+import { RESERVED_OUTPUT_TOKENS, autoCompactWindow } from "@/lib/context-window"
 import {
   CLI_BLOCKED_PLANS,
   type ProductCategory,
@@ -363,6 +363,16 @@ Console.WriteLine(json.GetProperty("choices")[0]
   // limite quando o gateway recusa. Conta centralizada em
   // lib/context-window.ts, espelho de docker/gateway/context_budget.py.
   const compactWindow = autoCompactWindow(maxModelLen)
+  // MAX_CONTEXT_TOKENS: a janela REAL do modelo. Para um id que o Claude Code
+  // não reconhece (todo alias de gateway) ele assume 200k e, desde o build
+  // 2.1.223, compacta proativamente dentro desse número — esta variável é a
+  // oficial para corrigir a janela assumida; sem ela a status line e o gatilho
+  // trabalham sobre 200k.
+  // MAX_OUTPUT_TOKENS: o Claude Code SUBTRAI a reserva de saída da janela de
+  // compact (20k por default, ou este valor). Alinhado ao piso do gateway
+  // (RESERVED_OUTPUT_TOKENS) a janela efetiva sobe de 84k para 96k em 131072.
+  // DISABLE_NONESSENTIAL_TRAFFIC: corta feature flags e tráfego de fundo.
+  const contextTokens = maxModelLen && maxModelLen > 0 ? maxModelLen : 65536
 
   const claudeSnippet = `export ANTHROPIC_BASE_URL="${url}"
 export ANTHROPIC_AUTH_TOKEN="<SUA_CHAVE_DE_ACESSO>"
@@ -371,7 +381,10 @@ export ANTHROPIC_MODEL="${model}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$ANTHROPIC_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$ANTHROPIC_MODEL"
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=${contextTokens}
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW=${compactWindow}
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=${RESERVED_OUTPUT_TOKENS}
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 claude`
 
   // Mesma config, persistente: o export de shell vale só pra sessão em que foi
@@ -387,7 +400,10 @@ claude`
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "${model}",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "${model}",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "${model}",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "${compactWindow}"
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "${contextTokens}",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "${compactWindow}",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "${RESERVED_OUTPUT_TOKENS}",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   }
 }`
 
@@ -498,7 +514,13 @@ wire_api = "responses"`
               erro de contexto antes de compactar. O valor é a capacidade que ele
               passa a assumir, não o ponto exato da compactação — ele compacta um
               pouco antes; o resto da janela fica reservado para a resposta e para
-              absorver um anexo grande no turno seguinte.
+              absorver um anexo grande no turno seguinte. O{" "}
+              <code className="font-mono">CLAUDE_CODE_MAX_CONTEXT_TOKENS</code>{" "}
+              informa a janela real do modelo (o Claude Code não reconhece o nome
+              do modelo e assumiria 200 mil), e o{" "}
+              <code className="font-mono">CLAUDE_CODE_MAX_OUTPUT_TOKENS</code>{" "}
+              é descontado da janela de compactação — alinhado ao mínimo de saída
+              do gateway, ele deixa mais contexto útil antes de compactar.
             </p>
           </div>
           <div>

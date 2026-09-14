@@ -883,3 +883,160 @@ def test_stats_vazios_nao_emitem_series():
     """Antes da primeira geração o /metrics não pode inventar um cenário com
     zeros — um p50 de 0.0s no relatório seria lido como pod instantâneo."""
     assert policy.ScenarioStats().prometheus_lines() == []
+
+
+# ---------- encaixe de proporção ----------
+
+
+def test_pick_canvas_escolhe_a_proporcao_mais_proxima():
+    """Uma selfie 506×1164 (0,43) tem de cair no canvas retrato, não no
+    quadrado que é o default — é a escolha errada aqui que estica a pessoa."""
+    assert policy.pick_canvas(506, 1164, ["1024x1024", "1536x1024", "1024x1536"]) == (
+        1024,
+        1536,
+    )
+    assert policy.pick_canvas(1600, 900, ["1024x1024", "1536x1024", "1024x1536"]) == (
+        1536,
+        1024,
+    )
+    assert policy.pick_canvas(800, 800, ["1024x1024", "1536x1024", "1024x1536"]) == (
+        1024,
+        1024,
+    )
+
+
+def test_pick_canvas_desempata_pela_menor_area():
+    """1024×1536, 1280×1920 e 1536×2304 são todas 2:3. Escolher a maior faria
+    uma edição sem `size` custar 2,25× de GPU sem ninguém ter pedido."""
+    allowed = ["1024x1536", "1280x1920", "1536x2304"]
+    assert policy.pick_canvas(506, 1164, allowed) == (1024, 1536)
+
+
+def test_pick_canvas_com_max_area_so_escolhe_o_que_cabe():
+    """Grade casada: um canvas acima de 1 MP faria o pipeline reduzir a
+    referência e a grade voltaria a divergir."""
+    allowed = ["1024x1024", "1536x1024", "1024x1536", "816x1216"]
+    assert policy.pick_canvas(506, 1164, allowed, max_area=1024 * 1024) == (816, 1216)
+    assert policy.pick_canvas(1600, 900, allowed, max_area=1024 * 1024) == (1024, 1024)
+    # sem nada que caiba, a allowlist inteira — nunca um 500
+    assert policy.pick_canvas(506, 1164, ["1024x1536"], max_area=1024 * 1024) == (1024, 1536)
+    # 1024×1024 é exatamente 1 MP e o pipeline só reduz o que PASSA disso
+    assert policy.pick_canvas(800, 800, allowed, max_area=1024 * 1024) == (1024, 1024)
+
+
+def test_pick_canvas_recusa_dimensao_invalida():
+    with pytest.raises(policy.ImageRequestError) as e:
+        policy.pick_canvas(0, 1164, ["1024x1536"])
+    assert e.value.code == "invalid_image_size"
+
+
+def test_plan_aspect_fit_completa_nas_laterais_e_e_simetrico():
+    """506×1164 num canvas 2:3 pede 776 de largura: 135 de cada lado. Simétrico
+    porque deslocar o sujeito mudaria o enquadramento que isto preserva."""
+    fit = policy.plan_aspect_fit(506, 1164, 1024, 1536)
+    assert (fit.pad_top, fit.pad_bottom) == (0, 0)
+    assert fit.pad_left == 135 and fit.pad_right == 135
+    assert fit.padded_width == 776 and fit.padded_height == 1164
+    assert abs(fit.padded_width / fit.padded_height - 1024 / 1536) < 0.01
+
+
+def test_plan_aspect_fit_completa_em_cima_e_embaixo():
+    """Foto mais LARGA que o canvas: o padding vai para o outro eixo."""
+    fit = policy.plan_aspect_fit(1600, 900, 1024, 1536)
+    assert (fit.pad_left, fit.pad_right) == (0, 0)
+    assert fit.pad_top > 0 and fit.pad_bottom > 0
+    assert abs(fit.padded_width / fit.padded_height - 1024 / 1536) < 0.01
+
+
+def test_plan_aspect_fit_nao_mexe_no_que_ja_casa():
+    """2% de folga: recortar ~20px da saída custaria uma cópia para não mudar
+    nada visível."""
+    assert policy.plan_aspect_fit(1024, 1536, 1024, 1536).is_noop
+    assert policy.plan_aspect_fit(1020, 1536, 1024, 1536).is_noop
+
+
+def test_plan_aspect_fit_resto_impar_nao_perde_pixel():
+    """O resto vai para um lado só; somar os dois tem de devolver o total."""
+    fit = policy.plan_aspect_fit(505, 1164, 1024, 1536)
+    assert fit.pad_left + 505 + fit.pad_right == fit.padded_width
+
+
+def test_crop_box_desfaz_o_padding_na_escala_da_saida():
+    """A geração sai a 1024 de largura e a foto paddada tinha 776: descontar os
+    mesmos 135 pixels deixaria o recorte fora de lugar por toda a escala."""
+    fit = policy.plan_aspect_fit(506, 1164, 1024, 1536)
+    left, top, right, bottom = fit.crop_box(1024, 1536)
+    assert (top, bottom) == (0, 1536)
+    assert left == round(1024 * 135 / 776) == 178
+    assert right == 1024 - 178
+    # e o que sobra tem a proporção da FOTO, que é o ponto de tudo isto
+    assert abs((right - left) / (bottom - top) - 506 / 1164) < 0.02
+
+
+def test_output_size_bate_com_o_crop():
+    fit = policy.plan_aspect_fit(506, 1164, 1024, 1536)
+    left, top, right, bottom = fit.crop_box(1024, 1536)
+    assert fit.output_size(1024, 1536) == (right - left, bottom - top)
+
+
+def test_crop_box_degenerado_devolve_a_imagem_inteira():
+    """Invariante local: padding maior que a própria foto não sai de
+    plan_aspect_fit, mas se saísse, uma imagem de largura zero só falharia lá na
+    frente, no encode."""
+    fit = policy.AspectFit(600, 600, 0, 0, 1000, 1000)
+    assert fit.crop_box(100, 100) == (0, 0, 100, 100)
+
+
+# ---------------------------------------------------------------------------
+# contabilidade em tokens
+# ---------------------------------------------------------------------------
+
+
+def test_um_token_latente_cobre_16x16_px():
+    # 1024×1024 → 64×64 patches: é o image_seq_len que o pipeline calcula
+    assert policy.latent_tokens(1024, 1024) == 4096
+    assert policy.latent_tokens(1536, 1024) == 6144
+    # resto abaixo de 16 px não vira token — o pipeline pisa a múltiplo de 16
+    assert policy.latent_tokens(1030, 1030) == 4096
+    assert policy.latent_tokens(0, 1024) == 0
+
+
+def test_referencia_pequena_conta_pelas_proprias_dimensoes():
+    # 512×512 não é ampliada (o pipeline nunca faz upscale): 32×32
+    assert policy.reference_latent_tokens(512, 512) == 1024
+    # 506×1164 → piso a 496×1152 → 31×72
+    assert policy.reference_latent_tokens(506, 1164) == 31 * 72
+
+
+def test_referencia_grande_e_reduzida_a_1024x1024_de_area():
+    # 2048×2048 → escala 0,5 → 1024×1024 → 4096, e não 16384
+    assert policy.reference_latent_tokens(2048, 2048) == 4096
+    # 3000×2000 → escala sqrt(1048576/6e6)=0,418 → 1254×836 → piso 1248×832 → 78×52
+    assert policy.reference_latent_tokens(3000, 2000) == 78 * 52
+
+
+def test_estimativa_de_texto_respeita_o_teto_do_encoder():
+    assert policy.estimate_text_tokens("", 512) == 0
+    assert policy.estimate_text_tokens("gato", 512) == 1
+    assert policy.estimate_text_tokens("x" * 40, 512) == 10
+    # prompt maior que o teto conta só o que o modelo vê
+    assert policy.estimate_text_tokens("x" * 10_000, 512) == 512
+
+
+def test_usage_block_separa_entrada_de_saida():
+    usage = policy.usage_block(
+        text_tokens=12, reference_sizes=[(512, 512), (1024, 1024)],
+        width=1024, height=1536, n=1,
+    )
+    assert usage["prompt_tokens_details"] == {"text_tokens": 12, "image_tokens": 1024 + 4096}
+    assert usage["prompt_tokens"] == 12 + 1024 + 4096
+    assert usage["completion_tokens"] == 64 * 96
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    # sem cached_tokens: não há prefix cache em difusão
+    assert "cached_tokens" not in usage["prompt_tokens_details"]
+
+
+def test_usage_block_multiplica_a_saida_por_n():
+    usage = policy.usage_block(text_tokens=1, reference_sizes=[], width=1024, height=1024, n=2)
+    assert usage["completion_tokens"] == 2 * 4096
+    assert usage["prompt_tokens"] == 1

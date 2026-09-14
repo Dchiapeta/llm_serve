@@ -422,7 +422,8 @@ async def anthropic_sse_from_openai_stream(
     upstream, requested_model: str, on_done=None, filter_reasoning: bool = False,
     input_tokens_estimate: int = 0, ttft_timeout_s: float = 0.0,
     idle_timeout_s: float = 0.0, ping_interval_s: float = 0.0, log_label: str = "",
-    thinking_esperado: bool = True,
+    thinking_esperado: bool = True, retry_without_thinking=None,
+    _emit_message_start: bool = True,
 ):
     """Converte o stream SSE do vLLM (chat/completions, formato OpenAI) pro
     formato de eventos da Anthropic Messages API (message_start ->
@@ -466,28 +467,38 @@ async def anthropic_sse_from_openai_stream(
     um prefill longo, e pra não deixar o cliente no escuro quando o filtro de
     raciocínio represa a saída até fechar </think>."""
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    yield _sse("message_start", {
-        "type": "message_start",
-        "message": {
-            "id": message_id,
-            "type": "message",
-            "role": "assistant",
-            "model": requested_model,
-            "content": [],
-            "stop_reason": None,
-            "stop_sequence": None,
-            # os campos de cache vão a zero (não fazemos prompt caching — ver
-            # o cabeçalho deste módulo) mas PRESENTES: shape fiel à API real, e
-            # há cliente que soma os três pra calcular contexto usado, onde
-            # ausente (undefined) e 0 não são a mesma coisa.
-            "usage": {
-                "input_tokens": input_tokens_estimate,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 0,
+    # `_emit_message_start=False` é o modo do RETRY sem thinking (abaixo): o
+    # message_start do turno já foi pro cliente, o segundo stream só continua.
+    if _emit_message_start:
+        yield _sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": requested_model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                # os campos de cache vão a zero (não fazemos prompt caching — ver
+                # o cabeçalho deste módulo) mas PRESENTES: shape fiel à API real, e
+                # há cliente que soma os três pra calcular contexto usado, onde
+                # ausente (undefined) e 0 não são a mesma coisa.
+                "usage": {
+                    "input_tokens": input_tokens_estimate,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
+                },
             },
-        },
-    })
+        })
+    # Heartbeat pelo último byte ENVIADO ao cliente (não pelo último chunk
+    # recebido do vLLM): durante raciocínio filtrado os chunks chegam sem parar
+    # e nada é emitido, e a conexão ficava muda por minutos — o Claude Code
+    # mostrava "check your network" enquanto o pod seguia gerando.
+    last_emit = time.monotonic()
+    # usage/status do retry sem thinking, quando houve (ver finally)
+    retried: dict | None = None
 
     text_block_open = False
     text_block_index = None
@@ -532,13 +543,25 @@ async def anthropic_sse_from_openai_stream(
                 if chunk_task is None:
                     chunk_task = asyncio.ensure_future(_next_chunk(iterator))
                 budget = idle_timeout_s if first_chunk_seen else ttft_timeout_s
-                waits = [t for t in (ping_interval_s, budget) if t > 0]
+                now = time.monotonic()
+                # espera só o que FALTA de cada prazo, medido da própria
+                # referência: o budget conta desde o último chunk recebido, o
+                # ping desde o último byte emitido ao cliente
+                waits = []
+                if budget > 0:
+                    waits.append(max(0.0, budget - (now - waiting_since)))
+                if ping_interval_s > 0:
+                    waits.append(max(0.0, ping_interval_s - (now - last_emit)))
                 done, _ = await asyncio.wait(
                     {chunk_task}, timeout=min(waits) if waits else None
                 )
+                now = time.monotonic()
+                if ping_interval_s > 0 and now - last_emit >= ping_interval_s:
+                    yield PING
+                    last_emit = time.monotonic()
                 if not done:
-                    waited = time.monotonic() - waiting_since
-                    if budget and waited > budget:
+                    waited = now - waiting_since
+                    if budget and waited >= budget:
                         chunk_task.cancel()
                         aborted_reason = (
                             "prefill" if not first_chunk_seen else "silêncio"
@@ -549,8 +572,6 @@ async def anthropic_sse_from_openai_stream(
                             aborted_reason, waited, budget, log_label or "?",
                         )
                         break
-                    if ping_interval_s > 0:
-                        yield PING
                     continue
                 raw = chunk_task.result()
                 chunk_task = None
@@ -636,10 +657,12 @@ async def anthropic_sse_from_openai_stream(
                                 "content_block": {"type": "text", "text": ""},
                             })
                             text_block_open = True
+                            last_emit = time.monotonic()
                         yield _sse("content_block_delta", {
                             "type": "content_block_delta", "index": text_block_index,
                             "delta": {"type": "text_delta", "text": text},
                         })
+                        last_emit = time.monotonic()
 
                     for tc in delta.get("tool_calls") or []:
                         # tool call é entrega válida: resposta que só chama
@@ -663,6 +686,7 @@ async def anthropic_sse_from_openai_stream(
                                     "input": {},
                                 },
                             })
+                            last_emit = time.monotonic()
                         function = tc.get("function") or {}
                         args_fragment = function.get("arguments")
                         if args_fragment:
@@ -670,6 +694,7 @@ async def anthropic_sse_from_openai_stream(
                                 "type": "content_block_delta", "index": tool_blocks[oi],
                                 "delta": {"type": "input_json_delta", "partial_json": args_fragment},
                             })
+                            last_emit = time.monotonic()
         except (httpx.HTTPError, ConnectionError, OSError) as e:
             # conexão upstream caiu no meio do stream — fecha os blocks
             # abertos com o que já foi gerado, em vez de sumir sem nada.
@@ -704,6 +729,42 @@ async def anthropic_sse_from_openai_stream(
                 len(reasoning_buffer), log_label or "?",
             )
             reasoning_buffer = ""
+
+        if (
+            retry_without_thinking is not None and not entregou_visivel
+            and aborted_reason is None and finish_reason == "length" and thinking_esperado
+        ):
+            # O modelo gastou o max_tokens inteiro raciocinando e nunca emitiu
+            # texto. Devolver `error` aqui é FATAL para a compactação do Claude
+            # Code: desde o build 2.1.223 ele trata resposta vazia com
+            # finish_reason length como erro de limite de saída e encerra a
+            # sessão (anthropics/claude-code#85499). Refaz UMA vez com thinking
+            # desligado; o message_start já foi, então o segundo stream entra
+            # sem ele e continua o mesmo turno. Falhou o retry, cai no erro
+            # original abaixo.
+            novo = await retry_without_thinking()
+            if novo is not None:
+                logger.warning(
+                    "anthropic stream: raciocínio esgotou max_tokens sem texto em %s "
+                    "— refazendo sem thinking", log_label or "?",
+                )
+                capturado: dict = {}
+
+                def _capture(u, st):
+                    capturado["usage"] = u
+                    capturado["status"] = st
+
+                retried = capturado
+                async for ev in anthropic_sse_from_openai_stream(
+                    novo, requested_model, on_done=_capture,
+                    filter_reasoning=filter_reasoning,
+                    input_tokens_estimate=input_tokens_estimate,
+                    ttft_timeout_s=ttft_timeout_s, idle_timeout_s=idle_timeout_s,
+                    ping_interval_s=ping_interval_s, log_label=log_label,
+                    thinking_esperado=False, _emit_message_start=False,
+                ):
+                    yield ev
+                return
 
         if not entregou_visivel:
             # Nenhum bloco de conteúdo, por qualquer causa. Fechar a mensagem
@@ -784,7 +845,11 @@ async def anthropic_sse_from_openai_stream(
             await upstream.aclose()
         except Exception:
             pass
-        if on_done:
+        if on_done and retried is not None:
+            # o turno foi concluído pelo retry sem thinking: são o usage e o
+            # status dele que valem (o primeiro stream não entregou nada)
+            on_done(retried.get("usage"), retried.get("status", 502))
+        elif on_done:
             # status LÓGICO, não o do cabeçalho: o 200 já foi pro cliente junto
             # com o header, muito antes de o corpo morrer. Gravar 200 pra stream
             # que abortou (ou que não entregou nada) é o que mantinha essas

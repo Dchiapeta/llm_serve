@@ -9,16 +9,31 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart"
 
-const config: ChartConfig = {
+// Duas séries no config (não uma): tokens (das duas categorias — o pod de
+// imagem conta patches latentes + prompt) e imagens geradas, que é a outra
+// pergunta que se faz a uma máquina de imagem. Uma barra por vez — ver
+// `unit` abaixo.
+const CONFIG: ChartConfig = {
   tokens: { label: "Tokens", color: "var(--chart-1)" },
+  images: { label: "Imagens", color: "var(--chart-2)" },
+}
+
+const UNIT_LABEL: Record<"tokens" | "images", string> = {
+  tokens: "tokens",
+  images: "imagens",
 }
 
 export function UsageHistogram({
   data,
+  unit = "tokens",
 }: {
-  data: { label: string; tokens: number }[]
+  data: { label: string; tokens: number; images: number }[]
+  /** Qual série mostrar — a página não soma tokens com imagens no mesmo
+   *  eixo, unidades diferentes não compartilham escala. Escolhida por
+   *  UsageDistribution, que decide sozinha quando há as duas. */
+  unit?: "tokens" | "images"
 }) {
-  const total = data.reduce((s, d) => s + d.tokens, 0)
+  const total = data.reduce((s, d) => s + d[unit], 0)
 
   if (total === 0) {
     return (
@@ -29,7 +44,7 @@ export function UsageHistogram({
   }
 
   return (
-    <ChartContainer config={config} className="aspect-auto h-64 w-full">
+    <ChartContainer config={CONFIG} className="aspect-auto h-64 w-full">
       <BarChart data={data} margin={{ top: 8, right: 8, left: 8, bottom: 0 }}>
         <CartesianGrid vertical={false} />
         <XAxis
@@ -45,13 +60,17 @@ export function UsageHistogram({
             <ChartTooltipContent
               formatter={(value) => (
                 <span className="font-mono font-medium tabular-nums">
-                  {Number(value).toLocaleString("pt-BR")} tokens
+                  {Number(value).toLocaleString("pt-BR")} {UNIT_LABEL[unit]}
                 </span>
               )}
             />
           }
         />
-        <Bar dataKey="tokens" fill="var(--color-tokens)" radius={[4, 4, 0, 0]} />
+        <Bar
+          dataKey={unit}
+          fill={`var(--color-${unit})`}
+          radius={[4, 4, 0, 0]}
+        />
       </BarChart>
     </ChartContainer>
   )

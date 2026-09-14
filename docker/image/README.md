@@ -58,8 +58,11 @@ imagem pré-tool-calling.
 | `flux2-klein-4b-0.1.0` | **NÃO USAR.** Publicada antes da revisão. Devolve 500 (em vez de 400) para qualquer campo escalar com tipo errado; a admissão da fila é furável por handler cancelado (`CancelledError` não tratado — medido: `capacity=2` admitindo 21 gerações); `stop()` no meio de uma geração pendura a request para sempre; worker morto responde 504 indefinidamente com `/health` em 200; sem degradação pós-boot; sem teto de multipart no parser; recusa o `model` que o `pin_model` do gateway fixaria. |
 | `flux2-klein-4b-0.1.1` | Todas as correções da 0.1.0, cada uma com teste. Não devolve o bloco `meta`, e sorteia a seed dentro do torch — uma geração sem `seed` explícita não é reproduzível, e o registro em `image_generations` nasce com `prompt`/parâmetros nulos no `edits`. |
 | `flux2-klein-4b-0.1.2` | `meta` na resposta (prompt, dimensões, steps, guidance, model) e `ensure_seed` sorteando no nível da policy, para que a seed gravada seja a realmente usada. Traz também o teto de corpo por rota do agent (`read_body_capped`), que fecha o pod para corpo sem `Content-Length`. Não mede nada: sem tempo por fase e sem leitura de VRAM, dimensionar a GPU e o rate limit era estimativa. |
-| `flux2-klein-4b-0.1.3` | Atual em produção. **Instrumentação.** `meta.timings` com o tempo de cada fase (fila, decode, GPU, encode), métricas de VRAM no `/metrics` (incluindo a ocupação real do device, que o allocator do PyTorch não enxerga) e agregação por cenário `(resolução, nº de referências)`. Nenhuma mudança de comportamento na geração. |
-| `flux2-klein-4b-0.1.4` | **Ainda não publicada.** Prompt configurado na chave: as duas rotas resolvem o `prompt` por `policy.resolve_prompt`, e o `edits` passa a ler o `PROMPT_HEADER` que o gateway manda. Enquanto o pod rodar a `0.1.3`, o header é ignorado e uma chave que dependa do prompt configurado leva `400 missing_prompt` **só no `edits`** — o `generations` não depende desta versão, porque o gateway resolve o prompt no corpo. |
+| `flux2-klein-4b-0.1.3` | **Instrumentação.** `meta.timings` com o tempo de cada fase (fila, decode, GPU, encode), métricas de VRAM no `/metrics` (incluindo a ocupação real do device, que o allocator do PyTorch não enxerga) e agregação por cenário `(resolução, nº de referências)`. Nenhuma mudança de comportamento na geração. |
+| `flux2-klein-4b-0.1.4` | **Nunca publicada** — o conteúdo dela saiu na 0.1.5. Prompt configurado na chave: as duas rotas resolvem o `prompt` por `policy.resolve_prompt`, e o `edits` passa a ler o `PROMPT_HEADER` que o gateway manda. Enquanto o pod rodar a `0.1.3`, o header é ignorado e uma chave que dependa do prompt configurado leva `400 missing_prompt` **só no `edits`** — o `generations` não depende desta versão, porque o gateway resolve o prompt no corpo. |
+| `flux2-klein-4b-0.1.7` | **Próxima — build/push pendente.** Grade da referência igual à da saída em `/v1/images/edits` sem `size`. O pipeline reduz toda referência acima de 1 MP (e nunca amplia as menores), e a posição de referência e saída usa a mesma escala de 16 px por token: com canvas 1024×1536 a foto entrava a ~768×1152, e o modelo redesenhava o corpo maior e mais largo (try-on de 14/09/2026). Agora `pick_canvas` só considera canvas ≤ 1 MP (`max_area=REFERENCE_MAX_AREA`, caindo na allowlist inteira se nada couber) e a primeira referência é redimensionada para exatamente o canvas, com ou sem padding. **Muda o tamanho entregue:** com a allowlist default o único canvas ≤ 1 MP é 1024×1024, então uma selfie retrato sai com 1024 px de altura em vez de 1536 — incluir `816x1216` em `IMAGE_ALLOWED_SIZES` para ter retrato. `size` explícito continua como antes. Kill-switch em `IMAGE_MATCH_REFERENCE_GRID=false`. |
+| `flux2-klein-4b-0.1.6` | Em produção (as respostas já trazem `usage` em 14/09/2026). Bloco `usage` na resposta, no formato chat do vLLM: um token por patch latente de 16×16 px (a imagem gerada em `completion_tokens`, cada referência em `prompt_tokens`) mais os tokens de texto do prompt contados pelo tokenizer do encoder (chat template incluído, truncado em 512). É o que faz o agent somar imagem em `usage_metrics` e o gateway gravar `tokens_in/out` sem ramo especial — até aqui uma stack de imagem tinha consumo zero em todo painel. Nenhuma mudança na geração. Ver "Consumo em tokens" abaixo. |
+| `flux2-klein-4b-0.1.5` | Publicada em 13/09/2026, digest `sha256:68e0de0e5caaa9888e9a250ea45b862d7894be2be0ea318311a868c81a4333cd`. Carrega também o prompt por chave que a 0.1.4 nunca chegou a publicar. Encaixe de proporção em `/v1/images/edits`: quando o cliente NÃO manda `size`, o canvas passa a sair da proporção da primeira referência (`policy.pick_canvas`), a foto é completada com as próprias bordas até casar com ele (`policy.plan_aspect_fit`) e a saída é recortada de volta. É correção de QUALIDADE, não de formato: mandar uma foto 506×1164 para o canvas quadrado do default a esticava 53%, e uma foto esticada faz o modelo redesenhar o corpo a partir da imagem de referência — quem pediu para trocar de roupa recebia outra pessoa. Quem manda `size` continua recebendo exatamente o que pediu. O `meta` passa a trazer `width`/`height` do que foi ENTREGUE mais `canvas_width`/`canvas_height` quando diferem. Kill-switch em `IMAGE_ASPECT_FIT=false`. |
 
 A `0.1.0` fica no registry de propósito, e não é deletada: apagá-la faria a
 referência a ela em qualquer log ou anotação antiga virar um mistério, em vez de
@@ -241,6 +244,47 @@ A seed é do **batch**, não de cada imagem: com `n > 1` o pipeline consome de u
 
 Campo extra não quebra cliente OpenAI (os SDKs ignoram desconhecidos), e o
 conteúdo é do próprio requisitante.
+
+### Consumo em tokens: `usage`
+
+Desde a `0.1.6` a resposta traz também `usage`, no formato chat do vLLM:
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 4108,
+    "completion_tokens": 4096,
+    "total_tokens": 8204,
+    "prompt_tokens_details": { "text_tokens": 12, "image_tokens": 4096 }
+  }
+}
+```
+
+Difusão não gera texto, mas o transformer do FLUX.2 processa uma sequência de
+tokens como qualquer outro, e é ela que custa GPU. A conta espelha o pipeline
+do diffusers (`Flux2KleinPipeline`, verificado no código em 14/09/2026):
+
+- **um token latente cobre 16×16 px** — o VAE reduz 8× e o pipeline agrupa os
+  latentes em patches 2×2 antes do transformer;
+- **`completion_tokens`** = `n × (altura/16) × (largura/16)` do **canvas** —
+  1024×1024 são 4.096 tokens, 1024×1536 são 6.144. Com encaixe de proporção o
+  cliente recebe uma imagem menor (recorte), mas o custo é o do canvas;
+- **`prompt_tokens`** = tokens de texto + patches de cada referência.
+  O texto é contado pelo tokenizer do encoder como o pipeline o vê (chat
+  template do Qwen3 incluído, truncado em `IMAGE_MAX_SEQUENCE_LENGTH`). Cada
+  referência entra nas dimensões com que o pipeline a codifica: a primeira já
+  com o padding do encaixe, todas com o teto de área de 1024×1024 (escala
+  uniforme, nunca amplia) e piso a múltiplo de 16 — ver
+  `policy.reference_latent_tokens`;
+- `prompt_tokens_details` separa texto de imagem porque um prompt de 40
+  tokens com quatro referências é 99% imagem. Não há `cached_tokens`: não
+  existe prefix cache em difusão.
+
+Erro de geração não devolve `usage`: tokens de uma imagem que não saiu seriam
+custo inventado. O agent lê `usage` na raiz de qualquer resposta JSON e soma em
+`usage_metrics`; o gateway grava o mesmo bloco em `gateway_requests` — as duas
+tabelas concordam por construção, e a cota diária de tokens
+(`check_token_quota`) passa a valer para imagem como vale para texto.
 
 Recusas explícitas, todas com `error.code` estável:
 
@@ -517,13 +561,14 @@ ou mande o nome servido.
 ## Limitações conhecidas
 
 - **Sem moderação.** Não há classificação de conteúdo de prompt nem de imagem.
-- **Uso não é contabilizado em tokens.** Geração de imagem não produz tokens,
-  então `gateway_requests.tokens_in/out` e `usage_metrics` ficam nulos — e
-  `check_token_quota` fica cega para este workload. Os freios reais são
-  `IMAGE_RATE_LIMIT_RPM_GO` (10 submissões/min por stack, com 3 em voo) e
-  `check_concurrency`. A tabela
-  `image_generations` é o contador que uma cota por imagem usaria. O teto de
-  10/min é de submissão comercial; `scripts/loadtest_image.py` mede a vazão
+- **Tokens de imagem são uma conta, não uma medição.** O `usage` reproduz a
+  aritmética do pipeline (ver "Consumo em tokens"), não lê o tensor — se o
+  diffusers mudar o VAE, o patch ou o pré-processamento das referências, a
+  conta em `policy.py` precisa acompanhar. Pod anterior à `0.1.6` não manda
+  o bloco, e aí `tokens_in/out` ficam nulos como antes. Os freios de vazão
+  continuam sendo `IMAGE_RATE_LIMIT_RPM_GO` (10 submissões/min por stack, com
+  3 em voo) e `check_concurrency`; a cota diária de tokens vale, mas está em
+  0 (sem teto) para todos os planos. `scripts/loadtest_image.py` mede a vazão
   concluída real, que varia entre geração e edição.
 - **Volume não sobrevive à recriação do pod.** `CreatePodInput`
   (`lib/runpod.ts`) não expõe Network Volume, então `recreateMachine` rebaixa os

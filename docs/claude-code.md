@@ -162,15 +162,23 @@ O teto de input sintético subiu: com a margem por procedência
 (`CONTEXT_EXACT_SAFETY_FACTOR = 1.02`, ver seção 5), input perto da janela
 **deixou de ser rejeição esperada** — o gateway escala pro tokenizer real
 acima de ~58% da janela e reserva apenas 2% + 200 tokens. Em 131072 dá pra
-testar até `--context-tokens 110000`, e um 400 de contexto aí é falha do teste,
-não comportamento previsto.
+testar perto da janela, e um 400 de contexto aí é falha do teste, não
+comportamento previsto.
+
+⚠️ **`--context-tokens` NÃO é o tamanho real do prompt.** `build_big_context`
+dimensiona o bloco por uma regra de 4 chars/token, mas o código denso que ele
+gera tokeniza a ~2,7 chars/token — o prompt sai **~1,5× maior** do que o número
+pedido. Medido em 13/09/2026: `--context-tokens 110000` produziu prompts de
+**164 861 tokens** e o gateway rejeitou os 24 requests com 400, sem medir nada.
+Para mirar ~105k reais numa janela de 131072, usar **`--context-tokens 70000`**.
+Confira sempre o `prompt_tokens` real do relatório, não o valor pedido.
 
 ```bash
 # Pro (2× A40 TP=2, 27B: pool ~540k tokens ≈ ~4,2 sessões cheias)
 python3 scripts/loadtest.py \
   --base-url https://api.trystac.com \
   --api-key <chave Pro> --model <alias pro> \
-  --levels 2,4,6 --context-tokens 110000 --max-tokens 16000
+  --levels 2,4,6 --context-tokens 70000 --max-tokens 8000
 ```
 
 No Pro o número que decide não é vazão, é **TTFT**: o gargalo é o prefill de
@@ -211,7 +219,10 @@ Permanente — recomendado, é o que não se esquece:
     "ANTHROPIC_BASE_URL": "https://api.trystac.com",
     "ANTHROPIC_AUTH_TOKEN": "<sua chave do plano>",
     "ANTHROPIC_MODEL": "<alias do modelo do plano>",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "104000"
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "131072",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "104000",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   }
 }
 ```
@@ -226,8 +237,33 @@ Só para a sessão do terminal atual:
 export ANTHROPIC_BASE_URL=https://api.trystac.com
 export ANTHROPIC_AUTH_TOKEN=<sua chave do plano>
 export ANTHROPIC_MODEL=<alias do modelo do plano>
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW=104000
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8000
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 ```
+
+**As três variáveis novas (13/09/2026).** Desde o build 2.1.223 o Claude Code trata
+todo alias de gateway como modelo desconhecido, assume 200k e **compacta
+proativamente** dentro disso; se a compactação falhar, encerra a sessão
+(anthropics/claude-code#85499). `CLAUDE_CODE_MAX_CONTEXT_TOKENS` é a variável oficial
+para declarar a janela real. Medido na CLI 2.1.270 com `--debug`, a janela EFETIVA de
+compactação é `AUTO_COMPACT_WINDOW − reserva de saída`, e a reserva é 20000 por
+default ou o valor de `CLAUDE_CODE_MAX_OUTPUT_TOKENS`:
+
+| Config | effectiveWindow |
+|---|---|
+| nenhuma variável | 180000 (200k assumidos) |
+| `AUTO_COMPACT_WINDOW=104000` | 84000 |
+| + `MAX_OUTPUT_TOKENS=16000` | 88000 |
+| + `MAX_OUTPUT_TOKENS=8000` | 96000 |
+
+Com os ~18k fixos do system prompt do próprio Claude Code, 84000 deixava ~66k úteis
+— era o que fazia três turnos com arquivos grandes bastarem para compactar. O 8000 é o
+`MIN_MAX_TOKENS` do gateway (saída garantida), então não corta nada que o gateway já
+não cortasse. `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` evita chamadas de fundo.
+Não usar `modelOverrides` para "reconhecer" o alias como um modelo Claude: a CLI
+passaria a mandar `thinking.budget_tokens`, que o gateway rejeita com 400.
 
 **Por que 104000.** A variável não é o gatilho: ela declara a **capacidade** que
 o Claude Code passa a assumir, e ele compacta numa fração *interna* dela — entre

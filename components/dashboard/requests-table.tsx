@@ -4,7 +4,7 @@ import * as React from "react"
 import { Search } from "lucide-react"
 
 import type { ApiKeyPurpose, GatewayRequest, TemplatePlan } from "@/lib/types"
-import { requestOrigin } from "@/lib/request-origin"
+import { isImagePath, requestOrigin } from "@/lib/request-origin"
 import { Badge } from "@/components/ui/badge"
 import { PlanBadge } from "@/components/machines/plan-badge"
 import { RequestOriginBadge } from "@/components/dashboard/request-origin-badge"
@@ -230,7 +230,18 @@ export function RequestsTable({ rows }: { rows: RequestRow[] }) {
                 )}
               </TableCell>
               <TableCell className="text-right font-mono text-xs tabular-nums">
-                {r.tokens_in ?? "—"} / {r.tokens_out ?? "—"}
+                {isImagePath(r.path) && r.tokens_in == null && r.tokens_out == null ? (
+                  // Rota de imagem SEM contagem: pod anterior à 0.1.6, que
+                  // não devolvia `usage`. A partir dela o pod conta patches
+                  // latentes + prompt e a linha cai no ramo de baixo como
+                  // qualquer chat. O rótulo explícito existe porque "— / —"
+                  // seria indistinguível de "não medimos".
+                  <span className="text-muted-foreground">n/a · pod antigo</span>
+                ) : (
+                  <>
+                    {r.tokens_in ?? "—"} / {r.tokens_out ?? "—"}
+                  </>
+                )}
               </TableCell>
               <TableCell className="text-right font-mono text-xs tabular-nums">
                 {formatDuration(r.duration_ms)}

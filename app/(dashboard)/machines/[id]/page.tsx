@@ -11,6 +11,7 @@ import {
 } from "@/lib/machines"
 import { runpod, runpodConsoleUrl } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
+import { formatConsumption, formatImageCount } from "@/lib/consumption"
 import type { Account, ApiKey, Machine, Template, UsageMetric } from "@/lib/types"
 import { Badge } from "@/components/ui/badge"
 import {
@@ -78,6 +79,7 @@ export default async function MachineDetailPage({
     { data: keysData },
     { data: accountsData },
     { data: usageData },
+    { data: imageUsageData },
     { data: machineStacks },
   ] = await Promise.all([
     machine.template_id
@@ -95,6 +97,10 @@ export default async function MachineDetailPage({
       .eq("machine_id", id)
       .order("window_start", { ascending: false })
       .limit(500),
+    // image_usage_rollup (migration 0067) — máquina nunca mistura categoria
+    // (template.category é fixo por máquina), então esta consulta só traz
+    // linhas se `machine` for de imagem.
+    db.from("image_usage_rollup").select("api_key_id, images").eq("machine_id", id),
     db
       .from("stacks")
       .select("id, usage_class")
@@ -123,6 +129,10 @@ export default async function MachineDetailPage({
   const allKeys = (keysData ?? []) as KeyWithAccount[]
   const accounts = (accountsData ?? []) as Account[]
   const usage = (usageData ?? []) as UsageMetric[]
+  const imageUsage = (imageUsageData ?? []) as {
+    api_key_id: string | null
+    images: number
+  }[]
 
   // Uso agregado por chave. Só existe linha em usage_metrics quando houve request
   // real (o coletor filtra requests > 0), então a presença no mapa já significa
@@ -135,6 +145,12 @@ export default async function MachineDetailPage({
     acc.tokensIn += u.tokens_in
     acc.tokensOut += u.tokens_out
     usageByKey.set(u.api_key_id, acc)
+  }
+
+  const imagesByKey = new Map<string, number>()
+  for (const u of imageUsage) {
+    if (!u.api_key_id) continue
+    imagesByKey.set(u.api_key_id, (imagesByKey.get(u.api_key_id) ?? 0) + u.images)
   }
 
   // Só as chaves que EFETIVAMENTE acessaram esta máquina (têm uso registrado).
@@ -289,8 +305,17 @@ export default async function MachineDetailPage({
           </CardHeader>
           <CardContent>
             <p className="text-xs text-muted-foreground">
-              {usage.reduce((s, u) => s + u.tokens_in + u.tokens_out, 0).toLocaleString("pt-BR")}{" "}
-              tokens processados
+              {/* Tokens para as duas categorias: o pod de imagem conta
+                  patches latentes + prompt no `usage` (lib/consumption.ts).
+                  Máquina de imagem ganha a contagem de imagens ao lado —
+                  é o que tokens não dizem. */}
+              {`${usage
+                .reduce((s, u) => s + u.tokens_in + u.tokens_out, 0)
+                .toLocaleString("pt-BR")} tokens processados`}
+              {template?.category === "image" &&
+                ` · ${formatImageCount(
+                  imageUsage.reduce((s, u) => s + u.images, 0)
+                )} imagens geradas`}
             </p>
           </CardContent>
         </Card>
@@ -327,7 +352,7 @@ export default async function MachineDetailPage({
                     <TableHead>Chave</TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead>Requisições</TableHead>
-                    <TableHead>Tokens</TableHead>
+                    <TableHead>Consumo</TableHead>
                     <TableHead>Criada em</TableHead>
                     <TableHead>Base de conhecimento</TableHead>
                     <TableHead className="w-24" />
@@ -362,7 +387,11 @@ export default async function MachineDetailPage({
                         </TableCell>
                         <TableCell>{(u?.requests ?? 0).toLocaleString("pt-BR")}</TableCell>
                         <TableCell>
-                          {((u?.tokensIn ?? 0) + (u?.tokensOut ?? 0)).toLocaleString("pt-BR")}
+                          {formatConsumption({
+                            tokens: (u?.tokensIn ?? 0) + (u?.tokensOut ?? 0),
+                            images: imagesByKey.get(k.id) ?? 0,
+                            requests: u?.requests ?? 0,
+                          })}
                         </TableCell>
                         <TableCell className="text-xs text-muted-foreground">
                           {new Date(k.created_at).toLocaleDateString("pt-BR")}

@@ -93,6 +93,50 @@ def test_creating_com_exited_alem_do_prazo_vira_stopped():
     assert changed == [("m1", "stopped")]
 
 
+# ---------- reconcile: pod que SUMIU da API com a máquina em 'creating' ----------
+
+
+def test_creating_com_pod_ausente_recente_nao_e_marcada():
+    # pod recém-criado pode não ter aparecido na listagem ainda — a cautela
+    # original continua valendo dentro do prazo
+    supa = FakeSupa([{"id": "m1", "status": "creating", "runpod_pod_id": "p1",
+                      "public_url": "u", "created_at": iso(30), "last_activity_at": iso(30)}])
+    mgr = manager(supa, FakeRunpod([]), creating_grace_s=900)
+
+    changed = asyncio.run(mgr.reconcile_statuses_once())
+
+    assert changed == []
+    assert supa.status_writes == []
+
+
+def test_creating_com_pod_ausente_alem_do_prazo_vira_terminated():
+    # o bug: sem prazo a máquina ficava 'creating' PARA SEMPRE, e como
+    # wake_some_machine_for_plan devolve 'waking' se existe qualquer 'creating'
+    # no plano, uma máquina podre barrava auto-wake e provisionamento do plano
+    # inteiro. 'terminated' (com o pod_id intacto) é o estado que
+    # machine_was_lost reconhece como perdida e manda recriar
+    supa = FakeSupa([{"id": "m1", "status": "creating", "runpod_pod_id": "p1",
+                      "public_url": "u", "created_at": iso(2000), "last_activity_at": iso(2000)}])
+    mgr = manager(supa, FakeRunpod([]), creating_grace_s=900)
+
+    changed = asyncio.run(mgr.reconcile_statuses_once())
+
+    assert changed == [("m1", "terminated")]
+    assert supa.status_writes == [("m1", "terminated")]
+
+
+def test_pod_ausente_fora_de_creating_continua_terminated_na_hora():
+    # máquina running cujo pod sumiu não ganha prazo nenhum (comportamento
+    # antigo — o prazo é só pra quem ainda podia estar subindo)
+    supa = FakeSupa([{"id": "m1", "status": "running", "runpod_pod_id": "p1",
+                      "public_url": "u", "created_at": iso(10), "last_activity_at": iso(10)}])
+    mgr = manager(supa, FakeRunpod([]), creating_grace_s=900)
+
+    changed = asyncio.run(mgr.reconcile_statuses_once())
+
+    assert changed == [("m1", "terminated")]
+
+
 def test_running_com_exited_continua_virando_stopped():
     # a guarda é só para 'creating' — máquina pausada pelo console segue
     # sendo reconciliada como antes
