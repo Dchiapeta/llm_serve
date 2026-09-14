@@ -237,8 +237,9 @@ export type KnowledgeChunk = {
 }
 
 // "customer" conta pro slot de capacidade e pra cota diária de tokens;
-// "playground" é a chave interna gerada junto com a stack (migration 0044),
-// nunca exibida ao cliente, isenta dos dois.
+// "playground" era a chave interna gerada junto com a stack (migration 0044),
+// nunca exibida ao cliente, isenta dos dois. Não é mais criada — o valor
+// permanece só pelas chaves antigas que ainda existem no banco.
 export type ApiKeyPurpose = "customer" | "playground"
 
 export type ApiKey = {
@@ -254,8 +255,8 @@ export type ApiKey = {
   account_id: string
   // Pin histórico da máquina, não rota: o gateway resolve por
   // stacks.machine_id. Null enquanto a stack ainda não foi homeada — a chave
-  // de Playground nasce assim e o gateway preenche no primeiro request
-  // (place_base_stack → rebind_stack_keys).
+  // emitida por /api/keys nasce assim e o gateway preenche no primeiro
+  // request (place_base_stack → rebind_stack_keys).
   machine_id: string | null
   stack_id: string | null
   key_hash: string

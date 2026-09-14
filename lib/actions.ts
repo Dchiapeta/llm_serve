@@ -1454,89 +1454,15 @@ export async function createStack(formData: FormData): Promise<{
     .eq("id", stackId)
   if (linkError) throw new Error(linkError.message)
 
-  // Só a chave interna de Playground, nunca exibida ao cliente — ver
-  // getOrCreatePlaygroundKey para o caminho de backfill de stacks antigas.
-  await createKey({ accountId, machineId, stackId, purpose: "playground" })
-
+  // A stack nasce sem chave nenhuma. A chave interna de Playground (purpose
+  // "playground", migration 0044) deixou de ser criada: o Playground do
+  // painel do cliente só executa com chave "customer" da própria stack. As
+  // chaves "playground" já existentes no banco continuam válidas e isentas
+  // de slot/cota como antes — só não nasce nenhuma nova.
   revalidatePath("/stacks")
   revalidatePath("/accounts")
   if (machineCreated) revalidatePath("/machines")
   return { slug, machineId, machineCreated }
-}
-
-// Devolve a chave interna de Playground de uma stack (texto puro), criando-a
-// sob demanda se a stack foi criada antes desta feature existir. Nunca deve
-// ser exposta ao cliente — só o admin, via tela de Playground, a consome.
-export async function getOrCreatePlaygroundKey(stackId: string): Promise<{ plainKey: string }> {
-  const db = createSupabaseAdmin()
-
-  const findActivePlaygroundKey = async (): Promise<string | null> => {
-    const { data } = await db
-      .from("api_keys")
-      .select("plain_key")
-      .eq("stack_id", stackId)
-      .eq("purpose", "playground")
-      .eq("status", "active")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle<{ plain_key: string | null }>()
-    return data?.plain_key ?? null
-  }
-
-  const existing = await findActivePlaygroundKey()
-  if (existing) return { plainKey: existing }
-
-  const { data: stack } = await db
-    .from("stacks")
-    .select("id, account_id, machine_id")
-    .eq("id", stackId)
-    .single<{ id: string; account_id: string; machine_id: string | null }>()
-  if (!stack) throw new Error("Stack não encontrada")
-
-  // api_keys.machine_id é pin HISTÓRICO, nunca decide rota: o gateway roteia
-  // por stacks.machine_id (resolve_base_machine) e sincroniza a chave na
-  // máquina que resolver no momento (ensure_key_on_machine). Preencher aqui
-  // é só cortesia pro key-sync de reboot (list_active_keys_for_machine).
-  //
-  // Null é estado normal e esperado: stack recém-criada pelo checkout nasce
-  // sem máquina (insertStack, lib/stacks.ts) e o idle reaper de modelo base
-  // devolve qualquer stack ociosa a esse estado. Emitir a chave assim mesmo
-  // é o que faz o Playground funcionar na PRIMEIRA mensagem — o gateway
-  // homeia a stack nesse request (place_base_stack) e o rebind_stack_keys
-  // que vem junto preenche este campo sozinho. A chave "customer" emitida
-  // por /api/keys segue exatamente a mesma regra: criar chave nunca aloca
-  // máquina (estouraria o teto de 15s do panelFetch e faria falta de GPU no
-  // RunPod virar erro na emissão); é o primeiro uso que aloca.
-  let machineId = stack.machine_id
-  if (!machineId) {
-    const { data: customerKey } = await db
-      .from("api_keys")
-      .select("machine_id")
-      .eq("stack_id", stackId)
-      .eq("purpose", "customer")
-      .eq("status", "active")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle<{ machine_id: string }>()
-    machineId = customerKey?.machine_id ?? null
-  }
-
-  try {
-    return await createKey({
-      accountId: stack.account_id,
-      machineId,
-      stackId: stack.id,
-      purpose: "playground",
-    })
-  } catch (e) {
-    // Corrida: duas chamadas concorrentes passaram pelo check acima antes de
-    // qualquer uma terminar o insert — o índice único parcial (migration
-    // 0045: 1 chave "playground" ativa por stack) barra a segunda. Devolve a
-    // que venceu em vez de propagar o erro de violação de constraint.
-    const raced = await findActivePlaygroundKey()
-    if (raced) return { plainKey: raced }
-    throw e
-  }
 }
 
 // Remove uma stack do painel. A máquina que a hospeda (se houver) não é
@@ -1917,23 +1843,22 @@ export async function createKey(input: {
   // sempre passar uma data — chave "de produção" emitida manualmente pelo
   // painel para um cliente já validado pode ficar sem teto.
   expiresAt?: string | null
-  // "customer" (default) conta pro slot de capacidade da máquina e pra cota
-  // diária de tokens da conta. "playground" é a chave interna gerada junto
-  // com a stack para o admin testar o modelo do cliente — nunca exibida ao
-  // cliente, isenta de slot e de cota (ver migration 0044 e
-  // docker/gateway/main.py:check_token_quota).
-  purpose?: "customer" | "playground"
   // Política de RAG da chave (migration 0065): true = sempre consulta a base
   // de conhecimento da stack, false = nunca.
   //
   // Omitido grava null DE PROPÓSITO, e não um default nosso: null é o
   // comportamento legado (a base entra só quando a request não traz system
-  // próprio), então chamador não atualizado — chave de playground, scripts —
-  // continua exatamente como estava. Quem tem interface (CreateKeyDialog aqui,
+  // próprio), então chamador não atualizado — scripts — continua exatamente
+  // como estava. Quem tem interface (CreateKeyDialog aqui,
   // painel do cliente via POST /api/keys) sempre manda true/false explícito.
   enableKnowledgeBase?: boolean | null
 }): Promise<{ plainKey: string }> {
-  const purpose = input.purpose ?? "customer"
+  // Toda chave emitida é "customer": conta pro slot de capacidade da máquina
+  // e pra cota diária de tokens da conta. A chave interna "playground"
+  // (migration 0044) não é mais criada — o painel do cliente executa o
+  // Playground com chave "customer" da stack. O valor segue existindo na
+  // coluna e nos filtros de leitura por causa das chaves antigas.
+  const purpose = "customer"
   const db = createSupabaseAdmin()
 
   const { data: m } = input.machineId
@@ -1942,10 +1867,11 @@ export async function createKey(input: {
   if (input.machineId && !m) throw new Error("Máquina não encontrada")
   let machineAllocationBlocked: string | null = null
 
-  // Chave de playground não ocupa slot de capacidade — só chave "customer"
-  // entra no backstop abaixo. Check-then-insert: há corrida teórica entre
-  // duas emissões simultâneas, aceitável para um painel de administração.
-  if (purpose === "customer" && m) {
+  // Backstop de capacidade por máquina: só chave "customer" conta (a chave
+  // "playground" legada, migration 0044, fica fora da contagem).
+  // Check-then-insert: há corrida teórica entre duas emissões simultâneas,
+  // aceitável para um painel de administração.
+  if (m) {
     const { count: activeKeys } = await db
       .from("api_keys")
       .select("id", { count: "exact", head: true })
@@ -1994,7 +1920,7 @@ export async function createKey(input: {
     stackId = matchingStack?.id ?? null
   }
 
-  if (purpose === "customer" && machineAllocationBlocked) {
+  if (machineAllocationBlocked) {
     const { data: assignedStack } = stackId
       ? await db
           .from("stacks")
@@ -2030,13 +1956,7 @@ export async function createKey(input: {
   })
   if (error) throw new Error(error.message)
 
-  await logEvent(
-    input.machineId,
-    "key_created",
-    purpose === "playground"
-      ? "Chave interna de Playground criada"
-      : `Nova chave criada (${keyPrefix(plainKey)}…)`
-  )
+  await logEvent(input.machineId, "key_created", `Nova chave criada (${keyPrefix(plainKey)}…)`)
   // Chave pode ter sido criada logo após provisionar a máquina (createStack) —
   // o agent do pod ainda pode não estar de pé pra receber um sync direto do
   // painel (mesma race de startMachine, ver scheduleGatewayKeySync acima).
