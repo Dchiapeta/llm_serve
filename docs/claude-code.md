@@ -162,15 +162,23 @@ O teto de input sintético subiu: com a margem por procedência
 (`CONTEXT_EXACT_SAFETY_FACTOR = 1.02`, ver seção 5), input perto da janela
 **deixou de ser rejeição esperada** — o gateway escala pro tokenizer real
 acima de ~58% da janela e reserva apenas 2% + 200 tokens. Em 131072 dá pra
-testar até `--context-tokens 110000`, e um 400 de contexto aí é falha do teste,
-não comportamento previsto.
+testar perto da janela, e um 400 de contexto aí é falha do teste, não
+comportamento previsto.
+
+⚠️ **`--context-tokens` NÃO é o tamanho real do prompt.** `build_big_context`
+dimensiona o bloco por uma regra de 4 chars/token, mas o código denso que ele
+gera tokeniza a ~2,7 chars/token — o prompt sai **~1,5× maior** do que o número
+pedido. Medido em 13/09/2026: `--context-tokens 110000` produziu prompts de
+**164 861 tokens** e o gateway rejeitou os 24 requests com 400, sem medir nada.
+Para mirar ~105k reais numa janela de 131072, usar **`--context-tokens 70000`**.
+Confira sempre o `prompt_tokens` real do relatório, não o valor pedido.
 
 ```bash
 # Pro (2× A40 TP=2, 27B: pool ~540k tokens ≈ ~4,2 sessões cheias)
 python3 scripts/loadtest.py \
   --base-url https://api.trystac.com \
   --api-key <chave Pro> --model <alias pro> \
-  --levels 2,4,6 --context-tokens 110000 --max-tokens 16000
+  --levels 2,4,6 --context-tokens 70000 --max-tokens 8000
 ```
 
 No Pro o número que decide não é vazão, é **TTFT**: o gargalo é o prefill de

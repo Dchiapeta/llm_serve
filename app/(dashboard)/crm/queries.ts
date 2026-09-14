@@ -22,6 +22,7 @@ import {
   type CrmStackRow,
   type MatchSource,
 } from "@/lib/crm"
+import { EMPTY_CONSUMPTION, type Consumption } from "@/lib/consumption"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import {
   CLIENT_WINDOW_DAYS,
@@ -30,6 +31,7 @@ import {
   type Account,
   type BillingStatus,
   type Machine,
+  type ProductCategory,
   type TemplatePlan,
 } from "@/lib/types"
 import { isAllowedAdminEmail } from "@/lib/auth-admin"
@@ -79,6 +81,7 @@ type StackRecord = {
   account_id: string
   machine_id: string | null
   plan: TemplatePlan
+  category: ProductCategory
   slug: string
   name: string | null
   purchase_date: string
@@ -107,6 +110,18 @@ type UsageRecord = {
   requests: number
 }
 
+// Linha da view image_usage_rollup (migration 0067) — o par de UsageRecord
+// para o lado de imagem. Sem tokens_in/out nem requests: usage_metrics já
+// conta requests para a stack de imagem (o pod grava lá, com tokens zerados),
+// e somar image_requests em cima faria a mesma requisição contar duas vezes.
+type ImageUsageRecord = {
+  stack_id: string | null
+  account_id: string | null
+  api_key_id: string | null
+  machine_id: string | null
+  images: number
+}
+
 export type CrmData = {
   /** Todas as contas, sem filtro — quem recorta é selectCrm (lib/crm.ts). */
   rows: CrmRow[]
@@ -118,6 +133,9 @@ export type CrmData = {
   unmatchedSubscriptions: { id: string; status: string; monthlyCents: number }[]
   /** Tokens de linhas de uso que não puderam ser atribuídas a uma conta. */
   unattributedTokens: number
+  /** Imagens geradas sem stack nem chave identificável — mesmo motivo de
+   *  unattributedTokens, para o lado de image_generations. */
+  unattributedImages: number
   /** Uso ou custo vieram incompletos (teto de páginas ou erro na query). */
   usageTruncated: boolean
   costTruncated: boolean
@@ -161,6 +179,7 @@ export const getCrmData = cache(async function getCrmData(
     cfCustomersRes,
     cfAttemptsRes,
     usageRes,
+    imageUsageRes,
     chargefy,
   ] = await Promise.all([
     // Todas paginadas: o teto de 1000 linhas do PostgREST vale para qualquer
@@ -174,7 +193,7 @@ export const getCrmData = cache(async function getCrmData(
         db
           .from("stacks")
           .select(
-            "id, account_id, machine_id, plan, slug, name, purchase_date, usage_class, billing_status, past_due_since, provisioning_ref, last_activity_at, created_at"
+            "id, account_id, machine_id, plan, category, slug, name, purchase_date, usage_class, billing_status, past_due_since, provisioning_ref, last_activity_at, created_at"
           )
           .order("id") as unknown as PagedQuery
     ),
@@ -242,6 +261,21 @@ export const getCrmData = cache(async function getCrmData(
         .order("id")
       return (since ? q.gte("window_start", since) : q) as unknown as PagedQuery
     }),
+    fetchAll<ImageUsageRecord>(() => {
+      // image_usage_rollup (migration 0067) não tem coluna id: a view agrupa
+      // por (stack_id, account_id, api_key_id, machine_id, window_start), e é
+      // essa combinação — não uma única coluna — que fetchAll exige como
+      // ordenação estável para paginar sem pular nem repetir linha.
+      const q = db
+        .from("image_usage_rollup")
+        .select("stack_id, account_id, api_key_id, machine_id, images")
+        .order("machine_id", { nullsFirst: true })
+        .order("stack_id", { nullsFirst: true })
+        .order("account_id", { nullsFirst: true })
+        .order("api_key_id", { nullsFirst: true })
+        .order("window_start")
+      return (since ? q.gte("window_start", since) : q) as unknown as PagedQuery
+    }),
     getChargefySnapshot(),
   ])
 
@@ -266,13 +300,18 @@ export const getCrmData = cache(async function getCrmData(
   const cfCustomers = cfCustomersRes.rows
   const cfAttempts = cfAttemptsRes.rows
   const usage = usageRes.rows
+  const imageUsage = imageUsageRes.rows
 
   const keyById = new Map(keys.map((k) => [k.id, k]))
 
   // ---- Uso por stack (e por máquina, para o rateio de custo) ----
-  const usageByStack = new Map<string, { tokens: number; requests: number }>()
-  const usageByMachineStack = new Map<string, Map<string, number>>()
+  // Consumption soma tokens e imagens no mesmo objeto (lib/consumption.ts) —
+  // uma stack usa só uma das duas unidades na prática, então o campo que ela
+  // não usa fica em zero e não interfere na soma nem no rateio.
+  const usageByStack = new Map<string, Consumption>()
+  const usageByMachineStack = new Map<string, Map<string, Consumption>>()
   let unattributedTokens = 0
+  let unattributedImages = 0
 
   for (const u of usage) {
     const tokens = (u.tokens_in ?? 0) + (u.tokens_out ?? 0)
@@ -283,14 +322,43 @@ export const getCrmData = cache(async function getCrmData(
       unattributedTokens += tokens
       continue
     }
-    const agg = usageByStack.get(stackId) ?? { tokens: 0, requests: 0 }
+    const agg = usageByStack.get(stackId) ?? { ...EMPTY_CONSUMPTION }
     agg.tokens += tokens
     agg.requests += u.requests ?? 0
     usageByStack.set(stackId, agg)
 
     if (u.machine_id) {
-      const perStack = usageByMachineStack.get(u.machine_id) ?? new Map()
-      perStack.set(stackId, (perStack.get(stackId) ?? 0) + tokens)
+      const perStack =
+        usageByMachineStack.get(u.machine_id) ?? new Map<string, Consumption>()
+      const stackAgg = perStack.get(stackId) ?? { ...EMPTY_CONSUMPTION }
+      stackAgg.tokens += tokens
+      perStack.set(stackId, stackAgg)
+      usageByMachineStack.set(u.machine_id, perStack)
+    }
+  }
+
+  // image_usage_rollup.image_requests não entra em `requests`: usage_metrics
+  // já conta o que o pod VIU para a stack de imagem (o mesmo coletor grava lá,
+  // com tokens zerados) — somar as duas fontes na mesma coluna faria a stack
+  // de imagem contar linhas diferentes do resto (ver o comentário da 0067).
+  for (const u of imageUsage) {
+    const images = u.images ?? 0
+    const stackId =
+      u.stack_id ?? (u.api_key_id ? keyById.get(u.api_key_id)?.stack_id : null)
+    if (!stackId) {
+      unattributedImages += images
+      continue
+    }
+    const agg = usageByStack.get(stackId) ?? { ...EMPTY_CONSUMPTION }
+    agg.images += images
+    usageByStack.set(stackId, agg)
+
+    if (u.machine_id) {
+      const perStack =
+        usageByMachineStack.get(u.machine_id) ?? new Map<string, Consumption>()
+      const stackAgg = perStack.get(stackId) ?? { ...EMPTY_CONSUMPTION }
+      stackAgg.images += images
+      perStack.set(stackId, stackAgg)
       usageByMachineStack.set(u.machine_id, perStack)
     }
   }
@@ -312,6 +380,7 @@ export const getCrmData = cache(async function getCrmData(
 
   const gpuCostByStack = new Map<string, number>()
   const stacksByMachine = new Map<string, StackRecord[]>()
+  const categoryByStackId = new Map(stacks.map((s) => [s.id, s.category]))
   for (const s of stacks) {
     if (!s.machine_id) continue
     const list = stacksByMachine.get(s.machine_id) ?? []
@@ -321,21 +390,52 @@ export const getCrmData = cache(async function getCrmData(
 
   for (const row of cost.byMachine) {
     if (row.spent <= 0) continue
-    const tokensPerStack = usageByMachineStack.get(row.machineId)
-    const total = tokensPerStack
-      ? [...tokensPerStack.values()].reduce((a, b) => a + b, 0)
+    const perStack = usageByMachineStack.get(row.machineId)
+
+    // A máquina rateia na unidade NATIVA das stacks que ela hospeda — tokens
+    // para uma máquina de LLM, imagens para uma de imagem. Verificado com
+    // dados reais: hoje nenhuma máquina mistura categoria (lib/actions.ts
+    // recusa migrar uma stack para máquina de categoria diferente), então o
+    // rateio proporcional dentro de uma máquina é sempre entre grandezas da
+    // mesma unidade — antes deste fix, uma máquina de imagem sempre lia
+    // tokens=0 aqui e todo o custo dela caía no ramo "sem uso no período",
+    // dividido igualmente entre as stacks hospedadas (correto por acidente,
+    // não por desenho).
+    //
+    // Se essa premissa quebrar um dia (dado sujo, stack legada apontando pra
+    // máquina errada), cair para `requests` — o único número que as duas
+    // unidades produzem com a mesma semântica — em vez de deixar uma unidade
+    // "vencer" e levar todo o custo da outra.
+    const categories = new Set(
+      [...(perStack?.keys() ?? [])]
+        .map((id) => categoryByStackId.get(id))
+        .filter((c): c is ProductCategory => c != null)
+    )
+    const mixed = categories.size > 1
+    if (mixed) {
+      console.warn(
+        `CRM: máquina ${row.machineId} hospeda stacks de categorias ` +
+          "diferentes no mesmo período — rateio de custo caiu para " +
+          "requisições. Isso não deveria acontecer; investigar."
+      )
+    }
+    const quantityOf = (c: Consumption): number =>
+      mixed ? c.requests : categories.has("image") ? c.images : c.tokens
+
+    const total = perStack
+      ? [...perStack.values()].reduce((sum, c) => sum + quantityOf(c), 0)
       : 0
 
-    if (tokensPerStack && total > 0) {
+    if (perStack && total > 0) {
       // Rateio por consumo: quem gastou mais GPU carrega mais custo.
-      for (const [stackId, tokens] of tokensPerStack) {
+      for (const [stackId, c] of perStack) {
         gpuCostByStack.set(
           stackId,
-          (gpuCostByStack.get(stackId) ?? 0) + (row.spent * tokens) / total
+          (gpuCostByStack.get(stackId) ?? 0) + (row.spent * quantityOf(c)) / total
         )
       }
     } else {
-      // Sem token no período, o custo existe mesmo assim (a máquina ficou
+      // Sem consumo no período, o custo existe mesmo assim (a máquina ficou
       // ligada). Divide igualmente entre as stacks hospedadas nela.
       const hosted = stacksByMachine.get(row.machineId) ?? []
       if (hosted.length === 0) continue
@@ -449,13 +549,14 @@ export const getCrmData = cache(async function getCrmData(
     const accSubs = subsByAccount.get(account.id) ?? []
 
     const stackRows: CrmStackRow[] = accStacks.map((s) => {
-      const u = usageByStack.get(s.id) ?? { tokens: 0, requests: 0 }
+      const u = usageByStack.get(s.id) ?? { ...EMPTY_CONSUMPTION }
       const sub = accSubs.find((m) => m.stackId === s.id)?.sub
       return {
         id: s.id,
         slug: s.slug,
         name: s.name ?? s.slug,
         plan: s.plan,
+        category: s.category,
         machineId: s.machine_id,
         machineName: s.machine_id
           ? machineById.get(s.machine_id)?.name ?? null
@@ -467,6 +568,7 @@ export const getCrmData = cache(async function getCrmData(
         provisioningRef: s.provisioning_ref,
         lastActivityAt: effectiveLastActivity(s, u.requests),
         tokens: u.tokens,
+        images: u.images,
         requests: u.requests,
         activeKeys: activeKeysByStack.get(s.id) ?? 0,
         envs: envsByStack.get(s.id) ?? 0,
@@ -606,6 +708,7 @@ export const getCrmData = cache(async function getCrmData(
         account.created_at,
       lastUsedAt,
       tokens: stackRows.reduce((acc, s) => acc + s.tokens, 0),
+      images: stackRows.reduce((acc, s) => acc + s.images, 0),
       requests: stackRows.reduce((acc, s) => acc + s.requests, 0),
       activeKeys: stackRows.reduce((acc, s) => acc + s.activeKeys, 0),
       keyLimit,
@@ -616,7 +719,11 @@ export const getCrmData = cache(async function getCrmData(
     }
   })
 
-  rows.sort((a, b) => b.monthlyNetCents - a.monthlyNetCents || b.tokens - a.tokens)
+  // Desempate por `requests`, não por `tokens`: é o único escalar que tokens e
+  // imagens produzem com a mesma semântica (lib/consumption.ts,
+  // consumptionSortKey) — por tokens, toda stack de imagem empataria em 0 e
+  // cairia para a ordem de chegada.
+  rows.sort((a, b) => b.monthlyNetCents - a.monthlyNetCents || b.requests - a.requests)
 
   return {
     rows,
@@ -637,7 +744,12 @@ export const getCrmData = cache(async function getCrmData(
         monthlyCents: monthlyCents(m.sub).net,
       })),
     unattributedTokens,
-    usageTruncated: usageRes.truncated || usageRes.failed,
+    unattributedImages,
+    usageTruncated:
+      usageRes.truncated ||
+      usageRes.failed ||
+      imageUsageRes.truncated ||
+      imageUsageRes.failed,
     costTruncated: intervalsRes.truncated || intervalsRes.failed,
     // Sinal próprio: dobrar este caso em `usageTruncated` mandaria investigar
     // usage_metrics quando quem falhou foi accounts, stacks ou api_keys.

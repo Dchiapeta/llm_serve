@@ -46,3 +46,4 @@ __pycache__/
 
 # caches de pytest (docker/agent, docker/gateway, docker/image)
 .pytest_cache/
+tryon_out/

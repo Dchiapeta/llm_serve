@@ -24,6 +24,7 @@ coisa que dá para abortar sem deixar a GPU num estado desconhecido.
 import asyncio
 import base64
 import binascii
+import math
 import random
 import time
 from dataclasses import dataclass
@@ -172,6 +173,140 @@ def validate_size(raw, *, default: str, allowed: list[str]) -> tuple[int, int]:
         )
     width, height = value.split("x")
     return int(width), int(height)
+
+
+# Diferença relativa de proporção abaixo da qual não vale encaixar nada. 2% de
+# 1024 px são ~20 px divididos entre os dois lados: dentro do que o próprio VAE
+# arredonda, e recortar isso da saída custaria uma cópia para não mudar nada.
+ASPECT_TOLERANCE = 0.02
+
+
+@dataclass(frozen=True)
+class AspectFit:
+    """Como pôr uma foto de proporção X num canvas de proporção Y sem deformá-la.
+
+    O problema que isto resolve: mandar uma foto 506×1164 (0,43) para um canvas
+    1024×1536 (0,67) ESTICA a pessoa ~53% na horizontal. O modelo não devolve
+    uma pessoa distorcida — a foto esticada perde plausibilidade e ele redesenha
+    o corpo a partir da imagem de referência, então quem pediu para trocar de
+    roupa recebe outra pessoa. Medido em 10/09/2026.
+
+    A correção é geométrica, não de prompt: completar a foto com as próprias
+    bordas até a proporção do canvas, gerar, e recortar de volta o que foi
+    acrescentado. O que sai tem a proporção da FOTO, não a do canvas — e é por
+    isso que este objeto carrega as duas coisas, o padding (em pixels da foto) e
+    o recorte (em fração, porque a saída vem noutra escala).
+    """
+
+    pad_left: int
+    pad_right: int
+    pad_top: int
+    pad_bottom: int
+    # dimensões da foto DEPOIS do padding: é sobre elas que as frações de
+    # recorte são calculadas, e é a proporção delas que casa com o canvas.
+    padded_width: int
+    padded_height: int
+
+    @property
+    def is_noop(self) -> bool:
+        """True quando a foto já casa com o canvas e nada precisa ser feito."""
+        return not (self.pad_left or self.pad_right or self.pad_top or self.pad_bottom)
+
+    def crop_box(self, out_width: int, out_height: int) -> tuple[int, int, int, int]:
+        """Caixa (left, top, right, bottom) que desfaz o padding numa saída.
+
+        Em FRAÇÃO da imagem paddada e não em pixels absolutos: a geração sai na
+        resolução do canvas, que não é a da foto — descontar os mesmos pixels
+        que foram acrescentados deixaria o recorte fora de lugar por toda a
+        razão de escala entre as duas.
+        """
+        left = round(out_width * self.pad_left / self.padded_width)
+        right = out_width - round(out_width * self.pad_right / self.padded_width)
+        top = round(out_height * self.pad_top / self.padded_height)
+        bottom = out_height - round(out_height * self.pad_bottom / self.padded_height)
+        # Um recorte degenerado (esquerda ≥ direita) devolveria uma imagem de
+        # largura zero e o erro só apareceria no encode, longe daqui. Só é
+        # alcançável com padding maior que a própria foto, que plan_aspect_fit
+        # não produz — o guard existe para que a invariante seja local.
+        if left >= right or top >= bottom:
+            return (0, 0, out_width, out_height)
+        return (left, top, right, bottom)
+
+    def output_size(self, out_width: int, out_height: int) -> tuple[int, int]:
+        """Dimensões que o cliente REALMENTE recebe, depois do recorte."""
+        left, top, right, bottom = self.crop_box(out_width, out_height)
+        return right - left, bottom - top
+
+
+def pick_canvas(ref_width: int, ref_height: int, allowed: list[str]) -> tuple[int, int]:
+    """Entre as resoluções permitidas, a de proporção mais próxima à da foto.
+
+    Desempate pela MENOR área, e isso é deliberado: quando a allowlist tem
+    várias resoluções da mesma proporção (1024×1536, 1280×1920 e 1536×2304 são
+    todas 2:3), escolher a maior faria uma edição sem `size` passar a custar
+    2,25× de GPU sem ninguém ter pedido — e, com steps altos, estourar o
+    timeout do gateway. Quem quer mais resolução pede `size` explícito.
+
+    Compara log da razão e não diferença crua: 0,43 contra 0,67 e 1,5 contra
+    2,33 são o mesmo erro relativo, e a diferença crua diria que o segundo é
+    quase quatro vezes pior.
+    """
+    if ref_width <= 0 or ref_height <= 0:
+        raise ImageRequestError(
+            "imagem de referência com dimensão inválida", code="invalid_image_size"
+        )
+    target = ref_width / ref_height
+    best: tuple[int, int] | None = None
+    best_key: tuple[float, int] | None = None
+    for value in allowed:
+        width, height = (int(p) for p in value.split("x"))
+        key = (abs(math.log((width / height) / target)), width * height)
+        if best_key is None or key < best_key:
+            best, best_key = (width, height), key
+    assert best is not None  # allowed nunca é vazia: parse_size_list recusa
+    return best
+
+
+def plan_aspect_fit(
+    ref_width: int,
+    ref_height: int,
+    canvas_width: int,
+    canvas_height: int,
+    *,
+    tolerance: float = ASPECT_TOLERANCE,
+) -> AspectFit:
+    """Quanto acrescentar de cada lado da foto para ela casar com o canvas.
+
+    Simétrico por construção (o resto ímpar vai para a direita/baixo): deslocar
+    o sujeito para um dos lados mudaria o enquadramento, que é justamente o que
+    esta função existe para preservar.
+    """
+    if ref_width <= 0 or ref_height <= 0:
+        raise ImageRequestError(
+            "imagem de referência com dimensão inválida", code="invalid_image_size"
+        )
+    ref_aspect = ref_width / ref_height
+    canvas_aspect = canvas_width / canvas_height
+    noop = AspectFit(0, 0, 0, 0, ref_width, ref_height)
+    if abs(math.log(canvas_aspect / ref_aspect)) <= tolerance:
+        return noop
+
+    if ref_aspect < canvas_aspect:
+        # foto mais estreita que o canvas -> completa nas laterais
+        target = round(ref_height * canvas_aspect)
+        total = target - ref_width
+        if total <= 0:
+            return noop
+        left = total // 2
+        return AspectFit(left, total - left, 0, 0, target, ref_height)
+
+    # foto mais alta que o canvas -> completa em cima e embaixo
+    target = round(ref_width / canvas_aspect)
+    total = target - ref_height
+    if total <= 0:
+        return noop
+    top = total // 2
+    return AspectFit(0, 0, top, total - top, ref_width, target)
 
 
 def validate_model(raw, *, served: str, also_accept: frozenset[str] = frozenset()) -> str:

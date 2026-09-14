@@ -6,7 +6,8 @@ import { ArrowLeft } from "lucide-react"
 import { formatUsd } from "@/lib/billing"
 import { BILLING_BADGE, graceRemaining } from "@/lib/billing-status"
 import { formatMoney } from "@/lib/chargefy-format"
-import { formatDate, formatRelativeDay, formatTokens } from "@/lib/crm"
+import { formatDate, formatRelativeDay } from "@/lib/crm"
+import { formatConsumption } from "@/lib/consumption"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
@@ -94,7 +95,14 @@ export default async function CrmDetailPage({
       label: "Mensal",
       value: row.monthlyNetCents ? formatMoney(row.monthlyNetCents, row.currency) : "—",
     },
-    { label: "Tokens", value: formatTokens(row.tokens) },
+    {
+      label: "Consumo",
+      value: formatConsumption({
+        tokens: row.tokens,
+        images: row.images,
+        requests: row.requests,
+      }),
+    },
     { label: "Requisições", value: row.requests.toLocaleString("pt-BR") },
     { label: "Último uso", value: formatRelativeDay(row.lastUsedAt) },
     { label: "Chaves ativas", value: String(row.activeKeys) },
@@ -231,7 +239,7 @@ export default async function CrmDetailPage({
                 <TableHead>Cobrança</TableHead>
                 <TableHead>Classe</TableHead>
                 <TableHead>Último uso</TableHead>
-                <TableHead className="text-right!">Tokens</TableHead>
+                <TableHead className="text-right!">Consumo</TableHead>
                 <TableHead className="text-right!">Requests</TableHead>
                 <TableHead className="text-right!">Custo GPU</TableHead>
               </TableRow>
@@ -267,7 +275,11 @@ export default async function CrmDetailPage({
                     {formatRelativeDay(s.lastActivityAt)}
                   </TableCell>
                   <TableCell className="text-right font-mono text-sm tabular-nums">
-                    {formatTokens(s.tokens)}
+                    {formatConsumption({
+                      tokens: s.tokens,
+                      images: s.images,
+                      requests: s.requests,
+                    })}
                   </TableCell>
                   <TableCell className="text-right font-mono text-sm tabular-nums">
                     {s.requests.toLocaleString("pt-BR")}

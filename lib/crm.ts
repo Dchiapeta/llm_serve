@@ -5,7 +5,7 @@
 // isso não pode importar lib/chargefy.ts em runtime (o segredo da Chargefy não
 // pode entrar no bundle do browser). Só tipos e funções puras.
 
-import type { BillingStatus, TemplatePlan } from "./types"
+import type { BillingStatus, ProductCategory, TemplatePlan } from "./types"
 import { TEMPLATE_PLANS } from "./types"
 
 /** Como a assinatura da Chargefy foi ligada à conta — nem todo elo é igual. */
@@ -30,6 +30,7 @@ export type CrmStackRow = {
   slug: string
   name: string
   plan: TemplatePlan
+  category: ProductCategory
   machineId: string | null
   machineName: string | null
   billingStatusDb: BillingStatus
@@ -40,6 +41,10 @@ export type CrmStackRow = {
   /** null = nunca usada de fato (ver nota sobre o default now() em queries.ts) */
   lastActivityAt: string | null
   tokens: number
+  /** Imagens geradas (image_usage_rollup, migration 0067) — 0 para stack de
+   *  LLM, sempre. Ver lib/consumption.ts para a forma de somar/exibir junto
+   *  com tokens. */
+  images: number
   requests: number
   activeKeys: number
   envs: number
@@ -83,6 +88,7 @@ export type CrmRow = {
 
   lastUsedAt: string | null
   tokens: number
+  images: number
   requests: number
 
   activeKeys: number
@@ -104,6 +110,7 @@ export type CrmKpis = {
   atRiskCents: number
   avgTicketCents: number
   tokens: number
+  images: number
   requests: number
   gpuCostUsd: number
   marginBrlCents: number
@@ -184,6 +191,7 @@ export function summarizeCrm(rows: CrmRow[]): CrmKpis {
     atRiskCents: sum(atRisk, (r) => r.monthlyNetCents),
     avgTicketCents: paying.length ? Math.round(mrrCents / paying.length) : 0,
     tokens: sum(clientes, (r) => r.tokens),
+    images: sum(clientes, (r) => r.images),
     requests: sum(clientes, (r) => r.requests),
     gpuCostUsd: sum(clientes, (r) => r.gpuCostUsd),
     // Sem `?? 0` escondendo linha: com a Chargefy no ar toda conta tem margem
@@ -271,6 +279,7 @@ const CSV_COLUMNS: { header: string; pick: (r: CrmRow) => string | number }[] = 
   { header: "Cliente desde", pick: (r) => date(r.customerSince) },
   { header: "Ultimo uso", pick: (r) => date(r.lastUsedAt) },
   { header: "Tokens", pick: (r) => r.tokens },
+  { header: "Imagens", pick: (r) => r.images },
   { header: "Requests", pick: (r) => r.requests },
   { header: "Chaves ativas", pick: (r) => r.activeKeys },
   { header: "Ambientes", pick: (r) => r.envs },

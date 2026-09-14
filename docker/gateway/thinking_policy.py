@@ -20,10 +20,17 @@ class ThinkingPolicyError(ValueError):
 
 
 # Níveis do chat template do Qwen3.8 (low/medium/xhigh, default xhigh). O
-# protocolo OpenAI fala low/medium/high; o "high" do cliente vira o topo real
-# do template. O vLLM 0.24 só usa o reasoning_effort top-level para ligar/
-# desligar o thinking — o nível em si ele NÃO repassa ao template, por isso
-# apply_thinking_policy o copia para chat_template_kwargs.
+# protocolo OpenAI fala low/medium/high, e o "high" do cliente vira o topo real
+# do template.
+#
+# O campo top-level NÃO pode sobreviver à tradução. Medido em produção
+# (13/09/2026): com `reasoning_effort: "high"` no corpo, o template respondeu
+# 400 "Unexpected reasoning effort high. Supported types are xhigh (default),
+# medium, and low" — o valor cru chega ao jinja e vence o que estiver em
+# chat_template_kwargs. `low` e `medium` passavam por coincidência de
+# vocabulário, então o bug só aparecia no `high`. Por isso apply_thinking_policy
+# traduz para chat_template_kwargs E REMOVE o top-level: o on/off já está em
+# enable_thinking (explícito), e o nível, no kwarg traduzido.
 EFFORT_TO_TEMPLATE = {"high": "xhigh"}
 
 
@@ -116,9 +123,13 @@ def apply_thinking_policy(body: dict, policy: ThinkingPolicy) -> None:
         # explícito em chat_template_kwargs é do cliente e vence
         kwargs["reasoning_effort"] = EFFORT_TO_TEMPLATE.get(policy.effort, policy.effort)
     body["chat_template_kwargs"] = kwargs
+    # o top-level sai SEMPRE que a política foi materializada (ver
+    # EFFORT_TO_TEMPLATE): deixá-lo aí faz o valor cru do protocolo chegar ao
+    # chat template e derrubar a request com 400. `reasoning` (objeto da
+    # Responses API) não é tocado — é outro campo, servido nativamente pelo vLLM.
+    body.pop("reasoning_effort", None)
     # Tudo converge para a chave que o chat template realmente lê. É isto que
     # thinking_esperado_de e o filtro de <think> passam a ler depois — a
     # decisão materializada no corpo, não a política solta. `thinking` sai
-    # porque é campo Anthropic e o vLLM recusaria; reasoning_effort fica, que
-    # há modelo que usa os dois.
+    # porque é campo Anthropic e o vLLM recusaria.
     body.pop("thinking", None)

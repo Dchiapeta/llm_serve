@@ -13,7 +13,8 @@ import {
 
 import { formatUsd } from "@/lib/billing"
 import { formatMoney } from "@/lib/chargefy-format"
-import { formatTokens, parseScope, selectCrm, type CrmFilters } from "@/lib/crm"
+import { parseScope, selectCrm, type CrmFilters } from "@/lib/crm"
+import { formatConsumption } from "@/lib/consumption"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -63,6 +64,7 @@ export async function CrmBody({
     chargefy,
     unmatchedSubscriptions,
     unattributedTokens,
+    unattributedImages,
     usageTruncated,
     costTruncated,
     coreIncomplete,
@@ -127,8 +129,12 @@ export async function CrmBody({
       icon: AlertTriangle,
     },
     {
-      label: "Tokens no período",
-      value: formatTokens(kpis.tokens),
+      label: "Consumo no período",
+      value: formatConsumption({
+        tokens: kpis.tokens,
+        images: kpis.images,
+        requests: kpis.requests,
+      }),
       sub: `${kpis.requests.toLocaleString("pt-BR")} requisições`,
       icon: Activity,
     },
@@ -236,6 +242,7 @@ export async function CrmBody({
 
       {(unmatchedSubscriptions.length > 0 ||
         unattributedTokens > 0 ||
+        unattributedImages > 0 ||
         usageTruncated ||
         costTruncated ||
         coreIncomplete ||
@@ -261,9 +268,30 @@ export async function CrmBody({
             )}
             {unattributedTokens > 0 && (
               <p>
-                <strong>{formatTokens(unattributedTokens)}</strong> tokens em
-                registros de uso sem stack nem chave identificável — não
+                <strong>
+                  {formatConsumption({
+                    tokens: unattributedTokens,
+                    images: 0,
+                    requests: 0,
+                  })}
+                </strong>{" "}
+                em registros de uso sem stack nem chave identificável — não
                 atribuídos a nenhum cliente.
+              </p>
+            )}
+            {unattributedImages > 0 && (
+              <p>
+                <strong>
+                  {formatConsumption({
+                    tokens: 0,
+                    images: unattributedImages,
+                    requests: 0,
+                  })}
+                </strong>{" "}
+                geradas sem stack nem chave identificável — o mesmo caso
+                acima, do lado de <code>image_generations</code> (FK{" "}
+                <code>on delete set null</code>: sobrevive à stack apagada,
+                mas perde o dono).
               </p>
             )}
             {coreIncomplete && (
@@ -275,8 +303,9 @@ export async function CrmBody({
             )}
             {usageTruncated && (
               <p className="text-destructive">
-                A leitura de <code>usage_metrics</code> falhou ou excedeu o teto
-                de páginas: os números de token estão incompletos.
+                A leitura de <code>usage_metrics</code> ou{" "}
+                <code>image_usage_rollup</code> falhou ou excedeu o teto de
+                páginas: os números de consumo estão incompletos.
               </p>
             )}
             {chargefy.truncated && (
@@ -298,10 +327,14 @@ export async function CrmBody({
 
       <p className="text-xs text-muted-foreground">
         Tokens e requisições vêm de <code>usage_metrics</code>, a mesma fonte que
-        o gateway usa para aplicar a cota diária. A aba de Requisições usa{" "}
-        <code>gateway_requests</code> (uma linha por request) e os totais não
-        batem por construção. Cobrança vem da API da Chargefy ao vivo — o espelho
-        no banco (<code>chargefy_subscriptions</code>) está vazio, então{" "}
+        o gateway usa para aplicar a cota diária. Imagens vêm de{" "}
+        <code>image_usage_rollup</code>, um rollup sobre{" "}
+        <code>image_generations</code> — geração de imagem não produz token, e
+        as duas fontes se somam por stack sem se sobrepor. A aba de Requisições
+        usa <code>gateway_requests</code> (uma linha por request) e os totais
+        não batem por construção. Cobrança vem da API da Chargefy ao vivo — o
+        espelho no banco (<code>chargefy_subscriptions</code>) está vazio,
+        então{" "}
         <Link href="/stacks" className="underline">
           o status de cobrança das stacks
         </Link>{" "}

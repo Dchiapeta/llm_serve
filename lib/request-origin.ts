@@ -59,6 +59,29 @@ const CODEX: RequestOrigin = {
     "bg-emerald-100! text-emerald-700! dark:bg-emerald-950! dark:text-emerald-300!",
 }
 
+// Rota de imagem (images/generations, images/edits) é fato do PROTOCOLO, não
+// da ferramenta que chama — quem gera imagem pode falar por curl, por
+// openai-python (try-on automatizado) ou pelo painel. checkImagePath() roda
+// ANTES do laço de User-Agent (ver requestOrigin abaixo), na mesma posição do
+// keyPurpose === "playground": sem isso, uma geração via openai-python bateria
+// primeiro em BY_USER_AGENT (padrão "openai-python" → SDK) e o rótulo de
+// imagem nunca seria alcançado, porque BY_PATH só é consultado depois do laço.
+const IMAGEM: RequestOrigin = {
+  label: "Imagem",
+  className:
+    "bg-fuchsia-100! text-fuchsia-700! dark:bg-fuchsia-950! dark:text-fuchsia-300!",
+}
+
+const IMAGE_PATHS = new Set(["images/generations", "images/edits"])
+
+/** Exportado para quem precisa saber "isto é uma requisição de imagem?" sem
+ *  duplicar a lista de paths — hoje só a coluna de tokens da tabela de
+ *  requisições (components/dashboard/requests-table.tsx), que não tem token
+ *  nenhum para mostrar nessas linhas. */
+export function isImagePath(path: string): boolean {
+  return IMAGE_PATHS.has(path)
+}
+
 // Ordem importa: o primeiro match vence. Padrões mais específicos primeiro
 // (um cliente pode mandar "cursor" E "openai-node" no mesmo UA).
 const BY_USER_AGENT: Array<{ match: string[]; origin: RequestOrigin }> = [
@@ -141,6 +164,9 @@ export function requestOrigin(input: {
   keyPurpose?: ApiKeyPurpose | null
 }): RequestOrigin {
   if (input.keyPurpose === "playground") return PLAYGROUND
+  // Ver o comentário de IMAGEM acima: tem que vir antes do laço de UA, não
+  // como mais uma entrada de BY_PATH.
+  if (IMAGE_PATHS.has(input.path)) return IMAGEM
 
   const ua = input.userAgent?.toLowerCase() ?? ""
   if (ua) {

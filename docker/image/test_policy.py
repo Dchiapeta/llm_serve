@@ -883,3 +883,93 @@ def test_stats_vazios_nao_emitem_series():
     """Antes da primeira geração o /metrics não pode inventar um cenário com
     zeros — um p50 de 0.0s no relatório seria lido como pod instantâneo."""
     assert policy.ScenarioStats().prometheus_lines() == []
+
+
+# ---------- encaixe de proporção ----------
+
+
+def test_pick_canvas_escolhe_a_proporcao_mais_proxima():
+    """Uma selfie 506×1164 (0,43) tem de cair no canvas retrato, não no
+    quadrado que é o default — é a escolha errada aqui que estica a pessoa."""
+    assert policy.pick_canvas(506, 1164, ["1024x1024", "1536x1024", "1024x1536"]) == (
+        1024,
+        1536,
+    )
+    assert policy.pick_canvas(1600, 900, ["1024x1024", "1536x1024", "1024x1536"]) == (
+        1536,
+        1024,
+    )
+    assert policy.pick_canvas(800, 800, ["1024x1024", "1536x1024", "1024x1536"]) == (
+        1024,
+        1024,
+    )
+
+
+def test_pick_canvas_desempata_pela_menor_area():
+    """1024×1536, 1280×1920 e 1536×2304 são todas 2:3. Escolher a maior faria
+    uma edição sem `size` custar 2,25× de GPU sem ninguém ter pedido."""
+    allowed = ["1024x1536", "1280x1920", "1536x2304"]
+    assert policy.pick_canvas(506, 1164, allowed) == (1024, 1536)
+
+
+def test_pick_canvas_recusa_dimensao_invalida():
+    with pytest.raises(policy.ImageRequestError) as e:
+        policy.pick_canvas(0, 1164, ["1024x1536"])
+    assert e.value.code == "invalid_image_size"
+
+
+def test_plan_aspect_fit_completa_nas_laterais_e_e_simetrico():
+    """506×1164 num canvas 2:3 pede 776 de largura: 135 de cada lado. Simétrico
+    porque deslocar o sujeito mudaria o enquadramento que isto preserva."""
+    fit = policy.plan_aspect_fit(506, 1164, 1024, 1536)
+    assert (fit.pad_top, fit.pad_bottom) == (0, 0)
+    assert fit.pad_left == 135 and fit.pad_right == 135
+    assert fit.padded_width == 776 and fit.padded_height == 1164
+    assert abs(fit.padded_width / fit.padded_height - 1024 / 1536) < 0.01
+
+
+def test_plan_aspect_fit_completa_em_cima_e_embaixo():
+    """Foto mais LARGA que o canvas: o padding vai para o outro eixo."""
+    fit = policy.plan_aspect_fit(1600, 900, 1024, 1536)
+    assert (fit.pad_left, fit.pad_right) == (0, 0)
+    assert fit.pad_top > 0 and fit.pad_bottom > 0
+    assert abs(fit.padded_width / fit.padded_height - 1024 / 1536) < 0.01
+
+
+def test_plan_aspect_fit_nao_mexe_no_que_ja_casa():
+    """2% de folga: recortar ~20px da saída custaria uma cópia para não mudar
+    nada visível."""
+    assert policy.plan_aspect_fit(1024, 1536, 1024, 1536).is_noop
+    assert policy.plan_aspect_fit(1020, 1536, 1024, 1536).is_noop
+
+
+def test_plan_aspect_fit_resto_impar_nao_perde_pixel():
+    """O resto vai para um lado só; somar os dois tem de devolver o total."""
+    fit = policy.plan_aspect_fit(505, 1164, 1024, 1536)
+    assert fit.pad_left + 505 + fit.pad_right == fit.padded_width
+
+
+def test_crop_box_desfaz_o_padding_na_escala_da_saida():
+    """A geração sai a 1024 de largura e a foto paddada tinha 776: descontar os
+    mesmos 135 pixels deixaria o recorte fora de lugar por toda a escala."""
+    fit = policy.plan_aspect_fit(506, 1164, 1024, 1536)
+    left, top, right, bottom = fit.crop_box(1024, 1536)
+    assert (top, bottom) == (0, 1536)
+    assert left == round(1024 * 135 / 776) == 178
+    assert right == 1024 - 178
+    # e o que sobra tem a proporção da FOTO, que é o ponto de tudo isto
+    assert abs((right - left) / (bottom - top) - 506 / 1164) < 0.02
+
+
+def test_output_size_bate_com_o_crop():
+    fit = policy.plan_aspect_fit(506, 1164, 1024, 1536)
+    left, top, right, bottom = fit.crop_box(1024, 1536)
+    assert fit.output_size(1024, 1536) == (right - left, bottom - top)
+
+
+def test_crop_box_degenerado_devolve_a_imagem_inteira():
+    """Invariante local: padding maior que a própria foto não sai de
+    plan_aspect_fit, mas se saísse, uma imagem de largura zero só falharia lá na
+    frente, no encode."""
+    fit = policy.AspectFit(600, 600, 0, 0, 1000, 1000)
+    assert fit.crop_box(100, 100) == (0, 0, 100, 100)

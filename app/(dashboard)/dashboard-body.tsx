@@ -23,6 +23,7 @@ import { CapacityBar } from "@/components/machines/capacity-bar"
 import { StatusBadge } from "@/components/machines/status-badge"
 import { UsageDistribution } from "@/components/dashboard/usage-distribution"
 import { PeriodSwitch } from "@/components/dashboard/period-switch"
+import { formatConsumption } from "@/lib/consumption"
 
 import { LiveStatusBadge } from "./machines/live-status-badge"
 
@@ -84,8 +85,24 @@ export async function DashboardBody({
     ? await usageQuery.gte("window_start", since)
     : await usageQuery
 
+  // image_usage_rollup (migration 0067): mesma janela do usage_metrics acima,
+  // para os dois somarem o mesmo período — geração de imagem não produz
+  // token, e sem isto uma máquina de imagem apareceria sempre com "0 tokens"
+  // nesta página, igual ao bug que a view existe para consertar.
+  const imageUsageQuery = db
+    .from("image_usage_rollup")
+    .select("machine_id, window_start, images")
+  const { data: imageUsageData } = since
+    ? await imageUsageQuery.gte("window_start", since)
+    : await imageUsageQuery
+
   const templateById = new Map(templates.map((t) => [t.id, t]))
   const usage = (usageData ?? []) as UsageMetric[]
+  const imageUsage = (imageUsageData ?? []) as {
+    machine_id: string | null
+    window_start: string
+    images: number
+  }[]
   const events = (eventsData ?? []) as MachineEvent[]
 
   // Ocupação = CONTAGEM de stacks hospedadas (migration 0037), não chaves
@@ -115,6 +132,7 @@ export async function DashboardBody({
   const usedSlots = capacities.reduce((s, c) => s + c.cap.slotsUsed, 0)
   const totalRequests = usage.reduce((s, u) => s + u.requests, 0)
   const totalTokens = usage.reduce((s, u) => s + u.tokens_in + u.tokens_out, 0)
+  const totalImages = imageUsage.reduce((s, u) => s + u.images, 0)
   const totalCostPerHr = running.reduce((s, m) => s + (m.cost_per_hr ?? 0), 0)
 
   const machineById = new Map(machines.map((m) => [m.id, m]))
@@ -193,9 +211,19 @@ export async function DashboardBody({
       (tokensByBucket.get(k) ?? 0) + u.tokens_in + u.tokens_out
     )
   }
+  const imagesByBucket = new Map<string, number>()
+  for (const u of imageUsage) {
+    const k = keyOf(new Date(u.window_start).getTime())
+    imagesByBucket.set(k, (imagesByBucket.get(k) ?? 0) + u.images)
+  }
   const histogramData = Array.from({ length: bucketCount }, (_, i) => {
     const ms = now - (bucketCount - 1 - i) * step
-    return { label: labelOf(ms), tokens: tokensByBucket.get(keyOf(ms)) ?? 0 }
+    const k = keyOf(ms)
+    return {
+      label: labelOf(ms),
+      tokens: tokensByBucket.get(k) ?? 0,
+      images: imagesByBucket.get(k) ?? 0,
+    }
   })
 
   const kpis = [
@@ -245,7 +273,11 @@ export async function DashboardBody({
               {totalRequests.toLocaleString("pt-BR")}
             </p>
             <p className="mt-1 text-xs text-muted-foreground">
-              {totalTokens.toLocaleString("pt-BR")} tokens
+              {formatConsumption({
+                tokens: totalTokens,
+                images: totalImages,
+                requests: 0,
+              })}
             </p>
           </CardContent>
         </Card>
@@ -303,7 +335,7 @@ export async function DashboardBody({
           <CardHeader>
             <CardTitle>Distribuição de uso</CardTitle>
             <CardDescription>
-              Requisições por máquina ou tokens no tempo —{" "}
+              Requisições por máquina ou consumo no tempo —{" "}
               {PERIOD_LABELS[period]}
             </CardDescription>
           </CardHeader>

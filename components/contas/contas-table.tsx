@@ -99,7 +99,13 @@ export type StackInfo = Stack & {
     status: ApiKey["status"]
     created_at: string
   }[]
-  usage: { tokensIn: number; tokensOut: number; requests: number }
+  usage: {
+    tokensIn: number
+    tokensOut: number
+    requests: number
+    /** image_usage_rollup (migration 0067) — 0 para stack de LLM, sempre. */
+    images: number
+  }
 }
 
 export type StackRow = {

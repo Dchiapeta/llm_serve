@@ -10,7 +10,8 @@ import {
   TriangleAlert,
 } from "lucide-react"
 
-import { formatRelativeDay, formatTokens, type CrmRow } from "@/lib/crm"
+import { formatRelativeDay, type CrmRow } from "@/lib/crm"
+import { formatConsumption } from "@/lib/consumption"
 import { BILLING_BADGE, graceRemaining } from "@/lib/billing-status"
 import { formatMoney } from "@/lib/chargefy-format"
 import { formatUsd } from "@/lib/billing"
@@ -34,7 +35,7 @@ type SortKey =
   | "name"
   | "monthly"
   | "lastUsed"
-  | "tokens"
+  | "consumo"
   | "requests"
   | "keys"
   | "envs"
@@ -48,7 +49,7 @@ const NUMERIC: Record<SortKey, boolean> = {
   name: false,
   monthly: true,
   lastUsed: true,
-  tokens: true,
+  consumo: true,
   requests: true,
   keys: true,
   envs: true,
@@ -87,8 +88,12 @@ export function CrmTable({
         case "monthly":
           cmp = a.monthlyNetCents - b.monthlyNetCents
           break
-        case "tokens":
-          cmp = a.tokens - b.tokens
+        case "consumo":
+          // requests, não tokens: é o único escalar comparável entre uma
+          // stack de LLM e uma de imagem (lib/consumption.ts,
+          // consumptionSortKey) — por tokens, toda stack de imagem empataria
+          // em 0.
+          cmp = a.requests - b.requests
           break
         case "requests":
           cmp = a.requests - b.requests
@@ -131,7 +136,7 @@ export function CrmTable({
             <TableHead>Cobrança</TableHead>
             <SortableHead label="Mensal" col="monthly" align="right" {...headProps} />
             <SortableHead label="Último uso" col="lastUsed" {...headProps} />
-            <SortableHead label="Tokens" col="tokens" align="right" {...headProps} />
+            <SortableHead label="Consumo" col="consumo" align="right" {...headProps} />
             <SortableHead label="Requests" col="requests" align="right" {...headProps} />
             <SortableHead label="Chaves" col="keys" align="right" {...headProps} />
             <SortableHead label="Ambientes" col="envs" align="right" {...headProps} />
@@ -255,7 +260,11 @@ export function CrmTable({
                 </TableCell>
 
                 <TableCell className="text-right font-mono text-sm tabular-nums">
-                  {formatTokens(row.tokens)}
+                  {formatConsumption({
+                    tokens: row.tokens,
+                    images: row.images,
+                    requests: row.requests,
+                  })}
                 </TableCell>
                 <TableCell className="text-right font-mono text-sm tabular-nums">
                   {row.requests.toLocaleString("pt-BR")}

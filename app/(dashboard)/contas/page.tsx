@@ -24,6 +24,7 @@ export default async function ContasPage() {
     { data: machinesData },
     { data: keysData },
     { data: usageData },
+    { data: imageUsageData },
   ] = await Promise.all([
     db.from("accounts").select("*").order("created_at", { ascending: false }),
     db
@@ -32,6 +33,9 @@ export default async function ContasPage() {
     db.from("machines").select("id, name, status"),
     db.from("api_keys").select("id, account_id"),
     db.from("usage_metrics").select("api_key_id, tokens_in, tokens_out, requests"),
+    // image_usage_rollup (migration 0067) já vem com account_id direto — sem
+    // a indirection por chave que usage_metrics precisa aqui embaixo.
+    db.from("image_usage_rollup").select("account_id, images"),
   ])
 
   const accounts = (accountsData ?? []) as Account[]
@@ -46,6 +50,10 @@ export default async function ContasPage() {
     tokens_in: number
     tokens_out: number
     requests: number
+  }[]
+  const imageUsage = (imageUsageData ?? []) as {
+    account_id: string | null
+    images: number
   }[]
 
   const machineById = new Map(machines.map((m) => [m.id, m]))
@@ -84,6 +92,15 @@ export default async function ContasPage() {
     usageByAccount.set(accountId, agg)
   }
 
+  const imagesByAccount = new Map<string, number>()
+  for (const u of imageUsage) {
+    if (!u.account_id) continue
+    imagesByAccount.set(
+      u.account_id,
+      (imagesByAccount.get(u.account_id) ?? 0) + u.images
+    )
+  }
+
   const rows: UsuarioRow[] = accounts.map((account) => {
     const stackList = stacksByAccount.get(account.id) ?? []
     return {
@@ -94,6 +111,7 @@ export default async function ContasPage() {
       stacks: stackList.length,
       stackList,
       tokens: usageByAccount.get(account.id)?.tokens ?? 0,
+      images: imagesByAccount.get(account.id) ?? 0,
       requests: usageByAccount.get(account.id)?.requests ?? 0,
       createdAt: account.created_at,
     }

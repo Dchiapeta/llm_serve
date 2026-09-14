@@ -21,6 +21,7 @@ não confie só no que está em `supabase/migrations/` aqui.**
 | `stacks` | coluna `name`; `stacks_update_own` (RLS update) + grants **coluna-a-coluna** (`name`, `system_prompt`) para `authenticated`. **Diferente das demais colunas desta linha:** `default_temperature`/`default_top_p` (`0035` daqui) e `default_max_tokens`/`default_presence_penalty` (`0056` daqui) **não têm grant de update pro TryStac** — a leitura vem do `grant select` de tabela inteira que o TryStac já concedeu (fora deste repo), e a escrita é feita por **este repositório**, via `PATCH /api/stacks/[id]/model-config` (service role, sem RLS) — o painel do TryStac chama essa rota em vez de escrever direto no Supabase. Não "corrigir" isso adicionando um grant coluna-a-coluna achando que falta um — é intencional. |
 | `usage_metrics` | `usage_metrics_select_own_stack` (RLS select; desde a `0017` de lá resolve por `usage_metrics.stack_id` direto, sem passar por `api_keys`) e a view `stack_token_totals`. **A FK `api_key_id → api_keys` é `on delete set null` desde a `0066` daqui** (era `cascade` na `0001`: apagar a chave levava junto todo o uso dela, e o painel de lá perdia os tokens). Nunca voltar a `cascade`; toda agregação de uso deve ler por `stack_id`, não por `api_keys`. |
 | `knowledge_chunks` | policy de SELECT por conta (`authenticated`) + view `stack_knowledge_files` (agregada por `storage_path`, `security_invoker=true`, sem a coluna `embedding`) |
+| `image_generations` | `image_generations_select_own` (RLS select, mesmo formato de `usage_metrics_select_own_stack`) + `grant select ... to authenticated` (migration `0042` de lá) — nenhum grant de INSERT/UPDATE/DELETE, ver detalhe abaixo. Junto: a view `stack_image_totals` (irmã de `stack_token_totals`) e as RPCs `stack_image_summary`/`stack_image_usage` (mesmo desenho de segurança de `stack_usage_summary`/`stack_usage_buckets`, `0024` de lá — `security invoker`, `revoke ... from public, anon`). |
 | `api_keys` | colunas `name`, `last_used_at` (uso ainda não identificado neste repo); **`status` aceita `active`, `revoked` e `deleted`** (CHECK `not valid` na `0066` daqui) — `deleted` é o soft delete do painel de lá (`0041` de lá revoga o DELETE de `authenticated`; a `0006` de lá o concedia). Tudo que decide se a chave funciona ou conta (gateway `find_active_key`, `syncMachineKeys`, slots, cota) filtra `status = 'active'`, então `deleted` se comporta como `revoked` — só o rótulo do painel muda; grants **coluna-a-coluna** de update (`name`, `status`, e — desde a `0053` daqui — `use_custom_prompt`/`system_prompt`, e desde a `0055` daqui — `default_temperature`/`default_top_p`/`default_max_tokens`/`default_presence_penalty`, e desde a `0065` daqui — `enable_knowledge_base`) para `authenticated`. O grant de `enable_knowledge_base` mora na `0040` do TryStac e **depende da `0065` daqui já estar aplicada**: grant sobre coluna inexistente falha com `42703`. Sem o grant de **select**, a query da página de chaves de lá falha inteira — a coluna fica inacessível, não apenas invisível. **No caminho de volta:** nunca drope `enable_knowledge_base` com o gateway novo no ar — ele a pede no select de `find_active_key`, e a coluna sumindo vira 500 em 100% do tráfego. Reverta o gateway primeiro, a coluna depois (ou nunca: ela é aditiva e nullable, um gateway antigo a ignora). |
 
 ## Colunas deste repo escritas pelo lado do TryStac
@@ -64,9 +65,7 @@ Rollout sem indisponibilidade:
 Não publique o gateway novo antes da 0060: `find_active_key` seleciona
 `stacks.category` explicitamente e falha fechado se a coluna ainda não existir.
 
-## Tabelas novas que o TryStac ainda vai precisar acessar
-
-### `image_generations` + bucket `images` (migrations `0058`/`0059` daqui)
+## `image_generations` + bucket `images` (migrations `0058`/`0059`/`0067` daqui)
 
 Registro de cada imagem gerada por uma stack da categoria `image`: quem gerou (`account_id`,
 `stack_id`, `api_key_id`, `machine_id`), com que parâmetros, e onde o arquivo
@@ -74,18 +73,21 @@ está no bucket privado `images`. Escrita **só** pelo gateway, no caminho da
 própria requisição (`docker/gateway/image_gen.py`).
 
 Este repo cria a tabela com RLS habilitada e **sem policy**, como todas as
-outras. Para o app do cliente listar as próprias imagens, o TryStac precisa
-adicionar, do lado dele:
+outras — o TryStac abriu o acesso do lado dele na `0042` (ver a linha na
+tabela acima). Motivo original de existir: geração de imagem não produz
+token, então nenhuma soma de `tokens_in`/`tokens_out` enxerga o consumo de uma
+stack de imagem; `image_generations` é a fonte real, e cada lado agrega por
+cima dela do seu jeito — este repo com a view `image_usage_rollup` (`0067`,
+service role, sem RLS); o TryStac com `stack_image_totals`/RPCs (`0042`,
+`security invoker`, sob a policy abaixo). **As duas leituras são
+independentes** — não há dependência de ordem de deploy entre elas, e uma
+view/RPC nova de um lado não exige nada do outro.
 
-- `image_generations_select_own` — SELECT resolvendo a posse pelo join
-  `image_generations.stack_id → stacks.account_id → accounts.user_id = auth.uid()`,
-  no mesmo formato de `usage_metrics_select_own_stack`;
-- `grant select on image_generations to authenticated`.
-
-**Nenhum grant de INSERT/UPDATE/DELETE**: as linhas descrevem o que o gateway
-gravou, e um cliente que pudesse editá-las poderia atribuir a própria geração a
-outra stack. A expiração (`file_deleted_at`, e o `prompt` sendo apagado junto) é
-feita pelo reaper do gateway com service role.
+**Nenhum grant de INSERT/UPDATE/DELETE** para `authenticated` do lado do
+TryStac: as linhas descrevem o que o gateway gravou, e um cliente que pudesse
+editá-las poderia atribuir a própria geração a outra stack. A expiração
+(`file_deleted_at`, e o `prompt` sendo apagado junto) é feita pelo reaper do
+gateway com service role.
 
 **A leitura do arquivo é por signed URL de TTL curto** — o bucket é privado, e
 `getPublicUrl` não funciona nem deve ser tentado. O padrão é o de

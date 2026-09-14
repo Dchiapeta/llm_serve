@@ -4,7 +4,7 @@ import * as React from "react"
 import { Search } from "lucide-react"
 
 import type { ApiKeyPurpose, GatewayRequest, TemplatePlan } from "@/lib/types"
-import { requestOrigin } from "@/lib/request-origin"
+import { isImagePath, requestOrigin } from "@/lib/request-origin"
 import { Badge } from "@/components/ui/badge"
 import { PlanBadge } from "@/components/machines/plan-badge"
 import { RequestOriginBadge } from "@/components/dashboard/request-origin-badge"
@@ -230,7 +230,19 @@ export function RequestsTable({ rows }: { rows: RequestRow[] }) {
                 )}
               </TableCell>
               <TableCell className="text-right font-mono text-xs tabular-nums">
-                {r.tokens_in ?? "—"} / {r.tokens_out ?? "—"}
+                {isImagePath(r.path) ? (
+                  // Geração de imagem não produz token: null aqui é a
+                  // ausência da contagem, não uma medição zerada (ver
+                  // docker/gateway/main.py, _relay_image_response). "— / —"
+                  // seria indistinguível de "não medimos" para um caso onde,
+                  // na verdade, a medição não se aplica — daí o rótulo
+                  // explícito em vez do traço duplo.
+                  <span className="text-muted-foreground">n/a · imagem</span>
+                ) : (
+                  <>
+                    {r.tokens_in ?? "—"} / {r.tokens_out ?? "—"}
+                  </>
+                )}
               </TableCell>
               <TableCell className="text-right font-mono text-xs tabular-nums">
                 {formatDuration(r.duration_ms)}

@@ -37,7 +37,18 @@ from typing import AsyncIterator
 # que é quem conhece a própria configuração. O gateway só precisa de um teto de
 # corpo grande o bastante pra nunca recusar um pedido que o pod aceitaria.
 _REF_IMAGES = 4
-_BYTES_PER_REF = 5 * 1024 * 1024
+# 10 MiB e não 5 desde 13/09/2026, acompanhando IMAGE_MAX_FILE_SIZE_MB no
+# template. O 5 era teto de QUALIDADE sem que ninguém tivesse percebido: a
+# resolução da referência decide a fidelidade da peça (degradar o vestido de
+# 998 px para 499 px apaga o laceamento; a 249 px o modelo devolve outra peça),
+# porque a referência entra no pipeline como tokens visuais.
+#
+# Este número tem de subir JUNTO com o do pod, nunca depois: o pod passaria a
+# aceitar arquivos de 10 MiB que o gateway recusaria antes de chegar lá, e o
+# 413 sairia daqui — de um lugar que o log do pod não mostra. Na direção
+# contrária o erro é inofensivo (teto folgado aqui, recusa correta no pod), que
+# é exatamente o papel destas constantes: dimensionar, não validar.
+_BYTES_PER_REF = 10 * 1024 * 1024
 
 # Folga sobre a soma dos arquivos: cada parte do multipart carrega headers
 # (Content-Disposition, Content-Type) mais a boundary, e ainda há os campos de

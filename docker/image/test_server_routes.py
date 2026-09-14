@@ -947,3 +947,188 @@ def test_run_sem_cuda_nao_quebra_a_geracao(monkeypatch):
     )
     assert len(server._run(payload)) == 1
     assert payload.timings.gpu_s is not None
+
+
+# ---------------------------------------------------------------------------
+# encaixe de proporção em /v1/images/edits
+# ---------------------------------------------------------------------------
+
+
+def test_edits_sem_size_deriva_o_canvas_da_foto(client):
+    """O caso que motivou tudo: uma selfie retrato caía no canvas QUADRADO do
+    default e era esticada até ele, e é a foto esticada que faz o modelo
+    devolver outra pessoa."""
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "troque a roupa"},
+        files={"image": ("a.png", _png((506, 1164)), "image/png")},
+    )
+    assert r.status_code == 200
+    payload = client.chamadas[-1]
+    assert (payload.width, payload.height) == (1024, 1536)
+    assert payload.fit is not None
+    assert payload.fit.pad_left > 0 and payload.fit.pad_right > 0
+
+
+def test_edits_com_size_explicito_nao_encaixa_nada(client):
+    """Quem pede `size` está escolhendo o formato da saída e recebe exatamente
+    ele, como sempre recebeu — é o que mantém quem já integrou funcionando."""
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "troque a roupa", "size": "1024x1024"},
+        files={"image": ("a.png", _png((506, 1164)), "image/png")},
+    )
+    assert r.status_code == 200
+    payload = client.chamadas[-1]
+    assert (payload.width, payload.height) == (1024, 1024)
+    assert payload.fit is None
+    meta = r.json()["meta"]
+    assert (meta["width"], meta["height"]) == (1024, 1024)
+    assert "canvas_width" not in meta
+
+
+def test_edits_foto_que_ja_casa_com_o_canvas_nao_ganha_padding(client):
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "troque a roupa"},
+        files={"image": ("a.png", _png((1024, 1536)), "image/png")},
+    )
+    assert r.status_code == 200
+    payload = client.chamadas[-1]
+    assert (payload.width, payload.height) == (1024, 1536)
+    assert payload.fit is None
+
+
+def test_edits_kill_switch_desliga_o_encaixe(client, monkeypatch):
+    """Se o encaixe der problema em produção, desligar tem de ser reiniciar o
+    pod — não republicar imagem."""
+    monkeypatch.setattr(server, "ASPECT_FIT", False)
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "troque a roupa"},
+        files={"image": ("a.png", _png((506, 1164)), "image/png")},
+    )
+    assert r.status_code == 200
+    payload = client.chamadas[-1]
+    assert (payload.width, payload.height) == (1024, 1024)
+    assert payload.fit is None
+
+
+def test_edits_o_canvas_sai_da_PRIMEIRA_referencia(client):
+    """A primeira é a foto sendo editada; as outras são material (a peça). Um
+    vestido em paisagem não pode decidir o formato da saída."""
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "troque a roupa"},
+        files=[
+            ("image", ("alvo.png", _png((506, 1164)), "image/png")),
+            ("image", ("peca.png", _png((1600, 900)), "image/png")),
+        ],
+    )
+    assert r.status_code == 200
+    assert (client.chamadas[-1].width, client.chamadas[-1].height) == (1024, 1536)
+
+
+def test_meta_reporta_o_tamanho_ENTREGUE_e_o_canvas(client):
+    """O gateway grava cada geração no bucket com o tamanho do meta: reportar o
+    canvas descreveria uma imagem que ninguém tem."""
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "troque a roupa"},
+        files={"image": ("a.png", _png((506, 1164)), "image/png")},
+    )
+    meta = r.json()["meta"]
+    assert (meta["canvas_width"], meta["canvas_height"]) == (1024, 1536)
+    assert meta["width"] < meta["canvas_width"]
+    assert meta["height"] == 1536
+    assert abs(meta["width"] / meta["height"] - 506 / 1164) < 0.02
+
+
+def test_generations_nunca_encaixa_nada(client):
+    """Sem foto não há proporção a preservar; `size` continua mandando."""
+    r = client.post("/v1/images/generations", json={"prompt": "um gato"})
+    assert r.status_code == 200
+    assert client.chamadas[-1].fit is None
+
+
+def test_run_padda_a_entrada_e_recorta_a_saida(monkeypatch):
+    """O ciclo completo dentro do worker: a referência chega ao pipeline já na
+    proporção do canvas, e o que sai volta à proporção da foto."""
+    vistas: list = []
+
+    class _Pipe:
+        def __call__(self, **kwargs):
+            vistas.append(kwargs["image"][0].size)
+            return types.SimpleNamespace(
+                images=[Image.new("RGB", (kwargs["width"], kwargs["height"]))]
+            )
+
+    monkeypatch.setattr(server, "PIPE", _Pipe())
+    monkeypatch.setattr(server, "STATS", policy.ScenarioStats())
+
+    fit = policy.plan_aspect_fit(506, 1164, 1024, 1536)
+    payload = server.GenPayload(
+        prompt="troque a roupa",
+        width=1024,
+        height=1536,
+        steps=4,
+        guidance_scale=1.0,
+        n=1,
+        seed=7,
+        references=[_png((506, 1164))],
+        fit=fit,
+    )
+    saida = server._run(payload)
+
+    # entrada: a referência foi completada até a proporção do canvas
+    assert vistas[0] == (fit.padded_width, fit.padded_height)
+    assert abs(vistas[0][0] / vistas[0][1] - 1024 / 1536) < 0.01
+
+    # saída: recortada de volta para a proporção da FOTO
+    img = Image.open(io.BytesIO(base64.b64decode(saida[0])))
+    assert img.size == fit.output_size(1024, 1536)
+    assert abs(img.width / img.height - 506 / 1164) < 0.02
+
+
+def test_metrics_indexa_pelo_CANVAS_nao_pelo_entregue(monkeypatch):
+    """Custo de GPU e VRAM sai do canvas: indexar o /metrics pelo tamanho
+    recortado misturaria cenários de custos diferentes."""
+
+    class _Pipe:
+        def __call__(self, **kwargs):
+            return types.SimpleNamespace(
+                images=[Image.new("RGB", (kwargs["width"], kwargs["height"]))]
+            )
+
+    stats = policy.ScenarioStats()
+    monkeypatch.setattr(server, "PIPE", _Pipe())
+    monkeypatch.setattr(server, "STATS", stats)
+
+    server._run(
+        server.GenPayload(
+            prompt="x",
+            width=1024,
+            height=1536,
+            steps=4,
+            guidance_scale=1.0,
+            n=1,
+            seed=7,
+            references=[_png((506, 1164))],
+            fit=policy.plan_aspect_fit(506, 1164, 1024, 1536),
+        )
+    )
+    assert 'size="1024x1536"' in "\n".join(stats.prometheus_lines())
+
+
+def test_pad_replica_a_borda_em_vez_de_tarjar(monkeypatch):
+    """Tarja sólida é conteúdo que o modelo interpreta: ele preenche a faixa com
+    cenário inventado ou reenquadra o sujeito para caber nela."""
+    base = Image.new("RGB", (10, 30), (10, 20, 30))
+    for y in range(30):
+        base.putpixel((0, y), (200, 0, 0))
+        base.putpixel((9, y), (0, 0, 200))
+    fit = policy.plan_aspect_fit(10, 30, 1024, 1536)
+    padded = server._pad_to_canvas(base, fit)
+    assert padded.size == (fit.padded_width, fit.padded_height)
+    assert padded.getpixel((0, 15)) == (200, 0, 0)
+    assert padded.getpixel((padded.width - 1, 15)) == (0, 0, 200)
