@@ -238,8 +238,15 @@ class AspectFit:
         return right - left, bottom - top
 
 
-def pick_canvas(ref_width: int, ref_height: int, allowed: list[str]) -> tuple[int, int]:
+def pick_canvas(
+    ref_width: int, ref_height: int, allowed: list[str], *, max_area: int | None = None
+) -> tuple[int, int]:
     """Entre as resoluções permitidas, a de proporção mais próxima à da foto.
+
+    `max_area` restringe a escolha às resoluções que cabem nele, e cai de volta
+    na allowlist inteira quando nenhuma cabe — uma allowlist só com canvas
+    grandes não pode virar 500. É como a edição casa o canvas com a grade da
+    referência (ver REFERENCE_MAX_AREA).
 
     Desempate pela MENOR área, e isso é deliberado: quando a allowlist tem
     várias resoluções da mesma proporção (1024×1536, 1280×1920 e 1536×2304 são
@@ -256,10 +263,12 @@ def pick_canvas(ref_width: int, ref_height: int, allowed: list[str]) -> tuple[in
             "imagem de referência com dimensão inválida", code="invalid_image_size"
         )
     target = ref_width / ref_height
+    sizes = [tuple(int(p) for p in value.split("x")) for value in allowed]
+    if max_area is not None:
+        sizes = [s for s in sizes if s[0] * s[1] <= max_area] or sizes
     best: tuple[int, int] | None = None
     best_key: tuple[float, int] | None = None
-    for value in allowed:
-        width, height = (int(p) for p in value.split("x"))
+    for width, height in sizes:
         key = (abs(math.log((width / height) / target)), width * height)
         if best_key is None or key < best_key:
             best, best_key = (width, height), key

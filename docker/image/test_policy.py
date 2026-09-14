@@ -912,6 +912,18 @@ def test_pick_canvas_desempata_pela_menor_area():
     assert policy.pick_canvas(506, 1164, allowed) == (1024, 1536)
 
 
+def test_pick_canvas_com_max_area_so_escolhe_o_que_cabe():
+    """Grade casada: um canvas acima de 1 MP faria o pipeline reduzir a
+    referência e a grade voltaria a divergir."""
+    allowed = ["1024x1024", "1536x1024", "1024x1536", "816x1216"]
+    assert policy.pick_canvas(506, 1164, allowed, max_area=1024 * 1024) == (816, 1216)
+    assert policy.pick_canvas(1600, 900, allowed, max_area=1024 * 1024) == (1024, 1024)
+    # sem nada que caiba, a allowlist inteira — nunca um 500
+    assert policy.pick_canvas(506, 1164, ["1024x1536"], max_area=1024 * 1024) == (1024, 1536)
+    # 1024×1024 é exatamente 1 MP e o pipeline só reduz o que PASSA disso
+    assert policy.pick_canvas(800, 800, allowed, max_area=1024 * 1024) == (1024, 1024)
+
+
 def test_pick_canvas_recusa_dimensao_invalida():
     with pytest.raises(policy.ImageRequestError) as e:
         policy.pick_canvas(0, 1164, ["1024x1536"])

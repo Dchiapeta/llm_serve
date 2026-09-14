@@ -955,10 +955,61 @@ def test_run_sem_cuda_nao_quebra_a_geracao(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_edits_sem_size_deriva_o_canvas_da_foto(client):
+RETRATO_ATE_1MP = ["1024x1024", "1536x1024", "1024x1536", "816x1216"]
+
+
+def test_edits_sem_size_deriva_o_canvas_da_foto(client, monkeypatch):
     """O caso que motivou tudo: uma selfie retrato caía no canvas QUADRADO do
     default e era esticada até ele, e é a foto esticada que faz o modelo
-    devolver outra pessoa."""
+    devolver outra pessoa. Com a grade casada, o canvas é o retrato ≤ 1 MP."""
+    monkeypatch.setattr(server, "ALLOWED_SIZES", RETRATO_ATE_1MP)
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "troque a roupa"},
+        files={"image": ("a.png", _png((506, 1164)), "image/png")},
+    )
+    assert r.status_code == 200
+    payload = client.chamadas[-1]
+    assert (payload.width, payload.height) == (816, 1216)
+    assert payload.fit is not None
+    assert payload.fit.pad_left > 0 and payload.fit.pad_right > 0
+    assert payload.match_canvas is True
+
+
+def test_edits_referencia_entra_na_grade_exata_do_canvas(client, monkeypatch):
+    """O corpo "engordado" de 14/09: a foto entrava a ~768×1152 num canvas
+    1024×1536, grades diferentes. A primeira referência precisa chegar ao
+    pipeline com as dimensões do canvas — e a peça (segunda) não é tocada."""
+    monkeypatch.setattr(server, "ALLOWED_SIZES", RETRATO_ATE_1MP)
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "troque a roupa"},
+        files=[
+            ("image[]", ("alvo.png", _png((506, 1164)), "image/png")),
+            ("image[]", ("peca.png", _png((998, 1316)), "image/png")),
+        ],
+    )
+    assert r.status_code == 200, r.text
+    assert client.chamadas[-1].reference_sizes == [(816, 1216), (998, 1316)]
+
+
+def test_edits_grade_casada_nunca_escolhe_canvas_acima_de_1mp(client):
+    """Acima de 1 MP o pipeline reduz a referência de novo e a grade volta a
+    divergir. Na allowlist default o único ≤ 1 MP é o quadrado."""
+    r = client.post(
+        "/v1/images/edits",
+        data={"prompt": "troque a roupa"},
+        files={"image": ("a.png", _png((506, 1164)), "image/png")},
+    )
+    assert r.status_code == 200
+    payload = client.chamadas[-1]
+    assert (payload.width, payload.height) == (1024, 1024)
+    assert payload.reference_sizes == [(1024, 1024)]
+
+
+def test_edits_kill_switch_da_grade_volta_ao_canvas_antigo(client, monkeypatch):
+    monkeypatch.setattr(server, "ALLOWED_SIZES", RETRATO_ATE_1MP)
+    monkeypatch.setattr(server, "MATCH_REFERENCE_GRID", False)
     r = client.post(
         "/v1/images/edits",
         data={"prompt": "troque a roupa"},
@@ -967,8 +1018,8 @@ def test_edits_sem_size_deriva_o_canvas_da_foto(client):
     assert r.status_code == 200
     payload = client.chamadas[-1]
     assert (payload.width, payload.height) == (1024, 1536)
-    assert payload.fit is not None
-    assert payload.fit.pad_left > 0 and payload.fit.pad_right > 0
+    assert payload.match_canvas is False
+    assert payload.reference_sizes == [(payload.fit.padded_width, payload.fit.padded_height)]
 
 
 def test_edits_com_size_explicito_nao_encaixa_nada(client):
@@ -986,9 +1037,12 @@ def test_edits_com_size_explicito_nao_encaixa_nada(client):
     meta = r.json()["meta"]
     assert (meta["width"], meta["height"]) == (1024, 1024)
     assert "canvas_width" not in meta
+    assert payload.match_canvas is False
 
 
-def test_edits_foto_que_ja_casa_com_o_canvas_nao_ganha_padding(client):
+def test_edits_foto_que_ja_casa_com_o_canvas_nao_ganha_padding(client, monkeypatch):
+    """Sem padding, mas ainda redimensionada: casar a proporção não casa a grade."""
+    monkeypatch.setattr(server, "ALLOWED_SIZES", RETRATO_ATE_1MP)
     r = client.post(
         "/v1/images/edits",
         data={"prompt": "troque a roupa"},
@@ -996,8 +1050,9 @@ def test_edits_foto_que_ja_casa_com_o_canvas_nao_ganha_padding(client):
     )
     assert r.status_code == 200
     payload = client.chamadas[-1]
-    assert (payload.width, payload.height) == (1024, 1536)
+    assert (payload.width, payload.height) == (816, 1216)
     assert payload.fit is None
+    assert payload.reference_sizes == [(816, 1216)]
 
 
 def test_edits_kill_switch_desliga_o_encaixe(client, monkeypatch):
@@ -1013,11 +1068,13 @@ def test_edits_kill_switch_desliga_o_encaixe(client, monkeypatch):
     payload = client.chamadas[-1]
     assert (payload.width, payload.height) == (1024, 1024)
     assert payload.fit is None
+    assert payload.match_canvas is False
 
 
-def test_edits_o_canvas_sai_da_PRIMEIRA_referencia(client):
+def test_edits_o_canvas_sai_da_PRIMEIRA_referencia(client, monkeypatch):
     """A primeira é a foto sendo editada; as outras são material (a peça). Um
     vestido em paisagem não pode decidir o formato da saída."""
+    monkeypatch.setattr(server, "ALLOWED_SIZES", RETRATO_ATE_1MP)
     r = client.post(
         "/v1/images/edits",
         data={"prompt": "troque a roupa"},
@@ -1027,21 +1084,22 @@ def test_edits_o_canvas_sai_da_PRIMEIRA_referencia(client):
         ],
     )
     assert r.status_code == 200
-    assert (client.chamadas[-1].width, client.chamadas[-1].height) == (1024, 1536)
+    assert (client.chamadas[-1].width, client.chamadas[-1].height) == (816, 1216)
 
 
-def test_meta_reporta_o_tamanho_ENTREGUE_e_o_canvas(client):
+def test_meta_reporta_o_tamanho_ENTREGUE_e_o_canvas(client, monkeypatch):
     """O gateway grava cada geração no bucket com o tamanho do meta: reportar o
     canvas descreveria uma imagem que ninguém tem."""
+    monkeypatch.setattr(server, "ALLOWED_SIZES", RETRATO_ATE_1MP)
     r = client.post(
         "/v1/images/edits",
         data={"prompt": "troque a roupa"},
         files={"image": ("a.png", _png((506, 1164)), "image/png")},
     )
     meta = r.json()["meta"]
-    assert (meta["canvas_width"], meta["canvas_height"]) == (1024, 1536)
+    assert (meta["canvas_width"], meta["canvas_height"]) == (816, 1216)
     assert meta["width"] < meta["canvas_width"]
-    assert meta["height"] == 1536
+    assert meta["height"] == 1216
     assert abs(meta["width"] / meta["height"] - 506 / 1164) < 0.02
 
 
@@ -1191,10 +1249,11 @@ def test_usage_de_edits_conta_as_referencias_como_entrada(client):
     assert usage["completion_tokens"] == 4096
 
 
-def test_usage_conta_a_referencia_paddada_e_o_canvas_inteiro(client):
-    """Com encaixe de proporção a foto entra maior (padding) e a saída sai
-    menor (recorte) — o custo é o da foto paddada e do CANVAS, não do que o
-    cliente recebe."""
+def test_usage_conta_a_referencia_paddada_e_o_canvas_inteiro(client, monkeypatch):
+    """Com encaixe de proporção a foto entra paddada e redimensionada para o
+    canvas, e a saída sai menor (recorte) — o custo é o da referência COMO
+    ENTROU e do CANVAS, não do que o cliente recebe."""
+    monkeypatch.setattr(server, "ALLOWED_SIZES", RETRATO_ATE_1MP)
     r = client.post(
         "/v1/images/edits",
         data={"prompt": "x"},
@@ -1203,10 +1262,10 @@ def test_usage_conta_a_referencia_paddada_e_o_canvas_inteiro(client):
     assert r.status_code == 200, r.text
     payload = client.chamadas[-1]
     assert payload.fit is not None
-    padded = (payload.fit.padded_width, payload.fit.padded_height)
-    assert payload.reference_sizes == [padded]
+    canvas = (payload.width, payload.height)
+    assert payload.reference_sizes == [canvas]
     usage = r.json()["usage"]
-    assert usage["prompt_tokens_details"]["image_tokens"] == policy.reference_latent_tokens(*padded)
+    assert usage["prompt_tokens_details"]["image_tokens"] == policy.reference_latent_tokens(*canvas)
     assert usage["completion_tokens"] == policy.latent_tokens(payload.width, payload.height)
     meta = r.json()["meta"]
     assert usage["completion_tokens"] > policy.latent_tokens(meta["width"], meta["height"])

@@ -111,6 +111,17 @@ ALLOW_TF32 = os.environ.get("IMAGE_ALLOW_TF32", "true").lower() == "true"
 # pod, não republicar imagem.
 ASPECT_FIT = os.environ.get("IMAGE_ASPECT_FIT", "true").lower() == "true"
 
+# Grade da referência igual à da saída, no mesmo caminho do encaixe (sem `size`).
+#
+# O pipeline reduz toda referência acima de 1 MP e nunca amplia as menores, e a
+# posição (RoPE) de referência e saída começa em 0 na mesma escala de 16 px por
+# token. Com canvas 1024×1536 e a foto entrando a ~768×1152, o modelo via a
+# cliente numa grade 48×72 desenhando numa 64×96 — e redesenhava o corpo maior
+# e mais largo. Medido em 14/09/2026 (5 seeds): com as duas grades iguais, corpo,
+# altura e acessórios voltaram perto do original. O template oficial do ComfyUI
+# faz o mesmo (saída no tamanho da imagem 1 escalada a 1 MP).
+MATCH_REFERENCE_GRID = os.environ.get("IMAGE_MATCH_REFERENCE_GRID", "true").lower() == "true"
+
 DEVICE = os.environ.get("IMAGE_DEVICE", "cuda")
 
 GENERATIONS_PATH = "images/generations"
@@ -182,6 +193,11 @@ class GenPayload:
     # que determina custo de GPU e VRAM, logo é o que o /metrics deve indexar.
     # O que o cliente recebe sai menor, e quem sabe disso é o `fit`.
     fit: policy.AspectFit | None = None
+    # A primeira referência (já paddada, se houver `fit`) é redimensionada para
+    # exatamente width × height antes do pipeline. Independe do `fit`: uma foto
+    # que já casa com a proporção do canvas também precisa entrar na grade dele.
+    # Ver MATCH_REFERENCE_GRID.
+    match_canvas: bool = False
     # Preenchido em DOIS lugares: `queue_wait_s` pela fila (policy.py, no
     # momento em que o worker pega o job) e o resto por _run. É o payload que
     # os carrega porque ele é a única coisa que atravessa os dois — a fila
@@ -317,6 +333,10 @@ def _prepare_references(payload: GenPayload) -> list[Image.Image]:
     references = [_decode_reference(d) for d in payload.references]
     if payload.fit is not None and references:
         references[0] = _pad_to_canvas(references[0], payload.fit)
+    if payload.match_canvas and references:
+        canvas = (payload.width, payload.height)
+        if references[0].size != canvas:
+            references[0] = references[0].resize(canvas, Image.LANCZOS)
     payload.reference_sizes = [img.size for img in references]
     return references
 
@@ -1000,6 +1020,7 @@ async def images_edits(request: Request):
     # esticava essa foto até o canvas, que é o que faz o modelo trocar a pessoa
     # (ver policy.AspectFit).
     fit = None
+    match_canvas = False
     if ASPECT_FIT and requested_size is None and references:
         # Só o header do arquivo, não os pixels: `Image.open` é preguiçoso e o
         # `.load()` que custa fica no worker, onde já estava. É por isso que
@@ -1014,9 +1035,14 @@ async def images_edits(request: Request):
             # um caminho só para essa falha.
             ref_size = None
         if ref_size:
-            width, height = policy.pick_canvas(*ref_size, ALLOWED_SIZES)
+            # Com a grade casada, só canvas que o pipeline não reduz (≤ 1 MP):
+            # num 1024×1536 a referência seria reduzida de novo e a grade
+            # voltaria a divergir.
+            max_area = policy.REFERENCE_MAX_AREA if MATCH_REFERENCE_GRID else None
+            width, height = policy.pick_canvas(*ref_size, ALLOWED_SIZES, max_area=max_area)
             planned = policy.plan_aspect_fit(*ref_size, width, height)
             fit = None if planned.is_noop else planned
+            match_canvas = MATCH_REFERENCE_GRID
 
     return await _dispatch(
         GenPayload(
@@ -1024,6 +1050,7 @@ async def images_edits(request: Request):
             width=width,
             height=height,
             fit=fit,
+            match_canvas=match_canvas,
             steps=policy.validate_steps(form.get("steps"), default=STEPS, maximum=STEPS_MAX),
             guidance_scale=policy.validate_guidance_scale(
                 form.get("guidance_scale"), default=GUIDANCE_SCALE
