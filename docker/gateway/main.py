@@ -3995,6 +3995,9 @@ async def anthropic_messages(
         logger.warning(
             "anthropic proxy: timeout aguardando resposta de %s (%s)", flight_key, e
         )
+        # Sem esta linha a request morta não deixava rastro em gateway_requests:
+        # quem investigava "toda request longa morre" via só as que sobreviveram.
+        log_gateway_request(**log_ctx, status_code=503, stream=is_stream, usage=None)
         raise HTTPException(
             status_code=503,
             detail=(
@@ -4007,6 +4010,7 @@ async def anthropic_messages(
         # aqui sim "indisponível" é a descrição correta.
         release_flight(flight_key)
         logger.warning("anthropic proxy: upstream indisponível para %s (%s)", flight_key, e)
+        log_gateway_request(**log_ctx, status_code=503, stream=is_stream, usage=None)
         raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
     except BaseException:
         release_flight(flight_key)
@@ -5799,6 +5803,11 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # detalhe da exceção (pode conter a public_url interna do pod) só no
         # log do servidor — o cliente recebe uma mensagem genérica
         logger.warning("proxy: upstream indisponível para %s (%s)", flight_key, e)
+        # Inclui o ReadTimeout de MESSAGES_NONSTREAM_TIMEOUT_S: a request sem
+        # stream que passa dos 90s morria sem linha em gateway_requests, então a
+        # página de Requisições só mostrava as que sobreviveram (foi assim que
+        # o "toda request do n8n acima de 90s morre" ficou invisível).
+        log_gateway_request(**log_ctx, status_code=503, stream=is_stream_request, usage=None)
         raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
     except BaseException:
         # cliente desconectou no meio do body (CancelledError) ou qualquer
