@@ -121,14 +121,20 @@ class SupaClient:
         apply_stack_image_defaults) — o mesmo ATENÇÃO de ordem de deploy vale
         para as duas. Sampling e imagem nunca se cruzam: nenhuma stack serve
         texto e imagem ao mesmo tempo, então uma linha sempre tem um dos dois
-        conjuntos nulo."""
+        conjuntos nulo.
+
+        `default_reasoning_effort` (migration 0069, mesmo ATENÇÃO) é o nível
+        de raciocínio da própria CHAVE — none/low/medium/high, ou NULL para
+        herdar default_enable_thinking. Só existe na chave, não na stack:
+        resolve_thinking_policy o lê antes do boolean."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,purpose,"
-                "use_custom_prompt,system_prompt,default_enable_thinking,enable_knowledge_base,"
+                "use_custom_prompt,system_prompt,default_enable_thinking,default_reasoning_effort,"
+                "enable_knowledge_base,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
                 "default_image_size,default_image_steps,default_image_guidance_scale,default_image_seed,"
                 "accounts(name,"
@@ -156,6 +162,7 @@ class SupaClient:
             "use_custom_prompt": row.get("use_custom_prompt", False),
             "system_prompt": row.get("system_prompt"),
             "default_enable_thinking": row.get("default_enable_thinking"),
+            "default_reasoning_effort": row.get("default_reasoning_effort"),
             "enable_knowledge_base": row.get("enable_knowledge_base"),
             "default_temperature": row.get("default_temperature"),
             "default_top_p": row.get("default_top_p"),
