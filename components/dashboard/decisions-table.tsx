@@ -5,8 +5,9 @@ import Link from "next/link"
 import { Search } from "lucide-react"
 
 import type { ProvisionDecision, TemplatePlan } from "@/lib/types"
-import { causeLabel } from "@/components/machines/cause-labels"
+import { actorKind, causeLabel } from "@/components/machines/cause-labels"
 import { Badge } from "@/components/ui/badge"
+import { ActorBadge } from "@/components/machines/actor-badge"
 import { CauseBadge } from "@/components/machines/cause-badge"
 import { PlanBadge } from "@/components/machines/plan-badge"
 import { RequestOriginBadge } from "@/components/dashboard/request-origin-badge"
@@ -86,6 +87,7 @@ function pageWindow(current: number, total: number): Array<number | "…"> {
 export function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
   const [query, setQuery] = React.useState("")
   const [outcomeFilter, setOutcomeFilter] = React.useState(ALL)
+  const [kindFilter, setKindFilter] = React.useState(ALL)
   const [perPage, setPerPage] = React.useState(PER_PAGE_OPTIONS[1])
   const [page, setPage] = React.useState(1)
 
@@ -103,7 +105,8 @@ export function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
         (r.machines?.name.toLowerCase().includes(q) ?? false)
       : true
     const matchesOutcome = outcomeFilter === ALL || r.outcome === outcomeFilter
-    return matchesQuery && matchesOutcome
+    const matchesKind = kindFilter === ALL || actorKind(r.actor) === kindFilter
+    return matchesQuery && matchesOutcome && matchesKind
   })
 
   const totalPages = Math.max(Math.ceil(filtered.length / perPage), 1)
@@ -145,12 +148,31 @@ export function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
             <SelectItem value="served_503">503 servidos</SelectItem>
           </SelectContent>
         </Select>
+
+        <Select
+          value={kindFilter}
+          onValueChange={(v) => {
+            setKindFilter(v)
+            setPage(1)
+          }}
+        >
+          <SelectTrigger className="w-40">
+            <SelectValue placeholder="Tipo" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>Todos os tipos</SelectItem>
+            <SelectItem value="manual">Manual</SelectItem>
+            <SelectItem value="request">Requisição</SelectItem>
+            <SelectItem value="automatic">Automática</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
 
       <Table>
         <TableHeader>
           <TableRow>
             <TableHead>Hora</TableHead>
+            <TableHead>Tipo</TableHead>
             <TableHead>Resultado</TableHead>
             <TableHead>Causa</TableHead>
             <TableHead>Plano</TableHead>
@@ -159,13 +181,14 @@ export function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
             <TableHead>Chave</TableHead>
             <TableHead>Origem</TableHead>
             <TableHead>Máquina</TableHead>
+            <TableHead>Motivo</TableHead>
             <TableHead className="text-right!">Repetições</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {filtered.length === 0 && (
             <TableRow>
-              <TableCell colSpan={10} className="text-center text-muted-foreground">
+              <TableCell colSpan={12} className="text-center text-muted-foreground">
                 Nenhuma decisão encontrada.
               </TableCell>
             </TableRow>
@@ -174,6 +197,9 @@ export function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
             <TableRow key={r.id}>
               <TableCell className="text-xs text-muted-foreground">
                 {new Date(r.created_at).toLocaleString("pt-BR")}
+              </TableCell>
+              <TableCell>
+                <ActorBadge actor={r.actor} email={r.trigger_meta?.admin_email} />
               </TableCell>
               <TableCell>
                 <Badge className={OUTCOME_BADGE[r.outcome]}>{OUTCOME_LABEL[r.outcome]}</Badge>
@@ -202,7 +228,7 @@ export function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
                     userAgent={r.trigger_meta.user_agent ?? null}
                   />
                 ) : (
-                  <span className="text-xs text-muted-foreground">{r.actor}</span>
+                  <span className="text-xs text-muted-foreground">—</span>
                 )}
               </TableCell>
               <TableCell>
@@ -213,6 +239,14 @@ export function DecisionsTable({ rows }: { rows: DecisionRow[] }) {
                 ) : (
                   <span className="text-muted-foreground">—</span>
                 )}
+              </TableCell>
+              {/* mensagem crua (ex.: a recusa do RunPod) — truncada na célula,
+                  inteira no tooltip */}
+              <TableCell
+                className="max-w-64 truncate text-xs text-muted-foreground"
+                title={r.trigger_meta?.reason ?? undefined}
+              >
+                {r.trigger_meta?.reason ?? "—"}
               </TableCell>
               <TableCell className="text-right font-mono text-xs tabular-nums">
                 {r.repeat_count}

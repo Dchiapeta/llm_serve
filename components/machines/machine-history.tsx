@@ -15,6 +15,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { ActorBadge } from "@/components/machines/actor-badge"
 import { CauseBadge } from "@/components/machines/cause-badge"
 import { actorLabel, isBirthCause } from "@/components/machines/cause-labels"
 import { RequestOriginBadge } from "@/components/dashboard/request-origin-badge"
@@ -106,13 +107,17 @@ export function MachineHistory({
           <CardTitle>Por que esta máquina subiu</CardTitle>
           <CardDescription>
             {birth
-              ? `${fmt(birth.created_at)} · ${actorLabel(birth.actor ?? birth.trigger_meta?.actor)}`
+              ? fmt(birth.created_at)
               : "Sem causa estruturada — máquina anterior à migration 0070 ou evento perdido"}
           </CardDescription>
         </CardHeader>
         {birth && (
           <CardContent className="flex flex-col gap-3">
-            <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <ActorBadge
+                actor={birth.actor ?? birth.trigger_meta?.actor}
+                email={birth.trigger_meta?.admin_email}
+              />
               <CauseBadge cause={birth.cause} />
             </div>
             <Originator trigger={birth.trigger_meta} actor={birth.actor} />
@@ -146,13 +151,16 @@ export function MachineHistory({
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-sm">{e.message}</span>
                       <Badge variant="outline">{e.type}</Badge>
+                      {(e.actor ?? e.trigger_meta?.actor) && (
+                        <ActorBadge
+                          actor={e.actor ?? e.trigger_meta?.actor}
+                          email={e.trigger_meta?.admin_email}
+                        />
+                      )}
                       {e.cause && <CauseBadge cause={e.cause} />}
                     </div>
                     <p className="text-xs text-muted-foreground">
                       {fmt(e.created_at)}
-                      {(e.actor ?? e.trigger_meta?.actor) &&
-                        ` · ${actorLabel(e.actor ?? e.trigger_meta?.actor)}`}
-                      {e.trigger_meta?.admin_email && ` · ${e.trigger_meta.admin_email}`}
                       {e.trigger_meta?.key_prefix && ` · chave ${e.trigger_meta.key_prefix}…`}
                       {e.trigger_meta?.stack_slug && ` · ${e.trigger_meta.stack_slug}`}
                     </p>
@@ -182,11 +190,13 @@ export function MachineHistory({
               <TableHeader>
                 <TableRow>
                   <TableHead>Hora</TableHead>
+                  <TableHead>Tipo</TableHead>
                   <TableHead>Resultado</TableHead>
                   <TableHead>Causa</TableHead>
                   <TableHead>Stack</TableHead>
                   <TableHead>Chave</TableHead>
                   <TableHead>Origem</TableHead>
+                  <TableHead>Motivo</TableHead>
                   <TableHead className="text-right!">Repetições</TableHead>
                 </TableRow>
               </TableHeader>
@@ -194,6 +204,9 @@ export function MachineHistory({
                 {decisions.map((d) => (
                   <TableRow key={d.id}>
                     <TableCell className="text-xs text-muted-foreground">{fmt(d.created_at)}</TableCell>
+                    <TableCell>
+                      <ActorBadge actor={d.actor} email={d.trigger_meta?.admin_email} />
+                    </TableCell>
                     <TableCell>
                       <Badge variant={d.outcome === "granted" ? "secondary" : "destructive"}>
                         {d.outcome}
@@ -215,6 +228,12 @@ export function MachineHistory({
                       ) : (
                         <span className="text-muted-foreground">{actorLabel(d.actor)}</span>
                       )}
+                    </TableCell>
+                    <TableCell
+                      className="max-w-64 truncate text-xs text-muted-foreground"
+                      title={d.trigger_meta?.reason ?? undefined}
+                    >
+                      {d.trigger_meta?.reason ?? "—"}
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs tabular-nums">
                       {d.repeat_count}

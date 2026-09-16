@@ -154,6 +154,64 @@ async function adminTrigger(cause: string, extra?: Partial<TriggerEnvelope>): Pr
   }
 }
 
+// Teto da mensagem de erro guardada em trigger_meta.reason — a do RunPod é
+// curta, mas um stack trace acidental não pode virar a coluna jsonb.
+const DECISION_REASON_MAX = 300
+
+// Decisão do PAINEL sobre criar/religar/recriar (provision_decisions, migration
+// 0070): espelho do decisions.record_bg do gateway para as tentativas que
+// nascem aqui — "Nova máquina", Iniciar, Recriar, e as chamadas do gateway às
+// rotas /api/machines/*. Grava inclusive as que FALHAM no RunPod: até aqui um
+// clique que morria em "no instances currently available" não deixava rastro
+// nenhum, indistinguível de ninguém ter clicado. Best-effort, nunca lança.
+async function recordDecision(input: {
+  outcome: "granted" | "denied"
+  cause: string
+  meta: EventMeta
+  plan?: string | null
+  category?: string | null
+  machineId?: string | null
+  reason?: string | null
+}) {
+  const t = input.meta.trigger ?? {}
+  const reason = input.reason ? input.reason.slice(0, DECISION_REASON_MAX) : t.reason
+  const trigger: TriggerEnvelope = {
+    ...t,
+    cause: input.cause,
+    ...(reason ? { reason } : {}),
+  }
+  const db = createSupabaseAdmin()
+  const { error } = await db.from("provision_decisions").insert({
+    outcome: input.outcome,
+    cause: input.cause,
+    actor: t.actor ?? "panel",
+    plan: input.plan ?? t.plan ?? null,
+    category: input.category ?? t.category ?? null,
+    machine_id: input.machineId ?? t.machine_id ?? null,
+    account_id: t.account_id ?? null,
+    stack_id: t.stack_id ?? null,
+    api_key_id: t.api_key_id ?? null,
+    key_prefix: t.key_prefix ?? null,
+    trace_id: t.trace_id ?? null,
+    trigger_meta: trigger,
+  })
+  if (error) console.warn("provision_decisions: falha ao gravar decisão do painel:", error.message)
+}
+
+// plano/categoria do template de uma máquina — o pool que a decisão afeta
+async function templatePool(
+  db: ReturnType<typeof createSupabaseAdmin>,
+  templateId: string | null
+): Promise<{ plan: string | null; category: string | null }> {
+  if (!templateId) return { plan: null, category: null }
+  const { data } = await db
+    .from("templates")
+    .select("plan, category")
+    .eq("id", templateId)
+    .maybeSingle<Pick<Template, "plan" | "category">>()
+  return { plan: data?.plan ?? null, category: data?.category ?? null }
+}
+
 // Envelope vindo do gateway (rotas /api/machines/*): já traz actor e cause;
 // sem envelope (gateway antigo) cai na autoria do painel com uma causa
 // genérica, pra nunca fingir que sabe o que não sabe.
@@ -610,8 +668,17 @@ async function provisionMachine(input: {
     .single<Template>()
   if (tplErr || !tpl) return { error: "Produto não encontrado" }
 
+  // originador: envelope do gateway (rota /provision) ou o admin da sessão
+  const meta = input.meta ?? (await adminTrigger("provision.panel.manual"))
+  const pool = { plan: tpl.plan, category: tpl.category }
+  const deny = (cause: string, reason: string) =>
+    recordDecision({ outcome: "denied", cause, meta, ...pool, reason })
+
   const blocked = machineCreationBlockedReason(tpl, input.automatic === true)
-  if (blocked) return { error: blocked }
+  if (blocked) {
+    await deny("provision_denied.template_blocked", blocked)
+    return { error: blocked }
+  }
 
   // teto manual: valor informado, com fallback para o padrão do template
   const maxUsers = input.maxUsers ?? tpl.max_users
@@ -630,9 +697,9 @@ async function provisionMachine(input: {
       kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
     })
     if (maxUsers > cap) {
-      return {
-        error: `A GPU ${gpu?.displayName ?? gpuTypeId} comporta no máximo ${cap} usuário(s) para este modelo (pedido: ${maxUsers})`,
-      }
+      const error = `A GPU ${gpu?.displayName ?? gpuTypeId} comporta no máximo ${cap} usuário(s) para este modelo (pedido: ${maxUsers})`
+      await deny("provision_denied.validation", error)
+      return { error }
     }
   }
 
@@ -643,6 +710,9 @@ async function provisionMachine(input: {
     )
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
+    // a mensagem crua do RunPod vai para a decisão — é o que responde "por
+    // que o clique não virou máquina" (ex.: sem estoque da GPU)
+    await deny("provision_denied.runpod_error", `${gpu?.displayName ?? gpuTypeId}: ${msg}`)
     // Falta de estoque no RunPod é um erro esperado — devolve mensagem amigável
     if (msg.includes("no instances currently available")) {
       return {
@@ -692,10 +762,16 @@ async function provisionMachine(input: {
 
   await startFreshPodIfNeeded(pod, machine.id)
 
-  const meta = input.meta ?? (await adminTrigger("provision.panel.manual"))
   await logEvent(machine.id, "created", `Máquina "${name}" criada (${gpu?.displayName ?? gpuTypeId})`, {
     ...meta,
     machineLabel: name,
+  })
+  await recordDecision({
+    outcome: "granted",
+    cause: meta.cause ?? "provision.panel.manual",
+    meta,
+    ...pool,
+    machineId: machine.id,
   })
   revalidatePath("/machines")
   return { machineId: machine.id }
@@ -935,13 +1011,26 @@ export async function startMachine(
   const db = createSupabaseAdmin()
   const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
   if (!m?.runpod_pod_id) return { error: "Máquina sem pod associado" }
+  const meta: EventMeta = { ...(await adminTrigger("start.panel.manual")), machineLabel: m.name }
+  const pool = await templatePool(db, m.template_id)
   try {
     await runpod.startPod(m.runpod_pod_id)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     // Pod pausado não reserva GPU: o host pode tê-la cedido a outro cliente,
     // e aí o RunPod recusa o start até liberar (ou até recriarmos o pod).
-    if (msg.includes("not enough free GPUs")) {
+    const noGpu = msg.includes("not enough free GPUs")
+    // mesmos slugs do wake_machine do gateway: religar é religar, venha do
+    // botão ou da cascata
+    await recordDecision({
+      outcome: "denied",
+      cause: noGpu ? "wake_denied.no_gpu" : "wake_denied.failed",
+      meta,
+      ...pool,
+      machineId,
+      reason: msg,
+    })
+    if (noGpu) {
       return {
         error: `O host do pod "${m.name}" está sem GPU livre no momento.`,
         code: "no_gpu_on_host",
@@ -949,6 +1038,13 @@ export async function startMachine(
     }
     return { error: `Falha ao iniciar a máquina: ${msg}` }
   }
+  await recordDecision({
+    outcome: "granted",
+    cause: "start.panel.manual",
+    meta,
+    ...pool,
+    machineId,
+  })
   // "creating", não "running": o pod religa com o vLLM ainda carregando o
   // modelo; em "creating" a máquina fica invisível ao reaper de ociosidade e
   // aos picks do gateway, e o reconcile do gateway a promove a "running" quando
@@ -960,10 +1056,7 @@ export async function startMachine(
     .update({ status: "creating", last_activity_at: new Date().toISOString() })
     .eq("id", machineId)
   if (startErr) return { error: `Pod iniciado, mas falhou ao gravar o status: ${startErr.message}` }
-  await logEvent(machineId, "started", `Máquina "${m.name}" iniciada`, {
-    ...(await adminTrigger("start.panel.manual")),
-    machineLabel: m.name,
-  })
+  await logEvent(machineId, "started", `Máquina "${m.name}" iniciada`, meta)
   // O pod religa com o agent zerado (chaves só em memória). O gateway espera o
   // vLLM subir e reenvia.
   after(() =>
@@ -1006,8 +1099,15 @@ export async function recreateMachine(
   if (!tpl) {
     return { error: "O template desta máquina não existe mais — crie uma máquina nova" }
   }
+  const pool = { plan: tpl.plan, category: tpl.category }
+  const deny = (cause: string, reason: string) =>
+    recordDecision({ outcome: "denied", cause, meta, ...pool, machineId, reason })
+
   const blocked = machineCreationBlockedReason(tpl, automatic)
-  if (blocked) return { error: blocked }
+  if (blocked) {
+    await deny("recreate_denied.template_blocked", blocked)
+    return { error: blocked }
+  }
 
   // machines.gpu_type guarda o displayName (com sufixo "×N" em multi-GPU)
   const gpuName = m.gpu_type.replace(/\s*×\d+$/, "")
@@ -1030,9 +1130,9 @@ export async function recreateMachine(
       kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
     })
     if (m.max_users > cap) {
-      return {
-        error: `Com o template atual, ${gpu.displayName}${gpuCount > 1 ? ` ×${gpuCount}` : ""} comporta no máximo ${cap} usuário(s) — a máquina tem teto ${m.max_users}. Ajuste o template ou o teto antes de recriar.`,
-      }
+      const error = `Com o template atual, ${gpu.displayName}${gpuCount > 1 ? ` ×${gpuCount}` : ""} comporta no máximo ${cap} usuário(s) — a máquina tem teto ${m.max_users}. Ajuste o template ou o teto antes de recriar.`
+      await deny("recreate_denied.validation", error)
+      return { error }
     }
   }
 
@@ -1041,9 +1141,9 @@ export async function recreateMachine(
       await runpod.deletePod(m.runpod_pod_id)
     } catch (e) {
       if (!String(e).includes("404")) {
-        return {
-          error: `Falha ao terminar o pod antigo: ${e instanceof Error ? e.message : String(e)}`,
-        }
+        const error = `Falha ao terminar o pod antigo: ${e instanceof Error ? e.message : String(e)}`
+        await deny("recreate_denied.runpod_error", error)
+        return { error }
       }
     }
   }
@@ -1068,6 +1168,7 @@ export async function recreateMachine(
       .update({ status: "error", runpod_pod_id: null })
       .eq("id", machineId)
     await logEvent(machineId, "error", `Recriação da máquina "${m.name}" falhou: ${msg}`, meta)
+    await deny("recreate_denied.runpod_error", `${gpu.displayName}: ${msg}`)
     revalidatePath(`/machines/${machineId}`)
     revalidatePath("/machines")
     if (msg.includes("no instances currently available")) {
@@ -1115,6 +1216,13 @@ export async function recreateMachine(
     `Máquina "${m.name}" recriada em novo host (pod ${pod.id})`,
     meta
   )
+  await recordDecision({
+    outcome: "granted",
+    cause: meta.cause ?? "recreate.panel.manual",
+    meta,
+    ...pool,
+    machineId,
+  })
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
 }

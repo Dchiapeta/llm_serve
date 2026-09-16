@@ -21,6 +21,10 @@ const LABELS: Record<string, string> = {
   "provision_denied.lock_active": "Negado: já há uma criação em andamento",
   "provision_denied.cooldown": "Negado: tentativa recente (cooldown)",
   "provision_denied.panel_error": "Negado: o painel recusou ou falhou",
+  // decisões gravadas pelo próprio painel (recordDecision em lib/actions.ts)
+  "provision_denied.runpod_error": "Negado: o RunPod recusou criar o pod",
+  "provision_denied.validation": "Negado: teto de usuários acima da GPU",
+  "provision_denied.template_blocked": "Negado: template de teste/desabilitado",
   // wake
   "wake.request.no_machine_available": "Religada: requisição sem máquina disponível",
   "wake.request.stack_home_paused": "Religada: máquina da stack estava pausada",
@@ -39,6 +43,8 @@ const LABELS: Record<string, string> = {
   "recreate_denied.panel_unconfigured": "Recriação negada: painel não configurado",
   "recreate_denied.panel_error": "Recriação negada: o painel recusou ou falhou",
   "recreate_denied.template_blocked": "Recriação negada: template de teste/desabilitado",
+  "recreate_denied.runpod_error": "Recriação negada: o RunPod recusou",
+  "recreate_denied.validation": "Recriação negada: teto de usuários acima da GPU",
   // parada / partida
   "stop.provision.pause_when_healthy": "Pausada ao ficar saudável (reserva do pool)",
   "stop.lifecycle.idle": "Auto-pausa por ociosidade",
@@ -122,4 +128,30 @@ export const ACTOR_LABELS: Record<string, string> = {
 export function actorLabel(actor: string | null | undefined): string {
   if (!actor) return "—"
   return ACTOR_LABELS[actor] ?? actor
+}
+
+// A pergunta que o operador faz primeiro: foi alguém clicando, foi um
+// cliente mandando request, ou o sistema decidiu sozinho? Os cinco `actor`
+// gravados colapsam nestes três — é o eixo dos badges e do filtro da UI.
+export type ActorKind = "manual" | "request" | "automatic"
+
+export function actorKind(actor: string | null | undefined): ActorKind | null {
+  switch (actor) {
+    case "admin":
+    case "panel":
+      return "manual"
+    case "request":
+      return "request"
+    case "lifecycle":
+    case "gateway":
+      return "automatic"
+    default:
+      return null
+  }
+}
+
+export const ACTOR_KIND_LABELS: Record<ActorKind, string> = {
+  manual: "Manual",
+  request: "Requisição",
+  automatic: "Automática",
 }
