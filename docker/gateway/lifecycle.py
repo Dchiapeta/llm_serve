@@ -220,6 +220,8 @@ class LifecycleManager:
                         await self.supa.log_machine_event(
                             machine_id, "stack_released",
                             f"Stack {stack_id} liberada por ociosidade (vaga base livre)",
+                            cause="stack.released_idle",
+                            trigger={"actor": "lifecycle", "stack_id": stack_id},
                         )
                     except Exception:
                         pass  # histórico é best-effort
@@ -405,6 +407,9 @@ class LifecycleManager:
                         await self.supa.log_machine_event(
                             origin["id"], "sync",
                             f"Consolidação: {len(moved)} conta(s) migrada(s) para {target.get('name') or target['id']}",
+                            cause="stack.consolidated",
+                            trigger={"actor": "lifecycle", "machine_id": target["id"]},
+                            machine_label=origin.get("name"),
                         )
                     except Exception:
                         pass
@@ -589,6 +594,9 @@ class LifecycleManager:
                 await self.supa.log_machine_event(
                     machine_id, "stopped",
                     f"Auto-pausa: sem atividade há {self.machine_idle_stop_minutes:g} min",
+                    cause="stop.lifecycle.idle",
+                    trigger={"actor": "lifecycle", "machine_id": machine_id},
+                    machine_label=m.get("name"),
                 )
             except Exception:
                 pass

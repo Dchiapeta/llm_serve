@@ -12,7 +12,15 @@ import {
 import { runpod, runpodConsoleUrl } from "@/lib/runpod"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import { formatConsumption, formatImageCount } from "@/lib/consumption"
-import type { Account, ApiKey, Machine, Template, UsageMetric } from "@/lib/types"
+import type {
+  Account,
+  ApiKey,
+  Machine,
+  MachineEvent,
+  ProvisionDecision,
+  Template,
+  UsageMetric,
+} from "@/lib/types"
 import { Badge } from "@/components/ui/badge"
 import {
   Card,
@@ -37,6 +45,7 @@ import { RevokeKeyButton } from "@/components/accounts/revoke-key-button"
 import { CapacityBar } from "@/components/machines/capacity-bar"
 import { MachineAbout } from "@/components/machines/machine-about"
 import { MachineActions } from "@/components/machines/machine-actions"
+import { MachineHistory } from "@/components/machines/machine-history"
 import { StatusBadge } from "@/components/machines/status-badge"
 
 import { LiveStatusBadge } from "../live-status-badge"
@@ -44,6 +53,11 @@ import { LiveStatusBadge } from "../live-status-badge"
 export const dynamic = "force-dynamic"
 
 type KeyWithAccount = ApiKey & { accounts: { name: string } | null }
+
+// Janela de provision_decisions ao redor da criação da máquina (aba
+// Histórico): o 503 que precede o nascimento vem segundos antes; 10 min de
+// folga cobrem retries do cliente e o boot.
+const DECISION_WINDOW_MS = 10 * 60_000
 
 // "3d 4h", "2h 15min", "38min"
 function formatRuntime(ms: number): string {
@@ -74,6 +88,7 @@ export default async function MachineDetailPage({
   // Reflete o estado real do RunPod já no carregamento (não só via botão).
   const [machine] = await reconcileMachineStatuses([machineData], db)
 
+  const createdMs = new Date(machine.created_at).getTime()
   const [
     { data: tplData },
     { data: keysData },
@@ -81,6 +96,8 @@ export default async function MachineDetailPage({
     { data: usageData },
     { data: imageUsageData },
     { data: machineStacks },
+    { data: eventsData },
+    { data: decisionsData },
   ] = await Promise.all([
     machine.template_id
       ? db.from("templates").select("*").eq("id", machine.template_id).single<Template>()
@@ -105,6 +122,22 @@ export default async function MachineDetailPage({
       .from("stacks")
       .select("id, usage_class")
       .eq("machine_id", id),
+    // timeline da máquina (índice machine_events_machine_idx, migration 0070)
+    db
+      .from("machine_events")
+      .select("*")
+      .eq("machine_id", id)
+      .order("created_at", { ascending: true }),
+    // decisões do gateway ao redor do nascimento — filtradas por máquina OU
+    // pela janela de tempo, porque o 503 que precede a criação ainda não
+    // tinha machine_id; o filtro por pool (plano/categoria) é feito abaixo
+    db
+      .from("provision_decisions")
+      .select("*")
+      .gte("created_at", new Date(createdMs - DECISION_WINDOW_MS).toISOString())
+      .lte("created_at", new Date(createdMs + DECISION_WINDOW_MS).toISOString())
+      .order("created_at", { ascending: true })
+      .limit(200),
   ])
   const stacksCount = machineStacks?.length ?? 0
   // Ocupação = contagem de cabeças (migration 0037). Era a soma ponderada da
@@ -119,6 +152,15 @@ export default async function MachineDetailPage({
   const machineStackIds = new Set((machineStacks ?? []).map((s) => s.id))
 
   const template = tplData as Template | null
+  const events = (eventsData ?? []) as MachineEvent[]
+  // só o pool desta máquina: Go/llm de outra máquina no mesmo minuto não
+  // explica esta criação. Decisões já ligadas a esta máquina entram sempre.
+  const decisions = ((decisionsData ?? []) as ProvisionDecision[]).filter(
+    (d) =>
+      d.machine_id === id ||
+      ((template?.plan == null || d.plan == null || d.plan === template.plan) &&
+        (template?.category == null || d.category == null || d.category === template.category))
+  )
   // Teto de mistura (migration 0037): quantas stacks 'high' esta máquina
   // aceita. undefined = template sem teto configurado (fail-open).
   const highCount = (machineStacks ?? []).filter(
@@ -324,9 +366,14 @@ export default async function MachineDetailPage({
       <Tabs defaultValue="accounts">
         <TabsList>
           <TabsTrigger value="accounts">Contas & Slots</TabsTrigger>
+          <TabsTrigger value="historico">Histórico</TabsTrigger>
           <TabsTrigger value="env">Variáveis</TabsTrigger>
           <TabsTrigger value="about">Sobre</TabsTrigger>
         </TabsList>
+
+        <TabsContent value="historico" className="mt-4">
+          <MachineHistory events={events} decisions={decisions} />
+        </TabsContent>
 
         <TabsContent value="accounts" className="mt-4">
           <Card>

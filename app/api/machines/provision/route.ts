@@ -2,6 +2,7 @@ import { timingSafeEqual } from "crypto"
 import { NextRequest, NextResponse } from "next/server"
 
 import { provisionMachineForPlan } from "@/lib/actions"
+import { parseTriggerEnvelope } from "@/lib/machine-events"
 import {
   TEMPLATE_PLANS,
   type ProductCategory,
@@ -43,6 +44,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "category inválida" }, { status: 400 })
   }
   const category: ProductCategory = rawCategory
+  // Originador (migration 0070): quem/por que o gateway pediu a máquina.
+  // Filtrado pela allowlist e limitado em tamanho; ausente ou inválido é
+  // tratado como "gateway antigo", nunca como erro — criar a máquina é o que
+  // o cliente está esperando, o carimbo é diagnóstico.
+  const trigger = parseTriggerEnvelope(body?.trigger)
 
   let result: Awaited<ReturnType<typeof provisionMachineForPlan>>
   try {
@@ -50,6 +56,7 @@ export async function POST(req: NextRequest) {
       plan: plan as TemplatePlan,
       category,
       templateId,
+      trigger,
     })
   } catch (e) {
     // provisionMachine (RunPod/Supabase) pode lançar fora dos caminhos de

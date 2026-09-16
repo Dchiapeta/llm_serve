@@ -7,15 +7,16 @@ import { randomBytes } from "crypto"
 
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { allowedDomainsLabel, isAllowedAdminEmail } from "./auth-admin"
-import { requireAdminSession } from "./auth-admin-server"
+import { currentAdminEmail, requireAdminSession } from "./auth-admin-server"
 import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
+import { type EventMeta } from "./machine-events"
 import { vllmFlagsFromTemplate } from "./machines"
 import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
 import { insertStack } from "./stacks"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import { CLIENT_WINDOW_DAYS, MAX_KNOWLEDGE_FILE_SIZE_BYTES, PRODUCT_CATEGORIES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type Account, type ApiKey, type LoraAdapter, type Machine, type ProductCategory, type Stack, type StackClient, type Template, type TemplatePlan } from "./types"
+import { CLIENT_WINDOW_DAYS, MAX_KNOWLEDGE_FILE_SIZE_BYTES, PRODUCT_CATEGORIES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type Account, type ApiKey, type LoraAdapter, type Machine, type ProductCategory, type Stack, type StackClient, type Template, type TemplatePlan, type TriggerEnvelope } from "./types"
 
 // Janela de deduplicação do provisionamento: um retry do gateway dentro desse
 // intervalo reusa a máquina 'creating' recém-criada em vez de criar outra.
@@ -114,9 +115,54 @@ export async function logout() {
 
 // ---------- Helpers ----------
 
-async function logEvent(machineId: string | null, type: string, message: string) {
+// `meta` são as colunas estruturadas da migration 0070 (cause/actor/
+// trigger_meta/trace_id/machine_label). Opcional: os eventos de chave e de
+// sync continuam só com a mensagem. Só chaves presentes vão no insert — um
+// painel novo contra um banco sem a 0070 quebraria em 400 (e o insert aqui
+// não checa erro, então degradaria em silêncio): a migration vai ANTES.
+async function logEvent(
+  machineId: string | null,
+  type: string,
+  message: string,
+  meta?: EventMeta
+) {
   const db = createSupabaseAdmin()
-  await db.from("machine_events").insert({ machine_id: machineId, type, message })
+  const row: Record<string, unknown> = { machine_id: machineId, type, message }
+  if (meta?.cause) row.cause = meta.cause
+  if (meta?.trigger) {
+    row.trigger_meta = meta.trigger
+    if (meta.trigger.actor) row.actor = meta.trigger.actor
+    if (meta.trigger.trace_id) row.trace_id = meta.trigger.trace_id
+  }
+  if (meta?.machineLabel) row.machine_label = meta.machineLabel
+  await db.from("machine_events").insert(row)
+}
+
+// Autoria de uma ação do painel: quem clicou (sessão) — ou "panel" quando a
+// ação roda numa rota server-to-server sem sessão (ex.: /api/keys chamada
+// pelo app do cliente). Não redireciona: ver currentAdminEmail.
+async function adminTrigger(cause: string, extra?: Partial<TriggerEnvelope>): Promise<EventMeta> {
+  const email = await currentAdminEmail()
+  return {
+    cause,
+    trigger: {
+      actor: email ? "admin" : "panel",
+      cause,
+      ...(email ? { admin_email: email } : {}),
+      ...extra,
+    },
+  }
+}
+
+// Envelope vindo do gateway (rotas /api/machines/*): já traz actor e cause;
+// sem envelope (gateway antigo) cai na autoria do painel com uma causa
+// genérica, pra nunca fingir que sabe o que não sabe.
+async function metaFromGateway(
+  trigger: TriggerEnvelope | null | undefined,
+  fallbackCause: string
+): Promise<EventMeta> {
+  if (trigger) return { cause: trigger.cause ?? fallbackCause, trigger }
+  return adminTrigger(fallbackCause)
 }
 
 // Plano/tier do template: Go, Pro, Max ou Enterprise.
@@ -551,6 +597,8 @@ async function provisionMachine(input: {
   // Só o botão administrativo de nova máquina aceita template de teste.
   // Todos os caminhos autônomos passam true e são barrados.
   automatic?: boolean
+  // Por que/quem está criando (migration 0070). Ausente = clique manual.
+  meta?: EventMeta
 }): Promise<{ machineId: string } | { error: string }> {
   const db = createSupabaseAdmin()
   const { name, templateId, gpuTypeId } = input
@@ -644,7 +692,11 @@ async function provisionMachine(input: {
 
   await startFreshPodIfNeeded(pod, machine.id)
 
-  await logEvent(machine.id, "created", `Máquina "${name}" criada (${gpu?.displayName ?? gpuTypeId})`)
+  const meta = input.meta ?? (await adminTrigger("provision.panel.manual"))
+  await logEvent(machine.id, "created", `Máquina "${name}" criada (${gpu?.displayName ?? gpuTypeId})`, {
+    ...meta,
+    machineLabel: name,
+  })
   revalidatePath("/machines")
   return { machineId: machine.id }
 }
@@ -669,6 +721,10 @@ export async function provisionMachineForPlan(input: {
   plan: TemplatePlan
   category?: ProductCategory
   templateId?: string | null
+  // Originador, vindo do gateway (trigger_ctx.snapshot) já filtrado pela
+  // rota. Carimba o `created` que ESTA função grava — assim a causa
+  // sobrevive mesmo que o gateway morra antes do log dele.
+  trigger?: TriggerEnvelope | null
 }): Promise<
   | { machineId: string; name: string; publicUrl: string | null }
   | { error: string }
@@ -743,6 +799,7 @@ export async function provisionMachineForPlan(input: {
       templateId: tpl.id,
       gpuTypeId,
       automatic: true,
+      meta: await metaFromGateway(input.trigger, "provision.gateway.unknown"),
     })
     if (!("error" in prov)) {
       const { data: m } = await db
@@ -864,7 +921,10 @@ export async function stopMachine(
     .update({ status: "stopped" })
     .eq("id", machineId)
   if (stopErr) return { error: `Pod pausado, mas falhou ao gravar o status: ${stopErr.message}` }
-  await logEvent(machineId, "stopped", `Máquina "${m.name}" pausada`)
+  await logEvent(machineId, "stopped", `Máquina "${m.name}" pausada`, {
+    ...(await adminTrigger("stop.panel.manual")),
+    machineLabel: m.name,
+  })
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
 }
@@ -900,7 +960,10 @@ export async function startMachine(
     .update({ status: "creating", last_activity_at: new Date().toISOString() })
     .eq("id", machineId)
   if (startErr) return { error: `Pod iniciado, mas falhou ao gravar o status: ${startErr.message}` }
-  await logEvent(machineId, "started", `Máquina "${m.name}" iniciada`)
+  await logEvent(machineId, "started", `Máquina "${m.name}" iniciada`, {
+    ...(await adminTrigger("start.panel.manual")),
+    machineLabel: m.name,
+  })
   // O pod religa com o agent zerado (chaves só em memória). O gateway espera o
   // vLLM subir e reenvia.
   after(() =>
@@ -918,11 +981,19 @@ export async function startMachine(
 // Caminho de recuperação para quando o host do pod pausado ficou sem GPU.
 export async function recreateMachine(
   machineId: string,
-  automatic = false
+  automatic = false,
+  // originador vindo do gateway (rota /recreate); ausente = botão do painel
+  trigger?: TriggerEnvelope | null
 ): Promise<{ error: string } | void> {
   const db = createSupabaseAdmin()
   const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
   if (!m) return { error: "Máquina não encontrada" }
+  const meta: EventMeta = {
+    ...(automatic
+      ? await metaFromGateway(trigger, "recreate.gateway.unknown")
+      : await adminTrigger("recreate.panel.manual")),
+    machineLabel: m.name,
+  }
   if (!m.template_id) {
     return { error: "Máquina sem template associado — crie uma máquina nova" }
   }
@@ -996,7 +1067,7 @@ export async function recreateMachine(
       .from("machines")
       .update({ status: "error", runpod_pod_id: null })
       .eq("id", machineId)
-    await logEvent(machineId, "error", `Recriação da máquina "${m.name}" falhou: ${msg}`)
+    await logEvent(machineId, "error", `Recriação da máquina "${m.name}" falhou: ${msg}`, meta)
     revalidatePath(`/machines/${machineId}`)
     revalidatePath("/machines")
     if (msg.includes("no instances currently available")) {
@@ -1041,7 +1112,8 @@ export async function recreateMachine(
   await logEvent(
     machineId,
     "recreated",
-    `Máquina "${m.name}" recriada em novo host (pod ${pod.id})`
+    `Máquina "${m.name}" recriada em novo host (pod ${pod.id})`,
+    meta
   )
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
@@ -1093,7 +1165,8 @@ export async function terminateMachine(machineId: string) {
     machineId,
     "terminated",
     `Máquina "${m?.name}" apagada` +
-      (releasedCount > 0 ? ` — ${releasedCount} stack(s) liberada(s) para re-alocação` : "")
+      (releasedCount > 0 ? ` — ${releasedCount} stack(s) liberada(s) para re-alocação` : ""),
+    { ...(await adminTrigger("terminate.panel.manual")), machineLabel: m?.name ?? null }
   )
   await flushGatewayKeyCache().catch((e) =>
     console.error("Flush do cache do gateway após apagar máquina falhou:", e)
@@ -1263,7 +1336,9 @@ async function allocateMachineForTemplate(
     "id" | "is_enabled" | "is_test" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
   >,
   excludeMachineId?: string,
-  usageClass: Stack["usage_class"] = "low"
+  usageClass: Stack["usage_class"] = "low",
+  // causa gravada se a cascata chegar a CRIAR máquina (migration 0070)
+  cause = "provision.panel.stack_create"
 ): Promise<{ machineId: string; created: boolean }> {
   const blocked = userAllocationBlockedReason(tpl)
   if (blocked) throw new Error(blocked)
@@ -1336,6 +1411,7 @@ async function allocateMachineForTemplate(
       templateId: tpl.id,
       gpuTypeId,
       automatic: true,
+      meta: await adminTrigger(cause),
     })
     if (!("error" in prov)) return { machineId: prov.machineId, created: true }
     lastError = prov.error
@@ -1710,7 +1786,8 @@ export async function migrateStack(input: {
   } else {
     try {
       const alloc = await allocateMachineForTemplate(
-        db, targetTemplate, fromMachineId ?? undefined, usageClass
+        db, targetTemplate, fromMachineId ?? undefined, usageClass,
+        "provision.stack_migration"
       )
       targetMachineId = alloc.machineId
       machineCreated = alloc.created
@@ -1798,7 +1875,13 @@ export async function migrateStack(input: {
   await logEvent(
     targetMachineId,
     "stack_migrated",
-    `Stack ${stack.slug} migrada para esta máquina`
+    `Stack ${stack.slug} migrada para esta máquina`,
+    await adminTrigger("stack.migrated_manual", {
+      stack_id: stack.id,
+      stack_slug: stack.slug,
+      account_id: stack.account_id,
+      ...(fromMachineId ? { reason: `origem ${fromMachineId}` } : {}),
+    })
   )
 
   revalidatePath("/stacks")
@@ -1956,7 +2039,16 @@ export async function createKey(input: {
   })
   if (error) throw new Error(error.message)
 
-  await logEvent(input.machineId, "key_created", `Nova chave criada (${keyPrefix(plainKey)}…)`)
+  await logEvent(
+    input.machineId,
+    "key_created",
+    `Nova chave criada (${keyPrefix(plainKey)}…)`,
+    await adminTrigger("key.created", {
+      key_prefix: keyPrefix(plainKey),
+      account_id: input.accountId,
+      ...(input.stackId ? { stack_id: input.stackId } : {}),
+    })
+  )
   // Chave pode ter sido criada logo após provisionar a máquina (createStack) —
   // o agent do pod ainda pode não estar de pé pra receber um sync direto do
   // painel (mesma race de startMachine, ver scheduleGatewayKeySync acima).
@@ -2072,7 +2164,17 @@ export async function revokeKey(keyId: string) {
     .select()
     .single<ApiKey>()
   if (key) {
-    await logEvent(key.machine_id, "key_revoked", `Chave ${key.key_prefix}… revogada`)
+    await logEvent(
+      key.machine_id,
+      "key_revoked",
+      `Chave ${key.key_prefix}… revogada`,
+      await adminTrigger("key.revoked", {
+        key_prefix: key.key_prefix,
+        api_key_id: key.id,
+        account_id: key.account_id,
+        ...(key.stack_id ? { stack_id: key.stack_id } : {}),
+      })
+    )
     // Chave sem pin (stack ainda não homeada) não está em pod nenhum: não há
     // agent pra sincronizar nem página de máquina pra revalidar. O flush do
     // cache do gateway segue incondicional — é ele que de fato tira a chave

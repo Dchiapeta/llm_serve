@@ -116,6 +116,8 @@ from reasoning_filter import (
 from stream_watchdog import UpstreamStreamTimeout, aiter_bytes_watchdog
 from supa import SupaClient
 from generation_trace import request_trace_id, trace_decision
+import decisions
+from trigger_ctx import set_request_trigger, snapshot as trigger_snapshot
 from rag_policy import is_isolated_greeting, resolve_rag_policy
 from thinking_policy import (
     ThinkingPolicyError, apply_thinking_policy, resolve_thinking_policy,
@@ -798,6 +800,7 @@ async def lifespan(app: FastAPI):
     image_retention_task = asyncio.create_task(
         image_retention.image_retention_loop(supa, IMAGE_RETENTION_INTERVAL_S)
     )
+    decisions_task = asyncio.create_task(decisions.decisions_retention_loop(supa))
     yield
     reaper_task.cancel()
     machine_task.cancel()
@@ -806,6 +809,7 @@ async def lifespan(app: FastAPI):
     usage_class_task.cancel()
     billing_task.cancel()
     image_retention_task.cancel()
+    decisions_task.cancel()
     await proxy_client.aclose()
     await document_client.aclose()
     await openai_client.aclose()
@@ -1194,6 +1198,17 @@ async def authenticate(
     # Este guard também vale para a chave interna de Playground: diagnóstico
     # não transforma um pod de difusão em vLLM.
     product_stack, _product_plan = resolve_key_stack(entry)
+    # Originador da request pro rastreamento de causa (trigger_ctx.py,
+    # migration 0070): ANTES dos 402/403 abaixo de propósito — uma request
+    # barrada por billing ou política de CLI também deixa rastro. Lido lá no
+    # fundo da cascata (provisionamento/wake/503), sem passar parâmetro.
+    set_request_trigger(
+        entry,
+        plan=_product_plan,
+        category=(product_stack or {}).get("category") or LLM_CATEGORY,
+        path=path,
+        user_agent=headers.get("user-agent") if headers is not None else None,
+    )
     if (
         product_stack
         and (product_stack.get("category") or LLM_CATEGORY) == IMAGE_CATEGORY
@@ -1663,6 +1678,13 @@ async def relocate_stack_for_balance(stack: dict, reason: str) -> dict | None:
             target["id"], "stack_migrated",
             f"Stack {fresh.get('slug') or stack['id']} realocada por balanceamento "
             f"de carga ({reason})",
+            cause="stack.rebalanced",
+            trigger=trigger_snapshot(
+                "stack.rebalanced", plan=plan, category=category,
+                stack_id=stack["id"], stack_slug=fresh.get("slug"),
+                account_id=fresh.get("account_id"), reason=reason,
+            ),
+            machine_label=target.get("name"),
         )
     except Exception:
         pass  # histórico é best-effort, nunca desfaz um movimento já concluído
@@ -1727,12 +1749,20 @@ async def rebalance_high_caps_once(retry_budget: int = HIGH_CAP_MAX_RETRIES) -> 
                         f"rebalanceamento de uso alto: {reason}",
                         pause_when_healthy=False,
                         category=category,
+                        cause="provision.rebalance.high_caps",
                     )
                 retry_needed = True
                 try:
                     await supa.log_machine_event(
                         machine["id"], "rebalance_pending",
                         f"Stack de uso alto aguardando máquina com vaga ({reason})",
+                        cause="stack.rebalance_pending",
+                        trigger=trigger_snapshot(
+                            "stack.rebalance_pending", plan=plan, category=category,
+                            stack_id=stack.get("id"), stack_slug=stack.get("slug"),
+                            reason=reason,
+                        ),
+                        machine_label=machine.get("name"),
                     )
                 except Exception:
                     pass
@@ -2017,7 +2047,7 @@ async def auto_provision_enabled() -> bool:
     return value
 
 
-async def wake_machine(machine: dict, reason: str) -> str:
+async def wake_machine(machine: dict, reason: str, *, cause: str) -> str:
     """Religa um pod pausado (startPod) e o devolve ao pool de roteamento.
 
     Retorna: 'woke' = startPod disparado agora; 'cooldown' = tentativa recente
@@ -2027,8 +2057,19 @@ async def wake_machine(machine: dict, reason: str) -> str:
 
     O touch de atividade vem ANTES do flip para running: sem ele, o
     last_activity_at velho faria a auto-pausa parar a máquina de novo no
-    próximo ciclo, enquanto o vLLM ainda carrega o modelo."""
+    próximo ciclo, enquanto o vLLM ainda carrega o modelo.
+
+    `cause`: por qual ramo da cascata chegamos aqui (trigger_ctx.py). Cada
+    saída vira linha em provision_decisions; 'woke' carimba o `started`."""
+    trig = trigger_snapshot(
+        cause, machine_id=machine["id"], machine_name=machine.get("name"), reason=reason,
+    )
+
+    def _denied(why: str) -> None:
+        _record_decision(decisions.OUTCOME_DENIED, f"wake_denied.{why}", trig)
+
     if runpod_client is None or not machine.get("runpod_pod_id"):
+        _denied("failed")
         return "failed"
     now = time.time()
     if now - last_wake_attempt.get(machine["id"], 0) < WAKE_COOLDOWN_S:
@@ -2038,7 +2079,9 @@ async def wake_machine(machine: dict, reason: str) -> str:
         # saber que não há nada subindo — senão devolve waking_503 mentiroso e
         # nunca cai no fallback/provisionamento.
         if last_wake_outcome.get(machine["id"]) == "woke":
+            _denied("cooldown")
             return "cooldown"
+        _denied("failed")
         return "failed"
     # marca a tentativa antes do primeiro await — atômico dentro do event loop
     last_wake_attempt[machine["id"]] = now
@@ -2058,10 +2101,13 @@ async def wake_machine(machine: dict, reason: str) -> str:
             logger.warning(
                 "auto-wake: %s sem GPU no host, requer recriação (%s)", machine["id"], e
             )
+            _denied("no_gpu")
             return "no_gpu"
         logger.warning("auto-wake: startPod de %s falhou (%s)", machine["id"], e)
+        _denied("failed")
         return "failed"
     last_wake_outcome[machine["id"]] = "woke"
+    _record_decision(decisions.OUTCOME_GRANTED, cause, trig)
     try:
         await supa.touch_machine_activity(machine["id"])
     except Exception:
@@ -2079,7 +2125,10 @@ async def wake_machine(machine: dict, reason: str) -> str:
     _forget_machine_upserts(machine["id"])
     schedule_key_sync(machine["id"])
     try:
-        await supa.log_machine_event(machine["id"], "started", f"Auto-wake: {reason}")
+        await supa.log_machine_event(
+            machine["id"], "started", f"Auto-wake: {reason}",
+            cause=cause, trigger=trig, machine_label=machine.get("name"),
+        )
     except Exception:
         pass
     logger.info(
@@ -2129,11 +2178,17 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
         if lock_active(recreating_in_progress, m["id"], RECREATE_LOCK_TTL_S):
             recreating = True
             continue
-        outcome = await wake_machine(m, "requisição recebida sem máquina disponível")
+        outcome = await wake_machine(
+            m, "requisição recebida sem máquina disponível",
+            cause="wake.request.no_machine_available",
+        )
         if outcome == "woke":
             return "woke"
         if outcome == "no_gpu":
-            if await try_recreate_machine(m, "host sem GPU pra religar sob demanda"):
+            if await try_recreate_machine(
+                m, "host sem GPU pra religar sob demanda",
+                cause="recreate.request.no_gpu_on_wake",
+            ):
                 recreating = True
         elif outcome == "cooldown":
             # tentativa recente BEM-SUCEDIDA (wake_machine só devolve
@@ -2146,7 +2201,25 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
     return "waking" if waking else "none"
 
 
+# As seis fábricas de 503 pré-rota são chamadas no exato momento do `raise`,
+# em todos os call sites — por isso a decisão "servi 503 sem criar nada" é
+# gravada AQUI (provision_decisions, migration 0070) e não neles. Esses 503
+# nunca chegam a gateway_requests (falham antes de existir machine_id/
+# flight_key), e até a 0070 a única pista era o corpo que o cliente recebeu.
+def _record_decision(outcome: str, cause: str, trigger: dict) -> None:
+    """provision_decisions, fire-and-forget. `supa` só existe depois do
+    lifespan — em teste que importa main sem subir o app, não grava."""
+    client = globals().get("supa")
+    if client is not None:
+        decisions.record_bg(client, outcome, cause, trigger)
+
+
+def _served_503(cause: str, **extra) -> None:
+    _record_decision(decisions.OUTCOME_SERVED_503, cause, trigger_snapshot(cause, **extra))
+
+
 def waking_503() -> HTTPException:
+    _served_503("denied_503.waking")
     return HTTPException(
         status_code=503,
         detail="Sua máquina está sendo iniciada e ficará pronta em instantes. "
@@ -2156,6 +2229,7 @@ def waking_503() -> HTTPException:
 
 
 def provisioning_503() -> HTTPException:
+    _served_503("denied_503.provisioning")
     return HTTPException(
         status_code=503,
         detail="Estamos preparando uma máquina nova para você — ficará pronta em "
@@ -2165,6 +2239,7 @@ def provisioning_503() -> HTTPException:
 
 
 def recreating_503() -> HTTPException:
+    _served_503("denied_503.recreating")
     return HTTPException(
         status_code=503,
         detail="Estamos recriando sua máquina e ela ficará pronta em instantes. "
@@ -2174,6 +2249,7 @@ def recreating_503() -> HTTPException:
 
 
 def preparing_503() -> HTTPException:
+    _served_503("denied_503.preparing")
     return HTTPException(
         status_code=503,
         detail="Estamos preparando sua máquina — ela ficará disponível em instantes. "
@@ -2183,6 +2259,7 @@ def preparing_503() -> HTTPException:
 
 
 def agent_starting_503() -> HTTPException:
+    _served_503("denied_503.agent_starting")
     return HTTPException(
         status_code=503,
         detail="O serviço está iniciando e ficará pronto em instantes. "
@@ -2195,10 +2272,9 @@ def capacity_503(plan: str, reason: str) -> HTTPException:
     """Sem vaga em nenhuma máquina do plano (todas cheias, ou nenhuma no ar) e
     nada a religar/provisionar. Ao contrário de waking/provisioning/recreating,
     aqui não há infraestrutura subindo — é volume de requests concorrentes
-    excedendo a capacidade contratada. Logamos explicitamente porque esse 503
-    nunca chega a gateway_requests (pick_machine_with_free_slot falha antes de
-    existir machine_id/flight_key pra logar) — sem esta linha, a única pista
-    fica no corpo da resposta que o cliente recebeu."""
+    excedendo a capacidade contratada. O warning fica pelo alerta operacional;
+    a trilha por chave/stack está em provision_decisions (_served_503)."""
+    _served_503("denied_503.capacity", plan=plan, reason=reason)
     logger.warning(
         "capacidade: 503 no plano %s (%s) — provável excesso de requests "
         "concorrentes; sem máquina livre e nada a religar/provisionar",
@@ -2214,19 +2290,27 @@ def capacity_503(plan: str, reason: str) -> HTTPException:
 
 
 async def provision_machine_for_plan(
-    plan: str, category: str = LLM_CATEGORY
+    plan: str, category: str = LLM_CATEGORY, trigger: dict | None = None
 ) -> dict | None:
     """POST {PANEL_URL}/api/machines/provision — pede ao painel Next.js pra
     criar uma máquina nova do plano (o gateway nunca fala com a API de
     criação da RunPod diretamente, ver comentário das env vars no topo).
     None em qualquer falha (painel desligado/fora do ar, timeout, painel
-    recusou) — o chamador decide o fallback, nunca propaga exceção."""
+    recusou) — o chamador decide o fallback, nunca propaga exceção.
+
+    `trigger` (trigger_ctx.snapshot) vai no corpo: o painel carimba o evento
+    `created` que ele mesmo grava ao inserir em machines — assim o originador
+    sobrevive mesmo que este processo morra entre a resposta HTTP e o
+    log_machine_event do _provision_and_track. Painel antigo ignora o campo."""
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
         return None
+    body: dict = {"plan": plan, "category": category}
+    if trigger:
+        body["trigger"] = trigger
     try:
         r = await panel_client.post(
             f"{PANEL_URL}/api/machines/provision",
-            json={"plan": plan, "category": category},
+            json=body,
             headers={"X-Admin-Secret": PANEL_ADMIN_SECRET},
         )
     except httpx.HTTPError as e:
@@ -2244,17 +2328,22 @@ async def provision_machine_for_plan(
     return r.json()
 
 
-async def recreate_machine_via_panel(machine_id: str) -> dict | None:
+async def recreate_machine_via_panel(
+    machine_id: str, trigger: dict | None = None
+) -> dict | None:
     """POST {PANEL_URL}/api/machines/{id}/recreate — pede ao painel pra recriar
     o pod num host novo (delete + create + start), mantendo a MESMA row de
     machines (stacks/chaves seguem apontando pra ela). Usado quando o auto-wake
     falhou por 'not enough free GPUs'. None em qualquer falha (painel desligado/
-    fora do ar, timeout, recusa) — o chamador decide o fallback."""
+    fora do ar, timeout, recusa) — o chamador decide o fallback.
+    `trigger`: mesmo papel do provision_machine_for_plan (carimba o `recreated`
+    que o painel grava)."""
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
         return None
     try:
         r = await panel_client.post(
             f"{PANEL_URL}/api/machines/{machine_id}/recreate",
+            json={"trigger": trigger} if trigger else None,
             headers={"X-Admin-Secret": PANEL_ADMIN_SECRET},
         )
     except httpx.HTTPError as e:
@@ -2268,13 +2357,16 @@ async def recreate_machine_via_panel(machine_id: str) -> dict | None:
     return r.json()
 
 
-async def _recreate_and_track(machine_id: str, reason: str) -> None:
+async def _recreate_and_track(machine_id: str, reason: str, trigger: dict) -> None:
     """Task de background: recria o pod e libera a trava ao fim. O request que
     disparou já respondeu 503 + Retry-After; o cliente reconverge quando o pod
-    novo sobe (a reconciliação do gateway reenvia as chaves ao ficar running)."""
+    novo sobe (a reconciliação do gateway reenvia as chaves ao ficar running).
+    `trigger` é o snapshot do originador (passado por parâmetro, não lido do
+    ContextVar — ver trigger_ctx.py sobre a cópia rasa)."""
     try:
-        result = await recreate_machine_via_panel(machine_id)
+        result = await recreate_machine_via_panel(machine_id, trigger)
         if result is None:
+            _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.panel_error", trigger)
             logger.warning(
                 "recriação de %s não completou (%s) — fica na fila pro lifecycle retentar",
                 machine_id, reason,
@@ -2286,7 +2378,9 @@ async def _recreate_and_track(machine_id: str, reason: str) -> None:
         recreating_in_progress.pop(machine_id, None)
 
 
-async def try_recreate_machine(machine: dict, reason: str) -> bool:
+async def try_recreate_machine(
+    machine: dict, reason: str, *, cause: str | None = None
+) -> bool:
     """Dispara a recriação em background se o painel estiver configurado, não
     houver uma recriação em andamento pra essa máquina e o cooldown já tiver
     passado. Retorna True se há recriação encaminhada (disparada agora, já em
@@ -2299,27 +2393,38 @@ async def try_recreate_machine(machine: dict, reason: str) -> bool:
     o processo cair antes de concluir), o lifecycle loop retenta. A entrada só
     sai da fila quando uma recriação conclui com sucesso."""
     machine_id = machine["id"]
+    # cause=None é o retry do lifecycle (process_pending_recreates_once), que
+    # chama com a assinatura antiga (machine, reason)
+    cause = cause or "recreate.lifecycle.pending_retry"
+    trig = trigger_snapshot(
+        cause, machine_id=machine_id, machine_name=machine.get("name"), reason=reason,
+    )
     if not template_allows_automatic_creation(machine):
         pending_recreates.discard(machine_id)
+        _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.template_blocked", trig)
         logger.info(
             "recriação automática de %s ignorada: template desabilitado ou de teste",
             machine_id,
         )
         return False
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
+        _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.panel_unconfigured", trig)
         return False
     pending_recreates.add(machine_id)
     if lock_active(recreating_in_progress, machine_id, RECREATE_LOCK_TTL_S):
+        _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.lock_active", trig)
         return True
     now = time.time()
     if now - last_recreate_attempt.get(machine_id, 0) < RECREATE_COOLDOWN_S:
         # recriação recente já disparada — o pod novo está subindo
+        _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.cooldown", trig)
         return True
     # checagem + marcação sem await no meio (atômicas dentro do event loop,
-    # mesma disciplina do provisioning_in_progress)
+    # mesma disciplina do provisioning_in_progress); record_bg é síncrona
     last_recreate_attempt[machine_id] = now
     recreating_in_progress[machine_id] = now
-    spawn_tracked(_recreate_and_track(machine_id, reason))
+    _record_decision(decisions.OUTCOME_GRANTED, cause, trig)
+    spawn_tracked(_recreate_and_track(machine_id, reason, trig))
     return True
 
 
@@ -2389,17 +2494,23 @@ async def _sync_keys_when_healthy(machine_id: str) -> None:
 
 
 async def _provision_and_track(
-    plan: str, category: str, reason: str, pause_when_healthy: bool
+    plan: str, category: str, reason: str, pause_when_healthy: bool, trigger: dict
 ) -> None:
     """Task de background: cria -> espera saudável -> opcionalmente pausa
-    (reposição proativa) — nunca deixa exceção escapar (fire-and-forget)."""
+    (reposição proativa) — nunca deixa exceção escapar (fire-and-forget).
+    `trigger` é o snapshot do originador, passado por parâmetro de propósito
+    (a cópia do ContextVar pra task é rasa — ver trigger_ctx.py)."""
     try:
-        machine = await provision_machine_for_plan(plan, category)
+        machine = await provision_machine_for_plan(plan, category, trigger)
         if not machine:
+            _record_decision(decisions.OUTCOME_DENIED, "provision_denied.panel_error", trigger)
             return
         try:
             await supa.log_machine_event(
-                machine["machine_id"], "created", f"Provisionamento automático: {reason}"
+                machine["machine_id"], "created",
+                f"Provisionamento automático: {reason}",
+                cause=trigger.get("cause"), trigger=trigger,
+                machine_label=machine.get("name"),
             )
         except Exception:
             pass
@@ -2415,6 +2526,8 @@ async def _provision_and_track(
                     await supa.log_machine_event(
                         machine["machine_id"], "stopped",
                         "Reposição proativa: pausada assim que ficou saudável",
+                        cause="stop.provision.pause_when_healthy", trigger=trigger,
+                        machine_label=machine.get("name"),
                     )
                 except Exception as e:
                     logger.warning(
@@ -2432,6 +2545,7 @@ async def _provision_and_track(
 async def _try_provision_machine_for_plan(
     plan: str, reason: str, pause_when_healthy: bool,
     category: str = LLM_CATEGORY, ignore_switch: bool = False,
+    *, cause: str,
 ) -> bool:
     """Dispara a criação em background se o interruptor estiver ligado (ou
     `ignore_switch`), o painel estiver configurado, não houver uma criação em
@@ -2449,31 +2563,45 @@ async def _try_provision_machine_for_plan(
     cliente veria um 503 "preparando" eterno sem nada subindo. O interruptor
     continua sendo a trava de custo do provisionamento PROATIVO (pool de
     reserva, rebalance), que ninguém está esperando. Cooldown e lock por
-    plano valem em todos os casos."""
-    if not ignore_switch and not await auto_provision_enabled():
-        return False
-    if not PANEL_URL or not PANEL_ADMIN_SECRET:
+    plano valem em todos os casos.
+
+    `cause` (vocabulário de trigger_ctx.py) diz por qual ramo da cascata
+    chegamos aqui; toda saída — criar ou negar — vira linha em
+    provision_decisions (migration 0070), e a criação carimba o evento
+    `created`. As 4 negações vivem em decisions.provision_gate, puro e
+    testável sem fastapi; aqui só a leitura do estado e a marcação da trava."""
+    trig = trigger_snapshot(cause, plan=plan, category=category, reason=reason)
+    # único await da função, ANTES do gate: o interruptor vem do Supabase
+    switch_on = ignore_switch or await auto_provision_enabled()
+    pool_key = product_pool_key(plan, category)
+    now = time.time()
+    denied = decisions.provision_gate(
+        switch_on=switch_on,
         # sem painel configurado, provision_machine_for_plan sempre devolve
         # None — sem essa checagem aqui, o chamador levantaria um
         # provisioning_503() mentiroso (promete retry, mas nunca vai criar)
-        return False
-    pool_key = product_pool_key(plan, category)
-    if lock_active(provisioning_in_progress, pool_key, PROVISION_LOCK_TTL_S):
-        return False
-    now = time.time()
-    if now - last_provision_attempt.get(pool_key, 0) < PROVISION_COOLDOWN_S:
+        panel_configured=bool(PANEL_URL and PANEL_ADMIN_SECRET),
+        lock_active=lock_active(provisioning_in_progress, pool_key, PROVISION_LOCK_TTL_S),
+        last_attempt=last_provision_attempt.get(pool_key, 0),
+        now=now,
+        cooldown_s=PROVISION_COOLDOWN_S,
+        ignore_switch=ignore_switch,
+    )
+    if denied:
+        _record_decision(decisions.OUTCOME_DENIED, denied, trig)
         return False
     # daqui pra baixo não há mais nenhum await antes de marcar a trava —
     # checagem + marcação são atômicas dentro do event loop (mesmo cuidado
-    # do wake_machine existente)
+    # do wake_machine existente). record_bg é síncrona de propósito.
     last_provision_attempt[pool_key] = now
     provisioning_in_progress[pool_key] = now
-    spawn_tracked(_provision_and_track(plan, category, reason, pause_when_healthy))
+    _record_decision(decisions.OUTCOME_GRANTED, cause, trig)
+    spawn_tracked(_provision_and_track(plan, category, reason, pause_when_healthy, trig))
     return True
 
 
 async def try_provision_for_request(
-    plan: str, reason: str, category: str = LLM_CATEGORY
+    plan: str, reason: str, category: str = LLM_CATEGORY, *, cause: str
 ) -> bool:
     """Cascata reativa (3º nível): não pausa ao ficar saudável — o próprio
     request que disparou precisa da máquina de pé pro retry. Ignora o
@@ -2481,7 +2609,7 @@ async def try_provision_for_request(
     _try_provision_machine_for_plan): há um cliente pagante esperando."""
     return await _try_provision_machine_for_plan(
         plan, reason, pause_when_healthy=False, category=category,
-        ignore_switch=True,
+        ignore_switch=True, cause=cause,
     )
 
 
@@ -2489,9 +2617,12 @@ async def try_provision_for_pool(
     plan: str, reason: str, category: str = LLM_CATEGORY
 ) -> bool:
     """Reposição proativa: pausa ao ficar saudável — ninguém está esperando,
-    minimiza custo de GPU ociosa."""
+    minimiza custo de GPU ociosa. Assinatura sem `cause` de propósito: é o
+    callable injetado no LifecycleManager (e nos fakes de
+    test_lifecycle_capacity.py), e só existe um motivo pra chamá-la."""
     return await _try_provision_machine_for_plan(
-        plan, reason, pause_when_healthy=True, category=category
+        plan, reason, pause_when_healthy=True, category=category,
+        cause="provision.pool.refill",
     )
 
 
@@ -2512,7 +2643,8 @@ async def pick_machine_with_free_slot(plan: str, category: str = LLM_CATEGORY) -
     if lock_active(
         provisioning_in_progress, product_pool_key(plan, category), PROVISION_LOCK_TTL_S
     ) or await try_provision_for_request(
-        plan, "sem máquina com vaga nem pausada", category
+        plan, "sem máquina com vaga nem pausada", category,
+        cause="provision.request.no_free_slot",
     ):
         raise provisioning_503()
     if not machines:
@@ -2828,6 +2960,12 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
                 target["id"], "stack_migrated",
                 f"Stack {stack.get('slug') or stack['id']} realocada automaticamente "
                 f"({old_machine.get('name') or 'origem'} {reason})",
+                cause="stack.reallocated",
+                trigger=trigger_snapshot(
+                    "stack.reallocated",
+                    reason=f"origem {old_machine.get('name') or old_machine['id']} {reason}",
+                ),
+                machine_label=target.get("name"),
             )
         except Exception:
             pass  # histórico é best-effort, nunca derruba o request
@@ -2884,6 +3022,8 @@ async def place_base_stack(entry: dict, stack: dict) -> dict | None:
         await supa.log_machine_event(
             target["id"], "stack_placed",
             f"Stack {stack.get('slug') or stack['id']} re-alocada após ociosidade",
+            cause="stack.placed", trigger=trigger_snapshot("stack.placed"),
+            machine_label=target.get("name"),
         )
     except Exception:
         pass  # histórico é best-effort, nunca derruba o request
@@ -2938,7 +3078,8 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
                         # curso — o pod novo está subindo
                         raise recreating_503()
                     outcome = await wake_machine(
-                        machine, f"stack {slug}: máquina pausada e sem vaga nas demais"
+                        machine, f"stack {slug}: máquina pausada e sem vaga nas demais",
+                        cause="wake.request.stack_home_paused",
                     )
                     if outcome in ("woke", "cooldown"):
                         # 'cooldown' = request concorrente já disparou o wake e o
@@ -2948,7 +3089,8 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
                     if fresh and fresh.get("status") == "running":
                         raise waking_503()
                     if outcome == "no_gpu" and await try_recreate_machine(
-                        machine, f"stack {slug}: host sem GPU pra religar"
+                        machine, f"stack {slug}: host sem GPU pra religar",
+                        cause="recreate.request.stack_home_no_gpu",
                     ):
                         # host cedeu a GPU do pod pausado → recria num host novo
                         raise recreating_503()
@@ -2976,7 +3118,8 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
             product_pool_key(effective_plan, category),
             PROVISION_LOCK_TTL_S,
         ) or await try_provision_for_request(
-            effective_plan, "sem máquina para o modelo base", category
+            effective_plan, "sem máquina para o modelo base", category,
+            cause="provision.request.no_base_machine",
         ):
             raise provisioning_503()
         # Último recurso: a máquina da stack foi PERDIDA (pod sumiu do RunPod) e
@@ -2994,7 +3137,8 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
         # restaura uma máquina que o usuário já provisionou, na MESMA row de
         # machines (stacks e chaves seguem apontando pra ela).
         if lost_machine is not None and await try_recreate_machine(
-            lost_machine, f"stack {stack.get('slug') or stack['id']}: pod sumiu do RunPod"
+            lost_machine, f"stack {stack.get('slug') or stack['id']}: pod sumiu do RunPod",
+            cause="recreate.request.pod_lost",
         ):
             raise recreating_503()
         raise preparing_503()

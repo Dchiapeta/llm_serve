@@ -378,10 +378,67 @@ export type GatewayRequest = {
   created_at: string
 }
 
+// Quem originou um evento/decisão do ciclo de vida (migration 0070). Valores
+// gravados pelo gateway (docker/gateway/trigger_ctx.py) ou pelo painel
+// (adminTrigger em lib/actions.ts). "request" = chave de cliente; "lifecycle"
+// = cron do gateway; "admin" = clique no painel com sessão; "panel" = rota do
+// painel sem sessão (server-to-server); "gateway" = gateway sem envelope.
+export type TriggerActor = "request" | "lifecycle" | "admin" | "panel" | "gateway"
+
+// Só metadado — a lista de chaves é fechada em lib/machine-events.ts.
+export type TriggerEnvelope = {
+  actor?: TriggerActor | string
+  cause?: string
+  trace_id?: string
+  account_id?: string
+  account_name?: string
+  api_key_id?: string
+  key_prefix?: string
+  stack_id?: string
+  stack_slug?: string
+  plan?: string
+  category?: string
+  purpose?: string
+  path?: string
+  user_agent?: string
+  reason?: string
+  admin_email?: string
+  machine_id?: string
+  machine_name?: string
+}
+
 export type MachineEvent = {
   id: string
   machine_id: string | null
   type: string
   message: string
+  // Estrutura da migration 0070 — NULL em eventos anteriores a ela. `cause`
+  // é o slug fechado (rótulos em components/machines/cause-labels.ts).
+  cause: string | null
+  actor: string | null
+  trigger_meta: TriggerEnvelope | null
+  trace_id: string | null
+  machine_label: string | null
+  created_at: string
+}
+
+// Decisão do gateway sobre criar/religar/recriar (migration 0070): concedida,
+// negada (interruptor, trava, cooldown…) ou 503 servido sem criar nada. É o
+// que responde "por que NÃO subiu" e "quem tomou 503 e sumiu".
+export type ProvisionDecision = {
+  id: string
+  outcome: "granted" | "denied" | "served_503"
+  cause: string
+  actor: string
+  plan: string | null
+  category: string | null
+  machine_id: string | null
+  account_id: string | null
+  stack_id: string | null
+  api_key_id: string | null
+  key_prefix: string | null
+  trace_id: string | null
+  trigger_meta: TriggerEnvelope | null
+  repeat_count: number
   created_at: string
 }

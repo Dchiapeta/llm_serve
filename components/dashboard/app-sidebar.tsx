@@ -9,6 +9,7 @@ import {
   Boxes,
   ChevronsUpDown,
   Cpu,
+  GitBranch,
   Handshake,
   KeyRound,
   Layers,
@@ -70,6 +71,8 @@ const navGroups = [
       { href: "/templates", label: "Produtos", icon: Boxes },
       { href: "/stacks", label: "Stacks", icon: Layers },
       { href: "/requisicoes", label: "Requisições", icon: Activity },
+      // por que o gateway criou/religou/recriou máquina — e por que não
+      { href: "/decisoes", label: "Decisões", icon: GitBranch },
     ],
   },
   {
