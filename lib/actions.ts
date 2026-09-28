@@ -14,6 +14,11 @@ import { type EventMeta } from "./machine-events"
 import { vllmFlagsFromTemplate } from "./machines"
 import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
 import { insertStack } from "./stacks"
+import {
+  getOpenRouterCatalog,
+  openRouterModelKind,
+  type OpenRouterCatalogModel,
+} from "./openrouter"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
 import { CLIENT_WINDOW_DAYS, MAX_KNOWLEDGE_FILE_SIZE_BYTES, PRODUCT_CATEGORIES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type Account, type ApiKey, type LoraAdapter, type Machine, type ProductCategory, type Stack, type StackClient, type Template, type TemplatePlan, type TriggerEnvelope } from "./types"
@@ -807,6 +812,13 @@ export async function provisionMachineForPlan(input: {
 > {
   const db = createSupabaseAdmin()
 
+  // O gateway já nega na origem; esta é a trava do lado do painel, para um
+  // gateway antigo ou uma chamada manual à rota não ligarem GPU com as
+  // máquinas desligadas.
+  if (!(await getMachinesEnabled())) {
+    return { error: "Máquinas desligadas no painel" }
+  }
+
   let tpl: Template | null
   if (input.templateId) {
     const { data } = await db
@@ -1533,7 +1545,7 @@ async function allocateMachineForTemplate(
 // (/api/keys) ou o admin pelo CreateKeyDialog.
 export async function createStack(formData: FormData): Promise<{
   slug: string
-  machineId: string
+  machineId: string | null
   machineCreated: boolean
 }> {
   const db = createSupabaseAdmin()
@@ -1619,9 +1631,12 @@ export async function createStack(formData: FormData): Promise<{
   const stackId = inserted.stackId
   slug = inserted.slug
 
-  let machineId = chosenMachineId
+  let machineId: string | null = chosenMachineId || null
   let machineCreated = false
-  if (!machineId) {
+  // Máquinas desligadas (migration 0071): a stack nasce sem casa, como uma
+  // liberada por ociosidade. O gateway a aloca na primeira request depois que
+  // as máquinas forem religadas (place_base_stack) — alocar aqui ligaria GPU.
+  if (!machineId && (await getMachinesEnabled())) {
     try {
       const alloc = await allocateMachineForTemplate(db, tpl)
       machineId = alloc.machineId
@@ -1632,11 +1647,13 @@ export async function createStack(formData: FormData): Promise<{
     }
   }
 
-  const { error: linkError } = await db
-    .from("stacks")
-    .update({ machine_id: machineId })
-    .eq("id", stackId)
-  if (linkError) throw new Error(linkError.message)
+  if (machineId) {
+    const { error: linkError } = await db
+      .from("stacks")
+      .update({ machine_id: machineId })
+      .eq("id", stackId)
+    if (linkError) throw new Error(linkError.message)
+  }
 
   // A stack nasce sem chave nenhuma. A chave interna de Playground (purpose
   // "playground", migration 0044) deixou de ser criada: o Playground do
@@ -2261,6 +2278,141 @@ export async function setAutoProvisionEnabled(
     }
   }
   revalidatePath("/machines")
+}
+
+// ---------- Interruptores da migration 0071 ----------
+// machines_enabled: máquinas próprias (RunPod). Desligado, o gateway não manda
+// request para máquina e nada liga GPU sozinho (wake, provisionamento,
+// recriação). openrouter_enabled: o repasse ao OpenRouter para os modelos da
+// allowlist (página /modelos). Mesma tabela e mesmo cache do gateway que o
+// auto_provision_enabled.
+
+async function getSystemFlag(key: string, fallback: boolean): Promise<boolean> {
+  const db = createSupabaseAdmin()
+  const { data } = await db
+    .from("system_settings")
+    .select("value")
+    .eq("key", key)
+    .maybeSingle<{ value: boolean }>()
+  return data?.value ?? fallback
+}
+
+async function setSystemFlag(
+  key: string,
+  value: boolean
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const db = createSupabaseAdmin()
+  const { error } = await db
+    .from("system_settings")
+    .upsert({ key, value, updated_at: new Date().toISOString() })
+  if (error) return { error: error.message }
+  after(() => flushGatewaySettings())
+}
+
+// Faz o gateway esquecer os interruptores e a allowlist em cache (best-effort):
+// sem isso a mudança só vale depois do SETTINGS_CACHE_TTL_S dele (30s).
+async function flushGatewaySettings() {
+  const url = process.env.GATEWAY_URL
+  const secret = process.env.GATEWAY_ADMIN_SECRET
+  if (!url || !secret) return // gateway ainda não configurado
+  await fetch(`${url.replace(/\/$/, "")}/admin/flush-settings`, {
+    method: "POST",
+    headers: { "X-Admin-Secret": secret },
+    signal: AbortSignal.timeout(5_000),
+  }).catch((e) =>
+    console.error("Flush dos interruptores no gateway falhou (vale em até 30s):", e)
+  )
+}
+
+// Nasce ligado: é o comportamento de antes da 0071.
+export async function getMachinesEnabled(): Promise<boolean> {
+  return getSystemFlag("machines_enabled", true)
+}
+
+export async function setMachinesEnabled(
+  enabled: boolean
+): Promise<{ error: string } | void> {
+  const result = await setSystemFlag("machines_enabled", enabled)
+  if (result) return result
+  revalidatePath("/machines")
+  revalidatePath("/modelos")
+}
+
+export async function getOpenRouterEnabled(): Promise<boolean> {
+  return getSystemFlag("openrouter_enabled", false)
+}
+
+export async function setOpenRouterEnabled(
+  enabled: boolean
+): Promise<{ error: string } | void> {
+  const result = await setSystemFlag("openrouter_enabled", enabled)
+  if (result) return result
+  revalidatePath("/modelos")
+}
+
+// ---------- Allowlist do OpenRouter (openrouter_models, migration 0071) ----------
+
+export async function createOpenRouterModel(
+  formData: FormData
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const slug = String(formData.get("slug") || "").trim()
+  const label = String(formData.get("label") || "").trim() || null
+  if (!slug) return { error: "Informe o ID do modelo no OpenRouter" }
+
+  // O slug tem que existir no catálogo: um erro de digitação aqui viraria um
+  // 400 do OpenRouter para o cliente, que não tem como saber a causa.
+  let catalog: Map<string, OpenRouterCatalogModel>
+  try {
+    catalog = await getOpenRouterCatalog()
+  } catch (e) {
+    return {
+      error: `Não foi possível consultar o catálogo do OpenRouter: ${e instanceof Error ? e.message : String(e)}`,
+    }
+  }
+  const model = catalog.get(slug)
+  if (!model) return { error: `Modelo "${slug}" não existe no OpenRouter` }
+
+  const db = createSupabaseAdmin()
+  const { error } = await db.from("openrouter_models").insert({
+    slug,
+    kind: openRouterModelKind(model),
+    label: label ?? model.name,
+    enabled: true,
+  })
+  if (error) {
+    if (error.code === "23505") return { error: `"${slug}" já está na lista` }
+    return { error: error.message }
+  }
+  after(() => flushGatewaySettings())
+  revalidatePath("/modelos")
+}
+
+export async function setOpenRouterModelEnabled(
+  id: string,
+  enabled: boolean
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const db = createSupabaseAdmin()
+  const { error } = await db
+    .from("openrouter_models")
+    .update({ enabled, updated_at: new Date().toISOString() })
+    .eq("id", id)
+  if (error) return { error: error.message }
+  after(() => flushGatewaySettings())
+  revalidatePath("/modelos")
+}
+
+export async function deleteOpenRouterModel(
+  id: string
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const db = createSupabaseAdmin()
+  const { error } = await db.from("openrouter_models").delete().eq("id", id)
+  if (error) return { error: error.message }
+  after(() => flushGatewaySettings())
+  revalidatePath("/modelos")
 }
 
 export async function revokeKey(keyId: string) {

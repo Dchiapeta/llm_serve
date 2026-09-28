@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "crypto"
 import { NextRequest, NextResponse } from "next/server"
 
-import { recreateMachine } from "@/lib/actions"
+import { getMachinesEnabled, recreateMachine } from "@/lib/actions"
 import { parseTriggerEnvelope } from "@/lib/machine-events"
 
 function secretsMatch(a: string, b: string): boolean {
@@ -26,6 +26,13 @@ export async function POST(
     !secretsMatch(secret, process.env.PANEL_ADMIN_SECRET)
   ) {
     return NextResponse.json({ error: "admin secret inválido" }, { status: 401 })
+  }
+
+  // Máquinas desligadas (migration 0071): o gateway já nega antes de chamar;
+  // isto cobre um gateway antigo. O botão do painel usa a Server Action, que
+  // continua permitida — recriar à mão é decisão explícita de quem clica.
+  if (!(await getMachinesEnabled())) {
+    return NextResponse.json({ error: "Máquinas desligadas no painel" }, { status: 409 })
   }
 
   const { id } = await params

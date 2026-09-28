@@ -21,6 +21,7 @@ const LABELS: Record<string, string> = {
   "provision_denied.lock_active": "Negado: já há uma criação em andamento",
   "provision_denied.cooldown": "Negado: tentativa recente (cooldown)",
   "provision_denied.panel_error": "Negado: o painel recusou ou falhou",
+  "provision_denied.machines_disabled": "Negado: máquinas desligadas no painel",
   // decisões gravadas pelo próprio painel (recordDecision em lib/actions.ts)
   "provision_denied.runpod_error": "Negado: o RunPod recusou criar o pod",
   "provision_denied.validation": "Negado: teto de usuários acima da GPU",
@@ -31,6 +32,7 @@ const LABELS: Record<string, string> = {
   "wake_denied.cooldown": "Wake negado: tentativa recente (cooldown)",
   "wake_denied.no_gpu": "Wake negado: host sem GPU livre",
   "wake_denied.failed": "Wake negado: falha no startPod",
+  "wake_denied.machines_disabled": "Wake negado: máquinas desligadas no painel",
   // recriação
   "recreate.request.no_gpu_on_wake": "Recriada: host sem GPU ao religar",
   "recreate.request.stack_home_no_gpu": "Recriada: host da stack sem GPU",
@@ -45,6 +47,7 @@ const LABELS: Record<string, string> = {
   "recreate_denied.template_blocked": "Recriação negada: template de teste/desabilitado",
   "recreate_denied.runpod_error": "Recriação negada: o RunPod recusou",
   "recreate_denied.validation": "Recriação negada: teto de usuários acima da GPU",
+  "recreate_denied.machines_disabled": "Recriação negada: máquinas desligadas no painel",
   // parada / partida
   "stop.provision.pause_when_healthy": "Pausada ao ficar saudável (reserva do pool)",
   "stop.lifecycle.idle": "Auto-pausa por ociosidade",

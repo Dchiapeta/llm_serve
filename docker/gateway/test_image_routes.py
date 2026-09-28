@@ -16,8 +16,9 @@ que o desenho da persistência existe para evitar:
     ficou guardada.
 
 O authenticate/resolve_route reais ficam de fora (dependem de Supabase e de
-estado de máquina): _authorize_image_request é substituído por um duplo que faz
-o que o real faz de relevante aqui — devolver a rota e reservar o in_flight.
+estado de máquina): _authorize_image_key e _reserve_image_machine são
+substituídos por duplos que fazem o que os reais fazem de relevante aqui —
+devolver a chave, a rota e reservar o in_flight.
 """
 
 import base64
@@ -112,14 +113,18 @@ def ctx(monkeypatch):
     )
 
     async def fake_authorize(authorization, request, path):
-        flight_key = (STACK_ID, MACHINE["id"])
-        main.in_flight[flight_key] += 1
         # `state["entry"]` e não ENTRY: os testes de prompt configurado trocam a
         # chave em voo. O default é a chave sem prompt nenhum, que é o que todo
         # o resto do arquivo assume.
-        return state["entry"], "acc-1", MACHINE, STACK_ID, "Go"
+        return state["entry"], "acc-1", main.resolve_key_stack(state["entry"])[0], "Go"
 
-    monkeypatch.setattr(main, "_authorize_image_request", fake_authorize)
+    async def fake_reserve(entry, account_id):
+        flight_key = (STACK_ID, MACHINE["id"])
+        main.in_flight[flight_key] += 1
+        return MACHINE, STACK_ID, "Go"
+
+    monkeypatch.setattr(main, "_authorize_image_key", fake_authorize)
+    monkeypatch.setattr(main, "_reserve_image_machine", fake_reserve)
 
     state = {
         "response": lambda request: httpx.Response(
@@ -474,10 +479,10 @@ def test_edits_acima_do_teto_vira_413_e_nao_503(ctx, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Admissão: o que _authorize_image_request decide
+# Admissão: o que _authorize_image_key e _reserve_image_machine decidem
 # ---------------------------------------------------------------------------
 #
-# O fixture `ctx` acima substitui _authorize_image_request inteiro — é o certo
+# O fixture `ctx` acima substitui as duas funções inteiras — é o certo
 # para testar persistência, mas deixa de fora tudo que essa função decide. Aqui
 # ela roda DE VERDADE, com só as dependências dela trocadas: é o que cobre o
 # guard de plano, o toque de atividade e o teto de concorrência.
@@ -485,7 +490,7 @@ def test_edits_acima_do_teto_vira_413_e_nao_503(ctx, monkeypatch):
 
 @pytest.fixture
 def admissao(monkeypatch):
-    """Rotas com _authorize_image_request REAL e só o I/O dele trocado."""
+    """Rotas com a admissão REAL e só o I/O dela trocado."""
     supa = FakeSupa()
     monkeypatch.setattr(main, "supa", supa, raising=False)
 

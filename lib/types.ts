@@ -442,3 +442,15 @@ export type ProvisionDecision = {
   repeat_count: number
   created_at: string
 }
+
+// Allowlist do repasse ao OpenRouter (migration 0071). `slug` é o id do modelo
+// no OpenRouter e é o que o cliente manda em `model`.
+export type OpenRouterModel = {
+  id: string
+  slug: string
+  kind: "text" | "image"
+  label: string | null
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}

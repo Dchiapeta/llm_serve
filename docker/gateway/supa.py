@@ -934,6 +934,18 @@ class SupaClient:
         rows = r.json()
         return rows[0]["value"] if rows else default
 
+    # ---------- openrouter_models ----------
+
+    async def list_enabled_openrouter_models(self) -> list[dict]:
+        """Allowlist do repasse ao OpenRouter (migration 0071): só os
+        habilitados, [{slug, kind}]. Chamador é responsável por cachear."""
+        r = await self._rest.get(
+            "/openrouter_models",
+            params={"enabled": "is.true", "select": "slug,kind"},
+        )
+        r.raise_for_status()
+        return r.json()
+
     # ---------- lora_adapters ----------
 
     async def latest_ready_adapter_for_stack(self, stack_id: str) -> dict | None:

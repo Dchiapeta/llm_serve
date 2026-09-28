@@ -120,7 +120,15 @@ advisory lock.
 | `MACHINE_POOL_WATERMARK_SLOTS` | não    | Soma mínima de slots livres do plano (running + reserva pausada) antes de disparar reposição proativa (default 5) |
 | `MACHINE_HEALTH_TIMEOUT_S` | não        | Prazo máx. esperando `vllm_ready` numa máquina recém-criada antes de desistir (default 900) |
 | `MACHINE_HEALTH_POLL_INTERVAL_S` | não  | Intervalo entre polls de `/health` na máquina recém-criada (default 10) |
-| `SETTINGS_CACHE_TTL_S`    | não         | TTL do cache em memória do interruptor liga/desliga (`system_settings.auto_provision_enabled`, default 30) |
+| `SETTINGS_CACHE_TTL_S`    | não         | TTL do cache em memória dos interruptores de `system_settings` (`auto_provision_enabled`, `machines_enabled`, `openrouter_enabled`) e da allowlist `openrouter_models` (default 30) |
+| `OPENROUTER_API_KEY`      | não         | Chave da Stac no OpenRouter. Sem ela o repasse fica desligado mesmo com o interruptor do painel ligado (ver `openrouter.py`) |
+| `OPENROUTER_BASE_URL`     | não         | Default `https://openrouter.ai/api/v1` |
+| `OPENROUTER_APP_URL` / `OPENROUTER_APP_TITLE` | não | Atribuição no painel do OpenRouter (`HTTP-Referer` / `X-OpenRouter-Title`; defaults `https://trystac.com` / `Stac`) |
+| `OPENROUTER_MAX_TOKENS`   | não         | Teto de saída por request repassada (`max_tokens`/`max_completion_tokens`/`max_output_tokens`; default 32000, `0` = sem teto) |
+| `OPENROUTER_STREAM_TTFT_TIMEOUT_S` / `OPENROUTER_STREAM_IDLE_TIMEOUT_S` | não | Watchdog do streaming repassado (defaults 180 / 120) |
+| `OPENROUTER_NONSTREAM_TIMEOUT_S` | não  | Read da request repassada sem stream (default 300) |
+| `OPENROUTER_IMAGE_TIMEOUT_S` | não      | Read do `POST /images` do OpenRouter (default 240) |
+| `OPENROUTER_MAX_IMAGES`   | não         | Teto de `n` numa geração repassada (default 4) |
 | `UPSERT_CACHE_TTL_S`      | não         | TTL do cache "chave já upsertada no agent X" do fluxo base (default 600; invalidado por máquina a cada religada) |
 | `CLIENT_LIMIT_ENFORCE`    | não         | `0` (default) = MODO OBSERVAÇÃO: registra os ambientes e loga WARNING acima do teto, sem bloquear. `1` = devolve 403 ao ambiente que estoura o teto do plano. Ligue só depois de calibrar com os dados reais |
 | `MAX_CLIENTS_GO` / `_PRO` / `_MAX` / `_ENTERPRISE` | não | Teto de ambientes simultâneos por stack (defaults 5/25/50/sem teto; `0` = sem teto). Espelham `MAX_CLIENTS_BY_PLAN` em `lib/types.ts`, que é o que o painel exibe — mude os dois juntos |

@@ -80,6 +80,7 @@ export async function POST(req: NextRequest) {
 }
 
 function statusForError(message: string): number {
+  if (/^Máquinas desligadas/.test(message)) return 409
   if (/^Nenhum produto/.test(message)) return 404
   if (/não pertence ao plano informado/.test(message)) return 400
   if (/não pertence à categoria informada/.test(message)) return 400
