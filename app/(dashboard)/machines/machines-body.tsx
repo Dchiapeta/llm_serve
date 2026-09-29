@@ -1,6 +1,6 @@
 import { Suspense } from "react"
 
-import { getAutoProvisionEnabled } from "@/lib/actions"
+import { getAutoProvisionEnabled, getMachinesEnabled } from "@/lib/actions"
 import { computeCapacity } from "@/lib/capacity"
 import { reconcileMachineStatuses } from "@/lib/machines"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
@@ -24,6 +24,7 @@ import {
 import Link from "next/link"
 
 import { AutoProvisionToggle } from "@/components/machines/auto-provision-toggle"
+import { MachinesEnabledToggle } from "@/components/machines/machines-enabled-toggle"
 import { MachineRowActions } from "@/components/machines/machine-row-actions"
 import { PlanBadge } from "@/components/machines/plan-badge"
 import { StatusBadge } from "@/components/machines/status-badge"
@@ -38,7 +39,7 @@ import { getTemplates } from "./queries"
 export async function MachinesBody() {
   const db = createSupabaseAdmin()
 
-  const [{ data: machinesData }, templates, autoProvisionEnabled] =
+  const [{ data: machinesData }, templates, autoProvisionEnabled, machinesEnabled] =
     await Promise.all([
       db
         .from("machines")
@@ -47,6 +48,7 @@ export async function MachinesBody() {
         .order("created_at", { ascending: false }),
       getTemplates(),
       getAutoProvisionEnabled(),
+      getMachinesEnabled(),
     ])
 
   // Reconcilia o status do banco com a realidade do RunPod e descarta as que
@@ -74,6 +76,7 @@ export async function MachinesBody() {
 
   return (
     <div className="flex flex-col gap-6">
+      <MachinesEnabledToggle initialEnabled={machinesEnabled} />
       <AutoProvisionToggle initialEnabled={autoProvisionEnabled} />
 
       <Card>

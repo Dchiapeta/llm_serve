@@ -24,8 +24,8 @@ function checkSecret(req: NextRequest): NextResponse | null {
 
 // Chamada pelo painel admin do cliente (repo separado) pra emitir uma chave
 // "customer" de verdade — hash, prefixo, cota por stack e sync ao gateway,
-// tudo já resolvido por createKey. Nunca a chave interna de Playground (essa
-// segue por /api/playground/key).
+// tudo já resolvido por createKey. É a única rota de emissão de chave: a chave
+// interna de Playground (purpose "playground") não é mais criada.
 //
 // NÃO aloca máquina: a chave nasce com o machine_id que a stack tiver (null é
 // normal) e o gateway homeia a stack na PRIMEIRA request (resolve_base_machine
@@ -71,15 +71,13 @@ export async function POST(req: NextRequest) {
 
   try {
     // stack.machine_id null (idle reaper liberou a vaga, ou a stack nunca foi
-    // homeada) é aceito: mesmo caminho da chave de Playground
-    // (getOrCreatePlaygroundKey). Quem chama esta rota não espera pod nenhum.
+    // homeada) é aceito. Quem chama esta rota não espera pod nenhum.
     const { plainKey } = await createKey({
       accountId: stack.account_id,
       machineId: stack.machine_id,
       stackId,
       name,
       expiresAt,
-      purpose: "customer",
       enableKnowledgeBase,
     })
     return NextResponse.json({ plain_key: plainKey })

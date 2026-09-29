@@ -121,14 +121,20 @@ class SupaClient:
         apply_stack_image_defaults) — o mesmo ATENÇÃO de ordem de deploy vale
         para as duas. Sampling e imagem nunca se cruzam: nenhuma stack serve
         texto e imagem ao mesmo tempo, então uma linha sempre tem um dos dois
-        conjuntos nulo."""
+        conjuntos nulo.
+
+        `default_reasoning_effort` (migration 0069, mesmo ATENÇÃO) é o nível
+        de raciocínio da própria CHAVE — none/low/medium/high, ou NULL para
+        herdar default_enable_thinking. Só existe na chave, não na stack:
+        resolve_thinking_policy o lê antes do boolean."""
         r = await self._rest.get(
             "/api_keys",
             params={
                 "key_hash": f"eq.{key_hash}",
                 "status": "eq.active",
                 "select": "id,account_id,key_prefix,key_hash,stack_id,expires_at,purpose,"
-                "use_custom_prompt,system_prompt,default_enable_thinking,enable_knowledge_base,"
+                "use_custom_prompt,system_prompt,default_enable_thinking,default_reasoning_effort,"
+                "enable_knowledge_base,"
                 "default_temperature,default_top_p,default_max_tokens,default_presence_penalty,"
                 "default_image_size,default_image_steps,default_image_guidance_scale,default_image_seed,"
                 "accounts(name,"
@@ -156,6 +162,7 @@ class SupaClient:
             "use_custom_prompt": row.get("use_custom_prompt", False),
             "system_prompt": row.get("system_prompt"),
             "default_enable_thinking": row.get("default_enable_thinking"),
+            "default_reasoning_effort": row.get("default_reasoning_effort"),
             "enable_knowledge_base": row.get("enable_knowledge_base"),
             "default_temperature": row.get("default_temperature"),
             "default_top_p": row.get("default_top_p"),
@@ -462,12 +469,31 @@ class SupaClient:
         )
         r.raise_for_status()
 
-    async def log_machine_event(self, machine_id: str, type_: str, message: str) -> None:
-        """Espelho do logEvent do painel — eventos do lifecycle aparecem na UI."""
-        r = await self._rest.post(
-            "/machine_events",
-            json={"machine_id": machine_id, "type": type_, "message": message},
-        )
+    async def log_machine_event(
+        self, machine_id: str, type_: str, message: str, *,
+        cause: str | None = None, trigger: dict | None = None,
+        machine_label: str | None = None,
+    ) -> None:
+        """Espelho do logEvent do painel — eventos do lifecycle aparecem na UI.
+
+        `cause` (vocabulário fechado, trigger_ctx.py) e `trigger` (envelope de
+        trigger_ctx.snapshot) são as colunas estruturadas da migration 0070;
+        actor e trace_id saem do envelope. Só chaves não-nulas vão no JSON —
+        um gateway novo escrevendo num banco sem a 0070 ainda quebraria em
+        400, e o try/except dos chamadores engole; por isso a migration vai
+        SEMPRE antes do deploy do gateway."""
+        row: dict = {"machine_id": machine_id, "type": type_, "message": message}
+        if cause:
+            row["cause"] = cause
+        if trigger:
+            row["trigger_meta"] = trigger
+            if trigger.get("actor"):
+                row["actor"] = trigger["actor"]
+            if trigger.get("trace_id"):
+                row["trace_id"] = trigger["trace_id"]
+        if machine_label:
+            row["machine_label"] = machine_label
+        r = await self._rest.post("/machine_events", json=row)
         r.raise_for_status()
 
     async def count_active_routes(self, machine_id: str) -> int:
@@ -523,6 +549,20 @@ class SupaClient:
         fire-and-forget (spawn_tracked) no fechamento de cada requisição —
         nunca no caminho crítico da resposta ao cliente."""
         r = await self._rest.post("/gateway_requests", json=row)
+        r.raise_for_status()
+
+    async def insert_provision_decision(self, row: dict) -> None:
+        """Uma linha por decisão do ciclo de vida (migration 0070) — concedida,
+        negada ou 503 servido sem criar nada. Fire-and-forget via
+        decisions.record_bg; quem engole o erro é o _write de lá."""
+        r = await self._rest.post("/provision_decisions", json=row)
+        r.raise_for_status()
+
+    async def delete_provision_decisions_before(self, cutoff_iso: str) -> None:
+        """Retenção de provision_decisions (decisions.RETENTION_DAYS)."""
+        r = await self._rest.delete(
+            "/provision_decisions", params={"created_at": f"lt.{cutoff_iso}"}
+        )
         r.raise_for_status()
 
     async def touch_stack_client(
@@ -893,6 +933,18 @@ class SupaClient:
         r.raise_for_status()
         rows = r.json()
         return rows[0]["value"] if rows else default
+
+    # ---------- openrouter_models ----------
+
+    async def list_enabled_openrouter_models(self) -> list[dict]:
+        """Allowlist do repasse ao OpenRouter (migration 0071): só os
+        habilitados, [{slug, kind}]. Chamador é responsável por cachear."""
+        r = await self._rest.get(
+            "/openrouter_models",
+            params={"enabled": "is.true", "select": "slug,kind"},
+        )
+        r.raise_for_status()
+        return r.json()
 
     # ---------- lora_adapters ----------
 

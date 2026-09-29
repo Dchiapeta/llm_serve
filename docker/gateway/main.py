@@ -57,6 +57,7 @@ import document_generate
 import image_gen
 import image_proxy
 import image_retention
+import openrouter
 from anthropic_compat import (
     anthropic_error_body,
     anthropic_nonstreaming_body,
@@ -116,6 +117,8 @@ from reasoning_filter import (
 from stream_watchdog import UpstreamStreamTimeout, aiter_bytes_watchdog
 from supa import SupaClient
 from generation_trace import request_trace_id, trace_decision
+import decisions
+from trigger_ctx import set_request_trigger, snapshot as trigger_snapshot
 from rag_policy import is_isolated_greeting, resolve_rag_policy
 from thinking_policy import (
     ThinkingPolicyError, apply_thinking_policy, resolve_thinking_policy,
@@ -530,6 +533,31 @@ KEY_SYNC_LOCK_TTL_S = float(os.environ.get("KEY_SYNC_LOCK_TTL_S", "1200"))
 # TTL do cache em memória do interruptor liga/desliga (system_settings) —
 # evita 1 round-trip ao Supabase por request na hot path
 SETTINGS_CACHE_TTL_S = float(os.environ.get("SETTINGS_CACHE_TTL_S", "30"))
+
+# ---------- repasse para o OpenRouter (ver openrouter.py) ----------
+# Sem a chave o repasse fica desligado mesmo com o interruptor do painel
+# ligado — o gateway segue só com máquinas, como antes.
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.environ.get(
+    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+).rstrip("/")
+# atribuição no painel do OpenRouter (HTTP-Referer / X-OpenRouter-Title)
+OPENROUTER_APP_URL = os.environ.get("OPENROUTER_APP_URL", "https://trystac.com")
+OPENROUTER_APP_TITLE = os.environ.get("OPENROUTER_APP_TITLE", "Stac")
+# Teto de saída por request. Aqui o custo é por token cobrado do nosso
+# crédito, não uma máquina já paga — daí um teto próprio, mais folgado que o
+# MAX_MAX_TOKENS das máquinas (a janela desses modelos é bem maior). 0 desliga.
+OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "32000"))
+# Prazos do repasse. Mais folgados que os das máquinas: o OpenRouter manda
+# keep-alive próprio durante o processamento, então silêncio de verdade é raro,
+# e um modelo grande de raciocínio pode demorar a soltar o primeiro token.
+OPENROUTER_STREAM_TTFT_TIMEOUT_S = float(os.environ.get("OPENROUTER_STREAM_TTFT_TIMEOUT_S", "180"))
+OPENROUTER_STREAM_IDLE_TIMEOUT_S = float(os.environ.get("OPENROUTER_STREAM_IDLE_TIMEOUT_S", "120"))
+OPENROUTER_NONSTREAM_TIMEOUT_S = float(os.environ.get("OPENROUTER_NONSTREAM_TIMEOUT_S", "300"))
+# geração de imagem no OpenRouter passa de 90s em modelo de qualidade alta
+# (a doc cita 94s para um gpt-image em 16:9)
+OPENROUTER_IMAGE_TIMEOUT_S = float(os.environ.get("OPENROUTER_IMAGE_TIMEOUT_S", "240"))
+OPENROUTER_MAX_IMAGES = int(os.environ.get("OPENROUTER_MAX_IMAGES", "4"))
 # TTL do cache "chave já upsertada no agent X" — o agent perde as chaves em
 # memória a cada restart do pod, então o fluxo base garante a chave via
 # upsert lazy antes do proxy; o cache evita 1 round-trip ao agent por request
@@ -600,6 +628,13 @@ key_cache: dict[str, tuple[dict | None, float]] = {}
 # rebalanceamento); o caminho de request (try_provision_for_request) ignora
 # ele — ver docstring de _try_provision_machine_for_plan.
 auto_provision_cache: tuple[bool, float] | None = None
+# demais flags de system_settings (machines_enabled, openrouter_enabled):
+# key -> (valor, expira_em). Mesmo TTL do auto_provision_cache.
+settings_cache: dict[str, tuple[bool, float]] = {}
+# allowlist do OpenRouter (openrouter_models habilitados): ({slug: kind}, expira_em)
+openrouter_catalog_cache: tuple[dict[str, str], float] | None = None
+# None quando OPENROUTER_API_KEY não está configurada (repasse desligado)
+openrouter_client: httpx.AsyncClient | None = None
 
 # requests em voo por (account_id, machine_id) — base do drain da Fase 5.
 # Em memória: válido apenas com réplica única do gateway.
@@ -693,7 +728,7 @@ runpod_client: RunPodClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supa, store, proxy_client, document_client, openai_client, panel_client, demo_client, lifecycle_mgr, runpod_client
+    global supa, store, proxy_client, document_client, openai_client, panel_client, demo_client, lifecycle_mgr, runpod_client, openrouter_client
     supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET, IMAGE_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
     # read curto (60s): o Cloudflare na frente do RunPod às vezes derruba (RST)
@@ -753,6 +788,27 @@ async def lifespan(app: FastAPI):
         transport=httpx.AsyncHTTPTransport(retries=2),
     )
     await assert_demo_pod_is_dedicated()
+    if OPENROUTER_API_KEY:
+        # client próprio: a Bearer é a NOSSA chave do OpenRouter (nunca a do
+        # cliente) e o pool não disputa conexão com o tráfego das máquinas.
+        # O read de cada request é definido na chamada (stream x não-stream x
+        # imagem); o daqui é só o default.
+        openrouter_client = httpx.AsyncClient(
+            base_url=OPENROUTER_BASE_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "HTTP-Referer": OPENROUTER_APP_URL,
+                "X-OpenRouter-Title": OPENROUTER_APP_TITLE,
+            },
+            timeout=httpx.Timeout(OPENROUTER_NONSTREAM_TIMEOUT_S, connect=10.0, write=30.0, pool=10.0),
+            limits=httpx.Limits(
+                max_connections=200, max_keepalive_connections=40, keepalive_expiry=30.0
+            ),
+            transport=httpx.AsyncHTTPTransport(retries=2),
+        )
+    else:
+        openrouter_client = None
+        logger.info("OPENROUTER_API_KEY ausente — repasse para o OpenRouter desligado")
     if RUNPOD_API_KEY:
         runpod_client = RunPodClient(RUNPOD_API_KEY)
     else:
@@ -798,6 +854,7 @@ async def lifespan(app: FastAPI):
     image_retention_task = asyncio.create_task(
         image_retention.image_retention_loop(supa, IMAGE_RETENTION_INTERVAL_S)
     )
+    decisions_task = asyncio.create_task(decisions.decisions_retention_loop(supa))
     yield
     reaper_task.cancel()
     machine_task.cancel()
@@ -806,11 +863,14 @@ async def lifespan(app: FastAPI):
     usage_class_task.cancel()
     billing_task.cancel()
     image_retention_task.cancel()
+    decisions_task.cancel()
     await proxy_client.aclose()
     await document_client.aclose()
     await openai_client.aclose()
     await panel_client.aclose()
     await demo_client.aclose()
+    if openrouter_client is not None:
+        await openrouter_client.aclose()
     await store.aclose()
     await supa.aclose()
     if runpod_client:
@@ -1194,6 +1254,17 @@ async def authenticate(
     # Este guard também vale para a chave interna de Playground: diagnóstico
     # não transforma um pod de difusão em vLLM.
     product_stack, _product_plan = resolve_key_stack(entry)
+    # Originador da request pro rastreamento de causa (trigger_ctx.py,
+    # migration 0070): ANTES dos 402/403 abaixo de propósito — uma request
+    # barrada por billing ou política de CLI também deixa rastro. Lido lá no
+    # fundo da cascata (provisionamento/wake/503), sem passar parâmetro.
+    set_request_trigger(
+        entry,
+        plan=_product_plan,
+        category=(product_stack or {}).get("category") or LLM_CATEGORY,
+        path=path,
+        user_agent=headers.get("user-agent") if headers is not None else None,
+    )
     if (
         product_stack
         and (product_stack.get("category") or LLM_CATEGORY) == IMAGE_CATEGORY
@@ -1663,6 +1734,13 @@ async def relocate_stack_for_balance(stack: dict, reason: str) -> dict | None:
             target["id"], "stack_migrated",
             f"Stack {fresh.get('slug') or stack['id']} realocada por balanceamento "
             f"de carga ({reason})",
+            cause="stack.rebalanced",
+            trigger=trigger_snapshot(
+                "stack.rebalanced", plan=plan, category=category,
+                stack_id=stack["id"], stack_slug=fresh.get("slug"),
+                account_id=fresh.get("account_id"), reason=reason,
+            ),
+            machine_label=target.get("name"),
         )
     except Exception:
         pass  # histórico é best-effort, nunca desfaz um movimento já concluído
@@ -1727,12 +1805,20 @@ async def rebalance_high_caps_once(retry_budget: int = HIGH_CAP_MAX_RETRIES) -> 
                         f"rebalanceamento de uso alto: {reason}",
                         pause_when_healthy=False,
                         category=category,
+                        cause="provision.rebalance.high_caps",
                     )
                 retry_needed = True
                 try:
                     await supa.log_machine_event(
                         machine["id"], "rebalance_pending",
                         f"Stack de uso alto aguardando máquina com vaga ({reason})",
+                        cause="stack.rebalance_pending",
+                        trigger=trigger_snapshot(
+                            "stack.rebalance_pending", plan=plan, category=category,
+                            stack_id=stack.get("id"), stack_slug=stack.get("slug"),
+                            reason=reason,
+                        ),
+                        machine_label=machine.get("name"),
                     )
                 except Exception:
                     pass
@@ -2017,7 +2103,85 @@ async def auto_provision_enabled() -> bool:
     return value
 
 
-async def wake_machine(machine: dict, reason: str) -> str:
+async def _cached_setting(key: str, default: bool) -> bool:
+    """Flag de system_settings com o mesmo cache curto do
+    auto_provision_enabled. Supabase fora do ar: mantém o último valor lido
+    (mesmo vencido), e só sem nenhum cai no default — um blip de rede não pode
+    virar o roteamento de todo mundo de uma hora pra outra."""
+    now = time.time()
+    cached = settings_cache.get(key)
+    if cached and cached[1] > now:
+        return cached[0]
+    try:
+        value = await supa.get_setting(key, default)
+    except Exception:
+        value = cached[0] if cached else default
+    settings_cache[key] = (value, now + SETTINGS_CACHE_TTL_S)
+    return value
+
+
+async def machines_enabled() -> bool:
+    """Interruptor das máquinas próprias (system_settings.machines_enabled,
+    migration 0071), na página de Máquinas do painel. Desligado: nenhuma
+    request vai para máquina e nada liga GPU sozinho — wake, provisionamento
+    (inclusive o de request, que ignora o auto_provision_enabled) e recriação
+    são negados na própria primitiva. As máquinas que já estão ligadas não
+    são paradas aqui: sem tráfego, a auto-pausa por ociosidade as desliga.
+    Nasce ligado (default True): é o comportamento de antes da migration."""
+    return await _cached_setting("machines_enabled", True)
+
+
+async def openrouter_enabled() -> bool:
+    """Interruptor do repasse ao OpenRouter (system_settings.openrouter_enabled),
+    na página Modelos (OpenRouter). Sem OPENROUTER_API_KEY é sempre False."""
+    if openrouter_client is None:
+        return False
+    return await _cached_setting("openrouter_enabled", False)
+
+
+async def openrouter_catalog() -> dict[str, str]:
+    """{slug: kind} dos modelos habilitados na página Modelos (OpenRouter),
+    vazio com o repasse desligado. Falha de leitura mantém o último catálogo."""
+    global openrouter_catalog_cache
+    if not await openrouter_enabled():
+        return {}
+    now = time.time()
+    if openrouter_catalog_cache and openrouter_catalog_cache[1] > now:
+        return openrouter_catalog_cache[0]
+    try:
+        rows = await supa.list_enabled_openrouter_models()
+        catalog = {row["slug"]: row["kind"] for row in rows}
+    except Exception as e:
+        logger.warning("openrouter: falha ao ler a allowlist de modelos (%s)", e)
+        catalog = openrouter_catalog_cache[0] if openrouter_catalog_cache else {}
+    openrouter_catalog_cache = (catalog, now + SETTINGS_CACHE_TTL_S)
+    return catalog
+
+
+async def openrouter_slug_for(model: str | None, kind: str) -> str | None:
+    """Slug do OpenRouter que atende este `model`, ou None (vai pra máquina)."""
+    return openrouter.pick_slug(model, kind, await openrouter_catalog())
+
+
+async def require_machines(model: str | None, kind: str) -> None:
+    """Barra a request que iria pra máquina com as máquinas desligadas.
+
+    Com o repasse ligado, o erro é de MODELO (404, com a lista do que é
+    aceito): o cliente tem como se corrigir sozinho trocando o `model`. Sem
+    repasse nenhum, não há o que corrigir do lado dele — 503."""
+    if await machines_enabled():
+        return
+    if await openrouter_enabled():
+        accepted = openrouter.accepted_models(await openrouter_catalog(), kind)
+        raise HTTPException(
+            status_code=404, detail=openrouter.unavailable_detail(model, accepted)
+        )
+    raise HTTPException(
+        status_code=503, detail="inferência temporariamente indisponível"
+    )
+
+
+async def wake_machine(machine: dict, reason: str, *, cause: str) -> str:
     """Religa um pod pausado (startPod) e o devolve ao pool de roteamento.
 
     Retorna: 'woke' = startPod disparado agora; 'cooldown' = tentativa recente
@@ -2027,8 +2191,25 @@ async def wake_machine(machine: dict, reason: str) -> str:
 
     O touch de atividade vem ANTES do flip para running: sem ele, o
     last_activity_at velho faria a auto-pausa parar a máquina de novo no
-    próximo ciclo, enquanto o vLLM ainda carrega o modelo."""
+    próximo ciclo, enquanto o vLLM ainda carrega o modelo.
+
+    `cause`: por qual ramo da cascata chegamos aqui (trigger_ctx.py). Cada
+    saída vira linha em provision_decisions; 'woke' carimba o `started`."""
+    trig = trigger_snapshot(
+        cause, machine_id=machine["id"], machine_name=machine.get("name"), reason=reason,
+    )
+
+    def _denied(why: str) -> None:
+        _record_decision(decisions.OUTCOME_DENIED, f"wake_denied.{why}", trig)
+
+    if not await machines_enabled():
+        # 'failed' e não um valor novo: todo chamador já sabe tratar "nada
+        # subindo", e o passo seguinte da cascata (provisionar/recriar) é
+        # negado pela mesma trava
+        _denied("machines_disabled")
+        return "failed"
     if runpod_client is None or not machine.get("runpod_pod_id"):
+        _denied("failed")
         return "failed"
     now = time.time()
     if now - last_wake_attempt.get(machine["id"], 0) < WAKE_COOLDOWN_S:
@@ -2038,7 +2219,9 @@ async def wake_machine(machine: dict, reason: str) -> str:
         # saber que não há nada subindo — senão devolve waking_503 mentiroso e
         # nunca cai no fallback/provisionamento.
         if last_wake_outcome.get(machine["id"]) == "woke":
+            _denied("cooldown")
             return "cooldown"
+        _denied("failed")
         return "failed"
     # marca a tentativa antes do primeiro await — atômico dentro do event loop
     last_wake_attempt[machine["id"]] = now
@@ -2058,10 +2241,13 @@ async def wake_machine(machine: dict, reason: str) -> str:
             logger.warning(
                 "auto-wake: %s sem GPU no host, requer recriação (%s)", machine["id"], e
             )
+            _denied("no_gpu")
             return "no_gpu"
         logger.warning("auto-wake: startPod de %s falhou (%s)", machine["id"], e)
+        _denied("failed")
         return "failed"
     last_wake_outcome[machine["id"]] = "woke"
+    _record_decision(decisions.OUTCOME_GRANTED, cause, trig)
     try:
         await supa.touch_machine_activity(machine["id"])
     except Exception:
@@ -2079,7 +2265,10 @@ async def wake_machine(machine: dict, reason: str) -> str:
     _forget_machine_upserts(machine["id"])
     schedule_key_sync(machine["id"])
     try:
-        await supa.log_machine_event(machine["id"], "started", f"Auto-wake: {reason}")
+        await supa.log_machine_event(
+            machine["id"], "started", f"Auto-wake: {reason}",
+            cause=cause, trigger=trig, machine_label=machine.get("name"),
+        )
     except Exception:
         pass
     logger.info(
@@ -2129,11 +2318,17 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
         if lock_active(recreating_in_progress, m["id"], RECREATE_LOCK_TTL_S):
             recreating = True
             continue
-        outcome = await wake_machine(m, "requisição recebida sem máquina disponível")
+        outcome = await wake_machine(
+            m, "requisição recebida sem máquina disponível",
+            cause="wake.request.no_machine_available",
+        )
         if outcome == "woke":
             return "woke"
         if outcome == "no_gpu":
-            if await try_recreate_machine(m, "host sem GPU pra religar sob demanda"):
+            if await try_recreate_machine(
+                m, "host sem GPU pra religar sob demanda",
+                cause="recreate.request.no_gpu_on_wake",
+            ):
                 recreating = True
         elif outcome == "cooldown":
             # tentativa recente BEM-SUCEDIDA (wake_machine só devolve
@@ -2146,7 +2341,25 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
     return "waking" if waking else "none"
 
 
+# As seis fábricas de 503 pré-rota são chamadas no exato momento do `raise`,
+# em todos os call sites — por isso a decisão "servi 503 sem criar nada" é
+# gravada AQUI (provision_decisions, migration 0070) e não neles. Esses 503
+# nunca chegam a gateway_requests (falham antes de existir machine_id/
+# flight_key), e até a 0070 a única pista era o corpo que o cliente recebeu.
+def _record_decision(outcome: str, cause: str, trigger: dict) -> None:
+    """provision_decisions, fire-and-forget. `supa` só existe depois do
+    lifespan — em teste que importa main sem subir o app, não grava."""
+    client = globals().get("supa")
+    if client is not None:
+        decisions.record_bg(client, outcome, cause, trigger)
+
+
+def _served_503(cause: str, **extra) -> None:
+    _record_decision(decisions.OUTCOME_SERVED_503, cause, trigger_snapshot(cause, **extra))
+
+
 def waking_503() -> HTTPException:
+    _served_503("denied_503.waking")
     return HTTPException(
         status_code=503,
         detail="Sua máquina está sendo iniciada e ficará pronta em instantes. "
@@ -2156,6 +2369,7 @@ def waking_503() -> HTTPException:
 
 
 def provisioning_503() -> HTTPException:
+    _served_503("denied_503.provisioning")
     return HTTPException(
         status_code=503,
         detail="Estamos preparando uma máquina nova para você — ficará pronta em "
@@ -2165,6 +2379,7 @@ def provisioning_503() -> HTTPException:
 
 
 def recreating_503() -> HTTPException:
+    _served_503("denied_503.recreating")
     return HTTPException(
         status_code=503,
         detail="Estamos recriando sua máquina e ela ficará pronta em instantes. "
@@ -2174,6 +2389,7 @@ def recreating_503() -> HTTPException:
 
 
 def preparing_503() -> HTTPException:
+    _served_503("denied_503.preparing")
     return HTTPException(
         status_code=503,
         detail="Estamos preparando sua máquina — ela ficará disponível em instantes. "
@@ -2183,6 +2399,7 @@ def preparing_503() -> HTTPException:
 
 
 def agent_starting_503() -> HTTPException:
+    _served_503("denied_503.agent_starting")
     return HTTPException(
         status_code=503,
         detail="O serviço está iniciando e ficará pronto em instantes. "
@@ -2195,10 +2412,9 @@ def capacity_503(plan: str, reason: str) -> HTTPException:
     """Sem vaga em nenhuma máquina do plano (todas cheias, ou nenhuma no ar) e
     nada a religar/provisionar. Ao contrário de waking/provisioning/recreating,
     aqui não há infraestrutura subindo — é volume de requests concorrentes
-    excedendo a capacidade contratada. Logamos explicitamente porque esse 503
-    nunca chega a gateway_requests (pick_machine_with_free_slot falha antes de
-    existir machine_id/flight_key pra logar) — sem esta linha, a única pista
-    fica no corpo da resposta que o cliente recebeu."""
+    excedendo a capacidade contratada. O warning fica pelo alerta operacional;
+    a trilha por chave/stack está em provision_decisions (_served_503)."""
+    _served_503("denied_503.capacity", plan=plan, reason=reason)
     logger.warning(
         "capacidade: 503 no plano %s (%s) — provável excesso de requests "
         "concorrentes; sem máquina livre e nada a religar/provisionar",
@@ -2214,19 +2430,27 @@ def capacity_503(plan: str, reason: str) -> HTTPException:
 
 
 async def provision_machine_for_plan(
-    plan: str, category: str = LLM_CATEGORY
+    plan: str, category: str = LLM_CATEGORY, trigger: dict | None = None
 ) -> dict | None:
     """POST {PANEL_URL}/api/machines/provision — pede ao painel Next.js pra
     criar uma máquina nova do plano (o gateway nunca fala com a API de
     criação da RunPod diretamente, ver comentário das env vars no topo).
     None em qualquer falha (painel desligado/fora do ar, timeout, painel
-    recusou) — o chamador decide o fallback, nunca propaga exceção."""
+    recusou) — o chamador decide o fallback, nunca propaga exceção.
+
+    `trigger` (trigger_ctx.snapshot) vai no corpo: o painel carimba o evento
+    `created` que ele mesmo grava ao inserir em machines — assim o originador
+    sobrevive mesmo que este processo morra entre a resposta HTTP e o
+    log_machine_event do _provision_and_track. Painel antigo ignora o campo."""
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
         return None
+    body: dict = {"plan": plan, "category": category}
+    if trigger:
+        body["trigger"] = trigger
     try:
         r = await panel_client.post(
             f"{PANEL_URL}/api/machines/provision",
-            json={"plan": plan, "category": category},
+            json=body,
             headers={"X-Admin-Secret": PANEL_ADMIN_SECRET},
         )
     except httpx.HTTPError as e:
@@ -2244,17 +2468,22 @@ async def provision_machine_for_plan(
     return r.json()
 
 
-async def recreate_machine_via_panel(machine_id: str) -> dict | None:
+async def recreate_machine_via_panel(
+    machine_id: str, trigger: dict | None = None
+) -> dict | None:
     """POST {PANEL_URL}/api/machines/{id}/recreate — pede ao painel pra recriar
     o pod num host novo (delete + create + start), mantendo a MESMA row de
     machines (stacks/chaves seguem apontando pra ela). Usado quando o auto-wake
     falhou por 'not enough free GPUs'. None em qualquer falha (painel desligado/
-    fora do ar, timeout, recusa) — o chamador decide o fallback."""
+    fora do ar, timeout, recusa) — o chamador decide o fallback.
+    `trigger`: mesmo papel do provision_machine_for_plan (carimba o `recreated`
+    que o painel grava)."""
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
         return None
     try:
         r = await panel_client.post(
             f"{PANEL_URL}/api/machines/{machine_id}/recreate",
+            json={"trigger": trigger} if trigger else None,
             headers={"X-Admin-Secret": PANEL_ADMIN_SECRET},
         )
     except httpx.HTTPError as e:
@@ -2268,13 +2497,16 @@ async def recreate_machine_via_panel(machine_id: str) -> dict | None:
     return r.json()
 
 
-async def _recreate_and_track(machine_id: str, reason: str) -> None:
+async def _recreate_and_track(machine_id: str, reason: str, trigger: dict) -> None:
     """Task de background: recria o pod e libera a trava ao fim. O request que
     disparou já respondeu 503 + Retry-After; o cliente reconverge quando o pod
-    novo sobe (a reconciliação do gateway reenvia as chaves ao ficar running)."""
+    novo sobe (a reconciliação do gateway reenvia as chaves ao ficar running).
+    `trigger` é o snapshot do originador (passado por parâmetro, não lido do
+    ContextVar — ver trigger_ctx.py sobre a cópia rasa)."""
     try:
-        result = await recreate_machine_via_panel(machine_id)
+        result = await recreate_machine_via_panel(machine_id, trigger)
         if result is None:
+            _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.panel_error", trigger)
             logger.warning(
                 "recriação de %s não completou (%s) — fica na fila pro lifecycle retentar",
                 machine_id, reason,
@@ -2286,7 +2518,9 @@ async def _recreate_and_track(machine_id: str, reason: str) -> None:
         recreating_in_progress.pop(machine_id, None)
 
 
-async def try_recreate_machine(machine: dict, reason: str) -> bool:
+async def try_recreate_machine(
+    machine: dict, reason: str, *, cause: str | None = None
+) -> bool:
     """Dispara a recriação em background se o painel estiver configurado, não
     houver uma recriação em andamento pra essa máquina e o cooldown já tiver
     passado. Retorna True se há recriação encaminhada (disparada agora, já em
@@ -2299,27 +2533,43 @@ async def try_recreate_machine(machine: dict, reason: str) -> bool:
     o processo cair antes de concluir), o lifecycle loop retenta. A entrada só
     sai da fila quando uma recriação conclui com sucesso."""
     machine_id = machine["id"]
+    # cause=None é o retry do lifecycle (process_pending_recreates_once), que
+    # chama com a assinatura antiga (machine, reason)
+    cause = cause or "recreate.lifecycle.pending_retry"
+    trig = trigger_snapshot(
+        cause, machine_id=machine_id, machine_name=machine.get("name"), reason=reason,
+    )
+    if not await machines_enabled():
+        # fica na fila de pending_recreates de propósito: religadas as
+        # máquinas, o lifecycle retenta sozinho a que se perdeu no meio tempo
+        _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.machines_disabled", trig)
+        return False
     if not template_allows_automatic_creation(machine):
         pending_recreates.discard(machine_id)
+        _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.template_blocked", trig)
         logger.info(
             "recriação automática de %s ignorada: template desabilitado ou de teste",
             machine_id,
         )
         return False
     if not PANEL_URL or not PANEL_ADMIN_SECRET:
+        _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.panel_unconfigured", trig)
         return False
     pending_recreates.add(machine_id)
     if lock_active(recreating_in_progress, machine_id, RECREATE_LOCK_TTL_S):
+        _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.lock_active", trig)
         return True
     now = time.time()
     if now - last_recreate_attempt.get(machine_id, 0) < RECREATE_COOLDOWN_S:
         # recriação recente já disparada — o pod novo está subindo
+        _record_decision(decisions.OUTCOME_DENIED, "recreate_denied.cooldown", trig)
         return True
     # checagem + marcação sem await no meio (atômicas dentro do event loop,
-    # mesma disciplina do provisioning_in_progress)
+    # mesma disciplina do provisioning_in_progress); record_bg é síncrona
     last_recreate_attempt[machine_id] = now
     recreating_in_progress[machine_id] = now
-    spawn_tracked(_recreate_and_track(machine_id, reason))
+    _record_decision(decisions.OUTCOME_GRANTED, cause, trig)
+    spawn_tracked(_recreate_and_track(machine_id, reason, trig))
     return True
 
 
@@ -2389,17 +2639,23 @@ async def _sync_keys_when_healthy(machine_id: str) -> None:
 
 
 async def _provision_and_track(
-    plan: str, category: str, reason: str, pause_when_healthy: bool
+    plan: str, category: str, reason: str, pause_when_healthy: bool, trigger: dict
 ) -> None:
     """Task de background: cria -> espera saudável -> opcionalmente pausa
-    (reposição proativa) — nunca deixa exceção escapar (fire-and-forget)."""
+    (reposição proativa) — nunca deixa exceção escapar (fire-and-forget).
+    `trigger` é o snapshot do originador, passado por parâmetro de propósito
+    (a cópia do ContextVar pra task é rasa — ver trigger_ctx.py)."""
     try:
-        machine = await provision_machine_for_plan(plan, category)
+        machine = await provision_machine_for_plan(plan, category, trigger)
         if not machine:
+            _record_decision(decisions.OUTCOME_DENIED, "provision_denied.panel_error", trigger)
             return
         try:
             await supa.log_machine_event(
-                machine["machine_id"], "created", f"Provisionamento automático: {reason}"
+                machine["machine_id"], "created",
+                f"Provisionamento automático: {reason}",
+                cause=trigger.get("cause"), trigger=trigger,
+                machine_label=machine.get("name"),
             )
         except Exception:
             pass
@@ -2415,6 +2671,8 @@ async def _provision_and_track(
                     await supa.log_machine_event(
                         machine["machine_id"], "stopped",
                         "Reposição proativa: pausada assim que ficou saudável",
+                        cause="stop.provision.pause_when_healthy", trigger=trigger,
+                        machine_label=machine.get("name"),
                     )
                 except Exception as e:
                     logger.warning(
@@ -2432,6 +2690,7 @@ async def _provision_and_track(
 async def _try_provision_machine_for_plan(
     plan: str, reason: str, pause_when_healthy: bool,
     category: str = LLM_CATEGORY, ignore_switch: bool = False,
+    *, cause: str,
 ) -> bool:
     """Dispara a criação em background se o interruptor estiver ligado (ou
     `ignore_switch`), o painel estiver configurado, não houver uma criação em
@@ -2449,31 +2708,50 @@ async def _try_provision_machine_for_plan(
     cliente veria um 503 "preparando" eterno sem nada subindo. O interruptor
     continua sendo a trava de custo do provisionamento PROATIVO (pool de
     reserva, rebalance), que ninguém está esperando. Cooldown e lock por
-    plano valem em todos os casos."""
-    if not ignore_switch and not await auto_provision_enabled():
+    plano valem em todos os casos.
+
+    `cause` (vocabulário de trigger_ctx.py) diz por qual ramo da cascata
+    chegamos aqui; toda saída — criar ou negar — vira linha em
+    provision_decisions (migration 0070), e a criação carimba o evento
+    `created`. As 4 negações vivem em decisions.provision_gate, puro e
+    testável sem fastapi; aqui só a leitura do estado e a marcação da trava."""
+    trig = trigger_snapshot(cause, plan=plan, category=category, reason=reason)
+    # o interruptor das máquinas vale até para o caminho de request
+    # (ignore_switch só pula o auto_provision_enabled, não este)
+    if not await machines_enabled():
+        _record_decision(decisions.OUTCOME_DENIED, "provision_denied.machines_disabled", trig)
         return False
-    if not PANEL_URL or not PANEL_ADMIN_SECRET:
+    # último await da função, ANTES do gate: o interruptor vem do Supabase
+    switch_on = ignore_switch or await auto_provision_enabled()
+    pool_key = product_pool_key(plan, category)
+    now = time.time()
+    denied = decisions.provision_gate(
+        switch_on=switch_on,
         # sem painel configurado, provision_machine_for_plan sempre devolve
         # None — sem essa checagem aqui, o chamador levantaria um
         # provisioning_503() mentiroso (promete retry, mas nunca vai criar)
-        return False
-    pool_key = product_pool_key(plan, category)
-    if lock_active(provisioning_in_progress, pool_key, PROVISION_LOCK_TTL_S):
-        return False
-    now = time.time()
-    if now - last_provision_attempt.get(pool_key, 0) < PROVISION_COOLDOWN_S:
+        panel_configured=bool(PANEL_URL and PANEL_ADMIN_SECRET),
+        lock_active=lock_active(provisioning_in_progress, pool_key, PROVISION_LOCK_TTL_S),
+        last_attempt=last_provision_attempt.get(pool_key, 0),
+        now=now,
+        cooldown_s=PROVISION_COOLDOWN_S,
+        ignore_switch=ignore_switch,
+    )
+    if denied:
+        _record_decision(decisions.OUTCOME_DENIED, denied, trig)
         return False
     # daqui pra baixo não há mais nenhum await antes de marcar a trava —
     # checagem + marcação são atômicas dentro do event loop (mesmo cuidado
-    # do wake_machine existente)
+    # do wake_machine existente). record_bg é síncrona de propósito.
     last_provision_attempt[pool_key] = now
     provisioning_in_progress[pool_key] = now
-    spawn_tracked(_provision_and_track(plan, category, reason, pause_when_healthy))
+    _record_decision(decisions.OUTCOME_GRANTED, cause, trig)
+    spawn_tracked(_provision_and_track(plan, category, reason, pause_when_healthy, trig))
     return True
 
 
 async def try_provision_for_request(
-    plan: str, reason: str, category: str = LLM_CATEGORY
+    plan: str, reason: str, category: str = LLM_CATEGORY, *, cause: str
 ) -> bool:
     """Cascata reativa (3º nível): não pausa ao ficar saudável — o próprio
     request que disparou precisa da máquina de pé pro retry. Ignora o
@@ -2481,7 +2759,7 @@ async def try_provision_for_request(
     _try_provision_machine_for_plan): há um cliente pagante esperando."""
     return await _try_provision_machine_for_plan(
         plan, reason, pause_when_healthy=False, category=category,
-        ignore_switch=True,
+        ignore_switch=True, cause=cause,
     )
 
 
@@ -2489,9 +2767,12 @@ async def try_provision_for_pool(
     plan: str, reason: str, category: str = LLM_CATEGORY
 ) -> bool:
     """Reposição proativa: pausa ao ficar saudável — ninguém está esperando,
-    minimiza custo de GPU ociosa."""
+    minimiza custo de GPU ociosa. Assinatura sem `cause` de propósito: é o
+    callable injetado no LifecycleManager (e nos fakes de
+    test_lifecycle_capacity.py), e só existe um motivo pra chamá-la."""
     return await _try_provision_machine_for_plan(
-        plan, reason, pause_when_healthy=True, category=category
+        plan, reason, pause_when_healthy=True, category=category,
+        cause="provision.pool.refill",
     )
 
 
@@ -2512,7 +2793,8 @@ async def pick_machine_with_free_slot(plan: str, category: str = LLM_CATEGORY) -
     if lock_active(
         provisioning_in_progress, product_pool_key(plan, category), PROVISION_LOCK_TTL_S
     ) or await try_provision_for_request(
-        plan, "sem máquina com vaga nem pausada", category
+        plan, "sem máquina com vaga nem pausada", category,
+        cause="provision.request.no_free_slot",
     ):
         raise provisioning_503()
     if not machines:
@@ -2828,6 +3110,12 @@ async def reallocate_stack(entry: dict, stack: dict, old_machine: dict) -> dict 
                 target["id"], "stack_migrated",
                 f"Stack {stack.get('slug') or stack['id']} realocada automaticamente "
                 f"({old_machine.get('name') or 'origem'} {reason})",
+                cause="stack.reallocated",
+                trigger=trigger_snapshot(
+                    "stack.reallocated",
+                    reason=f"origem {old_machine.get('name') or old_machine['id']} {reason}",
+                ),
+                machine_label=target.get("name"),
             )
         except Exception:
             pass  # histórico é best-effort, nunca derruba o request
@@ -2884,6 +3172,8 @@ async def place_base_stack(entry: dict, stack: dict) -> dict | None:
         await supa.log_machine_event(
             target["id"], "stack_placed",
             f"Stack {stack.get('slug') or stack['id']} re-alocada após ociosidade",
+            cause="stack.placed", trigger=trigger_snapshot("stack.placed"),
+            machine_label=target.get("name"),
         )
     except Exception:
         pass  # histórico é best-effort, nunca derruba o request
@@ -2938,7 +3228,8 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
                         # curso — o pod novo está subindo
                         raise recreating_503()
                     outcome = await wake_machine(
-                        machine, f"stack {slug}: máquina pausada e sem vaga nas demais"
+                        machine, f"stack {slug}: máquina pausada e sem vaga nas demais",
+                        cause="wake.request.stack_home_paused",
                     )
                     if outcome in ("woke", "cooldown"):
                         # 'cooldown' = request concorrente já disparou o wake e o
@@ -2948,7 +3239,8 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
                     if fresh and fresh.get("status") == "running":
                         raise waking_503()
                     if outcome == "no_gpu" and await try_recreate_machine(
-                        machine, f"stack {slug}: host sem GPU pra religar"
+                        machine, f"stack {slug}: host sem GPU pra religar",
+                        cause="recreate.request.stack_home_no_gpu",
                     ):
                         # host cedeu a GPU do pod pausado → recria num host novo
                         raise recreating_503()
@@ -2976,7 +3268,8 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
             product_pool_key(effective_plan, category),
             PROVISION_LOCK_TTL_S,
         ) or await try_provision_for_request(
-            effective_plan, "sem máquina para o modelo base", category
+            effective_plan, "sem máquina para o modelo base", category,
+            cause="provision.request.no_base_machine",
         ):
             raise provisioning_503()
         # Último recurso: a máquina da stack foi PERDIDA (pod sumiu do RunPod) e
@@ -2994,7 +3287,8 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
         # restaura uma máquina que o usuário já provisionou, na MESMA row de
         # machines (stacks e chaves seguem apontando pra ela).
         if lost_machine is not None and await try_recreate_machine(
-            lost_machine, f"stack {stack.get('slug') or stack['id']}: pod sumiu do RunPod"
+            lost_machine, f"stack {stack.get('slug') or stack['id']}: pod sumiu do RunPod",
+            cause="recreate.request.pod_lost",
         ):
             raise recreating_503()
         raise preparing_503()
@@ -3050,6 +3344,16 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str, 
     if effective_plan is None:
         raise HTTPException(status_code=503, detail="conta sem stack configurada")
     stack_id = stack["id"]
+
+    # Rede de segurança do interruptor das máquinas: toda rota que chega numa
+    # máquina passa por aqui. As rotas com repasse ao OpenRouter já barraram
+    # antes com a mensagem de modelo (require_machines); as que só existem em
+    # máquina (documents/*, images/extract, embeddings) param aqui.
+    if not await machines_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="inferência nas máquinas da Stac temporariamente desligada",
+        )
 
     route = await store.get_client_location(stack_id)
 
@@ -3357,6 +3661,55 @@ async def validate_body(
     # desconhecido não tem tratamento definido no chat template do vLLM
     messages = [m for m in messages if m.get("role") in ALLOWED_ROLES]
 
+    messages = await apply_system_prompt_and_rag(messages, entry, stack)
+
+    # Recorta imagem acima do que o pod aceita (machines.max_images_per_prompt,
+    # lido do --limit-mm-per-prompt do template). Tem que ser ANTES da
+    # estimativa de tokens, senão o orçamento conta imagem que não vai ser
+    # enviada. Sem isso o vLLM devolveria 400, e num cliente que reenvia a
+    # conversa toda esse 400 se repete pra sempre — ver content_policy.py.
+    messages, dropped_images = clamp_media(
+        messages, machine.get("max_images_per_prompt")
+    )
+    if dropped_images:
+        logger.info(
+            "conteúdo: %d imagem(ns) recortada(s) da stack %s (teto do pod: %s)",
+            dropped_images, stack_id, machine.get("max_images_per_prompt"),
+        )
+    body_json["messages"] = messages
+
+    # Clamp dinâmico pela janela real do modelo — por último, com o prompt
+    # FINAL (system da stack + RAG já injetados). Pode reduzir max_tokens
+    # abaixo de MIN_MAX_TOKENS: entre truncar thinking e devolver o 400 cru
+    # do vLLM, truncar é a degradação aceitável (o filtro de <think> tem
+    # fallback pra stream cortado por length).
+    tools = body_json.get("tools")
+    heuristic_est = estimate_prompt_tokens(messages=messages, tools=tools)
+    exact_text = prompt_text_for_tokenize(messages=messages, tools=tools)
+    # image_tokens: exact_text não leva as imagens (base64 não tokeniza como
+    # texto), então o custo delas tem que voltar por fora na contagem exata —
+    # senão perto do limite um prompt com imagem vale menos do que valia pela
+    # heurística. Único call site com messages, logo o único que precisa disso.
+    image_tokens = count_images(messages) * CONTEXT_IMAGE_TOKENS
+    est_tokens, kind = await resolve_est_tokens(
+        machine, heuristic_est, exact_text, image_tokens=image_tokens
+    )
+    budget = apply_context_budget(body_json, machine, est_tokens=est_tokens, kind=kind)
+    if budget_out is not None:
+        budget_out["budget"] = budget
+    return body_json
+
+
+async def apply_system_prompt_and_rag(
+    messages: list, entry: dict, stack: dict | None
+) -> list:
+    """System prompt de chave/stack + contexto de RAG sobre `messages`
+    (formato chat), com a precedência de sempre: system do cliente ganha, e o
+    RAG entra junto dele só quando a chave pede. Devolve a lista nova, com no
+    máximo UMA mensagem system, no índice 0.
+
+    Extraída de validate_body para o repasse ao OpenRouter aplicar a MESMA
+    política sem duplicá-la — os comentários abaixo são os originais."""
     # normaliza "system": no máximo UM, sempre no índice 0 — o chat template
     # do Qwen3.x rejeita ("System message must be at the beginning") qualquer
     # role "system" que não seja a primeira mensagem. Se o cliente já mandou
@@ -3429,42 +3782,7 @@ async def validate_body(
         system_message = await build_stack_system_message(messages, entry)
         if system_message:
             messages.insert(0, system_message)
-
-    # Recorta imagem acima do que o pod aceita (machines.max_images_per_prompt,
-    # lido do --limit-mm-per-prompt do template). Tem que ser ANTES da
-    # estimativa de tokens, senão o orçamento conta imagem que não vai ser
-    # enviada. Sem isso o vLLM devolveria 400, e num cliente que reenvia a
-    # conversa toda esse 400 se repete pra sempre — ver content_policy.py.
-    messages, dropped_images = clamp_media(
-        messages, machine.get("max_images_per_prompt")
-    )
-    if dropped_images:
-        logger.info(
-            "conteúdo: %d imagem(ns) recortada(s) da stack %s (teto do pod: %s)",
-            dropped_images, stack_id, machine.get("max_images_per_prompt"),
-        )
-    body_json["messages"] = messages
-
-    # Clamp dinâmico pela janela real do modelo — por último, com o prompt
-    # FINAL (system da stack + RAG já injetados). Pode reduzir max_tokens
-    # abaixo de MIN_MAX_TOKENS: entre truncar thinking e devolver o 400 cru
-    # do vLLM, truncar é a degradação aceitável (o filtro de <think> tem
-    # fallback pra stream cortado por length).
-    tools = body_json.get("tools")
-    heuristic_est = estimate_prompt_tokens(messages=messages, tools=tools)
-    exact_text = prompt_text_for_tokenize(messages=messages, tools=tools)
-    # image_tokens: exact_text não leva as imagens (base64 não tokeniza como
-    # texto), então o custo delas tem que voltar por fora na contagem exata —
-    # senão perto do limite um prompt com imagem vale menos do que valia pela
-    # heurística. Único call site com messages, logo o único que precisa disso.
-    image_tokens = count_images(messages) * CONTEXT_IMAGE_TOKENS
-    est_tokens, kind = await resolve_est_tokens(
-        machine, heuristic_est, exact_text, image_tokens=image_tokens
-    )
-    budget = apply_context_budget(body_json, machine, est_tokens=est_tokens, kind=kind)
-    if budget_out is not None:
-        budget_out["budget"] = budget
-    return body_json
+    return messages
 
 
 async def build_stack_system_message(messages: list, entry: dict) -> dict | None:
@@ -3873,6 +4191,266 @@ SHARED_POD_PLANS = {"Go", "VibeCoder", "Pro"}
 # limites da tradução.
 
 
+# ---------- Repasse para o OpenRouter ----------
+#
+# Ver openrouter.py (a parte pura e testada) para a regra de destino e o
+# porquê de cada decisão. Aqui fica o I/O: o client, o log e o relay.
+
+OPENROUTER_UPSTREAM = "openrouter"  # valor de gateway_requests.upstream
+
+
+def _openrouter_log_ctx(
+    *, entry: dict, stack_id: str | None, path: str, slug: str,
+    request: Request, started: float,
+) -> dict:
+    """log_ctx de uma request repassada: sem máquina (machine_id NULL) e com
+    o slug do OpenRouter na coluna `model`."""
+    return dict(
+        account_id=entry["account_id"], stack_id=stack_id,
+        api_key_id=entry["api_key_id"], machine_id=None, path=path, model=slug,
+        user_agent=request.headers.get("user-agent"), started=started,
+        upstream=OPENROUTER_UPSTREAM,
+    )
+
+
+def _openrouter_error(
+    status_code: int, message: str, *, anthropic: bool
+) -> JSONResponse:
+    content = (
+        anthropic_error_body(message)
+        if anthropic
+        else {"error": {"message": message, "type": "upstream_error", "code": status_code}}
+    )
+    return JSONResponse(status_code=status_code, content=content)
+
+
+def _openrouter_error_response(
+    status_code: int, raw: bytes, *, anthropic: bool, label: str
+) -> JSONResponse:
+    """Erro devolvido pelo OpenRouter, no shape do cliente. Chave inválida e
+    crédito esgotado são problema da CONTA da Stac, não da request: viram 503
+    genérico, e o motivo real fica só no log."""
+    message = upstream_error_message(raw)
+    if openrouter.hides_provider_error(status_code):
+        logger.error(
+            "openrouter: %s na conta da Stac (%s): %s", status_code, label, raw[:500]
+        )
+        return _openrouter_error(
+            503, "provedor de inferência temporariamente indisponível", anthropic=anthropic
+        )
+    logger.info("openrouter: %s devolveu %s: %s", label, status_code, raw[:300])
+    return _openrouter_error(status_code, message, anthropic=anthropic)
+
+
+async def openrouter_forward(
+    *, upstream_path: str, payload: dict, log_ctx: dict, anthropic: bool = False,
+) -> Response:
+    """Manda `payload` ao OpenRouter e repassa a resposta ao cliente no mesmo
+    protocolo, registrando tokens e custo em gateway_requests.
+
+    Streaming: bytes repassados como chegam, com heartbeat nos silêncios (ver
+    openrouter.with_heartbeat) e o mesmo watchdog de duas fases das máquinas
+    — só que com prazos próprios (OPENROUTER_STREAM_*)."""
+    is_stream = payload.get("stream") is True
+    label = f"{upstream_path}/{log_ctx.get('model')}"
+    timeout = httpx.Timeout(
+        (max(OPENROUTER_STREAM_TTFT_TIMEOUT_S, OPENROUTER_STREAM_IDLE_TIMEOUT_S) + 15.0)
+        if is_stream
+        else OPENROUTER_NONSTREAM_TIMEOUT_S,
+        connect=10.0, write=30.0, pool=10.0,
+    )
+    try:
+        upstream_req = openrouter_client.build_request(
+            "POST", f"/{upstream_path}", json=payload, timeout=timeout
+        )
+        upstream = await openrouter_client.send(upstream_req, stream=True)
+    except httpx.HTTPError as e:
+        logger.warning("openrouter: %s indisponível (%s)", label, e)
+        log_gateway_request(**log_ctx, status_code=503, stream=is_stream, usage=None)
+        return _openrouter_error(
+            503, "provedor de inferência indisponível, tente novamente", anthropic=anthropic
+        )
+
+    if upstream.status_code >= 400:
+        try:
+            raw = await upstream.aread()
+        except httpx.HTTPError:
+            raw = b""
+        finally:
+            await upstream.aclose()
+        log_gateway_request(
+            **log_ctx, status_code=upstream.status_code, stream=is_stream, usage=None
+        )
+        return _openrouter_error_response(
+            upstream.status_code, raw, anthropic=anthropic, label=label
+        )
+
+    if not is_stream:
+        try:
+            raw = await upstream.aread()
+        except (httpx.HTTPError, ConnectionError, OSError) as e:
+            logger.warning("openrouter: resposta interrompida em %s (%s)", label, e)
+            log_gateway_request(**log_ctx, status_code=502, stream=False, usage=None)
+            return _openrouter_error(
+                502, "o provedor interrompeu a resposta — tente novamente", anthropic=anthropic
+            )
+        finally:
+            await upstream.aclose()
+        usage, cost = openrouter.usage_and_cost(raw)
+        try:
+            failure = openrouter.error_of(json.loads(raw))
+        except Exception:
+            failure = None
+        if failure:
+            # 200 com só `error` no corpo: erro depois de a request ser aceita
+            log_gateway_request(
+                **log_ctx, status_code=502, stream=False, usage=usage, cost_usd=cost
+            )
+            return _openrouter_error(502, failure, anthropic=anthropic)
+        log_gateway_request(
+            **log_ctx, status_code=upstream.status_code, stream=False,
+            usage=usage, cost_usd=cost,
+        )
+        return Response(
+            content=openrouter.strip_cost_body(raw),
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type", "application/json"),
+        )
+
+    scanner = openrouter.UsageCostScanner()
+    stripper = openrouter.CostStripper()
+    chunks = openrouter.with_heartbeat(
+        aiter_bytes_watchdog(
+            upstream,
+            ttft_s=OPENROUTER_STREAM_TTFT_TIMEOUT_S,
+            idle_s=OPENROUTER_STREAM_IDLE_TIMEOUT_S,
+            log_label=label,
+        ),
+        ping=openrouter.ANTHROPIC_SSE_PING if anthropic else openrouter.OPENAI_SSE_PING,
+        interval_s=ANTHROPIC_SSE_PING_INTERVAL_S,
+    )
+
+    async def relay():
+        status_code = upstream.status_code
+        try:
+            async for chunk in chunks:
+                scanner.feed(chunk)  # cru: é daqui que sai o custo do log
+                out = stripper.feed(chunk)
+                if out:
+                    yield out
+            tail = stripper.flush()
+            if tail:
+                yield tail
+        except UpstreamStreamTimeout as e:
+            status_code = 504
+            yield openrouter.stream_error_frame(
+                f"o provedor não entregou resposta a tempo ({e.phase}, {e.waited:.0f}s) "
+                "— tente novamente",
+                "upstream_timeout", anthropic=anthropic,
+            )
+        except (httpx.HTTPError, ConnectionError, OSError):
+            status_code = 502
+            yield openrouter.stream_error_frame(
+                "a conexão com o provedor caiu antes de a resposta terminar — tente novamente",
+                "upstream_disconnect", anthropic=anthropic,
+            )
+        finally:
+            usage, cost = scanner.finish()
+            if scanner.error and status_code < 400:
+                logger.warning("openrouter: erro no meio do stream em %s: %s", label, scanner.error)
+                status_code = 502
+            # fecha o heartbeat ANTES do upstream: ele tem um __anext__
+            # pendente que, com o upstream fechado primeiro, morreria como
+            # "Task exception was never retrieved"
+            await chunks.aclose()
+            await upstream.aclose()
+            log_gateway_request(
+                **log_ctx, status_code=status_code, stream=True,
+                usage=usage, cost_usd=cost,
+            )
+
+    return StreamingResponse(
+        relay(),
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type", "text/event-stream"),
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def openrouter_text(
+    *, path: str, body: bytes, entry: dict, stack: dict | None, slug: str,
+    request: Request, started: float,
+) -> Response:
+    """chat/completions, completions e responses repassados ao OpenRouter.
+
+    Do validate_body das máquinas entra só o que é POLÍTICA DA CONTA e vale
+    para qualquer modelo: defaults de sampling de chave/stack e system prompt
+    + RAG. Fica de fora o que existe por causa do vLLM/Qwen (piso de
+    max_tokens, thinking via chat_template_kwargs, orçamento de contexto pelo
+    /tokenize do pod, recorte de imagens do --limit-mm-per-prompt)."""
+    try:
+        body_json = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="corpo inválido")
+    if not isinstance(body_json, dict):
+        raise HTTPException(status_code=400, detail="corpo inválido")
+
+    max_tokens_field = "max_output_tokens" if path == "responses" else "max_tokens"
+    apply_key_sampling_defaults(body_json, entry, max_tokens_field)
+    apply_stack_sampling_defaults(body_json, entry)
+    messages = body_json.get("messages")
+    if isinstance(messages, list):
+        if len(messages) > MAX_MESSAGES:
+            raise HTTPException(status_code=400, detail="número de mensagens excede o limite")
+        body_json["messages"] = await apply_system_prompt_and_rag(messages, entry, stack)
+    openrouter.prepare_openai_body(body_json, slug, OPENROUTER_MAX_TOKENS)
+
+    return await openrouter_forward(
+        upstream_path=openrouter.TEXT_PATHS[path],
+        payload=body_json,
+        log_ctx=_openrouter_log_ctx(
+            entry=entry, stack_id=(stack or {}).get("id"), path=path, slug=slug,
+            request=request, started=started,
+        ),
+    )
+
+
+async def openrouter_messages(
+    *, anthropic_body: dict, entry: dict, stack: dict | None, slug: str,
+    request: Request, started: float,
+) -> Response:
+    """/v1/messages repassado ao /api/v1/messages do OpenRouter, sem tradução.
+
+    System prompt e RAG seguem a mesma política do chat: o `system` Anthropic
+    entra como a mensagem system do formato chat, apply_system_prompt_and_rag
+    decide, e o texto resultante volta para `system`. Só é reescrito quando
+    MUDOU — reescrever sempre transformaria os blocks do Claude Code em string
+    e jogaria fora o cache_control deles."""
+    system_text = openrouter.anthropic_system_text(anthropic_body.get("system"))
+    messages = anthropic_body.get("messages")
+    if isinstance(messages, list):
+        if len(messages) > MAX_MESSAGES:
+            raise HTTPException(status_code=400, detail="número de mensagens excede o limite")
+        chat = ([{"role": "system", "content": system_text}] if system_text else []) + messages
+        chat = await apply_system_prompt_and_rag(chat, entry, stack)
+        new_system = (
+            text_of(chat[0].get("content")) if chat and chat[0].get("role") == "system" else ""
+        )
+        if new_system and new_system != system_text:
+            anthropic_body["system"] = new_system
+    openrouter.prepare_anthropic_body(anthropic_body, slug, OPENROUTER_MAX_TOKENS)
+
+    return await openrouter_forward(
+        upstream_path="messages",
+        payload=anthropic_body,
+        log_ctx=_openrouter_log_ctx(
+            entry=entry, stack_id=(stack or {}).get("id"), path="messages", slug=slug,
+            request=request, started=started,
+        ),
+        anthropic=True,
+    )
+
+
 @app.post("/v1/messages")
 async def anthropic_messages(
     request: Request,
@@ -3888,9 +4466,27 @@ async def anthropic_messages(
         authorization, x_api_key, request.headers, "messages"
     )
     account_id = entry["account_id"]
-    _, key_plan = resolve_key_stack(entry)
+    key_stack, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+
+    # parseado ANTES do resolve_route: o destino (OpenRouter x máquina) sai do
+    # `model` do corpo, e decidir isso não pode acordar máquina nenhuma
+    try:
+        anthropic_body = json.loads(raw_body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="corpo inválido")
+    if not isinstance(anthropic_body, dict):
+        raise HTTPException(status_code=400, detail="corpo inválido")
+
+    requested = openrouter.requested_model(anthropic_body)
+    slug = await openrouter_slug_for(requested, openrouter.TEXT_KIND)
+    if slug:
+        return await openrouter_messages(
+            anthropic_body=anthropic_body, entry=entry, stack=key_stack, slug=slug,
+            request=request, started=started,
+        )
+    await require_machines(requested, openrouter.TEXT_KIND)
 
     machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
     await maybe_touch(stack_id, machine["id"])
@@ -3905,12 +4501,6 @@ async def anthropic_messages(
         model=effective_model_name(stack_id, rewrite_model, machine),
         user_agent=request.headers.get("user-agent"), started=started,
     )
-
-    try:
-        anthropic_body = json.loads(raw_body)
-    except Exception:
-        release_flight(flight_key)
-        raise HTTPException(status_code=400, detail="corpo inválido")
 
     openai_body, requested_model = anthropic_to_openai_request(anthropic_body)
     is_stream = bool(anthropic_body.get("stream"))
@@ -3995,6 +4585,9 @@ async def anthropic_messages(
         logger.warning(
             "anthropic proxy: timeout aguardando resposta de %s (%s)", flight_key, e
         )
+        # Sem esta linha a request morta não deixava rastro em gateway_requests:
+        # quem investigava "toda request longa morre" via só as que sobreviveram.
+        log_gateway_request(**log_ctx, status_code=503, stream=is_stream, usage=None)
         raise HTTPException(
             status_code=503,
             detail=(
@@ -4007,6 +4600,7 @@ async def anthropic_messages(
         # aqui sim "indisponível" é a descrição correta.
         release_flight(flight_key)
         logger.warning("anthropic proxy: upstream indisponível para %s (%s)", flight_key, e)
+        log_gateway_request(**log_ctx, status_code=503, stream=is_stream, usage=None)
         raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
     except BaseException:
         release_flight(flight_key)
@@ -4250,6 +4844,7 @@ def log_gateway_request(
     path: str, model: str | None, status_code: int, stream: bool,
     started: float, usage: dict | None = None, user_agent: str | None = None,
     budget: PromptBudget | None = None,
+    upstream: str | None = None, cost_usd: float | None = None,
 ) -> None:
     """Log fire-and-forget de uma requisição completada (migration 0038,
     tabela gateway_requests). `started` é o time.monotonic() capturado na
@@ -4286,6 +4881,13 @@ def log_gateway_request(
         "tokens_out": usage.get("completion_tokens"),
         "duration_ms": int((time.monotonic() - started) * 1000),
     }
+    # Colunas da migration 0071, só presentes quando há valor: a linha de
+    # máquina continua idêntica à de antes, e um gateway novo com a migration
+    # ainda por aplicar não perde o log das máquinas.
+    if upstream is not None:
+        row["upstream"] = upstream
+    if cost_usd is not None:
+        row["cost_usd"] = cost_usd
     spawn_tracked(_write_gateway_request(row))
 
 
@@ -5222,15 +5824,12 @@ def _require_image_product(stack: dict | None, plan: str | None, path: str) -> N
     )
 
 
-async def _authorize_image_request(
+async def _authorize_image_key(
     authorization: str | None, request: Request, path: str
-) -> tuple[dict, str, dict, str, str]:
-    """Tronco comum de generations/edits: autentica, checa produto e limites,
-    resolve a máquina e reserva a vaga de concorrência.
-
-    Devolve (entry, account_id, machine, stack_id, effective_plan) com o
-    in_flight JÁ incrementado — quem chama é responsável pelo release_flight em
-    todos os caminhos de saída.
+) -> tuple[dict, str, dict, str]:
+    """Tronco comum de generations/edits: autentica, checa produto e limites.
+    Devolve (entry, account_id, key_stack, key_plan). A máquina é resolvida à
+    parte, em _reserve_image_machine — e só se a request for para máquina.
 
     A ordem é a mesma do catch-all e do /v1/messages, e cada passo está onde
     está por um motivo: o guard de produto vem antes do rate limit porque não faz
@@ -5258,7 +5857,16 @@ async def _authorize_image_request(
     # (DAILY_TOKEN_BUDGET), então uma conta com stack de texto e de imagem
     # divide o mesmo teto — hoje 0 (sem teto) para todos os planos.
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+    return entry, account_id, key_stack, key_plan
 
+
+async def _reserve_image_machine(entry: dict, account_id: str) -> tuple[dict, str, str]:
+    """Segunda metade do tronco de imagem: resolve a máquina e reserva a vaga.
+    Devolve (machine, stack_id, effective_plan) com o in_flight JÁ incrementado.
+
+    Separada de _authorize_image_key porque entre as duas o gateway decide o
+    destino: um modelo da allowlist do OpenRouter não passa por aqui, e não
+    pode acordar máquina nenhuma."""
     machine, _rewrite_model, effective_plan, stack_id = await resolve_route(
         account_id, entry
     )
@@ -5267,7 +5875,7 @@ async def _authorize_image_request(
     flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
     check_concurrency(flight_key, machine, effective_plan, IMAGE_CATEGORY)
-    return entry, account_id, machine, stack_id, effective_plan
+    return machine, stack_id, effective_plan
 
 
 def _image_log_ctx(
@@ -5387,13 +5995,17 @@ def _parse_image_payload(raw: bytes) -> dict:
     return payload
 
 
-async def _persist_images(payload: dict, log_ctx: dict, fallback_meta: dict) -> None:
+async def _persist_images(payload: dict, log_ctx: dict, fallback_meta: dict) -> str:
     """Sobe as imagens da resposta e grava as linhas de image_generations.
 
     Síncrono no caminho da requisição de propósito: uma resposta 200 desta rota
     significa "a imagem está guardada". Fire-and-forget daria latência menor mas
     não daria essa garantia — a task pode morrer no restart do gateway, e não há
     de onde reconstruir a imagem depois que o corpo foi entregue.
+
+    Devolve o `batch_id` do lote (a coluna de mesmo nome em image_generations):
+    é o que sai no header `X-Stac-Image-Batch`, para o painel reabrir as imagens
+    de uma execução sem guardar os bytes do outro lado.
 
     Levanta em falha confirmada; quem chama traduz para 502.
     """
@@ -5420,10 +6032,11 @@ async def _persist_images(payload: dict, log_ctx: dict, fallback_meta: dict) -> 
     except Exception:
         await _compensate_uploads(batch_id, uploaded)
         raise
+    return batch_id
 
 
 async def _relay_image_response(
-    upstream, flight_key: tuple[str, str], log_ctx: dict,
+    upstream, flight_key: tuple[str, str] | None, log_ctx: dict,
     fallback_meta: dict | None = None,
 ) -> Response:
     """Grava as imagens e devolve a resposta do pod ao cliente.
@@ -5450,6 +6063,7 @@ async def _relay_image_response(
     status_code = upstream.status_code
     headers: dict[str, str] = {}
     usage: dict | None = None
+    cost: float | None = None
     try:
         try:
             raw = await upstream.aread()
@@ -5470,7 +6084,17 @@ async def _relay_image_response(
             try:
                 payload = _parse_image_payload(raw)
                 usage = image_gen.usage_of(payload)
-                await _persist_images(payload, log_ctx, fallback_meta or {})
+                # O corpo segue byte a byte o do pod; o elo com o bucket vai
+                # só no header, que um cliente comum pode ignorar.
+                headers["X-Stac-Image-Batch"] = await _persist_images(
+                    payload, log_ctx, fallback_meta or {}
+                )
+                # Repasse ao OpenRouter: o custo vai para o log e SAI do corpo
+                # (é o que a Stac paga). Resposta de pod não tem custo e segue
+                # byte a byte, como sempre.
+                cost = _usage_cost(payload)
+                if openrouter.strip_cost(payload):
+                    raw = json.dumps(payload).encode()
             except image_gen.MalformedImageResponse as e:
                 # o pod respondeu 200 com um corpo que não reconhecemos. Não dá
                 # pra guardar nem pra prometer que guardamos.
@@ -5492,15 +6116,109 @@ async def _relay_image_response(
                 )
     finally:
         await upstream.aclose()
-        release_flight(flight_key)
+        if flight_key is not None:  # None = OpenRouter, sem vaga de máquina
+            release_flight(flight_key)
 
-    log_gateway_request(**log_ctx, status_code=status_code, stream=False, usage=usage)
+    log_gateway_request(
+        **log_ctx, status_code=status_code, stream=False, usage=usage, cost_usd=cost
+    )
     return Response(
         content=raw,
         status_code=status_code,
         media_type=upstream.headers.get("content-type", "application/json"),
         headers=headers or None,
     )
+
+
+def _usage_cost(payload: dict) -> float | None:
+    usage = payload.get("usage")
+    cost = usage.get("cost") if isinstance(usage, dict) else None
+    return float(cost) if isinstance(cost, (int, float)) and not isinstance(cost, bool) else None
+
+
+async def openrouter_image(
+    *, fields: dict, references: list[str] | None, path: str, entry: dict,
+    stack: dict | None, slug: str, request: Request, started: float,
+) -> Response:
+    """generations/edits repassados ao POST /api/v1/images do OpenRouter.
+
+    O prompt segue a precedência de sempre (cliente > chave > stack, ver
+    resolve_image_prompt). Os defaults de imagem de chave/stack (steps,
+    guidance, size) NÃO entram: foram calibrados para o FLUX do pod, e um
+    `size` fixo pode ser recusado por um modelo que só aceita proporções.
+    A resposta passa pelo mesmo _relay_image_response das máquinas: a imagem é
+    guardada no bucket antes do 200, igual."""
+    prompt = resolve_image_prompt(fields.get("prompt"), entry, stack)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt ausente")
+    payload = openrouter.image_body(
+        fields, slug=slug, prompt=prompt, references=references,
+        max_images=OPENROUTER_MAX_IMAGES,
+    )
+    log_ctx = _openrouter_log_ctx(
+        entry=entry, stack_id=(stack or {}).get("id"), path=path, slug=slug,
+        request=request, started=started,
+    )
+    fallback_meta = image_gen.request_meta({**fields, "prompt": prompt})
+    try:
+        upstream_req = openrouter_client.build_request(
+            "POST", "/images", json=payload,
+            timeout=httpx.Timeout(OPENROUTER_IMAGE_TIMEOUT_S, connect=10.0, write=60.0, pool=10.0),
+        )
+        upstream = await openrouter_client.send(upstream_req, stream=True)
+    except httpx.HTTPError as e:
+        logger.warning("openrouter: %s/%s indisponível (%s)", path, slug, e)
+        log_gateway_request(**log_ctx, status_code=503, stream=False, usage=None)
+        return _openrouter_error(
+            503, "provedor de inferência indisponível, tente novamente", anthropic=False
+        )
+    if upstream.status_code >= 400:
+        try:
+            raw = await upstream.aread()
+        except httpx.HTTPError:
+            raw = b""
+        finally:
+            await upstream.aclose()
+        log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=False, usage=None)
+        return _openrouter_error_response(
+            upstream.status_code, raw, anthropic=False, label=f"{path}/{slug}"
+        )
+    return await _relay_image_response(upstream, None, log_ctx, fallback_meta)
+
+
+async def _read_capped(request: Request, limit: int) -> bytes:
+    """Corpo inteiro com teto, para quando o multipart PRECISA ser lido aqui."""
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > limit:
+            raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
+    return bytes(buf)
+
+
+async def _parse_edit_form(request: Request, raw: bytes) -> tuple[dict, list[str]]:
+    """(campos de texto, referências como data URLs) de um multipart de edits
+    já lido em `raw`. `image` e `image[]` são os dois nomes que os SDKs da
+    OpenAI usam para as referências."""
+
+    async def receive():
+        return {"type": "http.request", "body": raw, "more_body": False}
+
+    try:
+        form = await Request(request.scope, receive).form(max_files=32, max_fields=64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="multipart inválido")
+    try:
+        fields = {k: v for k, v in form.multi_items() if isinstance(v, str)}
+        references = []
+        for name in ("image", "image[]"):
+            for item in form.getlist(name):
+                if isinstance(item, str):
+                    continue
+                references.append(openrouter.data_url(item.content_type, await item.read()))
+    finally:
+        await form.close()
+    return fields, references
 
 
 @app.post("/v1/images/generations")
@@ -5517,9 +6235,25 @@ async def images_generations(
     if len(body) > image_proxy.max_generation_bytes():
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
 
-    entry, account_id, machine, stack_id, _plan = await _authorize_image_request(
+    entry, account_id, key_stack, _plan = await _authorize_image_key(
         authorization, request, GENERATIONS_PATH
     )
+    requested = openrouter.requested_model(body)
+    slug = await openrouter_slug_for(requested, openrouter.IMAGE_KIND)
+    if slug:
+        try:
+            fields = json.loads(body)
+        except Exception:
+            raise HTTPException(status_code=400, detail="corpo inválido")
+        if not isinstance(fields, dict):
+            raise HTTPException(status_code=400, detail="corpo inválido")
+        return await openrouter_image(
+            fields=fields, references=None, path=GENERATIONS_PATH, entry=entry,
+            stack=key_stack, slug=slug, request=request, started=started,
+        )
+    await require_machines(requested, openrouter.IMAGE_KIND)
+
+    machine, stack_id, _plan = await _reserve_image_machine(entry, account_id)
     flight_key = (stack_id, machine["id"])
     log_ctx = _image_log_ctx(
         account_id=account_id, stack_id=stack_id, entry=entry, machine=machine,
@@ -5611,9 +6345,33 @@ async def images_edits(request: Request, authorization: str | None = Header(None
     entram na MESMA precedência".
     """
     started = time.monotonic()
-    entry, account_id, machine, stack_id, _plan = await _authorize_image_request(
+    entry, account_id, key_stack, _plan = await _authorize_image_key(
         authorization, request, EDITS_PATH
     )
+
+    # Repasse ao OpenRouter: o `model` mora DENTRO do multipart, então só dá
+    # pra decidir o destino lendo o corpo. Isso só acontece enquanto houver
+    # modelo de imagem na allowlist — sem nenhum, o edits segue em streaming
+    # como sempre (ver a docstring acima). Lido, o corpo vai inteiro para a
+    # máquina se o modelo não for do OpenRouter.
+    buffered: bytes | None = None
+    if openrouter.accepted_models(await openrouter_catalog(), openrouter.IMAGE_KIND):
+        buffered = await _read_capped(request, image_proxy.max_edit_bytes())
+        fields, references = await _parse_edit_form(request, buffered)
+        requested = openrouter.requested_model(fields)
+        slug = await openrouter_slug_for(requested, openrouter.IMAGE_KIND)
+        if slug:
+            if not references:
+                raise HTTPException(status_code=400, detail="imagem de referência ausente")
+            return await openrouter_image(
+                fields=fields, references=references, path=EDITS_PATH, entry=entry,
+                stack=key_stack, slug=slug, request=request, started=started,
+            )
+        await require_machines(requested, openrouter.IMAGE_KIND)
+    else:
+        await require_machines(None, openrouter.IMAGE_KIND)
+
+    machine, stack_id, _plan = await _reserve_image_machine(entry, account_id)
     flight_key = (stack_id, machine["id"])
     log_ctx = _image_log_ctx(
         account_id=account_id, stack_id=stack_id, entry=entry, machine=machine,
@@ -5645,8 +6403,12 @@ async def images_edits(request: Request, authorization: str | None = Header(None
         upstream_req = proxy_client.build_request(
             "POST",
             f"{machine['public_url']}/v1/{EDITS_PATH}",
-            content=image_proxy.counting_stream(
-                request.stream(), image_proxy.max_edit_bytes()
+            content=(
+                buffered
+                if buffered is not None
+                else image_proxy.counting_stream(
+                    request.stream(), image_proxy.max_edit_bytes()
+                )
             ),
             headers=upstream_headers,
             # retries=2 do transporte não conflita com o corpo em streaming: o
@@ -5701,6 +6463,31 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     key_stack, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+
+    # Destino da request (ver openrouter.py): modelo da allowlist vai para o
+    # OpenRouter; o resto segue para máquina, se as máquinas estiverem ligadas.
+    key_kind = (
+        openrouter.IMAGE_KIND
+        if (key_stack or {}).get("category") == IMAGE_CATEGORY
+        else openrouter.TEXT_KIND
+    )
+    if path in openrouter.TEXT_PATHS:
+        requested = openrouter.requested_model(body)
+        slug = await openrouter_slug_for(requested, openrouter.TEXT_KIND)
+        if slug:
+            return await openrouter_text(
+                path=path, body=body, entry=entry, stack=key_stack, slug=slug,
+                request=request, started=started,
+            )
+        await require_machines(requested, openrouter.TEXT_KIND)
+    elif path == "models" and not await machines_enabled():
+        # sem máquinas, a lista é só a allowlist (vazia com o repasse desligado)
+        return JSONResponse(content={
+            "object": "list",
+            "data": openrouter.model_list_entries(
+                openrouter.accepted_models(await openrouter_catalog(), key_kind)
+            ),
+        })
 
     machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
     await maybe_touch(stack_id, machine["id"])
@@ -5790,6 +6577,11 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # detalhe da exceção (pode conter a public_url interna do pod) só no
         # log do servidor — o cliente recebe uma mensagem genérica
         logger.warning("proxy: upstream indisponível para %s (%s)", flight_key, e)
+        # Inclui o ReadTimeout de MESSAGES_NONSTREAM_TIMEOUT_S: a request sem
+        # stream que passa dos 90s morria sem linha em gateway_requests, então a
+        # página de Requisições só mostrava as que sobreviveram (foi assim que
+        # o "toda request do n8n acima de 90s morre" ficou invisível).
+        log_gateway_request(**log_ctx, status_code=503, stream=is_stream_request, usage=None)
         raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
     except BaseException:
         # cliente desconectou no meio do body (CancelledError) ou qualquer
@@ -5812,7 +6604,10 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                 payload["data"] = [
                     m for m in payload.get("data", [])
                     if not str(m.get("id", "")).startswith("acct-")
-                ]
+                ] + openrouter.model_list_entries(
+                    # os modelos do OpenRouter aceitos para esta chave
+                    openrouter.accepted_models(await openrouter_catalog(), key_kind)
+                )
                 raw = json.dumps(payload).encode()
             except Exception:
                 pass
@@ -6267,6 +7062,19 @@ async def flush_key_cache(x_admin_secret: str | None = Header(None)):
     clients = len(client_seen)
     client_seen.clear()
     return {"ok": True, "flushed": n, "client_stacks_flushed": clients}
+
+
+@app.post("/admin/flush-settings")
+async def flush_settings(x_admin_secret: str | None = Header(None)):
+    """Esquece os interruptores de system_settings e a allowlist do OpenRouter
+    em cache. O painel chama ao mudar qualquer um deles: sem isto o clique só
+    valeria depois do SETTINGS_CACHE_TTL_S (30s)."""
+    global auto_provision_cache, openrouter_catalog_cache
+    require_admin(x_admin_secret)
+    settings_cache.clear()
+    auto_provision_cache = None
+    openrouter_catalog_cache = None
+    return {"ok": True}
 
 
 @app.post("/admin/sync-machine-keys")

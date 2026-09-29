@@ -9,6 +9,7 @@ import {
   Boxes,
   ChevronsUpDown,
   Cpu,
+  GitBranch,
   Handshake,
   KeyRound,
   Layers,
@@ -17,6 +18,7 @@ import {
   Monitor,
   Moon,
   Server,
+  Sparkles,
   Sun,
   Users,
   Wallet,
@@ -67,9 +69,12 @@ const navGroups = [
     label: "Servidores",
     items: [
       { href: "/machines", label: "Máquinas", icon: Server },
+      { href: "/modelos", label: "Modelos (OpenRouter)", icon: Sparkles },
       { href: "/templates", label: "Produtos", icon: Boxes },
       { href: "/stacks", label: "Stacks", icon: Layers },
       { href: "/requisicoes", label: "Requisições", icon: Activity },
+      // por que o gateway criou/religou/recriou máquina — e por que não
+      { href: "/decisoes", label: "Decisões", icon: GitBranch },
     ],
   },
   {

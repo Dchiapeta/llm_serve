@@ -1,7 +1,8 @@
 import { timingSafeEqual } from "crypto"
 import { NextRequest, NextResponse } from "next/server"
 
-import { recreateMachine } from "@/lib/actions"
+import { getMachinesEnabled, recreateMachine } from "@/lib/actions"
+import { parseTriggerEnvelope } from "@/lib/machine-events"
 
 function secretsMatch(a: string, b: string): boolean {
   const bufA = Buffer.from(a)
@@ -27,13 +28,24 @@ export async function POST(
     return NextResponse.json({ error: "admin secret inválido" }, { status: 401 })
   }
 
+  // Máquinas desligadas (migration 0071): o gateway já nega antes de chamar;
+  // isto cobre um gateway antigo. O botão do painel usa a Server Action, que
+  // continua permitida — recriar à mão é decisão explícita de quem clica.
+  if (!(await getMachinesEnabled())) {
+    return NextResponse.json({ error: "Máquinas desligadas no painel" }, { status: 409 })
+  }
+
   const { id } = await params
+  // corpo opcional: gateway antigo manda sem corpo; o novo manda {trigger}
+  // (migration 0070) — mesma regra da rota /provision: inválido = ausente
+  const body = await req.json().catch(() => null)
+  const trigger = parseTriggerEnvelope(body?.trigger)
   let result: Awaited<ReturnType<typeof recreateMachine>>
   try {
     // Rota exclusiva do gateway: em template de teste esta recriação é uma
     // criação automática e deve ser bloqueada; o botão do painel chama a
     // Server Action sem este segundo argumento e continua permitido.
-    result = await recreateMachine(id, true)
+    result = await recreateMachine(id, true, trigger)
   } catch (e) {
     // recreateMachine (RunPod/Supabase) pode lançar fora dos caminhos de erro
     // já tratados — nunca deixa o gateway receber o 500 HTML padrão do Next

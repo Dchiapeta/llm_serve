@@ -95,10 +95,26 @@ def resolve_thinking_policy(body: dict, entry: dict, stack: dict | None,
             raise ThinkingPolicyError("thinking.budget_tokens não é suportado por este endpoint")
         requested.append(thinking["type"] == "enabled")
 
+    # Nível de raciocínio da CHAVE (migration 0069): none/low/medium/high, ou
+    # None para herdar. Vem antes de default_enable_thinking na precedência
+    # porque é a configuração mais específica — diz o on/off E o nível.
+    key_effort = entry.get("default_reasoning_effort")
+    if key_effort is not None and key_effort not in ("none", "low", "medium", "high"):
+        raise ThinkingPolicyError("default_reasoning_effort deve ser none, low, medium, high ou null")
+
     if requested:
         if any(value != requested[0] for value in requested):
             raise ThinkingPolicyError("parâmetros de thinking conflitantes na requisição")
-        policy = ThinkingPolicy(requested[0], "request", effort_pedido if requested[0] else None)
+        effort = effort_pedido if requested[0] else None
+        if requested[0] and effort is None and key_effort not in (None, "none"):
+            # a request só LIGOU o thinking (enable_thinking / thinking.type),
+            # sem dizer o nível: o nível da chave preenche, como faria um
+            # default de sampling. Um reasoning_effort explícito já veio acima.
+            effort = key_effort
+        policy = ThinkingPolicy(requested[0], "request", effort)
+    elif key_effort is not None:
+        policy = ThinkingPolicy(key_effort != "none", "key",
+                                key_effort if key_effort != "none" else None)
     else:
         policy = ThinkingPolicy(None, "legacy")
         for source, config in (("key", entry), ("stack", stack or {})):

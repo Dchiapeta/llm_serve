@@ -68,3 +68,70 @@ def test_objeto_reasoning_da_responses_api_nao_e_tocado():
     mexer nele quebraria o Codex."""
     _, body = _apply({"reasoning": {"effort": "low"}})
     assert body["reasoning"] == {"effort": "low"}
+
+
+# ---------- default_reasoning_effort da chave (migration 0069) ----------
+
+def _apply_com_chave(body, entry, stack=None):
+    policy = resolve_thinking_policy(body, entry, stack, MACHINE)
+    apply_thinking_policy(body, policy)
+    return policy, body
+
+
+@pytest.mark.parametrize("nivel,template", [("low", "low"), ("medium", "medium"), ("high", "xhigh")])
+def test_nivel_da_chave_liga_e_manda_o_nivel(nivel, template):
+    policy, body = _apply_com_chave({"max_tokens": 12000}, {"default_reasoning_effort": nivel})
+    assert policy == ThinkingPolicy(True, "key", nivel)
+    assert body["chat_template_kwargs"] == {"enable_thinking": True, "reasoning_effort": template}
+
+
+def test_none_na_chave_desliga():
+    policy, body = _apply_com_chave({}, {"default_reasoning_effort": "none"})
+    assert policy == ThinkingPolicy(False, "key")
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_nivel_da_chave_ganha_do_boolean_da_chave_e_da_stack():
+    entry = {"default_reasoning_effort": "low", "default_enable_thinking": False}
+    policy, _ = _apply_com_chave({}, entry, {"default_enable_thinking": False})
+    assert policy == ThinkingPolicy(True, "key", "low")
+
+
+def test_null_na_chave_cai_no_boolean():
+    entry = {"default_reasoning_effort": None, "default_enable_thinking": True}
+    policy, body = _apply_com_chave({}, entry)
+    assert policy == ThinkingPolicy(True, "key")
+    assert "reasoning_effort" not in body["chat_template_kwargs"]
+
+
+def test_request_explicita_ganha_do_nivel_da_chave():
+    policy, body = _apply_com_chave({"reasoning_effort": "low"}, {"default_reasoning_effort": "high"})
+    assert policy == ThinkingPolicy(True, "request", "low")
+    assert body["chat_template_kwargs"]["reasoning_effort"] == "low"
+    policy, body = _apply_com_chave({"reasoning_effort": "none"}, {"default_reasoning_effort": "high"})
+    assert policy == ThinkingPolicy(False, "request")
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_request_que_so_liga_recebe_o_nivel_da_chave():
+    """`enable_thinking: true` (ou `thinking.type: enabled`) sem nível: o
+    nível da chave preenche, como um default de sampling preencheria."""
+    policy, body = _apply_com_chave({"chat_template_kwargs": {"enable_thinking": True}},
+                                    {"default_reasoning_effort": "high"})
+    assert policy == ThinkingPolicy(True, "request", "high")
+    assert body["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+    policy, _ = _apply_com_chave({"thinking": {"type": "enabled"}}, {"default_reasoning_effort": "medium"})
+    assert policy.effort == "medium"
+
+
+def test_request_que_desliga_ignora_o_nivel_da_chave():
+    policy, body = _apply_com_chave({"chat_template_kwargs": {"enable_thinking": False}},
+                                    {"default_reasoning_effort": "high"})
+    assert policy == ThinkingPolicy(False, "request")
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_nivel_invalido_na_chave_e_erro():
+    from thinking_policy import ThinkingPolicyError
+    with pytest.raises(ThinkingPolicyError):
+        resolve_thinking_policy({}, {"default_reasoning_effort": "xhigh"}, None, MACHINE)

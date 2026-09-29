@@ -93,6 +93,7 @@ function machineCapacity(
 
 type StackResult = {
   slug: string
+  machineId: string | null
   machineCreated: boolean
 }
 
@@ -234,6 +235,8 @@ export function CreateStackDialog({
               Stack <code className="font-mono">{result.slug}</code> criada.
               {result.machineCreated &&
                 " A máquina está subindo — fica pronta em ~1 min."}
+              {!result.machineId &&
+                " Sem máquina: as máquinas estão desligadas, e ela é alocada na primeira requisição depois de religadas."}
             </p>
             <Button onClick={() => setOpen(false)}>Concluir</Button>
           </div>

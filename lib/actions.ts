@@ -7,15 +7,21 @@ import { randomBytes } from "crypto"
 
 import { agent, type AgentKeyEntry, type LoraSignedFile } from "./agent"
 import { allowedDomainsLabel, isAllowedAdminEmail } from "./auth-admin"
-import { requireAdminSession } from "./auth-admin-server"
+import { currentAdminEmail, requireAdminSession } from "./auth-admin-server"
 import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
+import { type EventMeta } from "./machine-events"
 import { vllmFlagsFromTemplate } from "./machines"
 import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
 import { insertStack } from "./stacks"
+import {
+  getOpenRouterCatalog,
+  openRouterModelKind,
+  type OpenRouterCatalogModel,
+} from "./openrouter"
 import { listGpuTypes, podProxyUrl, runpod, type CreatePodInput } from "./runpod"
 import { createSupabaseAdmin, createSupabaseServerClient } from "./supabase/server"
-import { CLIENT_WINDOW_DAYS, MAX_KNOWLEDGE_FILE_SIZE_BYTES, PRODUCT_CATEGORIES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type Account, type ApiKey, type LoraAdapter, type Machine, type ProductCategory, type Stack, type StackClient, type Template, type TemplatePlan } from "./types"
+import { CLIENT_WINDOW_DAYS, MAX_KNOWLEDGE_FILE_SIZE_BYTES, PRODUCT_CATEGORIES, RAG_FILE_LIMIT_BY_PLAN, SHARED_POD_PLANS, TEMPLATE_PLANS, type Account, type ApiKey, type LoraAdapter, type Machine, type ProductCategory, type Stack, type StackClient, type Template, type TemplatePlan, type TriggerEnvelope } from "./types"
 
 // Janela de deduplicação do provisionamento: um retry do gateway dentro desse
 // intervalo reusa a máquina 'creating' recém-criada em vez de criar outra.
@@ -114,9 +120,112 @@ export async function logout() {
 
 // ---------- Helpers ----------
 
-async function logEvent(machineId: string | null, type: string, message: string) {
+// `meta` são as colunas estruturadas da migration 0070 (cause/actor/
+// trigger_meta/trace_id/machine_label). Opcional: os eventos de chave e de
+// sync continuam só com a mensagem. Só chaves presentes vão no insert — um
+// painel novo contra um banco sem a 0070 quebraria em 400 (e o insert aqui
+// não checa erro, então degradaria em silêncio): a migration vai ANTES.
+async function logEvent(
+  machineId: string | null,
+  type: string,
+  message: string,
+  meta?: EventMeta
+) {
   const db = createSupabaseAdmin()
-  await db.from("machine_events").insert({ machine_id: machineId, type, message })
+  const row: Record<string, unknown> = { machine_id: machineId, type, message }
+  if (meta?.cause) row.cause = meta.cause
+  if (meta?.trigger) {
+    row.trigger_meta = meta.trigger
+    if (meta.trigger.actor) row.actor = meta.trigger.actor
+    if (meta.trigger.trace_id) row.trace_id = meta.trigger.trace_id
+  }
+  if (meta?.machineLabel) row.machine_label = meta.machineLabel
+  await db.from("machine_events").insert(row)
+}
+
+// Autoria de uma ação do painel: quem clicou (sessão) — ou "panel" quando a
+// ação roda numa rota server-to-server sem sessão (ex.: /api/keys chamada
+// pelo app do cliente). Não redireciona: ver currentAdminEmail.
+async function adminTrigger(cause: string, extra?: Partial<TriggerEnvelope>): Promise<EventMeta> {
+  const email = await currentAdminEmail()
+  return {
+    cause,
+    trigger: {
+      actor: email ? "admin" : "panel",
+      cause,
+      ...(email ? { admin_email: email } : {}),
+      ...extra,
+    },
+  }
+}
+
+// Teto da mensagem de erro guardada em trigger_meta.reason — a do RunPod é
+// curta, mas um stack trace acidental não pode virar a coluna jsonb.
+const DECISION_REASON_MAX = 300
+
+// Decisão do PAINEL sobre criar/religar/recriar (provision_decisions, migration
+// 0070): espelho do decisions.record_bg do gateway para as tentativas que
+// nascem aqui — "Nova máquina", Iniciar, Recriar, e as chamadas do gateway às
+// rotas /api/machines/*. Grava inclusive as que FALHAM no RunPod: até aqui um
+// clique que morria em "no instances currently available" não deixava rastro
+// nenhum, indistinguível de ninguém ter clicado. Best-effort, nunca lança.
+async function recordDecision(input: {
+  outcome: "granted" | "denied"
+  cause: string
+  meta: EventMeta
+  plan?: string | null
+  category?: string | null
+  machineId?: string | null
+  reason?: string | null
+}) {
+  const t = input.meta.trigger ?? {}
+  const reason = input.reason ? input.reason.slice(0, DECISION_REASON_MAX) : t.reason
+  const trigger: TriggerEnvelope = {
+    ...t,
+    cause: input.cause,
+    ...(reason ? { reason } : {}),
+  }
+  const db = createSupabaseAdmin()
+  const { error } = await db.from("provision_decisions").insert({
+    outcome: input.outcome,
+    cause: input.cause,
+    actor: t.actor ?? "panel",
+    plan: input.plan ?? t.plan ?? null,
+    category: input.category ?? t.category ?? null,
+    machine_id: input.machineId ?? t.machine_id ?? null,
+    account_id: t.account_id ?? null,
+    stack_id: t.stack_id ?? null,
+    api_key_id: t.api_key_id ?? null,
+    key_prefix: t.key_prefix ?? null,
+    trace_id: t.trace_id ?? null,
+    trigger_meta: trigger,
+  })
+  if (error) console.warn("provision_decisions: falha ao gravar decisão do painel:", error.message)
+}
+
+// plano/categoria do template de uma máquina — o pool que a decisão afeta
+async function templatePool(
+  db: ReturnType<typeof createSupabaseAdmin>,
+  templateId: string | null
+): Promise<{ plan: string | null; category: string | null }> {
+  if (!templateId) return { plan: null, category: null }
+  const { data } = await db
+    .from("templates")
+    .select("plan, category")
+    .eq("id", templateId)
+    .maybeSingle<Pick<Template, "plan" | "category">>()
+  return { plan: data?.plan ?? null, category: data?.category ?? null }
+}
+
+// Envelope vindo do gateway (rotas /api/machines/*): já traz actor e cause;
+// sem envelope (gateway antigo) cai na autoria do painel com uma causa
+// genérica, pra nunca fingir que sabe o que não sabe.
+async function metaFromGateway(
+  trigger: TriggerEnvelope | null | undefined,
+  fallbackCause: string
+): Promise<EventMeta> {
+  if (trigger) return { cause: trigger.cause ?? fallbackCause, trigger }
+  return adminTrigger(fallbackCause)
 }
 
 // Plano/tier do template: Go, Pro, Max ou Enterprise.
@@ -551,6 +660,8 @@ async function provisionMachine(input: {
   // Só o botão administrativo de nova máquina aceita template de teste.
   // Todos os caminhos autônomos passam true e são barrados.
   automatic?: boolean
+  // Por que/quem está criando (migration 0070). Ausente = clique manual.
+  meta?: EventMeta
 }): Promise<{ machineId: string } | { error: string }> {
   const db = createSupabaseAdmin()
   const { name, templateId, gpuTypeId } = input
@@ -562,8 +673,17 @@ async function provisionMachine(input: {
     .single<Template>()
   if (tplErr || !tpl) return { error: "Produto não encontrado" }
 
+  // originador: envelope do gateway (rota /provision) ou o admin da sessão
+  const meta = input.meta ?? (await adminTrigger("provision.panel.manual"))
+  const pool = { plan: tpl.plan, category: tpl.category }
+  const deny = (cause: string, reason: string) =>
+    recordDecision({ outcome: "denied", cause, meta, ...pool, reason })
+
   const blocked = machineCreationBlockedReason(tpl, input.automatic === true)
-  if (blocked) return { error: blocked }
+  if (blocked) {
+    await deny("provision_denied.template_blocked", blocked)
+    return { error: blocked }
+  }
 
   // teto manual: valor informado, com fallback para o padrão do template
   const maxUsers = input.maxUsers ?? tpl.max_users
@@ -582,9 +702,9 @@ async function provisionMachine(input: {
       kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
     })
     if (maxUsers > cap) {
-      return {
-        error: `A GPU ${gpu?.displayName ?? gpuTypeId} comporta no máximo ${cap} usuário(s) para este modelo (pedido: ${maxUsers})`,
-      }
+      const error = `A GPU ${gpu?.displayName ?? gpuTypeId} comporta no máximo ${cap} usuário(s) para este modelo (pedido: ${maxUsers})`
+      await deny("provision_denied.validation", error)
+      return { error }
     }
   }
 
@@ -595,6 +715,9 @@ async function provisionMachine(input: {
     )
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
+    // a mensagem crua do RunPod vai para a decisão — é o que responde "por
+    // que o clique não virou máquina" (ex.: sem estoque da GPU)
+    await deny("provision_denied.runpod_error", `${gpu?.displayName ?? gpuTypeId}: ${msg}`)
     // Falta de estoque no RunPod é um erro esperado — devolve mensagem amigável
     if (msg.includes("no instances currently available")) {
       return {
@@ -644,7 +767,17 @@ async function provisionMachine(input: {
 
   await startFreshPodIfNeeded(pod, machine.id)
 
-  await logEvent(machine.id, "created", `Máquina "${name}" criada (${gpu?.displayName ?? gpuTypeId})`)
+  await logEvent(machine.id, "created", `Máquina "${name}" criada (${gpu?.displayName ?? gpuTypeId})`, {
+    ...meta,
+    machineLabel: name,
+  })
+  await recordDecision({
+    outcome: "granted",
+    cause: meta.cause ?? "provision.panel.manual",
+    meta,
+    ...pool,
+    machineId: machine.id,
+  })
   revalidatePath("/machines")
   return { machineId: machine.id }
 }
@@ -669,11 +802,22 @@ export async function provisionMachineForPlan(input: {
   plan: TemplatePlan
   category?: ProductCategory
   templateId?: string | null
+  // Originador, vindo do gateway (trigger_ctx.snapshot) já filtrado pela
+  // rota. Carimba o `created` que ESTA função grava — assim a causa
+  // sobrevive mesmo que o gateway morra antes do log dele.
+  trigger?: TriggerEnvelope | null
 }): Promise<
   | { machineId: string; name: string; publicUrl: string | null }
   | { error: string }
 > {
   const db = createSupabaseAdmin()
+
+  // O gateway já nega na origem; esta é a trava do lado do painel, para um
+  // gateway antigo ou uma chamada manual à rota não ligarem GPU com as
+  // máquinas desligadas.
+  if (!(await getMachinesEnabled())) {
+    return { error: "Máquinas desligadas no painel" }
+  }
 
   let tpl: Template | null
   if (input.templateId) {
@@ -743,6 +887,7 @@ export async function provisionMachineForPlan(input: {
       templateId: tpl.id,
       gpuTypeId,
       automatic: true,
+      meta: await metaFromGateway(input.trigger, "provision.gateway.unknown"),
     })
     if (!("error" in prov)) {
       const { data: m } = await db
@@ -864,7 +1009,10 @@ export async function stopMachine(
     .update({ status: "stopped" })
     .eq("id", machineId)
   if (stopErr) return { error: `Pod pausado, mas falhou ao gravar o status: ${stopErr.message}` }
-  await logEvent(machineId, "stopped", `Máquina "${m.name}" pausada`)
+  await logEvent(machineId, "stopped", `Máquina "${m.name}" pausada`, {
+    ...(await adminTrigger("stop.panel.manual")),
+    machineLabel: m.name,
+  })
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
 }
@@ -875,13 +1023,26 @@ export async function startMachine(
   const db = createSupabaseAdmin()
   const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
   if (!m?.runpod_pod_id) return { error: "Máquina sem pod associado" }
+  const meta: EventMeta = { ...(await adminTrigger("start.panel.manual")), machineLabel: m.name }
+  const pool = await templatePool(db, m.template_id)
   try {
     await runpod.startPod(m.runpod_pod_id)
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     // Pod pausado não reserva GPU: o host pode tê-la cedido a outro cliente,
     // e aí o RunPod recusa o start até liberar (ou até recriarmos o pod).
-    if (msg.includes("not enough free GPUs")) {
+    const noGpu = msg.includes("not enough free GPUs")
+    // mesmos slugs do wake_machine do gateway: religar é religar, venha do
+    // botão ou da cascata
+    await recordDecision({
+      outcome: "denied",
+      cause: noGpu ? "wake_denied.no_gpu" : "wake_denied.failed",
+      meta,
+      ...pool,
+      machineId,
+      reason: msg,
+    })
+    if (noGpu) {
       return {
         error: `O host do pod "${m.name}" está sem GPU livre no momento.`,
         code: "no_gpu_on_host",
@@ -889,6 +1050,13 @@ export async function startMachine(
     }
     return { error: `Falha ao iniciar a máquina: ${msg}` }
   }
+  await recordDecision({
+    outcome: "granted",
+    cause: "start.panel.manual",
+    meta,
+    ...pool,
+    machineId,
+  })
   // "creating", não "running": o pod religa com o vLLM ainda carregando o
   // modelo; em "creating" a máquina fica invisível ao reaper de ociosidade e
   // aos picks do gateway, e o reconcile do gateway a promove a "running" quando
@@ -900,7 +1068,7 @@ export async function startMachine(
     .update({ status: "creating", last_activity_at: new Date().toISOString() })
     .eq("id", machineId)
   if (startErr) return { error: `Pod iniciado, mas falhou ao gravar o status: ${startErr.message}` }
-  await logEvent(machineId, "started", `Máquina "${m.name}" iniciada`)
+  await logEvent(machineId, "started", `Máquina "${m.name}" iniciada`, meta)
   // O pod religa com o agent zerado (chaves só em memória). O gateway espera o
   // vLLM subir e reenvia.
   after(() =>
@@ -918,11 +1086,19 @@ export async function startMachine(
 // Caminho de recuperação para quando o host do pod pausado ficou sem GPU.
 export async function recreateMachine(
   machineId: string,
-  automatic = false
+  automatic = false,
+  // originador vindo do gateway (rota /recreate); ausente = botão do painel
+  trigger?: TriggerEnvelope | null
 ): Promise<{ error: string } | void> {
   const db = createSupabaseAdmin()
   const { data: m } = await db.from("machines").select("*").eq("id", machineId).single<Machine>()
   if (!m) return { error: "Máquina não encontrada" }
+  const meta: EventMeta = {
+    ...(automatic
+      ? await metaFromGateway(trigger, "recreate.gateway.unknown")
+      : await adminTrigger("recreate.panel.manual")),
+    machineLabel: m.name,
+  }
   if (!m.template_id) {
     return { error: "Máquina sem template associado — crie uma máquina nova" }
   }
@@ -935,8 +1111,15 @@ export async function recreateMachine(
   if (!tpl) {
     return { error: "O template desta máquina não existe mais — crie uma máquina nova" }
   }
+  const pool = { plan: tpl.plan, category: tpl.category }
+  const deny = (cause: string, reason: string) =>
+    recordDecision({ outcome: "denied", cause, meta, ...pool, machineId, reason })
+
   const blocked = machineCreationBlockedReason(tpl, automatic)
-  if (blocked) return { error: blocked }
+  if (blocked) {
+    await deny("recreate_denied.template_blocked", blocked)
+    return { error: blocked }
+  }
 
   // machines.gpu_type guarda o displayName (com sufixo "×N" em multi-GPU)
   const gpuName = m.gpu_type.replace(/\s*×\d+$/, "")
@@ -959,9 +1142,9 @@ export async function recreateMachine(
       kvReserveGbPerUser: tpl.kv_reserve_gb_per_user,
     })
     if (m.max_users > cap) {
-      return {
-        error: `Com o template atual, ${gpu.displayName}${gpuCount > 1 ? ` ×${gpuCount}` : ""} comporta no máximo ${cap} usuário(s) — a máquina tem teto ${m.max_users}. Ajuste o template ou o teto antes de recriar.`,
-      }
+      const error = `Com o template atual, ${gpu.displayName}${gpuCount > 1 ? ` ×${gpuCount}` : ""} comporta no máximo ${cap} usuário(s) — a máquina tem teto ${m.max_users}. Ajuste o template ou o teto antes de recriar.`
+      await deny("recreate_denied.validation", error)
+      return { error }
     }
   }
 
@@ -970,9 +1153,9 @@ export async function recreateMachine(
       await runpod.deletePod(m.runpod_pod_id)
     } catch (e) {
       if (!String(e).includes("404")) {
-        return {
-          error: `Falha ao terminar o pod antigo: ${e instanceof Error ? e.message : String(e)}`,
-        }
+        const error = `Falha ao terminar o pod antigo: ${e instanceof Error ? e.message : String(e)}`
+        await deny("recreate_denied.runpod_error", error)
+        return { error }
       }
     }
   }
@@ -996,7 +1179,8 @@ export async function recreateMachine(
       .from("machines")
       .update({ status: "error", runpod_pod_id: null })
       .eq("id", machineId)
-    await logEvent(machineId, "error", `Recriação da máquina "${m.name}" falhou: ${msg}`)
+    await logEvent(machineId, "error", `Recriação da máquina "${m.name}" falhou: ${msg}`, meta)
+    await deny("recreate_denied.runpod_error", `${gpu.displayName}: ${msg}`)
     revalidatePath(`/machines/${machineId}`)
     revalidatePath("/machines")
     if (msg.includes("no instances currently available")) {
@@ -1041,8 +1225,16 @@ export async function recreateMachine(
   await logEvent(
     machineId,
     "recreated",
-    `Máquina "${m.name}" recriada em novo host (pod ${pod.id})`
+    `Máquina "${m.name}" recriada em novo host (pod ${pod.id})`,
+    meta
   )
+  await recordDecision({
+    outcome: "granted",
+    cause: meta.cause ?? "recreate.panel.manual",
+    meta,
+    ...pool,
+    machineId,
+  })
   revalidatePath(`/machines/${machineId}`)
   revalidatePath("/machines")
 }
@@ -1093,7 +1285,8 @@ export async function terminateMachine(machineId: string) {
     machineId,
     "terminated",
     `Máquina "${m?.name}" apagada` +
-      (releasedCount > 0 ? ` — ${releasedCount} stack(s) liberada(s) para re-alocação` : "")
+      (releasedCount > 0 ? ` — ${releasedCount} stack(s) liberada(s) para re-alocação` : ""),
+    { ...(await adminTrigger("terminate.panel.manual")), machineLabel: m?.name ?? null }
   )
   await flushGatewayKeyCache().catch((e) =>
     console.error("Flush do cache do gateway após apagar máquina falhou:", e)
@@ -1263,7 +1456,9 @@ async function allocateMachineForTemplate(
     "id" | "is_enabled" | "is_test" | "gpu_types" | "gpu_count" | "max_users" | "model_footprint_gb" | "kv_reserve_gb_per_user"
   >,
   excludeMachineId?: string,
-  usageClass: Stack["usage_class"] = "low"
+  usageClass: Stack["usage_class"] = "low",
+  // causa gravada se a cascata chegar a CRIAR máquina (migration 0070)
+  cause = "provision.panel.stack_create"
 ): Promise<{ machineId: string; created: boolean }> {
   const blocked = userAllocationBlockedReason(tpl)
   if (blocked) throw new Error(blocked)
@@ -1336,6 +1531,7 @@ async function allocateMachineForTemplate(
       templateId: tpl.id,
       gpuTypeId,
       automatic: true,
+      meta: await adminTrigger(cause),
     })
     if (!("error" in prov)) return { machineId: prov.machineId, created: true }
     lastError = prov.error
@@ -1349,7 +1545,7 @@ async function allocateMachineForTemplate(
 // (/api/keys) ou o admin pelo CreateKeyDialog.
 export async function createStack(formData: FormData): Promise<{
   slug: string
-  machineId: string
+  machineId: string | null
   machineCreated: boolean
 }> {
   const db = createSupabaseAdmin()
@@ -1435,9 +1631,12 @@ export async function createStack(formData: FormData): Promise<{
   const stackId = inserted.stackId
   slug = inserted.slug
 
-  let machineId = chosenMachineId
+  let machineId: string | null = chosenMachineId || null
   let machineCreated = false
-  if (!machineId) {
+  // Máquinas desligadas (migration 0071): a stack nasce sem casa, como uma
+  // liberada por ociosidade. O gateway a aloca na primeira request depois que
+  // as máquinas forem religadas (place_base_stack) — alocar aqui ligaria GPU.
+  if (!machineId && (await getMachinesEnabled())) {
     try {
       const alloc = await allocateMachineForTemplate(db, tpl)
       machineId = alloc.machineId
@@ -1448,95 +1647,23 @@ export async function createStack(formData: FormData): Promise<{
     }
   }
 
-  const { error: linkError } = await db
-    .from("stacks")
-    .update({ machine_id: machineId })
-    .eq("id", stackId)
-  if (linkError) throw new Error(linkError.message)
+  if (machineId) {
+    const { error: linkError } = await db
+      .from("stacks")
+      .update({ machine_id: machineId })
+      .eq("id", stackId)
+    if (linkError) throw new Error(linkError.message)
+  }
 
-  // Só a chave interna de Playground, nunca exibida ao cliente — ver
-  // getOrCreatePlaygroundKey para o caminho de backfill de stacks antigas.
-  await createKey({ accountId, machineId, stackId, purpose: "playground" })
-
+  // A stack nasce sem chave nenhuma. A chave interna de Playground (purpose
+  // "playground", migration 0044) deixou de ser criada: o Playground do
+  // painel do cliente só executa com chave "customer" da própria stack. As
+  // chaves "playground" já existentes no banco continuam válidas e isentas
+  // de slot/cota como antes — só não nasce nenhuma nova.
   revalidatePath("/stacks")
   revalidatePath("/accounts")
   if (machineCreated) revalidatePath("/machines")
   return { slug, machineId, machineCreated }
-}
-
-// Devolve a chave interna de Playground de uma stack (texto puro), criando-a
-// sob demanda se a stack foi criada antes desta feature existir. Nunca deve
-// ser exposta ao cliente — só o admin, via tela de Playground, a consome.
-export async function getOrCreatePlaygroundKey(stackId: string): Promise<{ plainKey: string }> {
-  const db = createSupabaseAdmin()
-
-  const findActivePlaygroundKey = async (): Promise<string | null> => {
-    const { data } = await db
-      .from("api_keys")
-      .select("plain_key")
-      .eq("stack_id", stackId)
-      .eq("purpose", "playground")
-      .eq("status", "active")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle<{ plain_key: string | null }>()
-    return data?.plain_key ?? null
-  }
-
-  const existing = await findActivePlaygroundKey()
-  if (existing) return { plainKey: existing }
-
-  const { data: stack } = await db
-    .from("stacks")
-    .select("id, account_id, machine_id")
-    .eq("id", stackId)
-    .single<{ id: string; account_id: string; machine_id: string | null }>()
-  if (!stack) throw new Error("Stack não encontrada")
-
-  // api_keys.machine_id é pin HISTÓRICO, nunca decide rota: o gateway roteia
-  // por stacks.machine_id (resolve_base_machine) e sincroniza a chave na
-  // máquina que resolver no momento (ensure_key_on_machine). Preencher aqui
-  // é só cortesia pro key-sync de reboot (list_active_keys_for_machine).
-  //
-  // Null é estado normal e esperado: stack recém-criada pelo checkout nasce
-  // sem máquina (insertStack, lib/stacks.ts) e o idle reaper de modelo base
-  // devolve qualquer stack ociosa a esse estado. Emitir a chave assim mesmo
-  // é o que faz o Playground funcionar na PRIMEIRA mensagem — o gateway
-  // homeia a stack nesse request (place_base_stack) e o rebind_stack_keys
-  // que vem junto preenche este campo sozinho. A chave "customer" emitida
-  // por /api/keys segue exatamente a mesma regra: criar chave nunca aloca
-  // máquina (estouraria o teto de 15s do panelFetch e faria falta de GPU no
-  // RunPod virar erro na emissão); é o primeiro uso que aloca.
-  let machineId = stack.machine_id
-  if (!machineId) {
-    const { data: customerKey } = await db
-      .from("api_keys")
-      .select("machine_id")
-      .eq("stack_id", stackId)
-      .eq("purpose", "customer")
-      .eq("status", "active")
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle<{ machine_id: string }>()
-    machineId = customerKey?.machine_id ?? null
-  }
-
-  try {
-    return await createKey({
-      accountId: stack.account_id,
-      machineId,
-      stackId: stack.id,
-      purpose: "playground",
-    })
-  } catch (e) {
-    // Corrida: duas chamadas concorrentes passaram pelo check acima antes de
-    // qualquer uma terminar o insert — o índice único parcial (migration
-    // 0045: 1 chave "playground" ativa por stack) barra a segunda. Devolve a
-    // que venceu em vez de propagar o erro de violação de constraint.
-    const raced = await findActivePlaygroundKey()
-    if (raced) return { plainKey: raced }
-    throw e
-  }
 }
 
 // Remove uma stack do painel. A máquina que a hospeda (se houver) não é
@@ -1784,7 +1911,8 @@ export async function migrateStack(input: {
   } else {
     try {
       const alloc = await allocateMachineForTemplate(
-        db, targetTemplate, fromMachineId ?? undefined, usageClass
+        db, targetTemplate, fromMachineId ?? undefined, usageClass,
+        "provision.stack_migration"
       )
       targetMachineId = alloc.machineId
       machineCreated = alloc.created
@@ -1872,7 +2000,13 @@ export async function migrateStack(input: {
   await logEvent(
     targetMachineId,
     "stack_migrated",
-    `Stack ${stack.slug} migrada para esta máquina`
+    `Stack ${stack.slug} migrada para esta máquina`,
+    await adminTrigger("stack.migrated_manual", {
+      stack_id: stack.id,
+      stack_slug: stack.slug,
+      account_id: stack.account_id,
+      ...(fromMachineId ? { reason: `origem ${fromMachineId}` } : {}),
+    })
   )
 
   revalidatePath("/stacks")
@@ -1917,23 +2051,22 @@ export async function createKey(input: {
   // sempre passar uma data — chave "de produção" emitida manualmente pelo
   // painel para um cliente já validado pode ficar sem teto.
   expiresAt?: string | null
-  // "customer" (default) conta pro slot de capacidade da máquina e pra cota
-  // diária de tokens da conta. "playground" é a chave interna gerada junto
-  // com a stack para o admin testar o modelo do cliente — nunca exibida ao
-  // cliente, isenta de slot e de cota (ver migration 0044 e
-  // docker/gateway/main.py:check_token_quota).
-  purpose?: "customer" | "playground"
   // Política de RAG da chave (migration 0065): true = sempre consulta a base
   // de conhecimento da stack, false = nunca.
   //
   // Omitido grava null DE PROPÓSITO, e não um default nosso: null é o
   // comportamento legado (a base entra só quando a request não traz system
-  // próprio), então chamador não atualizado — chave de playground, scripts —
-  // continua exatamente como estava. Quem tem interface (CreateKeyDialog aqui,
+  // próprio), então chamador não atualizado — scripts — continua exatamente
+  // como estava. Quem tem interface (CreateKeyDialog aqui,
   // painel do cliente via POST /api/keys) sempre manda true/false explícito.
   enableKnowledgeBase?: boolean | null
 }): Promise<{ plainKey: string }> {
-  const purpose = input.purpose ?? "customer"
+  // Toda chave emitida é "customer": conta pro slot de capacidade da máquina
+  // e pra cota diária de tokens da conta. A chave interna "playground"
+  // (migration 0044) não é mais criada — o painel do cliente executa o
+  // Playground com chave "customer" da stack. O valor segue existindo na
+  // coluna e nos filtros de leitura por causa das chaves antigas.
+  const purpose = "customer"
   const db = createSupabaseAdmin()
 
   const { data: m } = input.machineId
@@ -1942,10 +2075,11 @@ export async function createKey(input: {
   if (input.machineId && !m) throw new Error("Máquina não encontrada")
   let machineAllocationBlocked: string | null = null
 
-  // Chave de playground não ocupa slot de capacidade — só chave "customer"
-  // entra no backstop abaixo. Check-then-insert: há corrida teórica entre
-  // duas emissões simultâneas, aceitável para um painel de administração.
-  if (purpose === "customer" && m) {
+  // Backstop de capacidade por máquina: só chave "customer" conta (a chave
+  // "playground" legada, migration 0044, fica fora da contagem).
+  // Check-then-insert: há corrida teórica entre duas emissões simultâneas,
+  // aceitável para um painel de administração.
+  if (m) {
     const { count: activeKeys } = await db
       .from("api_keys")
       .select("id", { count: "exact", head: true })
@@ -1994,7 +2128,7 @@ export async function createKey(input: {
     stackId = matchingStack?.id ?? null
   }
 
-  if (purpose === "customer" && machineAllocationBlocked) {
+  if (machineAllocationBlocked) {
     const { data: assignedStack } = stackId
       ? await db
           .from("stacks")
@@ -2033,9 +2167,12 @@ export async function createKey(input: {
   await logEvent(
     input.machineId,
     "key_created",
-    purpose === "playground"
-      ? "Chave interna de Playground criada"
-      : `Nova chave criada (${keyPrefix(plainKey)}…)`
+    `Nova chave criada (${keyPrefix(plainKey)}…)`,
+    await adminTrigger("key.created", {
+      key_prefix: keyPrefix(plainKey),
+      account_id: input.accountId,
+      ...(input.stackId ? { stack_id: input.stackId } : {}),
+    })
   )
   // Chave pode ter sido criada logo após provisionar a máquina (createStack) —
   // o agent do pod ainda pode não estar de pé pra receber um sync direto do
@@ -2143,6 +2280,141 @@ export async function setAutoProvisionEnabled(
   revalidatePath("/machines")
 }
 
+// ---------- Interruptores da migration 0071 ----------
+// machines_enabled: máquinas próprias (RunPod). Desligado, o gateway não manda
+// request para máquina e nada liga GPU sozinho (wake, provisionamento,
+// recriação). openrouter_enabled: o repasse ao OpenRouter para os modelos da
+// allowlist (página /modelos). Mesma tabela e mesmo cache do gateway que o
+// auto_provision_enabled.
+
+async function getSystemFlag(key: string, fallback: boolean): Promise<boolean> {
+  const db = createSupabaseAdmin()
+  const { data } = await db
+    .from("system_settings")
+    .select("value")
+    .eq("key", key)
+    .maybeSingle<{ value: boolean }>()
+  return data?.value ?? fallback
+}
+
+async function setSystemFlag(
+  key: string,
+  value: boolean
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const db = createSupabaseAdmin()
+  const { error } = await db
+    .from("system_settings")
+    .upsert({ key, value, updated_at: new Date().toISOString() })
+  if (error) return { error: error.message }
+  after(() => flushGatewaySettings())
+}
+
+// Faz o gateway esquecer os interruptores e a allowlist em cache (best-effort):
+// sem isso a mudança só vale depois do SETTINGS_CACHE_TTL_S dele (30s).
+async function flushGatewaySettings() {
+  const url = process.env.GATEWAY_URL
+  const secret = process.env.GATEWAY_ADMIN_SECRET
+  if (!url || !secret) return // gateway ainda não configurado
+  await fetch(`${url.replace(/\/$/, "")}/admin/flush-settings`, {
+    method: "POST",
+    headers: { "X-Admin-Secret": secret },
+    signal: AbortSignal.timeout(5_000),
+  }).catch((e) =>
+    console.error("Flush dos interruptores no gateway falhou (vale em até 30s):", e)
+  )
+}
+
+// Nasce ligado: é o comportamento de antes da 0071.
+export async function getMachinesEnabled(): Promise<boolean> {
+  return getSystemFlag("machines_enabled", true)
+}
+
+export async function setMachinesEnabled(
+  enabled: boolean
+): Promise<{ error: string } | void> {
+  const result = await setSystemFlag("machines_enabled", enabled)
+  if (result) return result
+  revalidatePath("/machines")
+  revalidatePath("/modelos")
+}
+
+export async function getOpenRouterEnabled(): Promise<boolean> {
+  return getSystemFlag("openrouter_enabled", false)
+}
+
+export async function setOpenRouterEnabled(
+  enabled: boolean
+): Promise<{ error: string } | void> {
+  const result = await setSystemFlag("openrouter_enabled", enabled)
+  if (result) return result
+  revalidatePath("/modelos")
+}
+
+// ---------- Allowlist do OpenRouter (openrouter_models, migration 0071) ----------
+
+export async function createOpenRouterModel(
+  formData: FormData
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const slug = String(formData.get("slug") || "").trim()
+  const label = String(formData.get("label") || "").trim() || null
+  if (!slug) return { error: "Informe o ID do modelo no OpenRouter" }
+
+  // O slug tem que existir no catálogo: um erro de digitação aqui viraria um
+  // 400 do OpenRouter para o cliente, que não tem como saber a causa.
+  let catalog: Map<string, OpenRouterCatalogModel>
+  try {
+    catalog = await getOpenRouterCatalog()
+  } catch (e) {
+    return {
+      error: `Não foi possível consultar o catálogo do OpenRouter: ${e instanceof Error ? e.message : String(e)}`,
+    }
+  }
+  const model = catalog.get(slug)
+  if (!model) return { error: `Modelo "${slug}" não existe no OpenRouter` }
+
+  const db = createSupabaseAdmin()
+  const { error } = await db.from("openrouter_models").insert({
+    slug,
+    kind: openRouterModelKind(model),
+    label: label ?? model.name,
+    enabled: true,
+  })
+  if (error) {
+    if (error.code === "23505") return { error: `"${slug}" já está na lista` }
+    return { error: error.message }
+  }
+  after(() => flushGatewaySettings())
+  revalidatePath("/modelos")
+}
+
+export async function setOpenRouterModelEnabled(
+  id: string,
+  enabled: boolean
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const db = createSupabaseAdmin()
+  const { error } = await db
+    .from("openrouter_models")
+    .update({ enabled, updated_at: new Date().toISOString() })
+    .eq("id", id)
+  if (error) return { error: error.message }
+  after(() => flushGatewaySettings())
+  revalidatePath("/modelos")
+}
+
+export async function deleteOpenRouterModel(
+  id: string
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const db = createSupabaseAdmin()
+  const { error } = await db.from("openrouter_models").delete().eq("id", id)
+  if (error) return { error: error.message }
+  after(() => flushGatewaySettings())
+  revalidatePath("/modelos")
+}
+
 export async function revokeKey(keyId: string) {
   const db = createSupabaseAdmin()
   const { data: key } = await db
@@ -2152,7 +2424,17 @@ export async function revokeKey(keyId: string) {
     .select()
     .single<ApiKey>()
   if (key) {
-    await logEvent(key.machine_id, "key_revoked", `Chave ${key.key_prefix}… revogada`)
+    await logEvent(
+      key.machine_id,
+      "key_revoked",
+      `Chave ${key.key_prefix}… revogada`,
+      await adminTrigger("key.revoked", {
+        key_prefix: key.key_prefix,
+        api_key_id: key.id,
+        account_id: key.account_id,
+        ...(key.stack_id ? { stack_id: key.stack_id } : {}),
+      })
+    )
     // Chave sem pin (stack ainda não homeada) não está em pod nenhum: não há
     // agent pra sincronizar nem página de máquina pra revalidar. O flush do
     // cache do gateway segue incondicional — é ele que de fato tira a chave
