@@ -18,3 +18,5 @@ jsonschema>=4.21
 # Dockerfile — ver document_generate.py. >=63 porque é a partir daí que
 # URLFetcher aceita `allowed_protocols` (bloqueio de rede externa).
 weasyprint>=63
+# cifra dos segredos das chaves espelho do OpenRouter (openrouter_keys.py)
+cryptography>=42

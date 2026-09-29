@@ -67,6 +67,25 @@ class FakeSupa:
     async def insert_image_generations(self, rows):
         self.rows.extend(rows)
 
+    # chaves espelho (0072)
+    async def get_openrouter_key(self, api_key_id):
+        return self.estado["or_keys"].get(api_key_id)
+
+    async def insert_openrouter_key(self, row):
+        if row["api_key_id"] in self.estado["or_keys"]:
+            return False
+        self.estado["or_keys"][row["api_key_id"]] = row
+        return True
+
+    async def delete_openrouter_key(self, api_key_id):
+        self.estado["or_keys"].pop(api_key_id, None)
+
+    async def get_api_key_identity(self, api_key_id):
+        if api_key_id != "key-1":
+            return None
+        return {"api_key_id": "key-1", "account_id": "acc-1",
+                "key_prefix": "stac_ab", "account_name": "Loja X"}
+
 
 @pytest.fixture
 def rota(monkeypatch):
@@ -77,6 +96,7 @@ def rota(monkeypatch):
         "logged": [],
         "sent": [],
         "resposta": None,
+        "or_keys": {},
     }
     supa = FakeSupa(estado)
     estado["supa"] = supa
@@ -119,6 +139,11 @@ def rota(monkeypatch):
     )
     main.settings_cache.clear()
     monkeypatch.setattr(main, "openrouter_catalog_cache", None)
+    # chaves espelho desligadas por padrão; o fixture `espelho` liga
+    monkeypatch.setattr(main, "openrouter_mgmt_client", None)
+    monkeypatch.setattr(main, "openrouter_secret_box", None)
+    main.openrouter_key_secrets.clear()
+    main.openrouter_key_failures.clear()
     estado["client"] = TestClient(main.app)
     yield estado
     main.settings_cache.clear()
@@ -440,3 +465,97 @@ def test_recriacao_negada_com_maquinas_desligadas(maquinas_desligadas):
     machine = {"id": "m-2", "name": "m"}
     assert asyncio.run(main.try_recreate_machine(machine, "teste")) is False
     assert maquinas_desligadas == ["recreate_denied.machines_disabled"]
+
+
+# ---------------------------------------------------------------------------
+# chave espelho no OpenRouter por chave da Stac (0072)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def espelho(rota, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    import openrouter_keys
+
+    box = openrouter_keys.SecretBox(Fernet.generate_key().decode())
+    mgmt = {"criadas": [], "apagadas": [], "falhar": False, "n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer sk-or-mgmt"
+        if request.method == "DELETE":
+            mgmt["apagadas"].append(request.url.path)
+            return httpx.Response(200, json={"deleted": True})
+        if mgmt["falhar"]:
+            return httpx.Response(500, json={"error": {"message": "boom"}})
+        mgmt["n"] += 1
+        body = json.loads(await request.aread())
+        mgmt["criadas"].append(body["name"])
+        return httpx.Response(201, json={
+            "data": {"hash": f"hash-{mgmt['n']}", "name": body["name"]},
+            "key": f"sk-or-v1-espelho-{mgmt['n']}",
+        })
+
+    monkeypatch.setattr(main, "openrouter_secret_box", box)
+    monkeypatch.setattr(main, "openrouter_mgmt_client", httpx.AsyncClient(
+        base_url="https://openrouter.test/api/v1",
+        headers={"Authorization": "Bearer sk-or-mgmt"},
+        transport=httpx.MockTransport(handler),
+    ))
+    rota["entry"] = {**rota["entry"], "account_name": "Loja X", "key_prefix": "stac_ab"}
+    rota["resposta"] = lambda r: httpx.Response(200, json={"choices": [], "usage": {
+        "prompt_tokens": 1, "completion_tokens": 1, "cost": 0.001}})
+    rota["mgmt"] = mgmt
+    rota["box"] = box
+    return rota
+
+
+def test_primeira_request_cria_a_espelho_e_as_seguintes_reusam(espelho):
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    assert espelho["mgmt"]["criadas"] == ["Stac · Loja X · stac_ab · key-1"]
+    for request, _body in espelho["sent"]:
+        assert request.headers["authorization"] == "Bearer sk-or-v1-espelho-1"
+    row = espelho["or_keys"]["key-1"]
+    assert row["openrouter_hash"] == "hash-1"
+    # o segredo vai cifrado para o banco
+    assert "espelho" not in row["secret_encrypted"]
+    assert espelho["box"].decrypt(row["secret_encrypted"]) == "sk-or-v1-espelho-1"
+
+
+def test_espelho_ja_gravada_e_lida_do_banco(espelho):
+    espelho["or_keys"]["key-1"] = {
+        "openrouter_hash": "hash-antiga",
+        "secret_encrypted": espelho["box"].encrypt("sk-or-v1-antiga"),
+    }
+    _chat(espelho, model=TEXT_SLUG)
+    assert espelho["mgmt"]["criadas"] == []
+    assert espelho["sent"][0][0].headers["authorization"] == "Bearer sk-or-v1-antiga"
+
+
+def test_falha_ao_criar_usa_a_compartilhada_e_nao_martela(espelho):
+    espelho["mgmt"]["falhar"] = True
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    for request, _body in espelho["sent"]:
+        assert request.headers["authorization"] == "Bearer sk-or-da-stac"
+    # a segunda request caiu no cooldown, sem nova tentativa
+    assert espelho["mgmt"]["n"] == 0 and "key-1" in main.openrouter_key_failures
+
+
+def test_401_na_espelho_esquece_para_recriar(espelho):
+    _chat(espelho, model=TEXT_SLUG)
+    espelho["resposta"] = lambda r: httpx.Response(401, json={"error": {"message": "User not found"}})
+    r = _chat(espelho, model=TEXT_SLUG)
+    assert r.status_code == 503
+    assert "key-1" not in main.openrouter_key_secrets
+    assert "key-1" not in espelho["or_keys"]
+
+
+def test_admin_provision_cria_a_espelho_da_chave_nova(espelho, monkeypatch):
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+    r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
+    assert r.json() == {"ok": True}
+    assert espelho["mgmt"]["criadas"] == ["Stac · Loja X · stac_ab · key-1"]
+    r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "outra"})
+    assert r.status_code == 404

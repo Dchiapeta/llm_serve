@@ -934,6 +934,67 @@ class SupaClient:
         rows = r.json()
         return rows[0]["value"] if rows else default
 
+    # ---------- openrouter_keys ----------
+
+    async def get_openrouter_key(self, api_key_id: str) -> dict | None:
+        """Chave espelho do OpenRouter desta chave da Stac (migration 0072),
+        {openrouter_hash, secret_encrypted}, ou None."""
+        r = await self._rest.get(
+            "/openrouter_keys",
+            params={
+                "api_key_id": f"eq.{api_key_id}",
+                "select": "openrouter_hash,secret_encrypted",
+                "limit": "1",
+            },
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    async def insert_openrouter_key(self, row: dict) -> bool:
+        """Grava a chave espelho. False se já existia uma para a mesma chave da
+        Stac (corrida entre duas criações) — quem chama apaga a sua no
+        OpenRouter e usa a que ficou."""
+        r = await self._rest.post(
+            "/openrouter_keys",
+            params={"on_conflict": "api_key_id"},
+            json=row,
+            headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
+        )
+        r.raise_for_status()
+        return bool(r.json())
+
+    async def delete_openrouter_key(self, api_key_id: str) -> None:
+        r = await self._rest.delete(
+            "/openrouter_keys", params={"api_key_id": f"eq.{api_key_id}"}
+        )
+        r.raise_for_status()
+
+    async def get_api_key_identity(self, api_key_id: str) -> dict | None:
+        """{api_key_id, account_id, key_prefix, account_name} de uma chave
+        ativa — o mínimo para nomear a chave espelho quando a criação vem do
+        painel, sem uma request do cliente (e sem o entry do key_cache)."""
+        r = await self._rest.get(
+            "/api_keys",
+            params={
+                "id": f"eq.{api_key_id}",
+                "status": "eq.active",
+                "select": "id,account_id,key_prefix,accounts(name)",
+                "limit": "1",
+            },
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "api_key_id": row["id"],
+            "account_id": row.get("account_id"),
+            "key_prefix": row.get("key_prefix"),
+            "account_name": (row.get("accounts") or {}).get("name"),
+        }
+
     # ---------- openrouter_models ----------
 
     async def list_enabled_openrouter_models(self) -> list[dict]:

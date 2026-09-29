@@ -129,6 +129,9 @@ advisory lock.
 | `OPENROUTER_NONSTREAM_TIMEOUT_S` | não  | Read da request repassada sem stream (default 300) |
 | `OPENROUTER_IMAGE_TIMEOUT_S` | não      | Read do `POST /images` do OpenRouter (default 240) |
 | `OPENROUTER_MAX_IMAGES`   | não         | Teto de `n` numa geração repassada (default 4) |
+| `OPENROUTER_MANAGEMENT_KEY` | não       | Management API key do OpenRouter (openrouter.ai/settings/management-keys). Com ela, cada chave da Stac ganha uma chave espelho no OpenRouter e o custo aparece por chave na Activity de lá (ver `openrouter_keys.py`). Sem ela, tudo usa `OPENROUTER_API_KEY` |
+| `OPENROUTER_KEYS_ENCRYPTION_KEY` | não* | Chave Fernet que cifra os segredos das chaves espelho em `openrouter_keys` (gerar com `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`). *Obrigatória junto com a de cima. Trocá-la invalida as espelhos já gravadas |
+| `OPENROUTER_KEY_RETRY_S`  | não         | Espera depois de uma falha ao criar a chave espelho de uma chave, antes de tentar de novo (default 300) |
 | `UPSERT_CACHE_TTL_S`      | não         | TTL do cache "chave já upsertada no agent X" do fluxo base (default 600; invalidado por máquina a cada religada) |
 | `CLIENT_LIMIT_ENFORCE`    | não         | `0` (default) = MODO OBSERVAÇÃO: registra os ambientes e loga WARNING acima do teto, sem bloquear. `1` = devolve 403 ao ambiente que estoura o teto do plano. Ligue só depois de calibrar com os dados reais |
 | `MAX_CLIENTS_GO` / `_PRO` / `_MAX` / `_ENTERPRISE` | não | Teto de ambientes simultâneos por stack (defaults 5/25/50/sem teto; `0` = sem teto). Espelham `MAX_CLIENTS_BY_PLAN` em `lib/types.ts`, que é o que o painel exibe — mude os dois juntos |

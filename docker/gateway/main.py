@@ -58,6 +58,7 @@ import image_gen
 import image_proxy
 import image_retention
 import openrouter
+import openrouter_keys
 from anthropic_compat import (
     anthropic_error_body,
     anthropic_nonstreaming_body,
@@ -558,6 +559,16 @@ OPENROUTER_NONSTREAM_TIMEOUT_S = float(os.environ.get("OPENROUTER_NONSTREAM_TIME
 # (a doc cita 94s para um gpt-image em 16:9)
 OPENROUTER_IMAGE_TIMEOUT_S = float(os.environ.get("OPENROUTER_IMAGE_TIMEOUT_S", "240"))
 OPENROUTER_MAX_IMAGES = int(os.environ.get("OPENROUTER_MAX_IMAGES", "4"))
+# Chave espelho no OpenRouter por chave da Stac (ver openrouter_keys.py). As
+# duas são necessárias; sem qualquer uma, o repasse segue só com a chave
+# compartilhada (OPENROUTER_API_KEY) e o custo por chave fica só em
+# gateway_requests.cost_usd.
+OPENROUTER_MANAGEMENT_KEY = os.environ.get("OPENROUTER_MANAGEMENT_KEY", "")
+OPENROUTER_KEYS_ENCRYPTION_KEY = os.environ.get("OPENROUTER_KEYS_ENCRYPTION_KEY", "")
+# depois de uma falha ao criar a chave espelho de uma chave da Stac, quanto
+# tempo esperar antes de tentar de novo (as requests nesse meio tempo usam a
+# chave compartilhada, sem martelar a API de gerenciamento)
+OPENROUTER_KEY_RETRY_S = float(os.environ.get("OPENROUTER_KEY_RETRY_S", "300"))
 # TTL do cache "chave já upsertada no agent X" — o agent perde as chaves em
 # memória a cada restart do pod, então o fluxo base garante a chave via
 # upsert lazy antes do proxy; o cache evita 1 round-trip ao agent por request
@@ -635,6 +646,17 @@ settings_cache: dict[str, tuple[bool, float]] = {}
 openrouter_catalog_cache: tuple[dict[str, str], float] | None = None
 # None quando OPENROUTER_API_KEY não está configurada (repasse desligado)
 openrouter_client: httpx.AsyncClient | None = None
+# chaves espelho (openrouter_keys.py): client da API de gerenciamento e a cifra.
+# Os dois None = mecanismo desligado.
+openrouter_mgmt_client: httpx.AsyncClient | None = None
+openrouter_secret_box: openrouter_keys.SecretBox | None = None
+# api_key_id -> segredo já decifrado. Não expira: o segredo de uma chave
+# espelho não muda; quem invalida é _forget_openrouter_key (401 do OpenRouter).
+openrouter_key_secrets: dict[str, str] = {}
+# api_key_id -> momento da última falha ao criar (ver OPENROUTER_KEY_RETRY_S)
+openrouter_key_failures: dict[str, float] = {}
+# uma criação por chave da Stac de cada vez
+openrouter_key_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 # requests em voo por (account_id, machine_id) — base do drain da Fase 5.
 # Em memória: válido apenas com réplica única do gateway.
@@ -728,7 +750,7 @@ runpod_client: RunPodClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supa, store, proxy_client, document_client, openai_client, panel_client, demo_client, lifecycle_mgr, runpod_client, openrouter_client
+    global supa, store, proxy_client, document_client, openai_client, panel_client, demo_client, lifecycle_mgr, runpod_client, openrouter_client, openrouter_mgmt_client, openrouter_secret_box
     supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET, IMAGE_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
     # read curto (60s): o Cloudflare na frente do RunPod às vezes derruba (RST)
@@ -809,6 +831,24 @@ async def lifespan(app: FastAPI):
     else:
         openrouter_client = None
         logger.info("OPENROUTER_API_KEY ausente — repasse para o OpenRouter desligado")
+    openrouter_mgmt_client = None
+    openrouter_secret_box = None
+    if OPENROUTER_MANAGEMENT_KEY and OPENROUTER_KEYS_ENCRYPTION_KEY:
+        try:
+            openrouter_secret_box = openrouter_keys.SecretBox(OPENROUTER_KEYS_ENCRYPTION_KEY)
+        except ValueError as e:
+            logger.error("chaves espelho do OpenRouter DESLIGADAS: %s", e)
+        else:
+            openrouter_mgmt_client = httpx.AsyncClient(
+                base_url=OPENROUTER_BASE_URL,
+                headers={"Authorization": f"Bearer {OPENROUTER_MANAGEMENT_KEY}"},
+                timeout=httpx.Timeout(15.0, connect=5.0),
+            )
+    else:
+        logger.info(
+            "OPENROUTER_MANAGEMENT_KEY/OPENROUTER_KEYS_ENCRYPTION_KEY ausente — "
+            "sem chave do OpenRouter por chave da Stac (custo só em gateway_requests)"
+        )
     if RUNPOD_API_KEY:
         runpod_client = RunPodClient(RUNPOD_API_KEY)
     else:
@@ -871,6 +911,8 @@ async def lifespan(app: FastAPI):
     await demo_client.aclose()
     if openrouter_client is not None:
         await openrouter_client.aclose()
+    if openrouter_mgmt_client is not None:
+        await openrouter_mgmt_client.aclose()
     await store.aclose()
     await supa.aclose()
     if runpod_client:
@@ -2156,6 +2198,102 @@ async def openrouter_catalog() -> dict[str, str]:
         catalog = openrouter_catalog_cache[0] if openrouter_catalog_cache else {}
     openrouter_catalog_cache = (catalog, now + SETTINGS_CACHE_TTL_S)
     return catalog
+
+
+async def openrouter_key_for(entry: dict) -> str | None:
+    """Segredo da chave espelho do OpenRouter desta chave da Stac, criando-a
+    se ainda não existe (ver openrouter_keys.py). None = usar a chave
+    compartilhada — com o mecanismo desligado, em cooldown depois de uma
+    falha, ou em qualquer erro. Nunca levanta: o repasse não pode falhar por
+    causa do acompanhamento de custo."""
+    api_key_id = entry.get("api_key_id")
+    if openrouter_mgmt_client is None or openrouter_secret_box is None or not api_key_id:
+        return None
+    cached = openrouter_key_secrets.get(api_key_id)
+    if cached:
+        return cached
+    if time.time() - openrouter_key_failures.get(api_key_id, 0) < OPENROUTER_KEY_RETRY_S:
+        return None
+    async with openrouter_key_locks[api_key_id]:
+        cached = openrouter_key_secrets.get(api_key_id)  # outra request criou
+        if cached:
+            return cached
+        try:
+            row = await supa.get_openrouter_key(api_key_id)
+            if row is None:
+                row = await _create_openrouter_key(entry)
+            secret = openrouter_secret_box.decrypt(row["secret_encrypted"])
+        except Exception as e:
+            openrouter_key_failures[api_key_id] = time.time()
+            logger.warning(
+                "openrouter: sem chave espelho para %s, usando a compartilhada (%s)",
+                api_key_id, e,
+            )
+            return None
+        openrouter_key_secrets[api_key_id] = secret
+        openrouter_key_failures.pop(api_key_id, None)
+        return secret
+
+
+async def _create_openrouter_key(entry: dict) -> dict:
+    """Cria a chave espelho no OpenRouter e grava a linha. Devolve a linha que
+    ficou no banco (a nossa, ou a de uma criação concorrente que venceu)."""
+    api_key_id = entry["api_key_id"]
+    name = openrouter_keys.key_name(entry)
+    r = await openrouter_mgmt_client.post("/keys", json={"name": name})
+    r.raise_for_status()
+    key_hash, secret = openrouter_keys.parse_created(r.json())
+    row = {
+        "api_key_id": api_key_id,
+        "openrouter_hash": key_hash,
+        "secret_encrypted": openrouter_secret_box.encrypt(secret),
+        "name": name,
+    }
+    try:
+        inserted = await supa.insert_openrouter_key(row)
+    except Exception:
+        await _delete_remote_openrouter_key(key_hash)  # não deixa órfã
+        raise
+    if not inserted:
+        # outra réplica/processo gravou antes: a dela vale, a nossa é apagada
+        await _delete_remote_openrouter_key(key_hash)
+        existing = await supa.get_openrouter_key(api_key_id)
+        if existing is None:
+            raise RuntimeError("chave espelho sumiu depois do conflito")
+        return existing
+    logger.info("openrouter: chave espelho criada para %s (%s)", api_key_id, name)
+    return row
+
+
+async def _delete_remote_openrouter_key(key_hash: str) -> None:
+    try:
+        r = await openrouter_mgmt_client.delete(f"/keys/{key_hash}")
+        r.raise_for_status()
+    except Exception as e:
+        logger.warning("openrouter: não deu para apagar a chave órfã %s (%s)", key_hash, e)
+
+
+def _forget_openrouter_key(api_key_id: str | None) -> None:
+    """O OpenRouter recusou (401) a chave espelho — apagada ou desativada à mão
+    no painel de lá. Esquece o segredo e a linha: a próxima request cria outra.
+    A request atual já foi respondida com o 503 genérico."""
+    if not api_key_id:
+        return
+    openrouter_key_secrets.pop(api_key_id, None)
+    logger.error("openrouter: chave espelho de %s recusada — será recriada", api_key_id)
+
+    async def _drop():
+        try:
+            await supa.delete_openrouter_key(api_key_id)
+        except Exception as e:
+            logger.warning("openrouter: falha ao apagar a linha da chave espelho %s (%s)", api_key_id, e)
+
+    spawn_tracked(_drop())
+
+
+def _openrouter_auth(secret: str | None) -> dict[str, str] | None:
+    """Header que troca a chave compartilhada (default do client) pela espelho."""
+    return {"Authorization": f"Bearer {secret}"} if secret else None
 
 
 async def openrouter_slug_for(model: str | None, kind: str) -> str | None:
@@ -4244,13 +4382,17 @@ def _openrouter_error_response(
 
 async def openrouter_forward(
     *, upstream_path: str, payload: dict, log_ctx: dict, anthropic: bool = False,
+    secret: str | None = None,
 ) -> Response:
     """Manda `payload` ao OpenRouter e repassa a resposta ao cliente no mesmo
     protocolo, registrando tokens e custo em gateway_requests.
 
     Streaming: bytes repassados como chegam, com heartbeat nos silêncios (ver
     openrouter.with_heartbeat) e o mesmo watchdog de duas fases das máquinas
-    — só que com prazos próprios (OPENROUTER_STREAM_*)."""
+    — só que com prazos próprios (OPENROUTER_STREAM_*).
+
+    `secret`: chave espelho da chave da Stac (openrouter_key_for); None usa a
+    compartilhada, que é o header default do openrouter_client."""
     is_stream = payload.get("stream") is True
     label = f"{upstream_path}/{log_ctx.get('model')}"
     timeout = httpx.Timeout(
@@ -4261,7 +4403,8 @@ async def openrouter_forward(
     )
     try:
         upstream_req = openrouter_client.build_request(
-            "POST", f"/{upstream_path}", json=payload, timeout=timeout
+            "POST", f"/{upstream_path}", json=payload, timeout=timeout,
+            headers=_openrouter_auth(secret),
         )
         upstream = await openrouter_client.send(upstream_req, stream=True)
     except httpx.HTTPError as e:
@@ -4281,6 +4424,8 @@ async def openrouter_forward(
         log_gateway_request(
             **log_ctx, status_code=upstream.status_code, stream=is_stream, usage=None
         )
+        if upstream.status_code == 401 and secret:
+            _forget_openrouter_key(log_ctx.get("api_key_id"))
         return _openrouter_error_response(
             upstream.status_code, raw, anthropic=anthropic, label=label
         )
@@ -4408,6 +4553,7 @@ async def openrouter_text(
     return await openrouter_forward(
         upstream_path=openrouter.TEXT_PATHS[path],
         payload=body_json,
+        secret=await openrouter_key_for(entry),
         log_ctx=_openrouter_log_ctx(
             entry=entry, stack_id=(stack or {}).get("id"), path=path, slug=slug,
             request=request, started=started,
@@ -4443,6 +4589,7 @@ async def openrouter_messages(
     return await openrouter_forward(
         upstream_path="messages",
         payload=anthropic_body,
+        secret=await openrouter_key_for(entry),
         log_ctx=_openrouter_log_ctx(
             entry=entry, stack_id=(stack or {}).get("id"), path="messages", slug=slug,
             request=request, started=started,
@@ -6160,10 +6307,12 @@ async def openrouter_image(
         request=request, started=started,
     )
     fallback_meta = image_gen.request_meta({**fields, "prompt": prompt})
+    secret = await openrouter_key_for(entry)
     try:
         upstream_req = openrouter_client.build_request(
             "POST", "/images", json=payload,
             timeout=httpx.Timeout(OPENROUTER_IMAGE_TIMEOUT_S, connect=10.0, write=60.0, pool=10.0),
+            headers=_openrouter_auth(secret),
         )
         upstream = await openrouter_client.send(upstream_req, stream=True)
     except httpx.HTTPError as e:
@@ -6180,6 +6329,8 @@ async def openrouter_image(
         finally:
             await upstream.aclose()
         log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=False, usage=None)
+        if upstream.status_code == 401 and secret:
+            _forget_openrouter_key(entry.get("api_key_id"))
         return _openrouter_error_response(
             upstream.status_code, raw, anthropic=False, label=f"{path}/{slug}"
         )
@@ -7075,6 +7226,28 @@ async def flush_settings(x_admin_secret: str | None = Header(None)):
     auto_provision_cache = None
     openrouter_catalog_cache = None
     return {"ok": True}
+
+
+@app.post("/admin/openrouter-keys/provision")
+async def admin_provision_openrouter_key(
+    request: Request, x_admin_secret: str | None = Header(None)
+):
+    """Cria a chave espelho do OpenRouter de uma chave da Stac recém-criada.
+    Chamado pelo painel (createKey) em background: a chave nasce aqui, e não
+    na primeira request, para já aparecer na Activity do OpenRouter. Se falhar,
+    a primeira request que for para o OpenRouter tenta de novo."""
+    require_admin(x_admin_secret)
+    body = await request.json()
+    api_key_id = body.get("api_key_id") if isinstance(body, dict) else None
+    if not isinstance(api_key_id, str) or not api_key_id:
+        raise HTTPException(status_code=400, detail="api_key_id obrigatório")
+    if openrouter_mgmt_client is None:
+        return {"ok": False, "reason": "chaves espelho desligadas no gateway"}
+    identity = await supa.get_api_key_identity(api_key_id)
+    if identity is None:
+        raise HTTPException(status_code=404, detail="chave não encontrada ou inativa")
+    secret = await openrouter_key_for(identity)
+    return {"ok": secret is not None}
 
 
 @app.post("/admin/sync-machine-keys")

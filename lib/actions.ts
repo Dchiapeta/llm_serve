@@ -2149,20 +2149,33 @@ export async function createKey(input: {
   // lugares é o teto de ambientes do gateway (client_identity.py).
   const plainKey = generateHexKey()
 
-  const { error } = await db.from("api_keys").insert({
-    account_id: input.accountId,
-    machine_id: input.machineId,
-    stack_id: stackId,
-    name: input.name ?? null,
-    key_hash: hashKey(plainKey),
-    key_prefix: keyPrefix(plainKey),
-    plain_key: plainKey,
-    status: "active",
-    expires_at: input.expiresAt ?? null,
-    purpose,
-    enable_knowledge_base: input.enableKnowledgeBase ?? null,
-  })
+  const { data: inserted, error } = await db
+    .from("api_keys")
+    .insert({
+      account_id: input.accountId,
+      machine_id: input.machineId,
+      stack_id: stackId,
+      name: input.name ?? null,
+      key_hash: hashKey(plainKey),
+      key_prefix: keyPrefix(plainKey),
+      plain_key: plainKey,
+      status: "active",
+      expires_at: input.expiresAt ?? null,
+      purpose,
+      enable_knowledge_base: input.enableKnowledgeBase ?? null,
+    })
+    .select("id")
+    .single<{ id: string }>()
   if (error) throw new Error(error.message)
+
+  // Chave espelho no OpenRouter (migration 0072): criada já aqui para a chave
+  // aparecer na Activity de lá desde o primeiro dia. Best-effort — se falhar,
+  // o gateway cria na primeira request dela que for para o OpenRouter.
+  after(() =>
+    provisionOpenRouterKey(inserted.id).catch((e) =>
+      console.error("Criação da chave no OpenRouter falhou (o gateway cobre na 1ª request):", e)
+    )
+  )
 
   await logEvent(
     input.machineId,
@@ -2208,6 +2221,22 @@ export async function flushGatewayKeyCache() {
     headers: { "X-Admin-Secret": secret },
     signal: AbortSignal.timeout(5_000),
   })
+}
+
+// Pede ao gateway a chave espelho do OpenRouter de uma chave recém-criada
+// (best-effort). Vive no gateway, e não aqui, porque é ele quem guarda a chave
+// de gerenciamento do OpenRouter e a cifra dos segredos.
+async function provisionOpenRouterKey(apiKeyId: string) {
+  const url = process.env.GATEWAY_URL
+  const secret = process.env.GATEWAY_ADMIN_SECRET
+  if (!url || !secret) return // gateway ainda não configurado
+  const res = await fetch(`${url.replace(/\/$/, "")}/admin/openrouter-keys/provision`, {
+    method: "POST",
+    headers: { "X-Admin-Secret": secret, "Content-Type": "application/json" },
+    body: JSON.stringify({ api_key_id: apiKeyId }),
+    signal: AbortSignal.timeout(20_000),
+  })
+  if (!res.ok) throw new Error(`gateway respondeu ${res.status}`)
 }
 
 // Pede ao gateway pra reenviar as chaves da máquina ao agent quando o pod
