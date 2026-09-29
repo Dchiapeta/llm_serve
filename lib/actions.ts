@@ -2377,7 +2377,25 @@ export async function setOpenRouterEnabled(
 ): Promise<{ error: string } | void> {
   const result = await setSystemFlag("openrouter_enabled", enabled)
   if (result) return result
+  // Repasse ligado = toda chave tem a sua no OpenRouter (migration 0072),
+  // inclusive as criadas enquanto ele estava desligado. Depois do flush do
+  // setSystemFlag: o gateway precisa ver o interruptor já ligado.
+  if (enabled) after(() => backfillOpenRouterKeys())
   revalidatePath("/modelos")
+}
+
+async function backfillOpenRouterKeys() {
+  const url = process.env.GATEWAY_URL
+  const secret = process.env.GATEWAY_ADMIN_SECRET
+  if (!url || !secret) return // gateway ainda não configurado
+  await flushGatewaySettings()
+  await fetch(`${url.replace(/\/$/, "")}/admin/openrouter-keys/backfill`, {
+    method: "POST",
+    headers: { "X-Admin-Secret": secret },
+    signal: AbortSignal.timeout(10_000),
+  }).catch((e) =>
+    console.error("Backfill das chaves no OpenRouter falhou (a 1ª request de cada chave cobre):", e)
+  )
 }
 
 // ---------- Allowlist do OpenRouter (openrouter_models, migration 0071) ----------

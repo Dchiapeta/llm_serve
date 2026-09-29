@@ -650,6 +650,10 @@ openrouter_client: httpx.AsyncClient | None = None
 # Os dois None = mecanismo desligado.
 openrouter_mgmt_client: httpx.AsyncClient | None = None
 openrouter_secret_box: openrouter_keys.SecretBox | None = None
+# por que o mecanismo ficou desligado no boot (None = ligado). Devolvido pelo
+# /admin/openrouter-keys/provision: diz QUAL variável faltou ou por que o valor
+# foi recusado, sem expor valor nenhum.
+openrouter_keys_disabled_reason: str | None = "gateway ainda não terminou de subir"
 # api_key_id -> segredo já decifrado. Não expira: o segredo de uma chave
 # espelho não muda; quem invalida é _forget_openrouter_key (401 do OpenRouter).
 openrouter_key_secrets: dict[str, str] = {}
@@ -750,7 +754,7 @@ runpod_client: RunPodClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supa, store, proxy_client, document_client, openai_client, panel_client, demo_client, lifecycle_mgr, runpod_client, openrouter_client, openrouter_mgmt_client, openrouter_secret_box
+    global supa, store, proxy_client, document_client, openai_client, panel_client, demo_client, lifecycle_mgr, runpod_client, openrouter_client, openrouter_mgmt_client, openrouter_secret_box, openrouter_keys_disabled_reason
     supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET, IMAGE_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
     # read curto (60s): o Cloudflare na frente do RunPod às vezes derruba (RST)
@@ -833,15 +837,29 @@ async def lifespan(app: FastAPI):
         logger.info("OPENROUTER_API_KEY ausente — repasse para o OpenRouter desligado")
     openrouter_mgmt_client = None
     openrouter_secret_box = None
-    if OPENROUTER_MANAGEMENT_KEY and OPENROUTER_KEYS_ENCRYPTION_KEY:
+    missing = [
+        name for name, value in (
+            ("OPENROUTER_MANAGEMENT_KEY", OPENROUTER_MANAGEMENT_KEY),
+            ("OPENROUTER_KEYS_ENCRYPTION_KEY", OPENROUTER_KEYS_ENCRYPTION_KEY),
+        ) if not value
+    ]
+    openrouter_keys_disabled_reason = (
+        f"variável ausente no processo do gateway: {', '.join(missing)}" if missing else None
+    )
+    if not missing:
         try:
-            openrouter_secret_box = openrouter_keys.SecretBox(OPENROUTER_KEYS_ENCRYPTION_KEY)
+            # strip: valor colado com espaço/quebra de linha no fim é o erro mais
+            # comum, e não muda a chave
+            openrouter_secret_box = openrouter_keys.SecretBox(
+                OPENROUTER_KEYS_ENCRYPTION_KEY.strip()
+            )
         except ValueError as e:
+            openrouter_keys_disabled_reason = str(e)
             logger.error("chaves espelho do OpenRouter DESLIGADAS: %s", e)
         else:
             openrouter_mgmt_client = httpx.AsyncClient(
                 base_url=OPENROUTER_BASE_URL,
-                headers={"Authorization": f"Bearer {OPENROUTER_MANAGEMENT_KEY}"},
+                headers={"Authorization": f"Bearer {OPENROUTER_MANAGEMENT_KEY.strip()}"},
                 timeout=httpx.Timeout(15.0, connect=5.0),
             )
     else:
@@ -7228,6 +7246,41 @@ async def flush_settings(x_admin_secret: str | None = Header(None)):
     return {"ok": True}
 
 
+async def _openrouter_keys_blocked() -> str | None:
+    """Por que as chaves espelho não podem ser criadas agora, ou None."""
+    if openrouter_mgmt_client is None:
+        return openrouter_keys_disabled_reason or "desligado"
+    if not await openrouter_enabled():
+        return "repasse ao OpenRouter desligado na página Modelos"
+    return None
+
+
+async def _backfill_openrouter_keys(identities: list[dict]) -> None:
+    """Uma de cada vez e com folga: a API de gerenciamento tem rate limit
+    (sem número documentado) e ninguém está esperando por isto."""
+    created = 0
+    for identity in identities:
+        if await openrouter_key_for(identity):
+            created += 1
+        await asyncio.sleep(0.5)
+    logger.info("openrouter: backfill de chaves espelho — %d de %d", created, len(identities))
+
+
+@app.post("/admin/openrouter-keys/backfill")
+async def admin_backfill_openrouter_keys(x_admin_secret: str | None = Header(None)):
+    """Cria, em background, a chave espelho de toda chave ativa de cliente que
+    ainda não tem uma. O painel chama ao LIGAR o repasse: a regra é "repasse
+    ligado = toda chave tem espelho", inclusive as criadas enquanto ele estava
+    desligado. Idempotente — chave que já tem espelho não entra na lista."""
+    require_admin(x_admin_secret)
+    blocked = await _openrouter_keys_blocked()
+    if blocked:
+        return {"ok": False, "reason": blocked}
+    identities = await supa.list_keys_without_openrouter_key()
+    spawn_tracked(_backfill_openrouter_keys(identities))
+    return {"ok": True, "queued": len(identities)}
+
+
 @app.post("/admin/openrouter-keys/provision")
 async def admin_provision_openrouter_key(
     request: Request, x_admin_secret: str | None = Header(None)
@@ -7235,14 +7288,19 @@ async def admin_provision_openrouter_key(
     """Cria a chave espelho do OpenRouter de uma chave da Stac recém-criada.
     Chamado pelo painel (createKey) em background: a chave nasce aqui, e não
     na primeira request, para já aparecer na Activity do OpenRouter. Se falhar,
-    a primeira request que for para o OpenRouter tenta de novo."""
+    a primeira request que for para o OpenRouter tenta de novo.
+
+    Só com o repasse LIGADO (interruptor da página /modelos): é ele que decide
+    se as chaves ganham espelho. Com ele desligado nada é criado — ao ligar, o
+    backfill abaixo cobre as chaves criadas nesse meio tempo."""
     require_admin(x_admin_secret)
     body = await request.json()
     api_key_id = body.get("api_key_id") if isinstance(body, dict) else None
     if not isinstance(api_key_id, str) or not api_key_id:
         raise HTTPException(status_code=400, detail="api_key_id obrigatório")
-    if openrouter_mgmt_client is None:
-        return {"ok": False, "reason": "chaves espelho desligadas no gateway"}
+    blocked = await _openrouter_keys_blocked()
+    if blocked:
+        return {"ok": False, "reason": blocked}
     identity = await supa.get_api_key_identity(api_key_id)
     if identity is None:
         raise HTTPException(status_code=404, detail="chave não encontrada ou inativa")

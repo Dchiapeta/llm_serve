@@ -55,3 +55,12 @@ def test_secret_box_chave_errada():
         SecretBox(Fernet.generate_key().decode()).decrypt(token)
     with pytest.raises(ValueError):
         SecretBox("nao-e-uma-chave-fernet")
+
+
+def test_secret_box_erro_diz_o_tamanho_sem_o_valor():
+    valor = Fernet.generate_key().decode()[:30]  # colado pela metade
+    with pytest.raises(ValueError) as exc:
+        SecretBox(valor)
+    msg = str(exc.value)
+    assert "30 caracteres" in msg
+    assert valor not in msg

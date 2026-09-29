@@ -970,6 +970,30 @@ class SupaClient:
         )
         r.raise_for_status()
 
+    async def list_keys_without_openrouter_key(self) -> list[dict]:
+        """Chaves ativas de cliente que ainda não têm chave espelho no
+        OpenRouter, no mesmo formato de get_api_key_identity. É o backfill de
+        quando o repasse é ligado."""
+        r = await self._rest.get(
+            "/api_keys",
+            params={
+                "status": "eq.active",
+                "purpose": "eq.customer",
+                "select": "id,account_id,key_prefix,accounts(name),openrouter_keys(api_key_id)",
+                "openrouter_keys": "is.null",
+            },
+        )
+        r.raise_for_status()
+        return [
+            {
+                "api_key_id": row["id"],
+                "account_id": row.get("account_id"),
+                "key_prefix": row.get("key_prefix"),
+                "account_name": (row.get("accounts") or {}).get("name"),
+            }
+            for row in r.json()
+        ]
+
     async def get_api_key_identity(self, api_key_id: str) -> dict | None:
         """{api_key_id, account_id, key_prefix, account_name} de uma chave
         ativa — o mínimo para nomear a chave espelho quando a criação vem do

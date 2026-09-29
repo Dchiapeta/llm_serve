@@ -80,6 +80,12 @@ class FakeSupa:
     async def delete_openrouter_key(self, api_key_id):
         self.estado["or_keys"].pop(api_key_id, None)
 
+    async def list_keys_without_openrouter_key(self):
+        return [
+            {"api_key_id": k, "account_id": "acc-1", "key_prefix": f"stac_{k}", "account_name": "Loja X"}
+            for k in ("key-1", "key-2") if k not in self.estado["or_keys"]
+        ]
+
     async def get_api_key_identity(self, api_key_id):
         if api_key_id != "key-1":
             return None
@@ -559,3 +565,36 @@ def test_admin_provision_cria_a_espelho_da_chave_nova(espelho, monkeypatch):
     assert espelho["mgmt"]["criadas"] == ["Stac · Loja X · stac_ab · key-1"]
     r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "outra"})
     assert r.status_code == 404
+
+
+def test_provision_nao_cria_com_o_repasse_desligado(espelho, monkeypatch):
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+    espelho["settings"]["openrouter_enabled"] = False
+    r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
+    assert r.json() == {"ok": False, "reason": "repasse ao OpenRouter desligado na página Modelos"}
+    assert espelho["mgmt"]["criadas"] == []
+
+
+def test_provision_diz_qual_variavel_falta(rota, monkeypatch):
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+    monkeypatch.setattr(
+        main, "openrouter_keys_disabled_reason",
+        "variável ausente no processo do gateway: OPENROUTER_MANAGEMENT_KEY",
+    )
+    r = rota["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
+    assert r.json()["reason"].endswith("OPENROUTER_MANAGEMENT_KEY")
+
+
+def test_backfill_cria_so_as_que_faltam(espelho, monkeypatch):
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+    espelho["or_keys"]["key-1"] = {
+        "openrouter_hash": "h", "secret_encrypted": espelho["box"].encrypt("sk-or-v1-x"),
+    }
+
+    async def sem_espera(_):
+        return None
+
+    monkeypatch.setattr(main.asyncio, "sleep", sem_espera)
+    r = espelho["client"].post("/admin/openrouter-keys/backfill")
+    assert r.json() == {"ok": True, "queued": 1}
+    assert espelho["mgmt"]["criadas"] == ["Stac · Loja X · stac_key-2 · key-2"]

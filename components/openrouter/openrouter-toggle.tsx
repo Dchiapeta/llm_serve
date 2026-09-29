@@ -81,8 +81,9 @@ export function OpenRouterToggle({
             <AlertDialogTitle>Ligar o repasse ao OpenRouter?</AlertDialogTitle>
             <AlertDialogDescription>
               Cada requisição de um modelo ativo passa a ser cobrada por token do
-              crédito da Stac no OpenRouter. O custo de cada uma fica registrado
-              em Requisições. {activeModels === 0 && "Ainda não há nenhum modelo ativo na lista."}
+              crédito da Stac no OpenRouter. Toda chave da Stac ganha a sua no
+              OpenRouter (inclusive as que já existem), para o custo aparecer por
+              chave na Activity de lá, e também fica registrado em Requisições. {activeModels === 0 && "Ainda não há nenhum modelo ativo na lista."}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

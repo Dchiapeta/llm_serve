@@ -70,7 +70,12 @@ class SecretBox:
         try:
             self._fernet = Fernet(fernet_key.encode() if isinstance(fernet_key, str) else fernet_key)
         except Exception as e:
-            raise ValueError(f"OPENROUTER_KEYS_ENCRYPTION_KEY inválida: {e}") from e
+            # só o tamanho e o formato esperado, nunca o valor
+            size = len(fernet_key) if isinstance(fernet_key, (str, bytes)) else 0
+            raise ValueError(
+                f"OPENROUTER_KEYS_ENCRYPTION_KEY inválida: tem {size} caracteres, "
+                f"o esperado são 44 em base64 url-safe terminando em '=' ({e})"
+            ) from e
 
     def encrypt(self, secret: str) -> str:
         return self._fernet.encrypt(secret.encode()).decode()
