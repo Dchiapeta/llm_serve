@@ -145,6 +145,7 @@ def rota(monkeypatch):
     )
     main.settings_cache.clear()
     monkeypatch.setattr(main, "openrouter_catalog_cache", None)
+    monkeypatch.setattr(main, "OPENROUTER_API_KEY", "sk-or-da-stac")
     # chaves espelho desligadas por padrão; o fixture `espelho` liga
     monkeypatch.setattr(main, "openrouter_mgmt_client", None)
     monkeypatch.setattr(main, "openrouter_secret_box", None)
@@ -519,7 +520,7 @@ def espelho(rota, monkeypatch):
 def test_primeira_request_cria_a_espelho_e_as_seguintes_reusam(espelho):
     assert _chat(espelho, model=TEXT_SLUG).status_code == 200
     assert _chat(espelho, model=TEXT_SLUG).status_code == 200
-    assert espelho["mgmt"]["criadas"] == ["Stac · Loja X · stac_ab · key-1"]
+    assert espelho["mgmt"]["criadas"] == ["acc-1/key-1"]
     for request, _body in espelho["sent"]:
         assert request.headers["authorization"] == "Bearer sk-or-v1-espelho-1"
     row = espelho["or_keys"]["key-1"]
@@ -562,7 +563,7 @@ def test_admin_provision_cria_a_espelho_da_chave_nova(espelho, monkeypatch):
     monkeypatch.setattr(main, "require_admin", lambda secret: None)
     r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
     assert r.json() == {"ok": True}
-    assert espelho["mgmt"]["criadas"] == ["Stac · Loja X · stac_ab · key-1"]
+    assert espelho["mgmt"]["criadas"] == ["acc-1/key-1"]
     r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "outra"})
     assert r.status_code == 404
 
@@ -597,4 +598,19 @@ def test_backfill_cria_so_as_que_faltam(espelho, monkeypatch):
     monkeypatch.setattr(main.asyncio, "sleep", sem_espera)
     r = espelho["client"].post("/admin/openrouter-keys/backfill")
     assert r.json() == {"ok": True, "queued": 1}
-    assert espelho["mgmt"]["criadas"] == ["Stac · Loja X · stac_key-2 · key-2"]
+    assert espelho["mgmt"]["criadas"] == ["acc-1/key-2"]
+
+
+def test_sem_compartilhada_usa_so_a_espelho(espelho, monkeypatch):
+    monkeypatch.setattr(main, "OPENROUTER_API_KEY", "")
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    assert espelho["sent"][0][0].headers["authorization"] == "Bearer sk-or-v1-espelho-1"
+
+
+def test_sem_compartilhada_e_sem_espelho_e_503(espelho, monkeypatch):
+    monkeypatch.setattr(main, "OPENROUTER_API_KEY", "")
+    espelho["mgmt"]["falhar"] = True
+    r = _chat(espelho, model=TEXT_SLUG)
+    assert r.status_code == 503
+    assert espelho["sent"] == []
+    assert espelho["logged"][0]["status_code"] == 503

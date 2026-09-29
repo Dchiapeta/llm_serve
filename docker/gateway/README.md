@@ -121,7 +121,7 @@ advisory lock.
 | `MACHINE_HEALTH_TIMEOUT_S` | não        | Prazo máx. esperando `vllm_ready` numa máquina recém-criada antes de desistir (default 900) |
 | `MACHINE_HEALTH_POLL_INTERVAL_S` | não  | Intervalo entre polls de `/health` na máquina recém-criada (default 10) |
 | `SETTINGS_CACHE_TTL_S`    | não         | TTL do cache em memória dos interruptores de `system_settings` (`auto_provision_enabled`, `machines_enabled`, `openrouter_enabled`) e da allowlist `openrouter_models` (default 30) |
-| `OPENROUTER_API_KEY`      | não         | Chave da Stac no OpenRouter. Sem ela o repasse fica desligado mesmo com o interruptor do painel ligado (ver `openrouter.py`) |
+| `OPENROUTER_API_KEY`      | não         | Chave compartilhada da Stac no OpenRouter. Opcional quando as chaves espelho (abaixo) estão configuradas: aí ela é só plano B para uma chave cuja espelho não pôde ser criada. Sem ela e sem as espelhos, o repasse fica desligado (ver `openrouter.py`) |
 | `OPENROUTER_BASE_URL`     | não         | Default `https://openrouter.ai/api/v1` |
 | `OPENROUTER_APP_URL` / `OPENROUTER_APP_TITLE` | não | Atribuição no painel do OpenRouter (`HTTP-Referer` / `X-OpenRouter-Title`; defaults `https://trystac.com` / `Stac`) |
 | `OPENROUTER_MAX_TOKENS`   | não         | Teto de saída por request repassada (`max_tokens`/`max_completion_tokens`/`max_output_tokens`; default 32000, `0` = sem teto) |
@@ -129,7 +129,7 @@ advisory lock.
 | `OPENROUTER_NONSTREAM_TIMEOUT_S` | não  | Read da request repassada sem stream (default 300) |
 | `OPENROUTER_IMAGE_TIMEOUT_S` | não      | Read do `POST /images` do OpenRouter (default 240) |
 | `OPENROUTER_MAX_IMAGES`   | não         | Teto de `n` numa geração repassada (default 4) |
-| `OPENROUTER_MANAGEMENT_KEY` | não       | Management API key do OpenRouter (openrouter.ai/settings/management-keys). Com ela, cada chave da Stac ganha uma chave espelho no OpenRouter e o custo aparece por chave na Activity de lá (ver `openrouter_keys.py`). Sem ela, tudo usa `OPENROUTER_API_KEY` |
+| `OPENROUTER_MANAGEMENT_KEY` | não       | Management API key do OpenRouter (openrouter.ai/settings/management-keys). Com ela, cada chave da Stac ganha uma chave espelho no OpenRouter e o custo aparece por chave na Activity de lá (ver `openrouter_keys.py`). Sem ela, tudo usa `OPENROUTER_API_KEY` (e sem as duas, o repasse fica desligado) |
 | `OPENROUTER_KEYS_ENCRYPTION_KEY` | não* | Chave Fernet que cifra os segredos das chaves espelho em `openrouter_keys` (gerar com `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`). *Obrigatória junto com a de cima. Trocá-la invalida as espelhos já gravadas |
 | `OPENROUTER_KEY_RETRY_S`  | não         | Espera depois de uma falha ao criar a chave espelho de uma chave, antes de tentar de novo (default 300) |
 | `UPSERT_CACHE_TTL_S`      | não         | TTL do cache "chave já upsertada no agent X" do fluxo base (default 600; invalidado por máquina a cada religada) |

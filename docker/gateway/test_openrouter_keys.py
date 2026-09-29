@@ -18,15 +18,12 @@ from cryptography.fernet import Fernet  # noqa: E402
 from openrouter_keys import SecretBox, key_name, parse_created  # noqa: E402
 
 
-def test_key_name_com_conta_prefixo_e_id():
-    entry = {"account_name": "Loja X", "key_prefix": "stac_ab12",
-             "api_key_id": "0f1e2d3c-aaaa-bbbb-cccc-000000000000"}
-    assert key_name(entry) == "Stac · Loja X · stac_ab12 · 0f1e2d3c"
-
-
-def test_key_name_sem_nome_de_conta_e_truncado():
-    assert key_name({"account_id": "acc-1"}) == "Stac · acc-1"
-    assert len(key_name({"account_name": "x" * 500})) == 120
+def test_key_name_e_conta_barra_chave():
+    entry = {"account_id": "8a1b2c3d-0000-0000-0000-000000000001", "account_name": "Loja X",
+             "key_prefix": "stac_ab12", "api_key_id": "0f1e2d3c-aaaa-bbbb-cccc-000000000000"}
+    assert key_name(entry) == (
+        "8a1b2c3d-0000-0000-0000-000000000001/0f1e2d3c-aaaa-bbbb-cccc-000000000000"
+    )
 
 
 def test_parse_created_formato_documentado():

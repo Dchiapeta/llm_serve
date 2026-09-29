@@ -35,14 +35,12 @@ MAX_NAME_CHARS = 120
 def key_name(entry: dict) -> str:
     """Nome da chave espelho no OpenRouter — é o que aparece na Activity.
 
-    Conta + prefixo da chave (o mesmo que o cliente vê no painel) + começo do
-    id, que é o que desempata duas chaves com o mesmo prefixo e liga a linha
-    do OpenRouter de volta a api_keys."""
-    account = (entry.get("account_name") or entry.get("account_id") or "sem conta").strip()
-    prefix = (entry.get("key_prefix") or "").strip()
-    key_id = str(entry.get("api_key_id") or "")[:8]
-    parts = ["Stac", account] + ([prefix] if prefix else []) + ([key_id] if key_id else [])
-    return " · ".join(parts)[:MAX_NAME_CHARS]
+    `<id da conta>/<id da chave>`, os dois completos (decisão do usuário,
+    29/09/2026): liga a linha do OpenRouter direto a accounts e api_keys, sem
+    ambiguidade entre chaves com o mesmo prefixo."""
+    account_id = str(entry.get("account_id") or "sem-conta")
+    api_key_id = str(entry.get("api_key_id") or "")
+    return f"{account_id}/{api_key_id}"[:MAX_NAME_CHARS]
 
 
 def parse_created(payload) -> tuple[str, str]:

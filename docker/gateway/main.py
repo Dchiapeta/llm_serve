@@ -814,27 +814,6 @@ async def lifespan(app: FastAPI):
         transport=httpx.AsyncHTTPTransport(retries=2),
     )
     await assert_demo_pod_is_dedicated()
-    if OPENROUTER_API_KEY:
-        # client próprio: a Bearer é a NOSSA chave do OpenRouter (nunca a do
-        # cliente) e o pool não disputa conexão com o tráfego das máquinas.
-        # O read de cada request é definido na chamada (stream x não-stream x
-        # imagem); o daqui é só o default.
-        openrouter_client = httpx.AsyncClient(
-            base_url=OPENROUTER_BASE_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "HTTP-Referer": OPENROUTER_APP_URL,
-                "X-OpenRouter-Title": OPENROUTER_APP_TITLE,
-            },
-            timeout=httpx.Timeout(OPENROUTER_NONSTREAM_TIMEOUT_S, connect=10.0, write=30.0, pool=10.0),
-            limits=httpx.Limits(
-                max_connections=200, max_keepalive_connections=40, keepalive_expiry=30.0
-            ),
-            transport=httpx.AsyncHTTPTransport(retries=2),
-        )
-    else:
-        openrouter_client = None
-        logger.info("OPENROUTER_API_KEY ausente — repasse para o OpenRouter desligado")
     openrouter_mgmt_client = None
     openrouter_secret_box = None
     missing = [
@@ -864,9 +843,32 @@ async def lifespan(app: FastAPI):
             )
     else:
         logger.info(
-            "OPENROUTER_MANAGEMENT_KEY/OPENROUTER_KEYS_ENCRYPTION_KEY ausente — "
-            "sem chave do OpenRouter por chave da Stac (custo só em gateway_requests)"
+            "chaves do OpenRouter por chave da Stac desligadas (%s)",
+            openrouter_keys_disabled_reason,
         )
+    # Client do repasse: existe se há COMO autenticar — a chave espelho de cada
+    # chave da Stac (acima) e/ou a compartilhada. A compartilhada é opcional:
+    # com as espelhos ligadas ela é só plano B (ver openrouter_forward). O read
+    # de cada request é definido na chamada; o daqui é só o default.
+    if OPENROUTER_API_KEY or openrouter_mgmt_client is not None:
+        headers = {
+            "HTTP-Referer": OPENROUTER_APP_URL,
+            "X-OpenRouter-Title": OPENROUTER_APP_TITLE,
+        }
+        if OPENROUTER_API_KEY:
+            headers["Authorization"] = f"Bearer {OPENROUTER_API_KEY}"
+        openrouter_client = httpx.AsyncClient(
+            base_url=OPENROUTER_BASE_URL,
+            headers=headers,
+            timeout=httpx.Timeout(OPENROUTER_NONSTREAM_TIMEOUT_S, connect=10.0, write=30.0, pool=10.0),
+            limits=httpx.Limits(
+                max_connections=200, max_keepalive_connections=40, keepalive_expiry=30.0
+            ),
+            transport=httpx.AsyncHTTPTransport(retries=2),
+        )
+    else:
+        openrouter_client = None
+        logger.info("sem OPENROUTER_API_KEY nem chaves espelho — repasse ao OpenRouter desligado")
     if RUNPOD_API_KEY:
         runpod_client = RunPodClient(RUNPOD_API_KEY)
     else:
@@ -4380,6 +4382,20 @@ def _openrouter_error(
     return JSONResponse(status_code=status_code, content=content)
 
 
+def _openrouter_no_key(log_ctx: dict, *, stream: bool, anthropic: bool) -> JSONResponse:
+    """Sem chave espelho (a criação falhou) e sem chave compartilhada de plano
+    B: não há com que chamar o OpenRouter. O motivo da falha está no log de
+    openrouter_key_for; o cliente recebe o 503 genérico."""
+    logger.error(
+        "openrouter: chave %s sem espelho e sem OPENROUTER_API_KEY de plano B",
+        log_ctx.get("api_key_id"),
+    )
+    log_gateway_request(**log_ctx, status_code=503, stream=stream, usage=None)
+    return _openrouter_error(
+        503, "provedor de inferência temporariamente indisponível", anthropic=anthropic
+    )
+
+
 def _openrouter_error_response(
     status_code: int, raw: bytes, *, anthropic: bool, label: str
 ) -> JSONResponse:
@@ -4413,6 +4429,8 @@ async def openrouter_forward(
     compartilhada, que é o header default do openrouter_client."""
     is_stream = payload.get("stream") is True
     label = f"{upstream_path}/{log_ctx.get('model')}"
+    if not secret and not OPENROUTER_API_KEY:
+        return _openrouter_no_key(log_ctx, stream=is_stream, anthropic=anthropic)
     timeout = httpx.Timeout(
         (max(OPENROUTER_STREAM_TTFT_TIMEOUT_S, OPENROUTER_STREAM_IDLE_TIMEOUT_S) + 15.0)
         if is_stream
@@ -6326,6 +6344,8 @@ async def openrouter_image(
     )
     fallback_meta = image_gen.request_meta({**fields, "prompt": prompt})
     secret = await openrouter_key_for(entry)
+    if not secret and not OPENROUTER_API_KEY:
+        return _openrouter_no_key(log_ctx, stream=False, anthropic=False)
     try:
         upstream_req = openrouter_client.build_request(
             "POST", "/images", json=payload,
