@@ -1,10 +1,14 @@
 "use client"
 
 import * as React from "react"
-import { MoreHorizontal, Trash2 } from "lucide-react"
+import { LifeBuoy, MoreHorizontal, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
-import { deleteOpenRouterModel, setOpenRouterModelEnabled } from "@/lib/actions"
+import {
+  deleteOpenRouterModel,
+  setOpenRouterFallback,
+  setOpenRouterModelEnabled,
+} from "@/lib/actions"
 import type { OpenRouterModel } from "@/lib/types"
 import {
   AlertDialog,
@@ -21,6 +25,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { Switch } from "@/components/ui/switch"
@@ -64,6 +69,27 @@ export function OpenRouterModelRowActions({ model }: { model: OpenRouterModel })
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
+          {model.kind === "text" && !model.fallback && (
+            <>
+              <DropdownMenuItem
+                disabled={pending}
+                onSelect={() =>
+                  startTransition(async () => {
+                    const result = await setOpenRouterFallback(model.id)
+                    if (result?.error) {
+                      toast.error(result.error)
+                      return
+                    }
+                    toast.success(`${model.slug} é o novo reserva de texto`)
+                  })
+                }
+              >
+                <LifeBuoy className="size-4" />
+                Usar como reserva de texto
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          )}
           <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
             <Trash2 className="size-4" />
             Remover
@@ -78,6 +104,8 @@ export function OpenRouterModelRowActions({ model }: { model: OpenRouterModel })
             <AlertDialogDescription>
               Clientes que usam este modelo passam a receber erro. O histórico de
               requisições dele continua em Requisições.
+              {model.fallback &&
+                " Ele é o reserva de texto: sem reserva, requisições sem máquina disponível voltam a receber erro."}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

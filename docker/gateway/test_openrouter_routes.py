@@ -59,7 +59,10 @@ class FakeSupa:
         return self.estado["settings"].get(key, default)
 
     async def list_enabled_openrouter_models(self):
-        return [{"slug": s, "kind": k} for s, k in self.estado["catalog"].items()]
+        return [
+            {"slug": s, "kind": k, "fallback": s == self.estado["fallback"]}
+            for s, k in self.estado["catalog"].items()
+        ]
 
     async def upload_image_object(self, storage_path, data, content_type):
         self.uploaded[storage_path] = data
@@ -103,6 +106,10 @@ def rota(monkeypatch):
         "sent": [],
         "resposta": None,
         "or_keys": {},
+        "fallback": None,
+        "machine": None,
+        "plan": "Max",
+        "resolve_calls": [],
     }
     supa = FakeSupa(estado)
     estado["supa"] = supa
@@ -117,7 +124,14 @@ def rota(monkeypatch):
         return estado["entry"], "hash", "Bearer sk-cliente"
 
     async def fake_resolve_route(account_id, entry):
-        raise AssertionError("request repassada não pode resolver máquina")
+        # default: nenhuma máquina disponível (o real dispara o wake e dá 503)
+        estado["resolve_calls"].append(entry["stack_id"])
+        machine = estado["machine"]
+        if machine is None:
+            raise main.HTTPException(status_code=503, detail="máquina ligando, tente novamente")
+        # plano fora de REASONING_LEAK_PLANS: o filtro de <think> do Qwen não
+        # é o assunto destes testes
+        return machine, False, estado["plan"], "stack-1"
 
     async def fake_quota(*a, **k):
         return None
@@ -401,6 +415,8 @@ def test_generations_vai_para_o_images_do_openrouter(rota):
     assert list(rota["supa"].uploaded.values()) == [PNG]
     assert rota["supa"].rows[0]["machine_id"] is None
     assert rota["logged"][0]["cost_usd"] == 0.04
+    # imagem fica FORA da regra de reserva: modelo da lista nem consulta máquina
+    assert rota["resolve_calls"] == []
 
 
 def test_edits_manda_as_referencias_como_data_url(rota):
@@ -614,3 +630,225 @@ def test_sem_compartilhada_e_sem_espelho_e_503(espelho, monkeypatch):
     assert r.status_code == 503
     assert espelho["sent"] == []
     assert espelho["logged"][0]["status_code"] == 503
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter como reserva das máquinas (30/09, migration 0073)
+# ---------------------------------------------------------------------------
+
+QWEN = "qwen/qwen3.8-27b"
+POD = {
+    "id": "m-pro", "public_url": "https://pod.test", "served_model_name": "pro-base",
+    "model_name": "Qwen/Qwen3.8-27B", "max_model_len": 131072, "max_concurrent_seqs": 16,
+}
+
+
+@pytest.fixture
+def reserva(rota, monkeypatch):
+    rota["catalog"][QWEN] = "text"
+    rota["fallback"] = QWEN
+    rota["resposta"] = lambda r: httpx.Response(200, json={"choices": [], "usage": {
+        "prompt_tokens": 1, "completion_tokens": 1}})
+    rota["pod"] = []
+
+    async def pod_handler(request: httpx.Request) -> httpx.Response:
+        rota["pod"].append(json.loads(await request.aread()))
+        return rota["pod_resposta"](request)
+
+    async def no_touch(*a, **k):
+        return None
+
+    monkeypatch.setattr(main, "maybe_touch", no_touch)
+    monkeypatch.setattr(main, "proxy_client",
+                        httpx.AsyncClient(transport=httpx.MockTransport(pod_handler)),
+                        raising=False)
+    main.in_flight.clear()
+    yield rota
+    assert sum(main.in_flight.values()) == 0  # nenhum desvio vaza vaga
+    main.in_flight.clear()
+
+
+def test_sem_maquina_modelo_da_lista_responde_pelo_openrouter(reserva):
+    r = _chat(reserva, model=TEXT_SLUG)
+    assert r.status_code == 200
+    assert reserva["resolve_calls"] == ["stack-1"]  # a máquina foi pedida (wake)
+    assert reserva["sent"][0][1]["model"] == TEXT_SLUG
+
+
+def test_sem_maquina_pro_base_cai_no_reserva(reserva):
+    _chat(reserva, model="pro-base")
+    assert reserva["sent"][0][1]["model"] == QWEN
+
+
+def test_maquina_disponivel_responde_qualquer_modelo_com_o_nome_pedido(reserva):
+    reserva["machine"] = POD
+    reserva["pod_resposta"] = lambda r: httpx.Response(200, json={
+        "id": "x", "model": "pro-base",
+        "choices": [{"message": {"role": "assistant", "content": "olá"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+    })
+    r = _chat(reserva, model=TEXT_SLUG)
+    assert r.status_code == 200
+    assert reserva["sent"] == []  # nada foi pro OpenRouter
+    assert reserva["pod"][0]["model"] == "pro-base"  # a máquina recebe o nome dela
+    assert r.json()["model"] == TEXT_SLUG  # o cliente vê o que pediu
+    assert r.json()["choices"][0]["message"]["content"] == "olá"
+
+
+def test_maquina_disponivel_stream_tambem_mostra_o_nome_pedido(reserva):
+    reserva["machine"] = POD
+    sse = (
+        b'data: {"id":"x","model":"pro-base","choices":[{"delta":{"content":"ol"}}]}\n\n'
+        b'data: {"id":"x","model":"pro-base","choices":[{"delta":{"content":"\xc3\xa1"},"finish_reason":"stop"}],'
+        b'"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    reserva["pod_resposta"] = lambda r: httpx.Response(
+        200, content=sse, headers={"content-type": "text/event-stream"}
+    )
+    r = _chat(reserva, model=TEXT_SLUG, stream=True)
+    assert b'"model":"pro-base"' not in r.content
+    assert r.content.count(('"model":"' + TEXT_SLUG + '"').encode()) == 2
+
+
+def test_maquina_lotada_desvia(reserva, monkeypatch):
+    reserva["machine"] = POD
+
+    def lotada(flight_key, *a, **k):
+        main.release_flight(flight_key)
+        raise main.HTTPException(status_code=429, detail="lotada")
+
+    monkeypatch.setattr(main, "check_concurrency", lotada)
+    r = _chat(reserva, model="pro-base")
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == QWEN and reserva["pod"] == []
+
+
+def test_conversa_maior_que_a_maquina_continua_no_openrouter(reserva, monkeypatch):
+    reserva["machine"] = POD
+
+    async def estourou(*a, **k):
+        raise main.ContextWindowExceeded("não cabe")
+
+    monkeypatch.setattr(main, "validate_body", estourou)
+    r = _chat(reserva, model=TEXT_SLUG)
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == TEXT_SLUG and reserva["pod"] == []
+    # o corpo desviado é o ORIGINAL do cliente, não o reescrito para a máquina
+    assert reserva["sent"][0][1]["messages"][-1] == {"role": "user", "content": "oi"}
+
+
+def test_maquinas_desligadas_pro_base_vai_pro_reserva(reserva):
+    reserva["settings"]["machines_enabled"] = False
+    r = _chat(reserva, model="pro-base")
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == QWEN
+    assert reserva["resolve_calls"] == []
+
+
+def test_sem_reserva_e_sem_maquina_segue_o_503_da_maquina(reserva):
+    reserva["fallback"] = None
+    r = _chat(reserva, model="pro-base")
+    assert r.status_code == 503 and reserva["sent"] == []
+
+
+def test_messages_sem_maquina_desvia_e_com_maquina_nao(reserva):
+    corpo = {"model": TEXT_SLUG, "max_tokens": 100,
+             "messages": [{"role": "user", "content": "oi"}]}
+    r = reserva["client"].post("/v1/messages", json=corpo, headers={"x-api-key": "sk-cliente"})
+    assert r.status_code == 200
+    assert reserva["sent"][0][0].url.path == "/api/v1/messages"
+    assert reserva["sent"][0][1]["model"] == TEXT_SLUG
+
+
+def test_messages_contexto_maior_que_a_maquina_desvia(reserva, monkeypatch):
+    reserva["machine"] = POD
+
+    async def estourou(*a, **k):
+        raise main.ContextWindowExceeded("não cabe")
+
+    monkeypatch.setattr(main, "validate_body", estourou)
+    r = reserva["client"].post(
+        "/v1/messages",
+        json={"model": "pro-base", "max_tokens": 100, "messages": [{"role": "user", "content": "oi"}]},
+        headers={"x-api-key": "sk-cliente"},
+    )
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == QWEN and reserva["pod"] == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_nome_pedido_sobrevive_ao_filtro_de_think_do_pro(reserva, stream):
+    reserva["machine"] = POD
+    reserva["plan"] = "Pro"  # REASONING_LEAK_PLANS: resposta passa pelo filtro de <think>
+    if stream:
+        sse = (
+            b'data: {"id":"x","model":"pro-base","choices":[{"index":0,"delta":{"content":"<think>hmm</think>"}}]}\n\n'
+            b'data: {"id":"x","model":"pro-base","choices":[{"index":0,"delta":{"content":"ol\xc3\xa1"},"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        reserva["pod_resposta"] = lambda r: httpx.Response(
+            200, content=sse, headers={"content-type": "text/event-stream"})
+    else:
+        reserva["pod_resposta"] = lambda r: httpx.Response(200, json={
+            "id": "x", "model": "pro-base",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "<think>hmm</think>olá"},
+                         "finish_reason": "stop"}],
+        })
+    r = _chat(reserva, model=TEXT_SLUG, stream=stream)
+    assert r.status_code == 200
+    assert b"pro-base" not in r.content
+    assert TEXT_SLUG.encode() in r.content
+    if not stream:
+        assert r.json()["choices"][0]["message"]["content"] == "olá"
+
+
+def test_models_sem_maquina_lista_o_openrouter(reserva):
+    r = reserva["client"].get("/v1/models", headers={"Authorization": "Bearer sk-cliente"})
+    assert r.status_code == 200
+    assert QWEN in [m["id"] for m in r.json()["data"]]
+
+
+@pytest.mark.parametrize("rota_", ["chat", "messages"])
+def test_maquina_inalcancavel_desvia(reserva, rota_):
+    reserva["machine"] = POD
+
+    def cai(request):
+        raise httpx.ConnectError("pod fora do ar")
+
+    reserva["pod_resposta"] = cai
+    if rota_ == "chat":
+        r = _chat(reserva, model="pro-base")
+    else:
+        r = reserva["client"].post(
+            "/v1/messages",
+            json={"model": "pro-base", "max_tokens": 100, "messages": [{"role": "user", "content": "oi"}]},
+            headers={"x-api-key": "sk-cliente"},
+        )
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == QWEN
+
+
+@pytest.mark.parametrize("rota_", ["chat", "messages"])
+def test_maquina_503_antes_do_primeiro_byte_desvia(reserva, rota_):
+    reserva["machine"] = POD
+    reserva["pod_resposta"] = lambda r: httpx.Response(503, json={"detail": "vLLM reiniciando"})
+    if rota_ == "chat":
+        r = _chat(reserva, model="pro-base", stream=True)
+    else:
+        r = reserva["client"].post(
+            "/v1/messages",
+            json={"model": "pro-base", "max_tokens": 100, "stream": True,
+                  "messages": [{"role": "user", "content": "oi"}]},
+            headers={"x-api-key": "sk-cliente"},
+        )
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == QWEN
+
+
+def test_maquina_503_sem_reserva_repassa_o_erro(reserva):
+    reserva["machine"] = POD
+    reserva["fallback"] = None
+    reserva["pod_resposta"] = lambda r: httpx.Response(503, json={"detail": "vLLM reiniciando"})
+    r = _chat(reserva, model="pro-base")
+    assert r.status_code == 503 and reserva["sent"] == []

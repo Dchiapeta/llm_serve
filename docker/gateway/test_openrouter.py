@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from openrouter import (  # noqa: E402
     ANTHROPIC_SSE_PING,
     CostStripper,
+    ModelNameRewriter,
     IMAGE_KIND,
     TEXT_KIND,
     UsageCostScanner,
@@ -27,6 +28,7 @@ from openrouter import (  # noqa: E402
     error_of,
     image_body,
     pick_slug,
+    pick_target,
     prepare_anthropic_body,
     prepare_openai_body,
     requested_model,
@@ -296,3 +298,25 @@ def test_heartbeat_propaga_erro_da_fonte():
         return False
 
     assert asyncio.run(run())
+
+
+# ---------- reserva e troca de nome (30/09) ----------
+
+
+def test_pick_target_pedido_ganha_do_reserva():
+    fallbacks = {TEXT_KIND: "qwen/qwen3.8-27b"}
+    assert pick_target("qwen/qwen3-coder", TEXT_KIND, CATALOG, fallbacks) == "qwen/qwen3-coder"
+    assert pick_target("pro-base", TEXT_KIND, CATALOG, fallbacks) == "qwen/qwen3.8-27b"
+    assert pick_target(None, TEXT_KIND, CATALOG, fallbacks) == "qwen/qwen3.8-27b"
+    # sem reserva de imagem configurado, modelo fora da lista não tem destino
+    assert pick_target("go-image", IMAGE_KIND, CATALOG, fallbacks) is None
+
+
+def test_model_name_rewriter_sse_e_corpo_inteiro():
+    rw = ModelNameRewriter("pro-base", "moonshotai/kimi-k3")
+    chunk1 = b'data: {"id":"x","model":"pro-base","choices":[{"delta":{"content":"o \\"model\\":\\"pro-base\\""}}]}\n\n'
+    out = rw.feed(chunk1[:25]) + rw.feed(chunk1[25:]) + rw.flush()
+    assert b'"model":"moonshotai/kimi-k3"' in out
+    # o texto gerado (aspas escapadas) não é tocado
+    assert b'\\"model\\":\\"pro-base\\"' in out
+    assert rw.whole(b'{"model": "pro-base", "x": 1}') == b'{"model": "moonshotai/kimi-k3", "x": 1}'

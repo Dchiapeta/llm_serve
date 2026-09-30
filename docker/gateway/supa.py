@@ -1023,10 +1023,13 @@ class SupaClient:
 
     async def list_enabled_openrouter_models(self) -> list[dict]:
         """Allowlist do repasse ao OpenRouter (migration 0071): só os
-        habilitados, [{slug, kind}]. Chamador é responsável por cachear."""
+        habilitados, [{slug, kind, fallback?}]. Chamador é responsável por
+        cachear. `select=*` e não a lista de colunas: `fallback` (0073) só
+        existe depois da migration, e pedi-la antes derrubaria o repasse
+        inteiro com um 400 do PostgREST."""
         r = await self._rest.get(
             "/openrouter_models",
-            params={"enabled": "is.true", "select": "slug,kind"},
+            params={"enabled": "is.true", "select": "*"},
         )
         r.raise_for_status()
         return r.json()

@@ -95,6 +95,15 @@ def pick_slug(model: str | None, kind: str, catalog: dict[str, str]) -> str | No
     return model if catalog.get(model) == kind else None
 
 
+def pick_target(
+    model: str | None, kind: str, catalog: dict[str, str], fallbacks: dict[str, str]
+) -> str | None:
+    """Modelo do OpenRouter que atende a request quando ela vai para lá: o
+    PEDIDO, se está na lista; senão o reserva do tipo (ex.: `go-base`, que só
+    existe nas máquinas, é atendido pelo Qwen3.8 27B). None = nenhum dos dois."""
+    return pick_slug(model, kind, catalog) or fallbacks.get(kind)
+
+
 def accepted_models(catalog: dict[str, str], kind: str) -> list[str]:
     return sorted(slug for slug, k in catalog.items() if k == kind)
 
@@ -414,6 +423,48 @@ class CostStripper:
     def flush(self) -> bytes:
         out, self._pending = _strip_cost_line(self._pending), b""
         return out
+
+
+class ModelNameRewriter:
+    """Troca o nome do modelo servido pela máquina pelo que o cliente PEDIU,
+    nas respostas de máquina (regra de 30/09/2026: com máquina disponível, ela
+    responde qualquer modelo pedido — o cliente que pediu o Kimi K3 continua
+    vendo "Kimi K3", mesmo respondido pelo modelo da máquina).
+
+    Linha a linha, como o CostStripper, e só no par `"model":"<servido>"`: as
+    aspas de dentro de uma string JSON vêm escapadas (\\"), então esse par
+    literal só existe como CAMPO, nunca no meio do texto gerado."""
+
+    __slots__ = ("_pending", "_pairs")
+
+    def __init__(self, served: str, requested: str) -> None:
+        self._pending = b""
+        old, new = json.dumps(served).encode(), json.dumps(requested).encode()
+        self._pairs = [
+            (b'"model":' + old, b'"model":' + new),
+            (b'"model": ' + old, b'"model": ' + new),
+        ]
+
+    def _line(self, line: bytes) -> bytes:
+        for old, new in self._pairs:
+            if old in line:
+                line = line.replace(old, new)
+        return line
+
+    def feed(self, chunk: bytes) -> bytes:
+        self._pending += chunk
+        if b"\n" not in self._pending:
+            return b""
+        head, _, self._pending = self._pending.rpartition(b"\n")
+        return b"\n".join(self._line(line) for line in head.split(b"\n")) + b"\n"
+
+    def flush(self) -> bytes:
+        out, self._pending = self._line(self._pending), b""
+        return out
+
+    def whole(self, raw: bytes) -> bytes:
+        """Corpo não-streamed inteiro."""
+        return self._line(raw)
 
 
 def stream_error_frame(message: str, code: str, *, anthropic: bool) -> bytes:

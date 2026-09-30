@@ -48,8 +48,8 @@ export async function ModelosBody() {
 
       {!machinesEnabled && (
         <p className="text-sm text-muted-foreground">
-          As máquinas próprias estão desligadas (página Máquinas): só os modelos
-          ativos desta lista respondem. Qualquer outro modelo recebe erro.
+          As máquinas próprias estão desligadas (página Máquinas): todo texto vai
+          para o OpenRouter — o modelo pedido se está na lista, senão o Reserva.
         </p>
       )}
       {catalog === null && (
@@ -64,7 +64,11 @@ export async function ModelosBody() {
           <CardTitle>Modelos aceitos</CardTitle>
           <CardDescription>
             {models.length} na lista · {active} ativo(s). O cliente escolhe pelo
-            ID, no campo &quot;model&quot; da requisição.
+            ID, no campo &quot;model&quot; da requisição. Com as máquinas ligadas,
+            o OpenRouter só responde quando não há máquina disponível para o
+            plano (a máquina é ligada em paralelo); aí responde o modelo pedido
+            se está na lista, senão o <strong>Reserva</strong>. Modelos de imagem
+            da lista vão sempre para o OpenRouter, sem ligar máquina de imagem.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -94,7 +98,10 @@ export async function ModelosBody() {
                   <TableRow key={m.id}>
                     <TableCell>
                       <div className="flex flex-col">
-                        <span className="font-medium">{m.label ?? m.slug}</span>
+                        <span className="flex items-center gap-2 font-medium">
+                          {m.label ?? m.slug}
+                          {m.fallback && <Badge variant="secondary">Reserva</Badge>}
+                        </span>
                         <code className="font-mono text-xs text-muted-foreground">
                           {m.slug}
                         </code>

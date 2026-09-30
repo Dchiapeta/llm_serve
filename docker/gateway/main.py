@@ -642,8 +642,9 @@ auto_provision_cache: tuple[bool, float] | None = None
 # demais flags de system_settings (machines_enabled, openrouter_enabled):
 # key -> (valor, expira_em). Mesmo TTL do auto_provision_cache.
 settings_cache: dict[str, tuple[bool, float]] = {}
-# allowlist do OpenRouter (openrouter_models habilitados): ({slug: kind}, expira_em)
-openrouter_catalog_cache: tuple[dict[str, str], float] | None = None
+# allowlist do OpenRouter (openrouter_models habilitados):
+# ({slug: kind}, {kind: slug do reserva}, expira_em)
+openrouter_catalog_cache: tuple[dict[str, str], dict[str, str], float] | None = None
 # None quando OPENROUTER_API_KEY não está configurada (repasse desligado)
 openrouter_client: httpx.AsyncClient | None = None
 # chaves espelho (openrouter_keys.py): client da API de gerenciamento e a cifra.
@@ -2201,23 +2202,43 @@ async def openrouter_enabled() -> bool:
     return await _cached_setting("openrouter_enabled", False)
 
 
-async def openrouter_catalog() -> dict[str, str]:
-    """{slug: kind} dos modelos habilitados na página Modelos (OpenRouter),
-    vazio com o repasse desligado. Falha de leitura mantém o último catálogo."""
+async def _openrouter_models() -> tuple[dict[str, str], dict[str, str]]:
+    """({slug: kind}, {kind: slug do reserva}) dos modelos habilitados na
+    página Modelos (OpenRouter), vazios com o repasse desligado. Falha de
+    leitura mantém o último catálogo."""
     global openrouter_catalog_cache
     if not await openrouter_enabled():
-        return {}
+        return {}, {}
     now = time.time()
-    if openrouter_catalog_cache and openrouter_catalog_cache[1] > now:
-        return openrouter_catalog_cache[0]
+    if openrouter_catalog_cache and openrouter_catalog_cache[2] > now:
+        return openrouter_catalog_cache[0], openrouter_catalog_cache[1]
     try:
         rows = await supa.list_enabled_openrouter_models()
         catalog = {row["slug"]: row["kind"] for row in rows}
+        fallbacks = {row["kind"]: row["slug"] for row in rows if row.get("fallback")}
     except Exception as e:
         logger.warning("openrouter: falha ao ler a allowlist de modelos (%s)", e)
-        catalog = openrouter_catalog_cache[0] if openrouter_catalog_cache else {}
-    openrouter_catalog_cache = (catalog, now + SETTINGS_CACHE_TTL_S)
-    return catalog
+        catalog, fallbacks = (
+            openrouter_catalog_cache[:2] if openrouter_catalog_cache else ({}, {})
+        )
+    openrouter_catalog_cache = (catalog, fallbacks, now + SETTINGS_CACHE_TTL_S)
+    return catalog, fallbacks
+
+
+async def openrouter_catalog() -> dict[str, str]:
+    """{slug: kind} dos modelos habilitados (vazio com o repasse desligado)."""
+    return (await _openrouter_models())[0]
+
+
+async def openrouter_text_target(model: str | None) -> str | None:
+    """Modelo do OpenRouter que atende uma request de TEXTO que vai para lá: o
+    pedido, se está na lista; senão o reserva de texto (0073). Imagem não tem
+    reserva — fica fora da regra, ver a migration."""
+    catalog, fallbacks = await _openrouter_models()
+    return openrouter.pick_target(
+        model, openrouter.TEXT_KIND, catalog,
+        {k: v for k, v in fallbacks.items() if k == openrouter.TEXT_KIND},
+    )
 
 
 async def openrouter_key_for(entry: dict) -> str | None:
@@ -4662,21 +4683,51 @@ async def anthropic_messages(
     if not isinstance(anthropic_body, dict):
         raise HTTPException(status_code=400, detail="corpo inválido")
 
+    # Destino (regra de 30/09, ver o catch-all e a migration 0073): máquinas
+    # ligadas → máquina primeiro, OpenRouter só como desvio quando não há
+    # máquina disponível; desligadas → OpenRouter direto.
     requested = openrouter.requested_model(anthropic_body)
-    slug = await openrouter_slug_for(requested, openrouter.TEXT_KIND)
-    if slug:
-        return await openrouter_messages(
-            anthropic_body=anthropic_body, entry=entry, stack=key_stack, slug=slug,
-            request=request, started=started,
-        )
-    await require_machines(requested, openrouter.TEXT_KIND)
 
-    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    async def _desvio(reason: str) -> Response | None:
+        fallback = await _text_fallback("messages", requested, reason)
+        if fallback is None:
+            return None
+        return await openrouter_messages(
+            anthropic_body=anthropic_body, entry=entry, stack=key_stack,
+            slug=fallback.slug, request=request, started=started,
+        )
+
+    if not await machines_enabled():
+        slug = await openrouter_text_target(requested)
+        if slug:
+            return await openrouter_messages(
+                anthropic_body=anthropic_body, entry=entry, stack=key_stack, slug=slug,
+                request=request, started=started,
+            )
+        await require_machines(requested, openrouter.TEXT_KIND)
+
+    try:
+        # sem máquina disponível, resolve_route já dispara o wake/criação
+        machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            desviada = await _desvio(f"sem máquina: {exc.detail}")
+            if desviada is not None:
+                return desviada
+        raise
     await maybe_touch(stack_id, machine["id"])
 
     flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
-    check_concurrency(flight_key, machine, effective_plan)
+    try:
+        check_concurrency(flight_key, machine, effective_plan)
+    except HTTPException as exc:
+        # check_concurrency já devolveu a vaga antes de levantar
+        if exc.status_code == 429:
+            desviada = await _desvio("máquina lotada")
+            if desviada is not None:
+                return desviada
+        raise
 
     log_ctx = dict(
         account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
@@ -4704,6 +4755,12 @@ async def anthropic_messages(
         )
     except ContextWindowExceeded as exc:
         release_flight(flight_key)
+        # conversa maior que a janela da máquina (ex.: cresceu no OpenRouter
+        # antes de a máquina ligar) continua no OpenRouter em vez de matar a
+        # sessão — só cai no erro abaixo com o repasse desligado
+        desviada = await _desvio("maior que a janela da máquina")
+        if desviada is not None:
+            return desviada
         # O estouro de contexto é o evento mais importante deste endpoint (mata
         # a sessão do usuário) e até aqui não deixava rastro NENHUM: nem em
         # gateway_requests, nem no log de aplicação — só a linha de access log
@@ -4782,12 +4839,30 @@ async def anthropic_messages(
         # falha de conexão de verdade (recusada, DNS, pod fora do ar etc.) —
         # aqui sim "indisponível" é a descrição correta.
         release_flight(flight_key)
+        if isinstance(e, _MACHINE_UNREACHABLE):
+            desviada = await _desvio("máquina inalcançável")
+            if desviada is not None:
+                return desviada
         logger.warning("anthropic proxy: upstream indisponível para %s (%s)", flight_key, e)
         log_gateway_request(**log_ctx, status_code=503, stream=is_stream, usage=None)
         raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
     except BaseException:
         release_flight(flight_key)
         raise
+
+    if upstream.status_code in _MACHINE_DOWN_STATUSES:
+        # pod de pé mas vLLM fora, antes do primeiro byte: mesmo desvio do
+        # catch-all. Sem desvio possível, segue o tratamento de erro de sempre.
+        fallback = await _text_fallback(
+            "messages", requested, f"máquina respondeu {upstream.status_code}"
+        )
+        if fallback is not None:
+            await upstream.aclose()
+            release_flight(flight_key)
+            return await openrouter_messages(
+                anthropic_body=anthropic_body, entry=entry, stack=key_stack,
+                slug=fallback.slug, request=request, started=started,
+            )
 
     async def _reenviar_sem_thinking(stream: bool):
         """Mesmo corpo já validado, thinking desligado — o retry de resposta vazia
@@ -6634,9 +6709,85 @@ async def images_edits(request: Request, authorization: str | None = Header(None
     return await _relay_image_response(upstream, flight_key, log_ctx)
 
 
+class _FallbackToOpenRouter(Exception):
+    """Desvio de uma request de TEXTO para o OpenRouter no meio do caminho da
+    máquina (sem máquina disponível, máquina lotada ou conversa maior que a
+    janela dela). Exceção, e não um `return`, de propósito: sobe pelos mesmos
+    except/finally que devolvem a vaga de in_flight, então o desvio nunca
+    vaza nem devolve a vaga duas vezes. Quem captura é o handler da rota."""
+
+    def __init__(self, slug: str, reason: str) -> None:
+        super().__init__(reason)
+        self.slug = slug
+        self.reason = reason
+
+
+async def _text_fallback(path: str, requested: str | None, reason: str) -> _FallbackToOpenRouter | None:
+    """O desvio, se o repasse está ligado e há modelo para atender (o pedido
+    da lista, senão o reserva de texto); None = segue o erro da máquina."""
+    if path not in openrouter.TEXT_PATHS and path != "messages":
+        return None
+    slug = await openrouter_text_target(requested)
+    if not slug:
+        return None
+    logger.info("openrouter: %s desviada para %s (%s)", path, slug, reason)
+    return _FallbackToOpenRouter(slug, reason)
+
+
+# Falhas da máquina que ainda permitem desviar para o OpenRouter: nenhum byte
+# da resposta foi para o cliente. ReadTimeout fica de fora de propósito — a
+# máquina pode estar gerando, e desviar repetiria a geração inteira.
+_MACHINE_UNREACHABLE = (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError)
+_MACHINE_DOWN_STATUSES = (502, 503, 504)
+
+
+class _EchoedUpstream:
+    """Resposta da máquina com o nome do modelo trocado pelo que o cliente
+    pediu (ver openrouter.ModelNameRewriter). Só implementa o que os caminhos
+    de relay usam: aread, aiter_bytes, aclose; o resto vem do original."""
+
+    def __init__(self, upstream, rewriter: "openrouter.ModelNameRewriter") -> None:
+        self._upstream = upstream
+        self._rewriter = rewriter
+
+    def __getattr__(self, name):
+        return getattr(self._upstream, name)
+
+    async def aread(self) -> bytes:
+        return self._rewriter.whole(await self._upstream.aread())
+
+    async def aiter_bytes(self):
+        async for chunk in self._upstream.aiter_bytes():
+            out = self._rewriter.feed(chunk)
+            if out:
+                yield out
+        tail = self._rewriter.flush()
+        if tail:
+            yield tail
+
+    async def aclose(self) -> None:
+        await self._upstream.aclose()
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request, authorization: str | None = Header(None)):
     started = time.monotonic()
+    ctx: dict = {}
+    try:
+        return await _proxy(path, request, authorization, started, ctx)
+    except _FallbackToOpenRouter as fallback:
+        return await openrouter_text(
+            path=path, body=ctx["body"], entry=ctx["entry"], stack=ctx["stack"],
+            slug=fallback.slug, request=request, started=started,
+        )
+
+
+async def _proxy(
+    path: str, request: Request, authorization: str | None, started: float, ctx: dict,
+):
+    """Corpo do catch-all. `ctx` devolve ao handler o que o desvio para o
+    OpenRouter precisa (corpo ORIGINAL, chave, stack) — o corpo daqui em
+    diante é reescrito para a máquina."""
     allowed_methods = ALLOWED_V1.get(path)
     if not allowed_methods or request.method not in allowed_methods:
         raise HTTPException(status_code=404, detail="not found")
@@ -6653,23 +6804,28 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
 
-    # Destino da request (ver openrouter.py): modelo da allowlist vai para o
-    # OpenRouter; o resto segue para máquina, se as máquinas estiverem ligadas.
+    # Destino da request (regra de 30/09, ver migration 0073). Com as máquinas
+    # LIGADAS a máquina vem primeiro, qualquer que seja o modelo pedido, e o
+    # OpenRouter só entra como desvio (_FallbackToOpenRouter) quando não há
+    # máquina disponível. Com elas DESLIGADAS, texto vai direto para o
+    # OpenRouter: o modelo pedido se está na lista, senão o reserva.
     key_kind = (
         openrouter.IMAGE_KIND
         if (key_stack or {}).get("category") == IMAGE_CATEGORY
         else openrouter.TEXT_KIND
     )
-    if path in openrouter.TEXT_PATHS:
-        requested = openrouter.requested_model(body)
-        slug = await openrouter_slug_for(requested, openrouter.TEXT_KIND)
+    requested = openrouter.requested_model(body) if path in openrouter.TEXT_PATHS else None
+    ctx.update(body=body, entry=entry, stack=key_stack)
+    machines_on = await machines_enabled()
+    if path in openrouter.TEXT_PATHS and not machines_on:
+        slug = await openrouter_text_target(requested)
         if slug:
             return await openrouter_text(
                 path=path, body=body, entry=entry, stack=key_stack, slug=slug,
                 request=request, started=started,
             )
         await require_machines(requested, openrouter.TEXT_KIND)
-    elif path == "models" and not await machines_enabled():
+    elif path == "models" and not machines_on:
         # sem máquinas, a lista é só a allowlist (vazia com o repasse desligado)
         return JSONResponse(content={
             "object": "list",
@@ -6678,7 +6834,26 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
             ),
         })
 
-    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    try:
+        # sem máquina disponível, resolve_route já DISPARA o wake/criação da
+        # máquina do plano antes do 503 — o desvio atende enquanto ela sobe
+        machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            fallback = await _text_fallback(path, requested, f"sem máquina: {exc.detail}")
+            if fallback:
+                raise fallback from None
+            if path == "models" and await openrouter_enabled():
+                # ferramentas (Cursor, Continue, n8n) chamam /v1/models ao
+                # conectar: sem máquina, a lista é a do OpenRouter, em vez de um
+                # 503 que as faria desistir antes da primeira request
+                return JSONResponse(content={
+                    "object": "list",
+                    "data": openrouter.model_list_entries(
+                        openrouter.accepted_models(await openrouter_catalog(), key_kind)
+                    ),
+                })
+        raise
     await maybe_touch(stack_id, machine["id"])
 
     # incrementa ANTES dos awaits lentos (leitura do body, embeddings do RAG):
@@ -6693,12 +6868,20 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     # derrubaria o /v1/models em 429. As rotas de imagem passam IMAGE_CATEGORY
     # pelo mesmo motivo; os outros call-sites são exclusivos de LLM, onde o
     # guard de categoria em authenticate já barrou a stack de imagem.
-    check_concurrency(
-        flight_key,
-        machine,
-        effective_plan,
-        (key_stack or {}).get("category") or LLM_CATEGORY,
-    )
+    try:
+        check_concurrency(
+            flight_key,
+            machine,
+            effective_plan,
+            (key_stack or {}).get("category") or LLM_CATEGORY,
+        )
+    except HTTPException as exc:
+        # check_concurrency já devolveu a vaga antes de levantar
+        if exc.status_code == 429:
+            fallback = await _text_fallback(path, requested, "máquina lotada")
+            if fallback:
+                raise fallback from None
+        raise
 
     log_ctx = dict(
         account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
@@ -6725,6 +6908,14 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                         body_json, entry, rewrite_model, machine, stack_id
                     )
                 body = json.dumps(body_json).encode()
+            except ContextWindowExceeded:
+                # conversa maior que a janela da máquina (ex.: cresceu no
+                # OpenRouter antes de a máquina ligar): continua lá. O
+                # except BaseException abaixo devolve a vaga.
+                fallback = await _text_fallback(path, requested, "maior que a janela da máquina")
+                if fallback:
+                    raise fallback from None
+                raise
             except HTTPException:
                 raise  # rejeição explícita (ex.: limite de mensagens) não pode virar "segue como está"
             except Exception:
@@ -6766,6 +6957,11 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # detalhe da exceção (pode conter a public_url interna do pod) só no
         # log do servidor — o cliente recebe uma mensagem genérica
         logger.warning("proxy: upstream indisponível para %s (%s)", flight_key, e)
+        if isinstance(e, _MACHINE_UNREACHABLE):
+            # máquina "running" no banco mas fora do ar, antes de qualquer byte
+            fallback = await _text_fallback(path, requested, "máquina inalcançável")
+            if fallback:
+                raise fallback from None
         # Inclui o ReadTimeout de MESSAGES_NONSTREAM_TIMEOUT_S: a request sem
         # stream que passa dos 90s morria sem linha em gateway_requests, então a
         # página de Requisições só mostrava as que sobreviveram (foi assim que
@@ -6778,6 +6974,23 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # in_flight > 0 pra sempre e a auto-pausa nunca mais dispara
         release_flight(flight_key)
         raise
+
+    if upstream.status_code in _MACHINE_DOWN_STATUSES and path in openrouter.TEXT_PATHS:
+        # pod de pé mas vLLM fora (reiniciando, sem memória): nada foi para o
+        # cliente ainda, então dá para atender pelo OpenRouter
+        fallback = await _text_fallback(
+            path, requested, f"máquina respondeu {upstream.status_code}"
+        )
+        if fallback:
+            await upstream.aclose()
+            release_flight(flight_key)
+            raise fallback
+
+    # A máquina responde qualquer modelo pedido (regra de 30/09): quem pediu o
+    # Kimi K3 continua vendo "Kimi K3" no campo `model`, não o alias do pod.
+    served = log_ctx["model"]
+    if requested and served and requested != served:
+        upstream = _EchoedUpstream(upstream, openrouter.ModelNameRewriter(served, requested))
 
     if path == "models":
         # lista também os adapters LoRA carregados na máquina ("acct-<uuid>")

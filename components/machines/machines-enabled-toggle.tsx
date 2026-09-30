@@ -60,8 +60,8 @@ export function MachinesEnabledToggle({ initialEnabled }: { initialEnabled: bool
           </Label>
           <p className="text-sm text-muted-foreground">
             {enabled
-              ? "Ligado: requisições de modelos fora da lista do OpenRouter vão para as máquinas, que sobem, religam e são recriadas sozinhas quando preciso."
-              : "Desligado: nenhuma requisição vai para as máquinas e nada é criado, religado ou recriado automaticamente. Só os modelos da página Modelos (OpenRouter) respondem."}
+              ? "Ligado: as máquinas respondem primeiro, qualquer que seja o modelo pedido, e sobem, religam e são recriadas sozinhas quando preciso. Sem máquina disponível, o OpenRouter responde enquanto ela sobe (se o repasse estiver ligado)."
+              : "Desligado: nenhuma requisição vai para as máquinas e nada é criado, religado ou recriado automaticamente. Todo texto vai para o OpenRouter (página Modelos)."}
           </p>
         </div>
         <Switch
@@ -77,10 +77,11 @@ export function MachinesEnabledToggle({ initialEnabled }: { initialEnabled: bool
           <AlertDialogHeader>
             <AlertDialogTitle>Desligar as máquinas?</AlertDialogTitle>
             <AlertDialogDescription>
-              Requisições de modelos que não estão na lista do OpenRouter passam
-              a falhar na hora, com um erro listando os modelos aceitos. As
-              máquinas que estão ligadas agora não são paradas por este botão:
-              sem tráfego, elas pausam sozinhas por ociosidade.
+              Todo texto passa a ser respondido pelo OpenRouter (o modelo pedido
+              se está na lista, senão o reserva). Sem reserva configurado, modelos
+              fora da lista recebem erro. As máquinas que estão ligadas agora não
+              são paradas por este botão: sem tráfego, elas pausam sozinhas por
+              ociosidade.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

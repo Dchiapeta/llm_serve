@@ -451,6 +451,9 @@ export type OpenRouterModel = {
   kind: "text" | "image"
   label: string | null
   enabled: boolean
+  // reserva de texto (migration 0073): responde pelo OpenRouter quando o
+  // modelo pedido não está na lista e não há máquina disponível
+  fallback?: boolean
   created_at: string
   updated_at: string
 }

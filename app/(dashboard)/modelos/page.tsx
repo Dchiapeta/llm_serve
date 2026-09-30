@@ -1,4 +1,5 @@
 import { Suspense } from "react"
+import Link from "next/link"
 
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
 import { Skeleton } from "@/components/ui/skeleton"
@@ -15,7 +16,10 @@ export default function ModelosPage() {
         <div>
           <h1 className="text-2xl font-semibold">Modelos (OpenRouter)</h1>
           <p className="text-sm text-muted-foreground">
-            Modelos atendidos pelo OpenRouter em vez das máquinas da Stac
+            Modelos atendidos pelo OpenRouter em vez das máquinas da Stac ·{" "}
+            <Link href="/documentacao/openrouter" className="underline underline-offset-4">
+              como funciona (temporário)
+            </Link>
           </p>
         </div>
         <CreateOpenRouterModelDialog />

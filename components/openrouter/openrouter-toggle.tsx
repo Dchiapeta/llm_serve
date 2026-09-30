@@ -63,7 +63,7 @@ export function OpenRouterToggle({
           </Label>
           <p className="text-sm text-muted-foreground">
             {enabled
-              ? `Ligado: requisições com um dos ${activeModels} modelo(s) ativo(s) abaixo no campo "model" são atendidas pelo OpenRouter.`
+              ? `Ligado: o OpenRouter responde texto quando não há máquina disponível para o plano (ou com as máquinas desligadas), e os modelos de imagem da lista. ${activeModels} modelo(s) ativo(s).`
               : "Desligado: nenhuma requisição vai para o OpenRouter, mesmo com modelos ativos na lista."}
           </p>
         </div>

@@ -2451,6 +2451,39 @@ export async function setOpenRouterModelEnabled(
   revalidatePath("/modelos")
 }
 
+// Reserva de texto (migration 0073): quem responde pelo OpenRouter quando o
+// modelo pedido não está na lista (ex.: go-base/pro-base) e não há máquina
+// disponível. Um só; imagem não tem reserva.
+export async function setOpenRouterFallback(
+  id: string
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const db = createSupabaseAdmin()
+  const { data: model } = await db
+    .from("openrouter_models")
+    .select("kind")
+    .eq("id", id)
+    .maybeSingle<{ kind: string }>()
+  if (!model) return { error: "Modelo não encontrado" }
+  if (model.kind !== "text") return { error: "Só modelos de texto podem ser o reserva" }
+  // desmarca o atual ANTES: o índice único parcial (um reserva por tipo)
+  // recusaria dois marcados ao mesmo tempo
+  const now = new Date().toISOString()
+  const { error: unsetError } = await db
+    .from("openrouter_models")
+    .update({ fallback: false, updated_at: now })
+    .eq("kind", "text")
+    .eq("fallback", true)
+  if (unsetError) return { error: unsetError.message }
+  const { error } = await db
+    .from("openrouter_models")
+    .update({ fallback: true, enabled: true, updated_at: now })
+    .eq("id", id)
+  if (error) return { error: error.message }
+  after(() => flushGatewaySettings())
+  revalidatePath("/modelos")
+}
+
 export async function deleteOpenRouterModel(
   id: string
 ): Promise<{ error: string } | void> {
