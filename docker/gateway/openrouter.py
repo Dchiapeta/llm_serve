@@ -82,6 +82,59 @@ def requested_model(body: bytes | dict | None) -> str | None:
     return model.strip() if isinstance(model, str) and model.strip() else None
 
 
+def plan_catalog(rows: list[dict], plan: str | None) -> tuple[dict[str, str], dict[str, str]]:
+    """({slug: kind}, {kind: slug do reserva}) que uma chave do `plan`
+    alcança, a partir das linhas habilitadas de openrouter_models.
+
+    `plans` (0074) lista os planos com acesso ao modelo; `fallback_plans`, de
+    quais planos ele é o reserva. Linha sem essas colunas (gateway novo antes
+    da migration) vale para todos os planos, com o `fallback` da 0073 — o
+    comportamento de antes. Com dois reservas do mesmo tipo para um plano, vale
+    o primeiro da lista (o painel não deixa isso acontecer)."""
+    catalog: dict[str, str] = {}
+    fallbacks: dict[str, str] = {}
+    for row in rows:
+        plans = row.get("plans")
+        if plans is not None and plan not in plans:
+            continue
+        slug, kind = row["slug"], row["kind"]
+        catalog[slug] = kind
+        fallback_plans = row.get("fallback_plans")
+        if fallback_plans is not None:
+            is_fallback = plan in fallback_plans
+        else:
+            is_fallback = bool(row.get("fallback"))
+        if is_fallback:
+            fallbacks.setdefault(kind, slug)
+    return catalog, fallbacks
+
+
+def plan_denial(model: str | None, kind: str, rows: list[dict], plan: str | None) -> str | None:
+    """Mensagem do 403 quando o `model` pedido está na lista, é do tipo da
+    rota, mas não é do plano da chave; None = não negado. Fora da lista não é
+    negado aqui: segue a regra de destino de sempre (a máquina responde
+    qualquer nome).
+
+    Modelo da lista sem plano NENHUM é um modelo ainda não lançado (o Kimi K3,
+    0074): a mensagem diz isso, em vez de sugerir um upgrade que não resolve."""
+    if not model:
+        return None
+    row = next((r for r in rows if r["slug"] == model and r["kind"] == kind), None)
+    plans = row.get("plans") if row else None
+    if plans is None or plan in plans:
+        return None
+    if not plans:
+        return f"o modelo '{model}' ainda não está disponível"
+    accepted = accepted_models(plan_catalog(rows, plan)[0], kind)
+    plano = f"no plano {plan}" if plan else "no seu plano"
+    if not accepted:
+        return f"o modelo '{model}' não está incluído {plano}"
+    return (
+        f"o modelo '{model}' não está incluído {plano}. "
+        f"Modelos do seu plano: {', '.join(accepted)}"
+    )
+
+
 def pick_slug(model: str | None, kind: str, catalog: dict[str, str]) -> str | None:
     """Slug do OpenRouter para o `model` pedido, ou None se ele não está na
     allowlist (ou está, mas é de outro tipo — um modelo de imagem não atende

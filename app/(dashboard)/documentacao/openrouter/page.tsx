@@ -14,7 +14,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 
-// Documentação do repasse ao OpenRouter (migrations 0071–0073). Existe para
+// Documentação do repasse ao OpenRouter (migrations 0071–0074). Existe para
 // não esquecer que isto está no ar: é um arranjo TEMPORÁRIO, e a seção "Como
 // remover" é o checklist do dia em que ele sair.
 
@@ -66,7 +66,11 @@ const ROUTING = [
   },
   {
     when: "Conversa maior que a janela da máquina",
-    who: "OpenRouter (evita matar a sessão do Claude Code).",
+    who: "OpenRouter (evita matar a sessão do Claude Code), se ainda couber na janela do plano.",
+  },
+  {
+    when: "Conversa maior que a janela do plano (Go 32K, Pro 256K)",
+    who: "Ninguém: 400 de contexto, com ou sem máquina.",
   },
 ]
 
@@ -148,11 +152,13 @@ export default function OpenRouterDocPage() {
         </Table>
         <p>
           No OpenRouter responde o <Strong>modelo pedido</Strong>, se ele está
-          ativo na lista da página Modelos; senão, o <Strong>reserva de texto</Strong>{" "}
-          (hoje <code>qwen/qwen3.8-27b</code>, trocável na página Modelos). É
-          assim que <code>go-base</code>/<code>pro-base</code>, nomes que só
-          existem nas máquinas, são atendidos. Assim que a máquina fica pronta,
-          a requisição seguinte volta para ela.
+          ativo na lista da página Modelos para o plano da chave; senão, o{" "}
+          <Strong>reserva de texto do plano</Strong> (hoje{" "}
+          <code>qwen/qwen3.5-9b</code> no Go e <code>qwen/qwen3.8-27b</code> no
+          Pro — o mesmo modelo da máquina de cada um; trocável na página
+          Modelos). É assim que <code>go-base</code>/<code>pro-base</code>, nomes
+          que só existem nas máquinas, são atendidos. Assim que a máquina fica
+          pronta, a requisição seguinte volta para ela.
         </p>
         <List>
           <li>
@@ -170,6 +176,47 @@ export default function OpenRouterDocPage() {
             <Strong>Sem reserva e modelo fora da lista</Strong>: com máquinas
             ligadas, o erro da máquina de sempre; com elas desligadas, 404 com a
             lista de modelos aceitos.
+          </li>
+        </List>
+      </Section>
+
+      <Section
+        title="Modelos e contexto por plano"
+        description="O que o site do TryStac anuncia, aplicado pelo gateway desde 01/10/2026 (migration 0074)."
+      >
+        <List>
+          <li>
+            <Strong>Modelos</Strong>: coluna Planos da página{" "}
+            <Link href="/modelos" className="underline underline-offset-4">Modelos</Link>{" "}
+            (<code>openrouter_models.plans</code>). Go: Qwen 3.5 9B e GLM 5.3
+            Flash. Pro: tudo do Go + Qwen 3.8 27B. Pedir um modelo da lista fora
+            do plano dá <Strong>403</Strong> com a lista do que o plano tem —
+            com máquina ou sem, repasse ligado ou não (a máquina responde
+            qualquer nome, então sem a trava o Go receberia o 9B com o nome do
+            27B). Nomes fora da lista (<code>go-base</code>, <code>gpt-4o</code>)
+            seguem para a máquina como sempre.
+          </li>
+          <li>
+            <Strong>Modelo ainda não lançado</Strong>: fica na lista,{" "}
+            <Strong>Ativo</Strong> e sem plano nenhum — 403 &quot;ainda não está
+            disponível&quot; para todos. É o caso do Kimi K3 (
+            <code>moonshotai/kimi-k3</code>). Desligar o Ativo dele{" "}
+            <Strong>tira</Strong> o bloqueio: o gateway só lê os ativos, e fora
+            da lista a máquina responderia pelo nome do Kimi. Para lançar, marque
+            os planos.
+          </li>
+          <li>
+            <Strong>Contexto</Strong>: Go 32K, Pro 256K, entrada + saída
+            (<code>docker/gateway/plan_limits.py</code>, envs{" "}
+            <code>PLAN_CONTEXT_TOKENS_GO</code>/<code>_PRO</code>). Na máquina
+            vale o menor entre a janela dela e a do plano; no OpenRouter, a do
+            plano. O Pro passa dos 128K da máquina pelo desvio ao OpenRouter.
+            Max e Enterprise não têm teto próprio.
+          </li>
+          <li>
+            Fora da regra: <code>/v1/documents/*</code> e{" "}
+            <code>/v1/images/extract</code> têm os limites próprios por plano
+            (páginas, MB), não o teto de contexto.
           </li>
         </List>
       </Section>
@@ -232,8 +279,14 @@ export default function OpenRouterDocPage() {
             para o cliente; o motivo real fica só no log do gateway.
           </li>
           <li>
-            O uso repassado não entra em <code>usage_metrics</code> (que vem das
-            máquinas): a classe de uso da stack e a cota diária não o enxergam.
+            O uso repassado entra em <code>usage_metrics</code> (migration 0075)
+            com <code>upstream = openrouter</code> e sem máquina, somado por
+            hora a partir de <code>gateway_requests</code>: conta no consumo da
+            stack/conta (painel e TryStac) e na cota diária. Fica fora das telas
+            por máquina, do rateio de custo de GPU do CRM e da classe de uso da
+            stack (que decide a divisão da VRAM). Não contam as requisições que
+            nem chegaram ao OpenRouter (503) nem as recusadas por problema da
+            conta da Stac lá (401/402).
           </li>
         </List>
       </Section>
@@ -332,6 +385,13 @@ export default function OpenRouterDocPage() {
             Decidir se o interruptor <Strong>Máquinas próprias</Strong>{" "}
             (<code>machines_enabled</code>) fica — ele é útil por si só como
             corta-custo de emergência.
+          </li>
+          <li>
+            O teto de contexto por plano (<code>plan_limits.py</code>){" "}
+            <Strong>não</Strong> é do repasse: fica. Já o acesso a modelo por
+            plano mora em <code>openrouter_models.plans</code> e some junto com
+            a tabela — com só máquinas, cada plano só tem o modelo da própria
+            máquina, então a trava deixa de ser necessária.
           </li>
           <li>
             Banco: migration nova que apaga <code>openrouter_keys</code>,{" "}

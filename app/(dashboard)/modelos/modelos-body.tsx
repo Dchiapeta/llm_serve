@@ -25,6 +25,7 @@ import {
 import { OpenRouterToggle } from "@/components/openrouter/openrouter-toggle"
 import {
   OpenRouterModelEnabledSwitch,
+  OpenRouterModelPlansSelect,
   OpenRouterModelRowActions,
 } from "@/components/openrouter/openrouter-model-row-actions"
 
@@ -64,11 +65,15 @@ export async function ModelosBody() {
           <CardTitle>Modelos aceitos</CardTitle>
           <CardDescription>
             {models.length} na lista · {active} ativo(s). O cliente escolhe pelo
-            ID, no campo &quot;model&quot; da requisição. Com as máquinas ligadas,
-            o OpenRouter só responde quando não há máquina disponível para o
-            plano (a máquina é ligada em paralelo); aí responde o modelo pedido
-            se está na lista, senão o <strong>Reserva</strong>. Modelos de imagem
-            da lista vão sempre para o OpenRouter, sem ligar máquina de imagem.
+            ID, no campo &quot;model&quot; da requisição, entre os modelos do{" "}
+            <strong>plano</strong> dele — pedir um modelo da lista fora do plano
+            dá 403, e um modelo sem plano nenhum fica bloqueado para todos
+            (lançamento futuro; mantenha-o Ativo, senão a máquina passa a
+            responder pelo nome dele). Com as máquinas ligadas, o OpenRouter só responde quando não
+            há máquina disponível para o plano (a máquina é ligada em paralelo);
+            aí responde o modelo pedido se está no plano, senão o{" "}
+            <strong>Reserva</strong> do plano. Modelos de imagem da lista vão
+            sempre para o OpenRouter, sem ligar máquina de imagem.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -77,6 +82,7 @@ export async function ModelosBody() {
               <TableRow>
                 <TableHead>Modelo</TableHead>
                 <TableHead>Tipo</TableHead>
+                <TableHead>Planos</TableHead>
                 <TableHead>Preço (1M tokens, entrada / saída)</TableHead>
                 <TableHead>Contexto</TableHead>
                 <TableHead>Ativo</TableHead>
@@ -86,7 +92,7 @@ export async function ModelosBody() {
             <TableBody>
               {models.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center text-muted-foreground">
+                  <TableCell colSpan={7} className="text-center text-muted-foreground">
                     Nenhum modelo ainda. Adicione o primeiro.
                   </TableCell>
                 </TableRow>
@@ -98,9 +104,13 @@ export async function ModelosBody() {
                   <TableRow key={m.id}>
                     <TableCell>
                       <div className="flex flex-col">
-                        <span className="flex items-center gap-2 font-medium">
+                        <span className="flex flex-wrap items-center gap-2 font-medium">
                           {m.label ?? m.slug}
-                          {m.fallback && <Badge variant="secondary">Reserva</Badge>}
+                          {(m.fallback_plans ?? []).length > 0 && (
+                            <Badge variant="secondary">
+                              Reserva · {(m.fallback_plans ?? []).join(", ")}
+                            </Badge>
+                          )}
                         </span>
                         <code className="font-mono text-xs text-muted-foreground">
                           {m.slug}
@@ -116,6 +126,9 @@ export async function ModelosBody() {
                       <Badge variant={m.kind === "image" ? "secondary" : "outline"}>
                         {m.kind === "image" ? "Imagem" : "Texto"}
                       </Badge>
+                    </TableCell>
+                    <TableCell>
+                      <OpenRouterModelPlansSelect model={m} />
                     </TableCell>
                     <TableCell className="tabular-nums">
                       {formatPricePerMillion(info) ?? "—"}

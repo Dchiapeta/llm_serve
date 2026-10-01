@@ -345,7 +345,11 @@ export type RoutingHistory = {
 export type UsageMetric = {
   id: string
   api_key_id: string | null
-  machine_id: string
+  // nulo no uso repassado ao OpenRouter, que não passa por máquina (0075)
+  machine_id: string | null
+  // null = coletado do agent de uma máquina; "openrouter" = repasse,
+  // agregado por hora a partir de gateway_requests (0075)
+  upstream?: string | null
   window_start: string
   requests: number
   tokens_in: number
@@ -451,8 +455,14 @@ export type OpenRouterModel = {
   kind: "text" | "image"
   label: string | null
   enabled: boolean
-  // reserva de texto (migration 0073): responde pelo OpenRouter quando o
-  // modelo pedido não está na lista e não há máquina disponível
+  // planos (stacks.plan) com acesso ao modelo (migration 0074). Fora deles o
+  // gateway responde 403. Ausente só antes da migration.
+  plans?: TemplatePlan[]
+  // planos dos quais o modelo é o reserva de texto (0074): responde pelo
+  // OpenRouter quando o modelo pedido não está na lista do plano e não há
+  // máquina disponível. Subconjunto de `plans`; um reserva por plano.
+  fallback_plans?: TemplatePlan[]
+  // OBSOLETA desde a 0074 (era o reserva único da 0073); o painel não usa.
   fallback?: boolean
   created_at: string
   updated_at: string

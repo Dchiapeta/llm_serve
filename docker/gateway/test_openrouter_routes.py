@@ -35,7 +35,7 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"conteudo da imagem"
 PNG_B64 = base64.b64encode(PNG).decode()
 
 
-def _entry(category="llm", system_prompt="Você é o assistente da Loja X."):
+def _entry(category="llm", system_prompt="Você é o assistente da Loja X.", plan="Go"):
     return {
         "account_id": "acc-1",
         "api_key_id": "key-1",
@@ -43,7 +43,7 @@ def _entry(category="llm", system_prompt="Você é o assistente da Loja X."):
         "purpose": "customer",
         "enable_knowledge_base": False,  # RAG desligado: nada de rede no teste
         "stacks": [{
-            "id": "stack-1", "plan": "Go", "category": category,
+            "id": "stack-1", "plan": plan, "category": category,
             "system_prompt": system_prompt,
         }],
     }
@@ -59,10 +59,15 @@ class FakeSupa:
         return self.estado["settings"].get(key, default)
 
     async def list_enabled_openrouter_models(self):
-        return [
-            {"slug": s, "kind": k, "fallback": s == self.estado["fallback"]}
-            for s, k in self.estado["catalog"].items()
-        ]
+        rows = []
+        for s, k in self.estado["catalog"].items():
+            row = {"slug": s, "kind": k, "fallback": s == self.estado["fallback"]}
+            # sem "plans" no estado: linha de antes da 0074 (aberta a todos)
+            if self.estado.get("plans") is not None:
+                row["plans"] = self.estado["plans"].get(s, [])
+                row["fallback_plans"] = self.estado["fallback_plans"].get(s, [])
+            rows.append(row)
+        return rows
 
     async def upload_image_object(self, storage_path, data, content_type):
         self.uploaded[storage_path] = data
@@ -852,3 +857,182 @@ def test_maquina_503_sem_reserva_repassa_o_erro(reserva):
     reserva["pod_resposta"] = lambda r: httpx.Response(503, json={"detail": "vLLM reiniciando"})
     r = _chat(reserva, model="pro-base")
     assert r.status_code == 503 and reserva["sent"] == []
+
+
+# ---------------------------------------------------------------------------
+# acesso a modelo e teto de contexto por plano (01/10, migration 0074)
+# ---------------------------------------------------------------------------
+
+QWEN9 = "qwen/qwen3.5-9b"
+GLM = "z-ai/glm-5.3-flash"
+TODOS = ["Go", "Pro", "Max", "Enterprise"]
+GO_POD = {
+    "id": "m-go", "public_url": "https://pod-go.test", "served_model_name": "go-base",
+    "model_name": "Qwen/Qwen3.5-9B", "max_model_len": 65536, "max_concurrent_seqs": 16,
+    "admin_secret": "segredo-do-pod",
+}
+
+
+@pytest.fixture
+def planos(reserva):
+    reserva["catalog"].update({QWEN9: "text", GLM: "text"})
+    reserva["plans"] = {
+        QWEN9: TODOS, GLM: TODOS, TEXT_SLUG: TODOS, IMAGE_SLUG: TODOS,
+        QWEN: ["Pro", "Max", "Enterprise"],
+    }
+    reserva["fallback_plans"] = {QWEN9: ["Go"], QWEN: ["Pro", "Max", "Enterprise"]}
+    reserva["plan"] = "Go"
+    return reserva
+
+
+def _texto_de_tokens(n: int) -> str:
+    # estimate_prompt_tokens: ~4 caracteres por token
+    return "abcd" * n
+
+
+def _pod_que_conta(tokens: int):
+    """Pod que responde o /admin/tokenize com `tokens` e o chat com 200."""
+    def resposta(request):
+        if request.url.path == "/admin/tokenize":
+            return httpx.Response(200, json={"count": tokens})
+        return httpx.Response(200, json={
+            "id": "x", "model": "go-base",
+            # Go/Pro passam pelo filtro de <think> (REASONING_LEAK_PLANS)
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                                                 "content": "<think>hmm</think>olá"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": tokens, "completion_tokens": 1},
+        })
+    return resposta
+
+
+def _chamadas_de_chat(estado):
+    return [b for b in estado["pod"] if "messages" in b]
+
+
+@pytest.mark.parametrize("repasse", [True, False])
+def test_go_pedindo_modelo_do_pro_e_403_sem_ligar_maquina(planos, repasse):
+    planos["settings"]["openrouter_enabled"] = repasse
+    r = _chat(planos, model=QWEN)
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert "plano Go" in detail and QWEN9 in detail and GLM in detail
+    assert planos["resolve_calls"] == [] and planos["sent"] == []
+
+
+def test_go_pedindo_modelo_do_pro_no_messages_e_403(planos):
+    r = planos["client"].post(
+        "/v1/messages",
+        json={"model": QWEN, "max_tokens": 100, "messages": [{"role": "user", "content": "oi"}]},
+        headers={"x-api-key": "sk-cliente"},
+    )
+    assert r.status_code == 403 and planos["sent"] == []
+
+
+@pytest.mark.parametrize("plano", ["Go", "Pro", "Max"])
+def test_kimi_k3_bloqueado_para_todos_mesmo_com_maquina(planos, plano):
+    # sem plano nenhum: nem a máquina (que responderia qualquer nome) atende
+    planos["catalog"]["moonshotai/kimi-k3"] = "text"
+    planos["plans"]["moonshotai/kimi-k3"] = []
+    planos["entry"] = _entry(plan=plano)
+    planos["plan"] = plano
+    planos["machine"] = GO_POD
+    r = _chat(planos, model="moonshotai/kimi-k3")
+    assert r.status_code == 403
+    assert r.json()["detail"] == "o modelo 'moonshotai/kimi-k3' ainda não está disponível"
+    assert planos["resolve_calls"] == [] and planos["sent"] == [] and planos["pod"] == []
+
+
+def test_pro_alcanca_o_27b(planos):
+    planos["entry"] = _entry(plan="Pro")
+    r = _chat(planos, model=QWEN)
+    assert r.status_code == 200 and planos["sent"][0][1]["model"] == QWEN
+
+
+def test_go_sem_maquina_cai_no_reserva_do_go(planos):
+    _chat(planos, model="go-base")
+    assert planos["sent"][0][1]["model"] == QWEN9
+
+
+def test_pro_sem_maquina_cai_no_reserva_do_pro(planos):
+    planos["entry"] = _entry(plan="Pro")
+    _chat(planos, model="pro-base")
+    assert planos["sent"][0][1]["model"] == QWEN
+
+
+def test_models_do_go_nao_lista_o_27b(planos):
+    r = planos["client"].get("/v1/models", headers={"Authorization": "Bearer sk-cliente"})
+    ids = [m["id"] for m in r.json()["data"]]
+    assert QWEN9 in ids and GLM in ids and QWEN not in ids
+
+
+def test_go_acima_de_32k_na_maquina_e_400_sem_desvio(planos):
+    # máquina do Go tem 64K, mas o plano é 32K: o estouro é do PLANO e não vai
+    # para o OpenRouter (lá também não caberia)
+    planos["machine"] = GO_POD
+    planos["pod_resposta"] = _pod_que_conta(40000)
+    r = _chat(planos, model="go-base", messages=[
+        {"role": "user", "content": _texto_de_tokens(40000)},
+    ])
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "context_length_exceeded"
+    assert "32768" in r.json()["error"]["message"]
+    assert planos["sent"] == [] and _chamadas_de_chat(planos) == []
+
+
+def test_go_abaixo_de_32k_na_maquina_passa(planos):
+    planos["machine"] = GO_POD
+    planos["pod_resposta"] = _pod_que_conta(20000)
+    r = _chat(planos, model="go-base", max_tokens=30000, messages=[
+        {"role": "user", "content": _texto_de_tokens(20000)},
+    ])
+    assert r.status_code == 200
+    enviado = _chamadas_de_chat(planos)[0]
+    # saída clampada ao que sobra dos 32K, não dos 64K da máquina
+    assert enviado["max_tokens"] <= 32768 - 20000
+
+
+def test_pro_acima_da_maquina_desvia_e_cabe_nos_256k(planos):
+    planos["entry"] = _entry(plan="Pro")
+    planos["plan"] = "Pro"
+    planos["machine"] = {**POD, "admin_secret": "segredo-do-pod"}  # 128K
+    planos["pod_resposta"] = _pod_que_conta(140000)
+    r = _chat(planos, model="pro-base", messages=[
+        {"role": "user", "content": _texto_de_tokens(140000)},
+    ])
+    assert r.status_code == 200
+    assert planos["sent"][0][1]["model"] == QWEN and _chamadas_de_chat(planos) == []
+
+
+def test_go_acima_de_32k_no_openrouter_e_400(planos):
+    planos["settings"]["machines_enabled"] = False
+    r = _chat(planos, model=QWEN9, messages=[
+        {"role": "user", "content": _texto_de_tokens(40000)},
+    ])
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "context_length_exceeded"
+    assert planos["sent"] == []
+
+
+def test_go_no_openrouter_clampa_a_saida_ao_plano(planos):
+    planos["settings"]["machines_enabled"] = False
+    r = _chat(planos, model=QWEN9, max_tokens=30000, messages=[
+        {"role": "user", "content": _texto_de_tokens(20000)},
+    ])
+    assert r.status_code == 200
+    # abaixo do teto do repasse (OPENROUTER_MAX_TOKENS): quem cortou foi o plano
+    assert planos["sent"][0][1]["max_tokens"] < 32768 - 20000
+
+
+def test_pro_acima_de_256k_no_openrouter_e_400_no_formato_anthropic(planos):
+    planos["entry"] = _entry(plan="Pro")
+    planos["settings"]["machines_enabled"] = False
+    r = planos["client"].post(
+        "/v1/messages",
+        json={"model": "pro-base", "max_tokens": 100,
+              "messages": [{"role": "user", "content": _texto_de_tokens(270000)}]},
+        headers={"x-api-key": "sk-cliente"},
+    )
+    assert r.status_code == 400
+    assert r.json()["type"] == "error" and "262144" in r.json()["error"]["message"]
+    assert planos["sent"] == []

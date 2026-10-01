@@ -5,7 +5,9 @@ import { Plus } from "lucide-react"
 import { toast } from "sonner"
 
 import { createOpenRouterModel } from "@/lib/actions"
+import { TEMPLATE_PLANS } from "@/lib/types"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
   DialogContent,
@@ -66,6 +68,19 @@ export function CreateOpenRouterModelDialog() {
             <Label htmlFor="label">Nome (opcional)</Label>
             <Input id="label" name="label" placeholder="O nome do catálogo, se vazio" />
           </div>
+          <fieldset className="flex flex-col gap-2">
+            <legend className="mb-2 text-sm font-medium">Planos com acesso</legend>
+            <div className="flex flex-wrap gap-4">
+              {TEMPLATE_PLANS.map((plan) => (
+                <div key={plan} className="flex items-center gap-2">
+                  <Checkbox id={`plan-${plan}`} name="plans" value={plan} defaultChecked />
+                  <Label htmlFor={`plan-${plan}`} className="font-normal">
+                    {plan}
+                  </Label>
+                </div>
+              ))}
+            </div>
+          </fieldset>
           <Button type="submit" disabled={pending}>
             {pending ? "Adicionando…" : "Adicionar"}
           </Button>
