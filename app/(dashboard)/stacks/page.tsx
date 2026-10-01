@@ -1,6 +1,7 @@
 import { KeyRound, Server, ServerCog, Users } from "lucide-react"
 
 import { createSupabaseAdmin } from "@/lib/supabase/server"
+import { fetchStackRequestQuotas } from "@/lib/request-quota"
 import type { Account, ApiKey, LoraAdapter, Machine, RoutingState, Stack, Template } from "@/lib/types"
 import {
   Card,
@@ -33,6 +34,7 @@ export default async function ContasPage() {
     { data: knowledgeData },
     { data: stacksData },
     { data: templatesData },
+    quotaByStack,
   ] = await Promise.all([
     db.from("accounts").select("*").order("name"),
     db.from("machines").select("*").neq("status", "terminated"),
@@ -61,6 +63,7 @@ export default async function ContasPage() {
       .eq("is_enabled", true)
       .eq("is_test", false)
       .order("name"),
+    fetchStackRequestQuotas(db),
   ])
 
   const accounts = (accountsData ?? []) as Account[]
@@ -244,6 +247,7 @@ export default async function ContasPage() {
             created_at: k.created_at,
           })),
           usage: stackUsage,
+          quota: quotaByStack.get(s.id) ?? null,
         },
         account,
         route,

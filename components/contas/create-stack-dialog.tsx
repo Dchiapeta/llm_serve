@@ -357,6 +357,9 @@ export function CreateStackDialog({
                   required
                   defaultValue={new Date().toISOString().slice(0, 10)}
                 />
+                <p className="text-xs text-muted-foreground">
+                  O dia desta data é quando a cota mensal de requisições renova.
+                </p>
               </div>
               <div className="flex flex-col gap-2">
                 <Label htmlFor="slug">ID do produto</Label>

@@ -655,6 +655,14 @@ class SupaClient:
         r.raise_for_status()
         return r.json() or 0
 
+    async def stack_request_quota(self, stack_id: str) -> list[dict]:
+        """Limite, uso e ciclo da cota mensal de requisições da stack
+        (migration 0076). Lista de 0 ou 1 linha; quem interpreta é
+        request_quota.snapshot_from_rpc."""
+        r = await self._rest.post("/rpc/stack_request_quota", json={"p_stack_id": stack_id})
+        r.raise_for_status()
+        return r.json() or []
+
     # ---------- stacks ----------
 
     async def get_stack(self, stack_id: str) -> dict | None:

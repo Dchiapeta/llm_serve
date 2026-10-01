@@ -147,6 +147,7 @@ def rota(monkeypatch):
     monkeypatch.setattr(main, "check_rate_limit", lambda *a, **k: None)
     monkeypatch.setattr(main, "check_image_rate_limit", lambda *a, **k: None)
     monkeypatch.setattr(main, "check_token_quota", fake_quota)
+    monkeypatch.setattr(main, "check_request_quota", fake_quota)
     monkeypatch.setattr(main, "log_gateway_request", lambda **kw: estado["logged"].append(kw))
 
     async def handler(request: httpx.Request) -> httpx.Response:

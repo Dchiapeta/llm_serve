@@ -60,6 +60,7 @@ import image_retention
 import openrouter
 import openrouter_keys
 import plan_limits
+import request_quota
 from anthropic_compat import (
     anthropic_error_body,
     anthropic_nonstreaming_body,
@@ -676,6 +677,12 @@ rate_buckets: dict[str, tuple[float, float]] = {}  # key_hash -> (tokens, last_r
 # cache curto da quota diária de tokens: account_id -> (tokens_usados, expira_em)
 token_usage_cache: dict[str, tuple[int, float]] = {}
 
+# cota mensal de requisições por stack (migration 0076, ver request_quota.py)
+request_quota_cache = request_quota.QuotaCache()
+# (stack_id, fim do ciclo) já avisados no log em modo só-registro — sem isso
+# cada requisição de uma stack acima da cota repetiria a mesma linha
+request_quota_warned: set[tuple[str, str]] = set()
+
 # rate limit da demo pública: por IP e um teto global na mesma janela (ver
 # DEMO_LIMIT_GLOBAL). Janela deslizante, não token bucket — o motivo está no
 # docstring de demo.SlidingWindowLimiter.
@@ -952,6 +959,28 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+class RequestQuotaExceeded(HTTPException):
+    """429 da cota mensal de requisições, com o corpo no protocolo do cliente.
+
+    Subclasse pelo mesmo motivo de ContextWindowExceeded: os `except
+    HTTPException` dos call sites continuam valendo, e o handler dedicado
+    abaixo (resolvido por MRO) troca o {"detail": ...} pelo shape de erro que
+    os SDKs OpenAI/Anthropic sabem ler."""
+
+    def __init__(self, message: str, headers: dict[str, str], shape: str = "openai"):
+        super().__init__(status_code=429, detail=message, headers=headers)
+        self.shape = shape
+
+
+@app.exception_handler(RequestQuotaExceeded)
+async def request_quota_exceeded_handler(request: Request, exc: RequestQuotaExceeded):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=request_quota.quota_body_for(exc.shape, exc.detail),
+        headers=exc.headers,
+    )
 
 
 @app.exception_handler(ContextWindowExceeded)
@@ -1470,6 +1499,55 @@ async def check_token_quota(account_id: str, plan: str | None, purpose: str = "c
             detail=f"quota diária de tokens excedida ({used}/{budget})",
             headers={"Retry-After": "3600"},
         )
+
+
+async def check_request_quota(
+    stack: dict | None, plan: str | None, purpose: str = "customer", shape: str = "openai",
+) -> None:
+    """Cota mensal de requisições da stack da chave (migration 0076).
+
+    Chamada ao lado de check_token_quota em toda rota que registra em
+    gateway_requests — a regra é "toda requisição registrada conta", então
+    uma rota nova que registre e não passe por aqui seria uso grátis. Fica
+    fora o /v1/messages/count_tokens, que é métrica interna e não registra.
+
+    Admitir soma 1 no snapshot (ver request_quota.py). Recusar não soma: o 429
+    sai antes de existir linha em gateway_requests, então também não conta no
+    banco. `stack` None (conta sem stack) e a chave interna de playground
+    passam sem consulta; stack de imagem também, sem gastar a RPC numa
+    categoria que a 0076 já devolve sem teto."""
+    if purpose == "playground" or not stack:
+        return
+    if (stack.get("category") or LLM_CATEGORY) != LLM_CATEGORY:
+        return
+    stack_id = stack["id"]
+    now = time.time()
+    snap = request_quota_cache.get(stack_id, now)
+    if snap is None:
+        try:
+            rows = await supa.stack_request_quota(stack_id)
+            snap = request_quota.snapshot_from_rpc(rows, now)
+        except (httpx.HTTPError, ValueError) as e:
+            # ValueError: corpo que não é JSON (r.json()) — falha aberta também
+            logger.warning("cota de requisições indisponível (stack %s): %s — liberando", stack_id, e)
+            snap = request_quota.unavailable_snapshot(now)
+        request_quota_cache.put(stack_id, snap)
+    if snap.exhausted():
+        if request_quota.REQUEST_QUOTA_ENFORCE:
+            raise RequestQuotaExceeded(
+                request_quota.quota_message(plan, snap),
+                request_quota.quota_headers(snap, now),
+                shape=shape,
+            )
+        warn_key = (stack_id, snap.cycle_end.isoformat() if snap.cycle_end else "")
+        if warn_key not in request_quota_warned:
+            request_quota_warned.add(warn_key)
+            logger.warning(
+                "cota de requisições: stack %s (%s) excederia %d/%d — só registro "
+                "(REQUEST_QUOTA_ENFORCE desligado)",
+                stack.get("slug") or stack_id, plan, snap.used, snap.limit,
+            )
+    snap.used += 1
 
 
 async def authenticate_anthropic(
@@ -4819,6 +4897,9 @@ async def anthropic_messages(
     key_stack, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+    await check_request_quota(
+        key_stack, key_plan, entry.get("purpose", "customer"), shape="anthropic"
+    )
 
     # parseado ANTES do resolve_route: o destino (OpenRouter x máquina) sai do
     # `model` do corpo, e decidir isso não pode acordar máquina nenhuma
@@ -5432,9 +5513,10 @@ async def _authenticate_for_extraction(
     authenticate seja uniforme e um endpoint novo não nasça sem o parâmetro."""
     entry, key_hash = await authenticate(authorization, headers, path)
     account_id = entry["account_id"]
-    _, key_plan = resolve_key_stack(entry)
+    key_stack, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+    await check_request_quota(key_stack, key_plan, entry.get("purpose", "customer"))
 
     if len(schema) > MAX_SCHEMA_BYTES:
         raise HTTPException(
@@ -6037,6 +6119,9 @@ async def generate_document(
     stack, plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, plan)
     account_id = entry["account_id"]
+    # antes da bifurcação: o modo `html` não chama modelo, mas registra em
+    # gateway_requests e por isso também conta
+    await check_request_quota(stack, plan, entry.get("purpose", "customer"))
 
     # ---------- modo direto: HTML já pronto, sem modelo ----------
     if body.html:
@@ -6265,6 +6350,9 @@ async def _authorize_image_key(
     # (DAILY_TOKEN_BUDGET), então uma conta com stack de texto e de imagem
     # divide o mesmo teto — hoje 0 (sem teto) para todos os planos.
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+    # sem efeito hoje (imagem não tem cota de requisições, ver 0076); fica para
+    # a regra "toda rota que registra passa pela cota" não ter exceção
+    await check_request_quota(key_stack, key_plan, entry.get("purpose", "customer"))
     return entry, account_id, key_stack, key_plan
 
 
@@ -6958,6 +7046,7 @@ async def _proxy(
     key_stack, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+    await check_request_quota(key_stack, key_plan, entry.get("purpose", "customer"))
 
     # Destino da request (regra de 30/09, ver migration 0073). Com as máquinas
     # LIGADAS a máquina vem primeiro, qualquer que seja o modelo pedido, e o
