@@ -53,6 +53,7 @@ CAUSE_DENIED_SWITCH_OFF = "provision_denied.switch_off"
 CAUSE_DENIED_PANEL_UNCONFIGURED = "provision_denied.panel_unconfigured"
 CAUSE_DENIED_LOCK_ACTIVE = "provision_denied.lock_active"
 CAUSE_DENIED_COOLDOWN = "provision_denied.cooldown"
+CAUSE_DENIED_POOL_RECOVERING = "provision_denied.pool_recovering"
 
 
 def provision_gate(
@@ -64,6 +65,7 @@ def provision_gate(
     now: float,
     cooldown_s: float,
     ignore_switch: bool = False,
+    pool_recovering: bool = False,
 ) -> str | None:
     """Por que NÃO criar agora — ou None quando pode criar.
 
@@ -71,13 +73,19 @@ def provision_gate(
     interruptor vem antes da trava porque desligado é "nunca", e a trava
     antes do cooldown porque "já está criando" é mais informativo do que
     "tentou há pouco". `ignore_switch` é o caminho de REQUEST (cliente
-    pagante esperando) — só o interruptor é ignorado, o resto vale."""
+    pagante esperando) — só o interruptor é ignorado, o resto vale.
+
+    `pool_recovering`: há uma máquina do mesmo pool sendo recriada agora. Ela
+    é a capacidade que vem — criar outra por cima foi o que gerou a
+    llm-stack-705 (01/10). Vem logo depois da trava pelo mesmo motivo dela."""
     if not ignore_switch and not switch_on:
         return CAUSE_DENIED_SWITCH_OFF
     if not panel_configured:
         return CAUSE_DENIED_PANEL_UNCONFIGURED
     if lock_active:
         return CAUSE_DENIED_LOCK_ACTIVE
+    if pool_recovering:
+        return CAUSE_DENIED_POOL_RECOVERING
     if now - last_attempt < cooldown_s:
         return CAUSE_DENIED_COOLDOWN
     return None
@@ -106,11 +114,13 @@ def _row(outcome: str, cause: str, trigger: dict, repeat_count: int) -> dict:
     }
 
 
-def _dedup_key(cause: str, trigger: dict) -> tuple[str, str]:
+def _dedup_key(cause: str, trigger: dict) -> tuple[str, str, str]:
     # por stack quando há request (cada cliente conta separado); por pool
-    # quando é o lifecycle (não há cliente)
+    # quando é o lifecycle (não há cliente). E por máquina: sem ela, o wake
+    # negado da 2ª máquina do pool sumia como "repetição" do da 1ª, e o
+    # incidente de 01/10 (duas Pro recriadas pelo mesmo cliente) ficou ilegível.
     target = trigger.get("stack_id") or f"{trigger.get('plan')}:{trigger.get('category')}"
-    return (cause, str(target))
+    return (cause, str(target), str(trigger.get("machine_id") or ""))
 
 
 def should_record(cause: str, trigger: dict, now: float | None = None) -> int | None:
@@ -141,8 +151,11 @@ def record_bg(supa, outcome: str, cause: str, trigger: dict) -> bool:
     checagem e a marcação da trava" — um await aqui reabriria a corrida.
 
     True = uma linha foi enfileirada; False = suprimida pelo dedupe ou sem
-    event loop (testes síncronos)."""
-    repeat = should_record(cause, trigger)
+    event loop (testes síncronos).
+
+    `granted` nunca é deduplicada: cada concessão liga uma GPU, e duas
+    concessões na mesma janela são justamente o que se precisa ver."""
+    repeat = 1 if outcome == OUTCOME_GRANTED else should_record(cause, trigger)
     if repeat is None:
         return False
     try:

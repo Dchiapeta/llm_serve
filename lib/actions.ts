@@ -807,7 +807,7 @@ export async function provisionMachineForPlan(input: {
   // sobrevive mesmo que o gateway morra antes do log dele.
   trigger?: TriggerEnvelope | null
 }): Promise<
-  | { machineId: string; name: string; publicUrl: string | null }
+  | { machineId: string; name: string; publicUrl: string | null; reused?: boolean }
   | { error: string }
 > {
   const db = createSupabaseAdmin()
@@ -847,21 +847,32 @@ export async function provisionMachineForPlan(input: {
   // Se já há uma máquina do mesmo template em 'creating' criada há poucos
   // segundos, devolve ela em vez de criar outra. Seguro porque o provisionamento
   // é serializado por plano no gateway (nunca dispara 2 de propósito na janela).
+  //
+  // "Há poucos segundos" vale também para a máquina que acabou de ser
+  // RECRIADA ou religada: é a mesma linha, com created_at antigo, mas
+  // recreateMachine/startMachine/o wake do gateway zeram last_activity_at ao
+  // gravar 'creating'. Só por created_at, a llm-stack-704 recriada às
+  // 14:26:55 de 01/10 passou despercebida e a 705 foi criada 2 s depois.
   const dedupSince = new Date(Date.now() - PROVISION_DEDUP_WINDOW_MS).toISOString()
   const { data: recent } = await db
     .from("machines")
     .select("id, name, public_url, created_at")
     .eq("template_id", tpl.id)
     .eq("status", "creating")
-    .gte("created_at", dedupSince)
+    .or(`created_at.gte.${dedupSince},last_activity_at.gte.${dedupSince}`)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle<Pick<Machine, "id" | "name" | "public_url">>()
   if (recent) {
     console.warn(
-      `provisionMachineForPlan: máquina ${recent.id} do template ${tpl.id} criada há pouco ainda em 'creating' — retorna ela (dedup de retry) em vez de criar outra`
+      `provisionMachineForPlan: máquina ${recent.id} do template ${tpl.id} entrou em 'creating' há pouco — retorna ela (dedup) em vez de criar outra`
     )
-    return { machineId: recent.id, name: recent.name, publicUrl: recent.public_url ?? null }
+    return {
+      machineId: recent.id,
+      name: recent.name,
+      publicUrl: recent.public_url ?? null,
+      reused: true,
+    }
   }
 
   let viableGpuIds: string[]

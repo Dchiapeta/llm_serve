@@ -200,3 +200,132 @@ def test_reposicao_cai_na_conta_lora_sem_pool_free_slots():
 
     assert asyncio.run(mgr.ensure_capacity_once()) == []
     assert triggered == []
+
+
+# ---------- reconcile: só promove a 'running' com o vLLM pronto ----------
+
+
+def _health(result):
+    async def check(machine):
+        return result
+    return check
+
+
+def test_creating_com_health_inacessivel_no_prazo_nao_vira_running():
+    # pod recém-criado: contêiner ainda subindo, /health não responde. Promover
+    # aqui marcava a máquina pronta antes do vLLM e as requests caíam todas no
+    # OpenRouter (llm-stack-704, 01/10: running às 14:29:34, zero servidas)
+    supa = FakeSupa([{"id": "m1", "status": "creating", "runpod_pod_id": "p1",
+                      "public_url": "u", "created_at": iso(150), "last_activity_at": iso(150)}])
+    mgr = manager(supa, FakeRunpod([{"id": "p1", "desiredStatus": "RUNNING"}]),
+                  creating_grace_s=900, vllm_health_check=_health(None))
+
+    changed = asyncio.run(mgr.reconcile_statuses_once())
+
+    assert changed == []
+    assert supa.status_writes == []
+
+
+def test_creating_com_vllm_pronto_vira_running():
+    supa = FakeSupa([{"id": "m1", "status": "creating", "runpod_pod_id": "p1",
+                      "public_url": "u", "created_at": iso(150), "last_activity_at": iso(150)}])
+    mgr = manager(supa, FakeRunpod([{"id": "p1", "desiredStatus": "RUNNING"}]),
+                  creating_grace_s=900,
+                  vllm_health_check=_health({"vllm_ready": True, "vllm_alive": True}))
+
+    changed = asyncio.run(mgr.reconcile_statuses_once())
+
+    assert changed == [("m1", "running")]
+
+
+def test_creating_com_health_inacessivel_alem_do_prazo_volta_a_promover():
+    # passado o prazo de boot, o comportamento antigo: promove e deixa a
+    # auto-pausa decidir, em vez de manter um pod preso cobrando GPU
+    supa = FakeSupa([{"id": "m1", "status": "creating", "runpod_pod_id": "p1",
+                      "public_url": "u", "created_at": iso(2000), "last_activity_at": iso(2000)}])
+    mgr = manager(supa, FakeRunpod([{"id": "p1", "desiredStatus": "RUNNING"}]),
+                  creating_grace_s=900, vllm_health_check=_health(None))
+
+    changed = asyncio.run(mgr.reconcile_statuses_once())
+
+    assert changed == [("m1", "running")]
+
+
+# ---------- recriação pendente: só se o pool ainda precisa ----------
+
+
+class PendingSupa:
+    def __init__(self, machines, running=(), wakeable=()):
+        self.machines = {m["id"]: m for m in machines}
+        self.running = list(running)
+        self.wakeable = list(wakeable)
+
+    async def get_machine(self, machine_id):
+        return self.machines.get(machine_id)
+
+    async def list_running_machines_for_plan(self, plan, category="llm"):
+        return list(self.running)
+
+    async def list_wakeable_machines_for_plan(self, plan, category="llm"):
+        return list(self.wakeable)
+
+
+def _pending_manager(supa, pending):
+    recreated = []
+
+    async def try_recreate(machine, reason):
+        recreated.append(machine["id"])
+        return True
+
+    mgr = manager(supa, try_recreate_machine=try_recreate, pending_recreates=pending)
+    return mgr, recreated
+
+
+PRO_699 = {"id": "699", "status": "error", "runpod_pod_id": None,
+           "templates": {"plan": "Pro", "category": "llm"}}
+
+
+def test_pendencia_descartada_com_outra_maquina_do_pool_subindo():
+    # 01/10 13:20: a 699 foi recriada com a 703 e a Pro já subindo — terceira
+    # máquina Pro para um cliente
+    subindo = {"id": "703", "status": "creating", "created_at": iso(60), "last_activity_at": iso(60)}
+    supa = PendingSupa([PRO_699], wakeable=[subindo])
+    pending = {"699"}
+    mgr, recreated = _pending_manager(supa, pending)
+
+    asyncio.run(mgr.process_pending_recreates_once())
+
+    assert recreated == []
+    assert pending == set()
+
+
+def test_pendencia_descartada_com_outra_maquina_do_pool_running():
+    supa = PendingSupa([PRO_699], running=[{"id": "pro"}])
+    pending = {"699"}
+    mgr, recreated = _pending_manager(supa, pending)
+
+    asyncio.run(mgr.process_pending_recreates_once())
+
+    assert recreated == []
+    assert pending == set()
+
+
+def test_pendencia_recriada_quando_o_pool_esta_vazio():
+    supa = PendingSupa([PRO_699])
+    pending = {"699"}
+    mgr, recreated = _pending_manager(supa, pending)
+
+    asyncio.run(mgr.process_pending_recreates_once())
+
+    assert recreated == ["699"]
+
+
+def test_creating_presa_nao_conta_como_pool_coberto():
+    presa = {"id": "703", "status": "creating", "created_at": iso(5000), "last_activity_at": iso(5000)}
+    supa = PendingSupa([PRO_699], wakeable=[presa])
+    pending = {"699"}
+    mgr, recreated = _pending_manager(supa, pending)
+
+    asyncio.run(mgr.process_pending_recreates_once())
+
+    assert recreated == ["699"]
