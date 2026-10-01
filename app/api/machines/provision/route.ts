@@ -76,6 +76,9 @@ export async function POST(req: NextRequest) {
     name: result.name,
     status: "creating",
     public_url: result.publicUrl,
+    // máquina que já estava subindo, devolvida pelo dedup: o gateway não
+    // carimba um `created` para ela
+    reused: result.reused === true,
   })
 }
 

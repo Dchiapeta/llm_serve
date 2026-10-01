@@ -703,12 +703,15 @@ last_stack_touch: dict[str, float] = {}
 # última tentativa de auto-wake por máquina — evita tempestade de startPod
 # com requests concorrentes ou falhas repetidas (ex.: host sem GPU livre)
 last_wake_attempt: dict[str, float] = {}
-# resultado da última tentativa ('woke' | 'failed'): dentro do cooldown, só
-# uma tentativa que DEU CERTO justifica dizer ao cliente "sua máquina está
-# subindo". Sem isto, um startPod que falhou (RunPod 500, pod inválido) virava
-# 'cooldown' → 'waking' por WAKE_COOLDOWN_S, e a cascata nunca chegava ao
-# provisionamento — o cliente ficava em loop de 503 "sendo iniciada" com nada
-# subindo.
+# resultado da última tentativa ('pending' | 'woke' | 'failed'): dentro do
+# cooldown, só uma tentativa que DEU CERTO justifica dizer ao cliente "sua
+# máquina está subindo". Sem isto, um startPod que falhou (RunPod 500, pod
+# inválido) virava 'cooldown' → 'waking' por WAKE_COOLDOWN_S, e a cascata nunca
+# chegava ao provisionamento — o cliente ficava em loop de 503 "sendo iniciada"
+# com nada subindo.
+# 'pending' = startPod em voo. Conta como subindo: até 01/10 a marca prévia era
+# 'failed', e uma request concorrente lia o wake em andamento como falha e
+# provisionava outra máquina por cima (llm-stack-703, Pro, 01/10 13:12).
 last_wake_outcome: dict[str, str] = {}
 
 # chaves já garantidas no agent: (key_hash, machine_id) -> expira_em.
@@ -735,6 +738,11 @@ last_provision_attempt: dict[str, float] = {}
 # a GPU do pod pausado e só recriar num host novo o traz de volta.
 recreating_in_progress: dict[str, float] = {}
 last_recreate_attempt: dict[str, float] = {}
+# pool (product_pool_key) de cada máquina em recreating_in_progress. A trava é
+# por máquina, mas quem decide provisionar pensa por pool: sem este mapa a
+# cascata não sabia que o pool já tinha uma máquina sendo recriada e criava
+# outra por cima (llm-stack-705, Go, 01/10 14:26).
+recreating_pool: dict[str, str] = {}
 # fila de recriações pendentes: máquinas que o caminho reativo (no_gpu) marcou
 # pra recriar e ainda não confirmaram sucesso. O lifecycle loop reprocessa
 # (process_pending_recreates_once) — mesma disciplina do pending_unloads —
@@ -894,6 +902,7 @@ async def lifespan(app: FastAPI):
         runpod=runpod_client,
         machine_idle_stop_minutes=MACHINE_IDLE_STOP_MINUTES,
         creating_grace_s=MACHINE_HEALTH_TIMEOUT_S,
+        creating_stale_after_s=CREATING_STALE_AFTER_S,
         consolidation_max_origin_routes=CONSOLIDATION_MAX_ORIGIN_ROUTES,
         stop_recheck_grace_s=STOP_RECHECK_GRACE_S,
         try_provision_for_pool=try_provision_for_pool,
@@ -2397,17 +2406,26 @@ async def wake_machine(machine: dict, reason: str, *, cause: str) -> str:
         # segurando o startPod (sem martelar a RunPod), mas o chamador precisa
         # saber que não há nada subindo — senão devolve waking_503 mentiroso e
         # nunca cai no fallback/provisionamento.
-        if last_wake_outcome.get(machine["id"]) == "woke":
+        # 'pending' (startPod de outra request ainda em voo) também é "subindo":
+        # se ele terminar em no_gpu, quem o disparou recria; se falhar de vez, a
+        # próxima request depois do desfecho vê 'failed' e segue a cascata
+        if last_wake_outcome.get(machine["id"]) in ("woke", "pending"):
             _denied("cooldown")
             return "cooldown"
         _denied("failed")
         return "failed"
     # marca a tentativa antes do primeiro await — atômico dentro do event loop
     last_wake_attempt[machine["id"]] = now
-    last_wake_outcome[machine["id"]] = "failed"
+    last_wake_outcome[machine["id"]] = "pending"
     try:
         await runpod_client.start_pod(machine["runpod_pod_id"])
+    except asyncio.CancelledError:
+        # cliente desconectou no meio: desfecho desconhecido, não pode ficar
+        # 'pending' segurando a cascata pelo cooldown inteiro
+        last_wake_outcome[machine["id"]] = "failed"
+        raise
     except Exception as e:
+        last_wake_outcome[machine["id"]] = "failed"
         if is_no_gpu_error(e):
             # host cedeu a GPU do pod pausado — religar nunca vai funcionar, o
             # chamador precisa recriar o pod num host novo. Limpa o cooldown de
@@ -2468,7 +2486,28 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
                       cliente reintenta (recriando);
       - 'waking'    : há pausada subindo (cooldown de um wake recente bem
                       encaminhado), cliente reintenta;
-      - 'none'      : não há pausada nenhuma (chamador decide provisionar)."""
+      - 'none'      : não há pausada nenhuma (chamador decide provisionar).
+
+    Uma request põe de pé no máximo UMA máquina: a primeira que começar a subir
+    (religada, recriada, ou já subindo por outra request) encerra a cascata.
+    Até 01/10 o laço seguia para a próxima pausada depois de despachar uma
+    recriação, e um único request recriava todas as pausadas sem GPU no host
+    (Pro, 01/10 10:00: 699 e Pro recriadas para um cliente)."""
+    pool_key = product_pool_key(plan, category)
+    # recriação de outra request em voo neste pool: antes de qualquer await,
+    # então nenhuma leitura do banco no meio de um recreate do painel consegue
+    # concluir "pool vazio" (era a janela da llm-stack-705)
+    if pool_recovery_in_flight(pool_key):
+        return "recreating"
+    # UMA leitura para creating e stopped: com duas consultas separadas, uma
+    # máquina que passava de stopped para creating entre elas (o UPDATE do
+    # recreateMachine do painel) ficava fora das duas listas e o pool parecia
+    # vazio.
+    pool = await supa.list_wakeable_machines_for_plan(plan, category)
+    if pool_recovery_in_flight(pool_key):
+        return "recreating"
+    subindo = [m for m in pool if m.get("status") == "creating"]
+    stopped = [m for m in pool if m.get("status") == "stopped"]
     # máquina já subindo (religada por um request anterior, ou recém-criada
     # pelo painel/provisionamento): conta como 'waking' — sem isto, com o wake
     # gravando 'creating', o pool parecia vazio e a cascata religava uma 2ª
@@ -2478,7 +2517,6 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
     # o provisionamento do plano inteiro pra sempre (503 eterno). O reconcile é
     # quem conserta o status; este filtro só evita que a disponibilidade do plano
     # dependa disso (ver recovery.machine_boot_stalled).
-    subindo = await supa.list_creating_machines_for_plan(plan, category)
     presas = [m for m in subindo if machine_boot_stalled(m, CREATING_STALE_AFTER_S)]
     if presas:
         logger.warning(
@@ -2488,36 +2526,42 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
         )
     if len(subindo) > len(presas):
         return "waking"
-    stopped = await supa.list_stopped_machines_for_plan(plan, category)
     if not stopped:
         return "none"
-    recreating = False
-    waking = False
     for m in stopped:
         if lock_active(recreating_in_progress, m["id"], RECREATE_LOCK_TTL_S):
-            recreating = True
-            continue
+            return "recreating"
         outcome = await wake_machine(
             m, "requisição recebida sem máquina disponível",
             cause="wake.request.no_machine_available",
         )
         if outcome == "woke":
             return "woke"
-        if outcome == "no_gpu":
-            if await try_recreate_machine(
-                m, "host sem GPU pra religar sob demanda",
-                cause="recreate.request.no_gpu_on_wake",
-            ):
-                recreating = True
-        elif outcome == "cooldown":
-            # tentativa recente BEM-SUCEDIDA (wake_machine só devolve
-            # 'cooldown' depois de um 'woke') — o pod está subindo
-            waking = True
-        # 'failed': nada subindo nesta máquina — segue pra próxima pausada e,
-        # se nenhuma servir, devolve 'none' pro chamador provisionar
-    if recreating:
-        return "recreating"
-    return "waking" if waking else "none"
+        if outcome == "cooldown":
+            # startPod recente bem-sucedido ou ainda em voo — o pod está subindo
+            return "waking"
+        if outcome == "no_gpu" and await try_recreate_machine(
+            m, "host sem GPU pra religar sob demanda",
+            cause="recreate.request.no_gpu_on_wake", pool_key=pool_key,
+        ):
+            return "recreating"
+        # 'failed' (ou recriação negada): nada subindo nesta máquina — segue pra
+        # próxima pausada e, se nenhuma servir, devolve 'none' pro chamador
+        # provisionar
+    return "none"
+
+
+def pool_recovery_in_flight(pool_key: str) -> bool:
+    """Alguma máquina do pool está sendo recriada agora? Só memória, sem await —
+    pode ser chamada no meio de uma checagem+marcação atômica. Limpa do mapa as
+    entradas cuja trava já saiu ou expirou."""
+    for machine_id, pk in list(recreating_pool.items()):
+        if pk != pool_key:
+            continue
+        if lock_active(recreating_in_progress, machine_id, RECREATE_LOCK_TTL_S):
+            return True
+        recreating_pool.pop(machine_id, None)
+    return False
 
 
 # As seis fábricas de 503 pré-rota são chamadas no exato momento do `raise`,
@@ -2695,10 +2739,12 @@ async def _recreate_and_track(machine_id: str, reason: str, trigger: dict) -> No
             logger.info("recriação de %s disparada — %s", machine_id, reason)
     finally:
         recreating_in_progress.pop(machine_id, None)
+        recreating_pool.pop(machine_id, None)
 
 
 async def try_recreate_machine(
-    machine: dict, reason: str, *, cause: str | None = None
+    machine: dict, reason: str, *, cause: str | None = None,
+    pool_key: str | None = None,
 ) -> bool:
     """Dispara a recriação em background se o painel estiver configurado, não
     houver uma recriação em andamento pra essa máquina e o cooldown já tiver
@@ -2710,8 +2756,16 @@ async def try_recreate_machine(
 
     Enfileira a máquina em pending_recreates: se a chamada ao painel falhar (ou
     o processo cair antes de concluir), o lifecycle loop retenta. A entrada só
-    sai da fila quando uma recriação conclui com sucesso."""
+    sai da fila quando uma recriação conclui com sucesso.
+
+    `pool_key`: pool da máquina, registrado junto da trava (recreating_pool)
+    para a cascata do pool saber que há uma recriação em voo. Ausente, vem do
+    template embutido na linha (get_machine e as listagens por plano o trazem)."""
     machine_id = machine["id"]
+    if pool_key is None:
+        tpl = machine.get("templates")
+        if isinstance(tpl, dict) and tpl.get("plan"):
+            pool_key = product_pool_key(tpl["plan"], tpl.get("category") or LLM_CATEGORY)
     # cause=None é o retry do lifecycle (process_pending_recreates_once), que
     # chama com a assinatura antiga (machine, reason)
     cause = cause or "recreate.lifecycle.pending_retry"
@@ -2747,6 +2801,8 @@ async def try_recreate_machine(
     # mesma disciplina do provisioning_in_progress); record_bg é síncrona
     last_recreate_attempt[machine_id] = now
     recreating_in_progress[machine_id] = now
+    if pool_key:
+        recreating_pool[machine_id] = pool_key
     _record_decision(decisions.OUTCOME_GRANTED, cause, trig)
     spawn_tracked(_recreate_and_track(machine_id, reason, trig))
     return True
@@ -2828,6 +2884,14 @@ async def _provision_and_track(
         machine = await provision_machine_for_plan(plan, category, trigger)
         if not machine:
             _record_decision(decisions.OUTCOME_DENIED, "provision_denied.panel_error", trigger)
+            return
+        if machine.get("reused"):
+            # o dedup do painel devolveu uma máquina que já estava subindo
+            # (recém-criada, recriada ou religada) — nada nasceu aqui
+            logger.info(
+                "provisionamento: painel reaproveitou %s, que já estava subindo",
+                machine.get("machine_id"),
+            )
             return
         try:
             await supa.log_machine_event(
@@ -2915,6 +2979,7 @@ async def _try_provision_machine_for_plan(
         now=now,
         cooldown_s=PROVISION_COOLDOWN_S,
         ignore_switch=ignore_switch,
+        pool_recovering=pool_recovery_in_flight(pool_key),
     )
     if denied:
         _record_decision(decisions.OUTCOME_DENIED, denied, trig)
@@ -2976,6 +3041,8 @@ async def pick_machine_with_free_slot(plan: str, category: str = LLM_CATEGORY) -
         cause="provision.request.no_free_slot",
     ):
         raise provisioning_503()
+    if pool_recovery_in_flight(product_pool_key(plan, category)):
+        raise recreating_503()  # a provisão foi negada porque uma recriação começou
     if not machines:
         raise capacity_503(plan, "nenhuma máquina disponível")
     raise capacity_503(plan, "todas as máquinas estão cheias")
@@ -3420,6 +3487,7 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
                     if outcome == "no_gpu" and await try_recreate_machine(
                         machine, f"stack {slug}: host sem GPU pra religar",
                         cause="recreate.request.stack_home_no_gpu",
+                        pool_key=product_pool_key(effective_plan, category),
                     ):
                         # host cedeu a GPU do pod pausado → recria num host novo
                         raise recreating_503()
@@ -3451,6 +3519,9 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
             cause="provision.request.no_base_machine",
         ):
             raise provisioning_503()
+        if pool_recovery_in_flight(product_pool_key(effective_plan, category)):
+            # provisão negada porque uma recriação do pool começou no meio
+            raise recreating_503()
         # Último recurso: a máquina da stack foi PERDIDA (pod sumiu do RunPod) e
         # não há mais nada no plano pra servir. Sem isto o fluxo terminava num
         # preparing_503() mudo e permanente — nenhum caminho recriava uma
@@ -3468,6 +3539,7 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
         if lost_machine is not None and await try_recreate_machine(
             lost_machine, f"stack {stack.get('slug') or stack['id']}: pod sumiu do RunPod",
             cause="recreate.request.pod_lost",
+            pool_key=product_pool_key(effective_plan, category),
         ):
             raise recreating_503()
         raise preparing_503()

@@ -304,7 +304,9 @@ class SupaClient:
             "/machines",
             params={
                 "id": f"eq.{machine_id}",
-                "select": "*,templates(is_enabled,is_test)",
+                # plan/category: o lifecycle e a recriação precisam saber o
+                # pool da máquina (recreating_pool, pending_recreates)
+                "select": "*,templates(plan,category,is_enabled,is_test)",
                 "limit": "1",
             },
         )
@@ -408,6 +410,31 @@ class SupaClient:
             "/machines",
             params={
                 "status": "eq.creating",
+                "public_url": "not.is.null",
+                "runpod_pod_id": "not.is.null",
+                "select": "*,templates!inner(plan,category,is_enabled,is_test)",
+                "templates.plan": f"eq.{plan}",
+                "templates.category": f"eq.{category}",
+                "templates.is_enabled": "eq.true",
+                "templates.is_test": "eq.false",
+                "order": "created_at.asc",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def list_wakeable_machines_for_plan(
+        self, plan: str, category: str = "llm"
+    ) -> list[dict]:
+        """creating + stopped do plano/categoria numa consulta só — o snapshot
+        que wake_some_machine_for_plan precisa. Em duas consultas (creating,
+        depois stopped), uma máquina que mudava de stopped para creating entre
+        elas não aparecia em nenhuma, e a cascata provisionava por cima dela.
+        Mesmos filtros de list_creating/list_stopped_machines_for_plan."""
+        r = await self._rest.get(
+            "/machines",
+            params={
+                "status": "in.(creating,stopped)",
                 "public_url": "not.is.null",
                 "runpod_pod_id": "not.is.null",
                 "select": "*,templates!inner(plan,category,is_enabled,is_test)",
