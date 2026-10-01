@@ -136,7 +136,9 @@ export async function DashboardBody({
   const totalCostPerHr = running.reduce((s, m) => s + (m.cost_per_hr ?? 0), 0)
 
   const machineById = new Map(machines.map((m) => [m.id, m]))
-  const requestsByMachine = new Map<string, number>()
+  // machine_id nulo = uso repassado ao OpenRouter (migration 0075): fatia
+  // própria, para não se confundir com máquina removida
+  const requestsByMachine = new Map<string | null, number>()
   for (const u of usage) {
     requestsByMachine.set(
       u.machine_id,
@@ -145,7 +147,7 @@ export async function DashboardBody({
   }
   const donutData = [...requestsByMachine.entries()]
     .map(([id, requests]) => ({
-      name: machineById.get(id)?.name ?? "removida",
+      name: id === null ? "OpenRouter" : (machineById.get(id)?.name ?? "removida"),
       requests,
     }))
     .sort((a, b) => b.requests - a.requests)

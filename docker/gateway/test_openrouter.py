@@ -29,6 +29,8 @@ from openrouter import (  # noqa: E402
     image_body,
     pick_slug,
     pick_target,
+    plan_catalog,
+    plan_denial,
     prepare_anthropic_body,
     prepare_openai_body,
     requested_model,
@@ -68,6 +70,63 @@ def test_pick_slug_respeita_tipo():
     assert pick_slug("qwen/qwen3-coder", IMAGE_KIND, CATALOG) is None
     assert pick_slug("fora/da-lista", TEXT_KIND, CATALOG) is None
     assert pick_slug(None, TEXT_KIND, CATALOG) is None
+
+
+TODOS = ["Go", "Pro", "Max", "Enterprise"]
+ROWS = [
+    {"slug": "z-ai/glm-5.3-flash", "kind": TEXT_KIND, "plans": TODOS, "fallback_plans": []},
+    {"slug": "qwen/qwen3.8-27b", "kind": TEXT_KIND, "plans": ["Pro", "Max", "Enterprise"],
+     "fallback_plans": ["Pro", "Max", "Enterprise"], "fallback": True},
+    {"slug": "qwen/qwen3.5-9b", "kind": TEXT_KIND, "plans": TODOS, "fallback_plans": ["Go"]},
+    {"slug": "qwen/qwen-image-3", "kind": IMAGE_KIND, "plans": TODOS, "fallback_plans": []},
+    # ainda não lançado: na lista, sem plano nenhum
+    {"slug": "moonshotai/kimi-k3", "kind": TEXT_KIND, "plans": [], "fallback_plans": []},
+]
+
+
+def test_plan_catalog_recorta_modelos_e_reserva_por_plano():
+    catalog, fallbacks = plan_catalog(ROWS, "Go")
+    assert accepted_models(catalog, TEXT_KIND) == ["qwen/qwen3.5-9b", "z-ai/glm-5.3-flash"]
+    # o reserva do Go é o modelo da máquina do Go, não o 27B (que não é do Go)
+    assert fallbacks == {TEXT_KIND: "qwen/qwen3.5-9b"}
+    catalog, fallbacks = plan_catalog(ROWS, "Pro")
+    assert "qwen/qwen3.8-27b" in catalog
+    assert fallbacks == {TEXT_KIND: "qwen/qwen3.8-27b"}
+    # chave sem plano não alcança modelo nenhum que declare planos
+    assert plan_catalog(ROWS, None) == ({}, {})
+
+
+def test_plan_catalog_linha_anterior_a_0074_vale_para_todos():
+    legado = [{"slug": "qwen/qwen3.8-27b", "kind": TEXT_KIND, "fallback": True}]
+    assert plan_catalog(legado, "Go") == (
+        {"qwen/qwen3.8-27b": TEXT_KIND}, {TEXT_KIND: "qwen/qwen3.8-27b"}
+    )
+
+
+def test_plan_denial_so_nega_modelo_da_lista_fora_do_plano():
+    assert plan_denial("qwen/qwen3.8-27b", TEXT_KIND, ROWS, "Pro") is None
+    assert plan_denial("qwen/qwen3.5-9b", TEXT_KIND, ROWS, "Go") is None
+    # fora da lista não é negado: segue a regra de destino (máquina responde)
+    assert plan_denial("go-base", TEXT_KIND, ROWS, "Go") is None
+    assert plan_denial(None, TEXT_KIND, ROWS, "Go") is None
+    # modelo de outro tipo não é o pedido desta rota
+    assert plan_denial("qwen/qwen-image-3", TEXT_KIND, ROWS, None) is None
+    # linha anterior à 0074 (sem plans) vale para todos
+    assert plan_denial("x/y", TEXT_KIND, [{"slug": "x/y", "kind": TEXT_KIND}], "Go") is None
+
+
+def test_plan_denial_lista_o_que_o_plano_tem():
+    msg = plan_denial("qwen/qwen3.8-27b", TEXT_KIND, ROWS, "Go")
+    assert "'qwen/qwen3.8-27b'" in msg and "plano Go" in msg
+    assert "qwen/qwen3.5-9b, z-ai/glm-5.3-flash" in msg
+
+
+def test_modelo_sem_plano_nenhum_nao_esta_disponivel_para_ninguem():
+    for plan in TODOS + [None]:
+        msg = plan_denial("moonshotai/kimi-k3", TEXT_KIND, ROWS, plan)
+        assert msg == "o modelo 'moonshotai/kimi-k3' ainda não está disponível"
+    # e não aparece no catálogo de plano nenhum (nem em /v1/models)
+    assert all("moonshotai/kimi-k3" not in plan_catalog(ROWS, p)[0] for p in TODOS)
 
 
 def test_accepted_models_e_mensagem():

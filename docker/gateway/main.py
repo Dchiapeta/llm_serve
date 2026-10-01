@@ -59,6 +59,7 @@ import image_proxy
 import image_retention
 import openrouter
 import openrouter_keys
+import plan_limits
 from anthropic_compat import (
     anthropic_error_body,
     anthropic_nonstreaming_body,
@@ -642,9 +643,10 @@ auto_provision_cache: tuple[bool, float] | None = None
 # demais flags de system_settings (machines_enabled, openrouter_enabled):
 # key -> (valor, expira_em). Mesmo TTL do auto_provision_cache.
 settings_cache: dict[str, tuple[bool, float]] = {}
-# allowlist do OpenRouter (openrouter_models habilitados):
-# ({slug: kind}, {kind: slug do reserva}, expira_em)
-openrouter_catalog_cache: tuple[dict[str, str], dict[str, str], float] | None = None
+# allowlist do OpenRouter (openrouter_models habilitados), as linhas cruas:
+# (linhas, expira_em). O recorte por plano sai delas a cada request
+# (openrouter.plan_catalog), que é barato perto de um cache por plano.
+openrouter_catalog_cache: tuple[list[dict], float] | None = None
 # None quando OPENROUTER_API_KEY não está configurada (repasse desligado)
 openrouter_client: httpx.AsyncClient | None = None
 # chaves espelho (openrouter_keys.py): client da API de gerenciamento e a cifra.
@@ -1614,11 +1616,14 @@ def build_usage_metric_rows(
 
 
 async def collect_usage_metrics_once() -> None:
-    """Único escritor de usage_metrics: puxa os contadores acumulados do
-    agent de cada máquina running (zerando-os na leitura) e grava o delta
-    em usage_metrics. Roda sozinha no processo do gateway — antes de existir,
-    usage_metrics só era populado quando um admin abria o painel, o que
-    deixava a quota diária de tokens (check_token_quota) cega a qualquer
+    """Escritor do uso de MÁQUINA em usage_metrics: puxa os contadores
+    acumulados do agent de cada máquina running (zerando-os na leitura) e
+    grava o delta em usage_metrics. O uso repassado ao OpenRouter não passa
+    por agent e entra por outro caminho: um trigger em gateway_requests
+    (migration 0075), linhas com machine_id nulo. Roda sozinha no processo
+    do gateway — antes de existir, usage_metrics só era populado quando um
+    admin abria o painel, o que deixava a quota diária de tokens
+    (check_token_quota) cega a qualquer
     uso entre duas visitas (esse coletor do painel foi removido depois que
     causou atribuição incorreta a api_key_id=NULL por divergir do esquema
     de chave do agent).
@@ -2202,43 +2207,58 @@ async def openrouter_enabled() -> bool:
     return await _cached_setting("openrouter_enabled", False)
 
 
-async def _openrouter_models() -> tuple[dict[str, str], dict[str, str]]:
-    """({slug: kind}, {kind: slug do reserva}) dos modelos habilitados na
-    página Modelos (OpenRouter), vazios com o repasse desligado. Falha de
-    leitura mantém o último catálogo."""
+async def _openrouter_rows() -> list[dict]:
+    """Linhas habilitadas da página Modelos (OpenRouter), com cache curto.
+    Lidas mesmo com o repasse desligado: o acesso a modelo por plano (0074)
+    vale também no caminho de máquina. Falha de leitura mantém as últimas."""
     global openrouter_catalog_cache
-    if not await openrouter_enabled():
-        return {}, {}
     now = time.time()
-    if openrouter_catalog_cache and openrouter_catalog_cache[2] > now:
-        return openrouter_catalog_cache[0], openrouter_catalog_cache[1]
+    if openrouter_catalog_cache and openrouter_catalog_cache[1] > now:
+        return openrouter_catalog_cache[0]
     try:
         rows = await supa.list_enabled_openrouter_models()
-        catalog = {row["slug"]: row["kind"] for row in rows}
-        fallbacks = {row["kind"]: row["slug"] for row in rows if row.get("fallback")}
     except Exception as e:
         logger.warning("openrouter: falha ao ler a allowlist de modelos (%s)", e)
-        catalog, fallbacks = (
-            openrouter_catalog_cache[:2] if openrouter_catalog_cache else ({}, {})
-        )
-    openrouter_catalog_cache = (catalog, fallbacks, now + SETTINGS_CACHE_TTL_S)
-    return catalog, fallbacks
+        rows = openrouter_catalog_cache[0] if openrouter_catalog_cache else []
+    openrouter_catalog_cache = (rows, now + SETTINGS_CACHE_TTL_S)
+    return rows
 
 
-async def openrouter_catalog() -> dict[str, str]:
-    """{slug: kind} dos modelos habilitados (vazio com o repasse desligado)."""
-    return (await _openrouter_models())[0]
+async def _openrouter_models(plan: str | None) -> tuple[dict[str, str], dict[str, str]]:
+    """({slug: kind}, {kind: slug do reserva}) que uma chave do `plan`
+    alcança no OpenRouter; vazios com o repasse desligado."""
+    if not await openrouter_enabled():
+        return {}, {}
+    return openrouter.plan_catalog(await _openrouter_rows(), plan)
 
 
-async def openrouter_text_target(model: str | None) -> str | None:
+async def openrouter_catalog(plan: str | None) -> dict[str, str]:
+    """{slug: kind} dos modelos do plano (vazio com o repasse desligado)."""
+    return (await _openrouter_models(plan))[0]
+
+
+async def openrouter_text_target(model: str | None, plan: str | None) -> str | None:
     """Modelo do OpenRouter que atende uma request de TEXTO que vai para lá: o
-    pedido, se está na lista; senão o reserva de texto (0073). Imagem não tem
-    reserva — fica fora da regra, ver a migration."""
-    catalog, fallbacks = await _openrouter_models()
+    pedido, se está na lista do plano; senão o reserva de texto do plano
+    (0073/0074). Imagem não tem reserva — fica fora da regra, ver a 0073."""
+    catalog, fallbacks = await _openrouter_models(plan)
     return openrouter.pick_target(
         model, openrouter.TEXT_KIND, catalog,
         {k: v for k, v in fallbacks.items() if k == openrouter.TEXT_KIND},
     )
+
+
+async def require_plan_model(model: str | None, kind: str, plan: str | None) -> None:
+    """403 quando o modelo pedido está na página Modelos mas não no plano da
+    chave (0074: Go sem o Qwen 3.8 27B). Antes de qualquer destino, e com o
+    repasse ligado ou não: a máquina responde qualquer nome pedido (0073), e
+    sem esta trava o cliente Go que pedisse o 27B receberia o 9B com o nome do
+    27B. Modelo da lista sem plano nenhum (Kimi K3, ainda não lançado) é
+    barrado para todos. Modelo fora da lista não é barrado aqui (segue a regra
+    de destino)."""
+    detail = openrouter.plan_denial(model, kind, await _openrouter_rows(), plan)
+    if detail:
+        raise HTTPException(status_code=403, detail=detail)
 
 
 async def openrouter_key_for(entry: dict) -> str | None:
@@ -2337,12 +2357,12 @@ def _openrouter_auth(secret: str | None) -> dict[str, str] | None:
     return {"Authorization": f"Bearer {secret}"} if secret else None
 
 
-async def openrouter_slug_for(model: str | None, kind: str) -> str | None:
+async def openrouter_slug_for(model: str | None, kind: str, plan: str | None) -> str | None:
     """Slug do OpenRouter que atende este `model`, ou None (vai pra máquina)."""
-    return openrouter.pick_slug(model, kind, await openrouter_catalog())
+    return openrouter.pick_slug(model, kind, await openrouter_catalog(plan))
 
 
-async def require_machines(model: str | None, kind: str) -> None:
+async def require_machines(model: str | None, kind: str, plan: str | None) -> None:
     """Barra a request que iria pra máquina com as máquinas desligadas.
 
     Com o repasse ligado, o erro é de MODELO (404, com a lista do que é
@@ -2351,7 +2371,7 @@ async def require_machines(model: str | None, kind: str) -> None:
     if await machines_enabled():
         return
     if await openrouter_enabled():
-        accepted = openrouter.accepted_models(await openrouter_catalog(), kind)
+        accepted = openrouter.accepted_models(await openrouter_catalog(plan), kind)
         raise HTTPException(
             status_code=404, detail=openrouter.unavailable_detail(model, accepted)
         )
@@ -4579,6 +4599,47 @@ async def openrouter_forward(
     )
 
 
+def estimate_openai_prompt(path: str, body: dict) -> int:
+    """Tokens de entrada de um corpo OpenAI pela heurística do context_budget,
+    nos três formatos repassados: messages (chat), prompt (completions) e
+    input + instructions (responses, mesma conta do validate_responses_body)."""
+    if path == "responses":
+        return estimate_prompt_tokens(
+            tools=body.get("tools"),
+            extra_texts=[
+                json.dumps(body.get("input") or "", ensure_ascii=False),
+                body.get("instructions") or "",
+            ],
+        )
+    if isinstance(body.get("messages"), list):
+        return estimate_prompt_tokens(messages=body["messages"], tools=body.get("tools"))
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str):
+        prompt = json.dumps(prompt or "", ensure_ascii=False)
+    return estimate_prompt_tokens(extra_texts=[prompt])
+
+
+def enforce_plan_context(
+    body: dict, field: str, est_tokens: int, plan: str | None, *, shape: str = "openai",
+) -> None:
+    """Teto de contexto do plano (plan_limits) numa request que vai ao
+    OpenRouter: a mesma admissão e o mesmo clamp de saída do caminho de
+    máquina, contra a janela do PLANO. Sem tokenizer aqui, então a margem é a
+    de "não deu para contar" (EstimateKind.FALLBACK). Plano sem teto: no-op."""
+    window = plan_limits.plan_window(plan)
+    try:
+        apply_context_budget(
+            body, window, field, est_tokens=est_tokens, kind=EstimateKind.FALLBACK
+        )
+    except ContextWindowExceeded as exc:
+        logger.warning(
+            "contexto do plano estourado no repasse: est=%s plano=%s janela=%s",
+            est_tokens, plan, window.get("max_model_len"),
+        )
+        exc.shape = shape
+        raise
+
+
 async def openrouter_text(
     *, path: str, body: bytes, entry: dict, stack: dict | None, slug: str,
     request: Request, started: float,
@@ -4605,6 +4666,12 @@ async def openrouter_text(
         if len(messages) > MAX_MESSAGES:
             raise HTTPException(status_code=400, detail="número de mensagens excede o limite")
         body_json["messages"] = await apply_system_prompt_and_rag(messages, entry, stack)
+    if "max_completion_tokens" in body_json and max_tokens_field == "max_tokens":
+        max_tokens_field = "max_completion_tokens"
+    enforce_plan_context(
+        body_json, max_tokens_field, estimate_openai_prompt(path, body_json),
+        (stack or {}).get("plan"),
+    )
     openrouter.prepare_openai_body(body_json, slug, OPENROUTER_MAX_TOKENS)
 
     return await openrouter_forward(
@@ -4641,6 +4708,13 @@ async def openrouter_messages(
         )
         if new_system and new_system != system_text:
             anthropic_body["system"] = new_system
+    # estimado sobre a versão OpenAI do corpo (a conta do caminho de máquina,
+    # e a que sabe pesar imagem), mas o clamp é no max_tokens do Anthropic
+    enforce_plan_context(
+        anthropic_body, "max_tokens",
+        estimate_openai_prompt("chat/completions", anthropic_to_openai_request(anthropic_body)[0]),
+        (stack or {}).get("plan"), shape="anthropic",
+    )
     openrouter.prepare_anthropic_body(anthropic_body, slug, OPENROUTER_MAX_TOKENS)
 
     return await openrouter_forward(
@@ -4687,9 +4761,10 @@ async def anthropic_messages(
     # ligadas → máquina primeiro, OpenRouter só como desvio quando não há
     # máquina disponível; desligadas → OpenRouter direto.
     requested = openrouter.requested_model(anthropic_body)
+    await require_plan_model(requested, openrouter.TEXT_KIND, key_plan)
 
     async def _desvio(reason: str) -> Response | None:
-        fallback = await _text_fallback("messages", requested, reason)
+        fallback = await _text_fallback("messages", requested, reason, key_plan)
         if fallback is None:
             return None
         return await openrouter_messages(
@@ -4698,13 +4773,13 @@ async def anthropic_messages(
         )
 
     if not await machines_enabled():
-        slug = await openrouter_text_target(requested)
+        slug = await openrouter_text_target(requested, key_plan)
         if slug:
             return await openrouter_messages(
                 anthropic_body=anthropic_body, entry=entry, stack=key_stack, slug=slug,
                 request=request, started=started,
             )
-        await require_machines(requested, openrouter.TEXT_KIND)
+        await require_machines(requested, openrouter.TEXT_KIND, key_plan)
 
     try:
         # sem máquina disponível, resolve_route já dispara o wake/criação
@@ -4715,6 +4790,8 @@ async def anthropic_messages(
             if desviada is not None:
                 return desviada
         raise
+    # janela efetiva = min(máquina, plano) — ver plan_limits.py
+    machine, plan_capped = plan_limits.capped_machine(machine, effective_plan)
     await maybe_touch(stack_id, machine["id"])
 
     flight_key = (stack_id, machine["id"])
@@ -4757,8 +4834,9 @@ async def anthropic_messages(
         release_flight(flight_key)
         # conversa maior que a janela da máquina (ex.: cresceu no OpenRouter
         # antes de a máquina ligar) continua no OpenRouter em vez de matar a
-        # sessão — só cai no erro abaixo com o repasse desligado
-        desviada = await _desvio("maior que a janela da máquina")
+        # sessão — só cai no erro abaixo com o repasse desligado. Maior que a
+        # janela do PLANO não é desviada: no OpenRouter também não caberia.
+        desviada = None if plan_capped else await _desvio("maior que a janela da máquina")
         if desviada is not None:
             return desviada
         # O estouro de contexto é o evento mais importante deste endpoint (mata
@@ -4854,7 +4932,7 @@ async def anthropic_messages(
         # pod de pé mas vLLM fora, antes do primeiro byte: mesmo desvio do
         # catch-all. Sem desvio possível, segue o tratamento de erro de sempre.
         fallback = await _text_fallback(
-            "messages", requested, f"máquina respondeu {upstream.status_code}"
+            "messages", requested, f"máquina respondeu {upstream.status_code}", key_plan
         )
         if fallback is not None:
             await upstream.aclose()
@@ -6499,11 +6577,12 @@ async def images_generations(
     if len(body) > image_proxy.max_generation_bytes():
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
 
-    entry, account_id, key_stack, _plan = await _authorize_image_key(
+    entry, account_id, key_stack, key_plan = await _authorize_image_key(
         authorization, request, GENERATIONS_PATH
     )
     requested = openrouter.requested_model(body)
-    slug = await openrouter_slug_for(requested, openrouter.IMAGE_KIND)
+    await require_plan_model(requested, openrouter.IMAGE_KIND, key_plan)
+    slug = await openrouter_slug_for(requested, openrouter.IMAGE_KIND, key_plan)
     if slug:
         try:
             fields = json.loads(body)
@@ -6515,7 +6594,7 @@ async def images_generations(
             fields=fields, references=None, path=GENERATIONS_PATH, entry=entry,
             stack=key_stack, slug=slug, request=request, started=started,
         )
-    await require_machines(requested, openrouter.IMAGE_KIND)
+    await require_machines(requested, openrouter.IMAGE_KIND, key_plan)
 
     machine, stack_id, _plan = await _reserve_image_machine(entry, account_id)
     flight_key = (stack_id, machine["id"])
@@ -6609,7 +6688,7 @@ async def images_edits(request: Request, authorization: str | None = Header(None
     entram na MESMA precedência".
     """
     started = time.monotonic()
-    entry, account_id, key_stack, _plan = await _authorize_image_key(
+    entry, account_id, key_stack, key_plan = await _authorize_image_key(
         authorization, request, EDITS_PATH
     )
 
@@ -6619,11 +6698,12 @@ async def images_edits(request: Request, authorization: str | None = Header(None
     # como sempre (ver a docstring acima). Lido, o corpo vai inteiro para a
     # máquina se o modelo não for do OpenRouter.
     buffered: bytes | None = None
-    if openrouter.accepted_models(await openrouter_catalog(), openrouter.IMAGE_KIND):
+    if openrouter.accepted_models(await openrouter_catalog(key_plan), openrouter.IMAGE_KIND):
         buffered = await _read_capped(request, image_proxy.max_edit_bytes())
         fields, references = await _parse_edit_form(request, buffered)
         requested = openrouter.requested_model(fields)
-        slug = await openrouter_slug_for(requested, openrouter.IMAGE_KIND)
+        await require_plan_model(requested, openrouter.IMAGE_KIND, key_plan)
+        slug = await openrouter_slug_for(requested, openrouter.IMAGE_KIND, key_plan)
         if slug:
             if not references:
                 raise HTTPException(status_code=400, detail="imagem de referência ausente")
@@ -6631,9 +6711,9 @@ async def images_edits(request: Request, authorization: str | None = Header(None
                 fields=fields, references=references, path=EDITS_PATH, entry=entry,
                 stack=key_stack, slug=slug, request=request, started=started,
             )
-        await require_machines(requested, openrouter.IMAGE_KIND)
+        await require_machines(requested, openrouter.IMAGE_KIND, key_plan)
     else:
-        await require_machines(None, openrouter.IMAGE_KIND)
+        await require_machines(None, openrouter.IMAGE_KIND, key_plan)
 
     machine, stack_id, _plan = await _reserve_image_machine(entry, account_id)
     flight_key = (stack_id, machine["id"])
@@ -6722,12 +6802,15 @@ class _FallbackToOpenRouter(Exception):
         self.reason = reason
 
 
-async def _text_fallback(path: str, requested: str | None, reason: str) -> _FallbackToOpenRouter | None:
+async def _text_fallback(
+    path: str, requested: str | None, reason: str, plan: str | None,
+) -> _FallbackToOpenRouter | None:
     """O desvio, se o repasse está ligado e há modelo para atender (o pedido
-    da lista, senão o reserva de texto); None = segue o erro da máquina."""
+    da lista do plano, senão o reserva do plano); None = segue o erro da
+    máquina."""
     if path not in openrouter.TEXT_PATHS and path != "messages":
         return None
-    slug = await openrouter_text_target(requested)
+    slug = await openrouter_text_target(requested, plan)
     if not slug:
         return None
     logger.info("openrouter: %s desviada para %s (%s)", path, slug, reason)
@@ -6815,22 +6898,24 @@ async def _proxy(
         else openrouter.TEXT_KIND
     )
     requested = openrouter.requested_model(body) if path in openrouter.TEXT_PATHS else None
+    if path in openrouter.TEXT_PATHS:
+        await require_plan_model(requested, openrouter.TEXT_KIND, key_plan)
     ctx.update(body=body, entry=entry, stack=key_stack)
     machines_on = await machines_enabled()
     if path in openrouter.TEXT_PATHS and not machines_on:
-        slug = await openrouter_text_target(requested)
+        slug = await openrouter_text_target(requested, key_plan)
         if slug:
             return await openrouter_text(
                 path=path, body=body, entry=entry, stack=key_stack, slug=slug,
                 request=request, started=started,
             )
-        await require_machines(requested, openrouter.TEXT_KIND)
+        await require_machines(requested, openrouter.TEXT_KIND, key_plan)
     elif path == "models" and not machines_on:
         # sem máquinas, a lista é só a allowlist (vazia com o repasse desligado)
         return JSONResponse(content={
             "object": "list",
             "data": openrouter.model_list_entries(
-                openrouter.accepted_models(await openrouter_catalog(), key_kind)
+                openrouter.accepted_models(await openrouter_catalog(key_plan), key_kind)
             ),
         })
 
@@ -6840,7 +6925,9 @@ async def _proxy(
         machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
     except HTTPException as exc:
         if exc.status_code == 503:
-            fallback = await _text_fallback(path, requested, f"sem máquina: {exc.detail}")
+            fallback = await _text_fallback(
+                path, requested, f"sem máquina: {exc.detail}", key_plan
+            )
             if fallback:
                 raise fallback from None
             if path == "models" and await openrouter_enabled():
@@ -6850,10 +6937,12 @@ async def _proxy(
                 return JSONResponse(content={
                     "object": "list",
                     "data": openrouter.model_list_entries(
-                        openrouter.accepted_models(await openrouter_catalog(), key_kind)
+                        openrouter.accepted_models(await openrouter_catalog(key_plan), key_kind)
                     ),
                 })
         raise
+    # janela efetiva = min(máquina, plano) — ver plan_limits.py
+    machine, plan_capped = plan_limits.capped_machine(machine, effective_plan)
     await maybe_touch(stack_id, machine["id"])
 
     # incrementa ANTES dos awaits lentos (leitura do body, embeddings do RAG):
@@ -6878,7 +6967,7 @@ async def _proxy(
     except HTTPException as exc:
         # check_concurrency já devolveu a vaga antes de levantar
         if exc.status_code == 429:
-            fallback = await _text_fallback(path, requested, "máquina lotada")
+            fallback = await _text_fallback(path, requested, "máquina lotada", key_plan)
             if fallback:
                 raise fallback from None
         raise
@@ -6911,8 +7000,11 @@ async def _proxy(
             except ContextWindowExceeded:
                 # conversa maior que a janela da máquina (ex.: cresceu no
                 # OpenRouter antes de a máquina ligar): continua lá. O
-                # except BaseException abaixo devolve a vaga.
-                fallback = await _text_fallback(path, requested, "maior que a janela da máquina")
+                # except BaseException abaixo devolve a vaga. Maior que a
+                # janela do PLANO não: no OpenRouter também não caberia.
+                fallback = None if plan_capped else await _text_fallback(
+                    path, requested, "maior que a janela da máquina", key_plan
+                )
                 if fallback:
                     raise fallback from None
                 raise
@@ -6959,7 +7051,7 @@ async def _proxy(
         logger.warning("proxy: upstream indisponível para %s (%s)", flight_key, e)
         if isinstance(e, _MACHINE_UNREACHABLE):
             # máquina "running" no banco mas fora do ar, antes de qualquer byte
-            fallback = await _text_fallback(path, requested, "máquina inalcançável")
+            fallback = await _text_fallback(path, requested, "máquina inalcançável", key_plan)
             if fallback:
                 raise fallback from None
         # Inclui o ReadTimeout de MESSAGES_NONSTREAM_TIMEOUT_S: a request sem
@@ -6979,7 +7071,7 @@ async def _proxy(
         # pod de pé mas vLLM fora (reiniciando, sem memória): nada foi para o
         # cliente ainda, então dá para atender pelo OpenRouter
         fallback = await _text_fallback(
-            path, requested, f"máquina respondeu {upstream.status_code}"
+            path, requested, f"máquina respondeu {upstream.status_code}", key_plan
         )
         if fallback:
             await upstream.aclose()
@@ -7008,7 +7100,7 @@ async def _proxy(
                     if not str(m.get("id", "")).startswith("acct-")
                 ] + openrouter.model_list_entries(
                     # os modelos do OpenRouter aceitos para esta chave
-                    openrouter.accepted_models(await openrouter_catalog(), key_kind)
+                    openrouter.accepted_models(await openrouter_catalog(key_plan), key_kind)
                 )
                 raw = json.dumps(payload).encode()
             except Exception:

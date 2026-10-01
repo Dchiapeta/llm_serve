@@ -2406,7 +2406,9 @@ export async function createOpenRouterModel(
   await requireAdminSession()
   const slug = String(formData.get("slug") || "").trim()
   const label = String(formData.get("label") || "").trim() || null
+  const plans = parseModelPlans(formData.getAll("plans"))
   if (!slug) return { error: "Informe o ID do modelo no OpenRouter" }
+  if (plans.length === 0) return { error: "Escolha ao menos um plano" }
 
   // O slug tem que existir no catálogo: um erro de digitação aqui viraria um
   // 400 do OpenRouter para o cliente, que não tem como saber a causa.
@@ -2427,6 +2429,7 @@ export async function createOpenRouterModel(
     kind: openRouterModelKind(model),
     label: label ?? model.name,
     enabled: true,
+    plans,
   })
   if (error) {
     if (error.code === "23505") return { error: `"${slug}" já está na lista` }
@@ -2451,33 +2454,86 @@ export async function setOpenRouterModelEnabled(
   revalidatePath("/modelos")
 }
 
-// Reserva de texto (migration 0073): quem responde pelo OpenRouter quando o
-// modelo pedido não está na lista (ex.: go-base/pro-base) e não há máquina
-// disponível. Um só; imagem não tem reserva.
-export async function setOpenRouterFallback(
-  id: string
+// Planos válidos de um form/lista, na ordem da escada (TEMPLATE_PLANS).
+function parseModelPlans(raw: unknown[]): TemplatePlan[] {
+  const wanted = new Set(raw.map((v) => String(v)))
+  return TEMPLATE_PLANS.filter((plan) => wanted.has(plan))
+}
+
+// Acesso por plano (migration 0074): fora destes planos o gateway responde 403
+// para o modelo. Tirar um plano tira junto o papel de reserva dele — o check
+// da tabela exige reserva ⊆ planos.
+export async function setOpenRouterModelPlans(
+  id: string,
+  rawPlans: string[]
 ): Promise<{ error: string } | void> {
   await requireAdminSession()
+  const plans = parseModelPlans(rawPlans)
   const db = createSupabaseAdmin()
   const { data: model } = await db
     .from("openrouter_models")
-    .select("kind")
+    .select("fallback_plans")
     .eq("id", id)
-    .maybeSingle<{ kind: string }>()
+    .maybeSingle<{ fallback_plans: TemplatePlan[] | null }>()
   if (!model) return { error: "Modelo não encontrado" }
-  if (model.kind !== "text") return { error: "Só modelos de texto podem ser o reserva" }
-  // desmarca o atual ANTES: o índice único parcial (um reserva por tipo)
-  // recusaria dois marcados ao mesmo tempo
-  const now = new Date().toISOString()
-  const { error: unsetError } = await db
-    .from("openrouter_models")
-    .update({ fallback: false, updated_at: now })
-    .eq("kind", "text")
-    .eq("fallback", true)
-  if (unsetError) return { error: unsetError.message }
   const { error } = await db
     .from("openrouter_models")
-    .update({ fallback: true, enabled: true, updated_at: now })
+    .update({
+      plans,
+      fallback_plans: (model.fallback_plans ?? []).filter((p) => plans.includes(p)),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", id)
+  if (error) return { error: error.message }
+  after(() => flushGatewaySettings())
+  revalidatePath("/modelos")
+}
+
+// Reserva de texto do plano (migrations 0073/0074): quem responde pelo
+// OpenRouter quando o modelo pedido não está na lista do plano (ex.:
+// go-base/pro-base) e não há máquina disponível. Um por plano; imagem não tem
+// reserva.
+export async function setOpenRouterFallback(
+  id: string,
+  plan: string
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const [target] = parseModelPlans([plan])
+  if (!target) return { error: `Plano inválido: ${plan}` }
+  const db = createSupabaseAdmin()
+  const { data: model } = await db
+    .from("openrouter_models")
+    .select("kind, plans, fallback_plans")
+    .eq("id", id)
+    .maybeSingle<{ kind: string; plans: TemplatePlan[] | null; fallback_plans: TemplatePlan[] | null }>()
+  if (!model) return { error: "Modelo não encontrado" }
+  if (model.kind !== "text") return { error: "Só modelos de texto podem ser o reserva" }
+  if (!(model.plans ?? []).includes(target)) {
+    return { error: `O modelo não está liberado para o plano ${target}` }
+  }
+  // tira o plano do reserva atual ANTES: um reserva por plano
+  const now = new Date().toISOString()
+  const { data: current, error: readError } = await db
+    .from("openrouter_models")
+    .select("id, fallback_plans")
+    .eq("kind", "text")
+    .contains("fallback_plans", [target])
+    .neq("id", id)
+  if (readError) return { error: readError.message }
+  for (const row of (current ?? []) as { id: string; fallback_plans: TemplatePlan[] }[]) {
+    const { error: unsetError } = await db
+      .from("openrouter_models")
+      .update({
+        fallback_plans: row.fallback_plans.filter((p) => p !== target),
+        updated_at: now,
+      })
+      .eq("id", row.id)
+    if (unsetError) return { error: unsetError.message }
+  }
+  const fallbackPlans = parseModelPlans([...(model.fallback_plans ?? []), target])
+  const { error } = await db
+    .from("openrouter_models")
+    .update({ fallback_plans: fallbackPlans, enabled: true, updated_at: now })
     .eq("id", id)
   if (error) return { error: error.message }
   after(() => flushGatewaySettings())

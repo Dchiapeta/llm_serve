@@ -126,6 +126,7 @@ advisory lock.
 | `OPENROUTER_APP_URL` / `OPENROUTER_APP_TITLE` | não | Atribuição no painel do OpenRouter (`HTTP-Referer` / `X-OpenRouter-Title`; defaults `https://trystac.com` / `Stac`) |
 | `OPENROUTER_MAX_TOKENS`   | não         | Teto de saída por request repassada (`max_tokens`/`max_completion_tokens`/`max_output_tokens`; default 32000, `0` = sem teto) |
 | `OPENROUTER_STREAM_TTFT_TIMEOUT_S` / `OPENROUTER_STREAM_IDLE_TIMEOUT_S` | não | Watchdog do streaming repassado (defaults 180 / 120) |
+| `PLAN_CONTEXT_TOKENS_GO` / `_PRO` | não | Janela de contexto (entrada + saída) do plano, em tokens (defaults 32768 / 262144, o que o site anuncia; `0` = sem teto). Vale na máquina (min com o `--max-model-len`) e no OpenRouter. Max/Enterprise não têm teto próprio — ver `plan_limits.py` |
 | `OPENROUTER_NONSTREAM_TIMEOUT_S` | não  | Read da request repassada sem stream (default 300) |
 | `OPENROUTER_IMAGE_TIMEOUT_S` | não      | Read do `POST /images` do OpenRouter (default 240) |
 | `OPENROUTER_MAX_IMAGES`   | não         | Teto de `n` numa geração repassada (default 4) |
