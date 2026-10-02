@@ -26,6 +26,7 @@ import time
 import uuid
 
 import httpx
+from product_analytics import StreamCompletion
 
 from reasoning_filter import (
     EMPTY_RESPONSE_MESSAGE,
@@ -469,8 +470,9 @@ async def anthropic_sse_from_openai_stream(
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
     # `_emit_message_start=False` é o modo do RETRY sem thinking (abaixo): o
     # message_start do turno já foi pro cliente, o segundo stream só continua.
+    message_start = None
     if _emit_message_start:
-        yield _sse("message_start", {
+        message_start = _sse("message_start", {
             "type": "message_start",
             "message": {
                 "id": message_id,
@@ -520,11 +522,18 @@ async def anthropic_sse_from_openai_stream(
     entregou_visivel = False
 
     aborted_reason = None
+    completion = StreamCompletion()
+    exhausted = False
     # fora do try pra que o finally alcance: se o CLIENTE desconectar no meio
     # (GeneratorExit num yield), a task de leitura tem que ser cancelada, senão
     # fica rodando órfã segurando a conexão upstream
     chunk_task = None
     try:
+        if message_start is not None:
+            # O primeiro yield também precisa do finally: desconectar aqui
+            # deve fechar o upstream, liberar a vaga e registrar 499.
+            yield message_start
+            last_emit = time.monotonic()
         try:
             # Pump manual em vez de `async for`: é o que permite separar o
             # prazo do PRIMEIRO chunk (prefill) do prazo de silêncio no meio do
@@ -576,7 +585,9 @@ async def anthropic_sse_from_openai_stream(
                 raw = chunk_task.result()
                 chunk_task = None
                 if raw is None:
+                    exhausted = True
                     break
+                completion.feed(raw)
                 if not first_chunk_seen:
                     first_chunk_seen = True
                     logger.info(
@@ -592,7 +603,7 @@ async def anthropic_sse_from_openai_stream(
                         continue
                     payload_raw = stripped[len(b"data:"):].strip()
                     if payload_raw == b"[DONE]":
-                        continue
+                        continue  # esperar o delimitador SSE completo
                     try:
                         chunk = json.loads(payload_raw)
                     except Exception:
@@ -695,6 +706,9 @@ async def anthropic_sse_from_openai_stream(
                                 "delta": {"type": "input_json_delta", "partial_json": args_fragment},
                             })
                             last_emit = time.monotonic()
+                if completion.terminal:
+                    exhausted = True
+                    break
         except (httpx.HTTPError, ConnectionError, OSError) as e:
             # conexão upstream caiu no meio do stream — fecha os blocks
             # abertos com o que já foi gerado, em vez de sumir sem nada.
@@ -832,6 +846,9 @@ async def anthropic_sse_from_openai_stream(
             "usage": delta_usage,
         })
         yield _sse("message_stop", {"type": "message_stop"})
+    except (asyncio.CancelledError, GeneratorExit):
+        aborted_reason = "client"
+        raise
     finally:
         # ordem importa: cancelar a leitura ANTES de fechar o upstream, senão o
         # aclose disputa com um __anext__ ainda em voo
@@ -845,7 +862,9 @@ async def anthropic_sse_from_openai_stream(
             await upstream.aclose()
         except Exception:
             pass
-        if on_done and retried is not None:
+        if on_done and aborted_reason == "client":
+            on_done(usage, 499)
+        elif on_done and retried is not None:
             # o turno foi concluído pelo retry sem thinking: são o usage e o
             # status dele que valem (o primeiro stream não entregou nada)
             on_done(retried.get("usage"), retried.get("status", 502))
@@ -862,4 +881,5 @@ async def anthropic_sse_from_openai_stream(
                 status_logico = 502
             else:
                 status_logico = getattr(upstream, "status_code", 200)
+            status_logico = completion.status(status_logico, exhausted)
             on_done(usage, status_logico)

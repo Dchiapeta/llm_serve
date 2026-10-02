@@ -109,6 +109,7 @@ from recovery import (
 )
 from usage_class import classify_stack
 from usage_norm import SseUsageScanner, normalize_usage, usage_from_event
+import product_analytics
 from routing import RoutingStore
 from runpod_api import RunPodClient
 from reasoning_filter import (
@@ -934,6 +935,7 @@ async def lifespan(app: FastAPI):
         image_retention.image_retention_loop(supa, IMAGE_RETENTION_INTERVAL_S)
     )
     decisions_task = asyncio.create_task(decisions.decisions_retention_loop(supa))
+    analytics_task = asyncio.create_task(product_analytics.export_loop(supa))
     yield
     reaper_task.cancel()
     machine_task.cancel()
@@ -943,6 +945,11 @@ async def lifespan(app: FastAPI):
     billing_task.cancel()
     image_retention_task.cancel()
     decisions_task.cancel()
+    analytics_task.cancel()
+    try:
+        await analytics_task
+    except asyncio.CancelledError:
+        pass
     await proxy_client.aclose()
     await document_client.aclose()
     await openai_client.aclose()
@@ -4669,9 +4676,13 @@ async def openrouter_forward(
         finally:
             await upstream.aclose()
         usage, cost = openrouter.usage_and_cost(raw)
+        invalid_body = False
         try:
-            failure = openrouter.error_of(json.loads(raw))
+            payload = json.loads(raw)
+            invalid_body = not isinstance(payload, dict)
+            failure = openrouter.error_of(payload) if not invalid_body else None
         except Exception:
+            invalid_body = True
             failure = None
         if failure:
             # 200 com só `error` no corpo: erro depois de a request ser aceita
@@ -4680,7 +4691,7 @@ async def openrouter_forward(
             )
             return _openrouter_error(502, failure, anthropic=anthropic)
         log_gateway_request(
-            **log_ctx, status_code=upstream.status_code, stream=False,
+            **log_ctx, status_code=502 if invalid_body else upstream.status_code, stream=False,
             usage=usage, cost_usd=cost,
         )
         return Response(
@@ -4704,15 +4715,24 @@ async def openrouter_forward(
 
     async def relay():
         status_code = upstream.status_code
+        completion = product_analytics.StreamCompletion()
+        exhausted = False
         try:
             async for chunk in chunks:
+                completion.feed(chunk)
                 scanner.feed(chunk)  # cru: é daqui que sai o custo do log
                 out = stripper.feed(chunk)
                 if out:
                     yield out
+                if completion.terminal:
+                    break
+            exhausted = True
             tail = stripper.flush()
             if tail:
                 yield tail
+        except (asyncio.CancelledError, GeneratorExit):
+            status_code = 499
+            raise
         except UpstreamStreamTimeout as e:
             status_code = 504
             yield openrouter.stream_error_frame(
@@ -4728,6 +4748,7 @@ async def openrouter_forward(
             )
         finally:
             usage, cost = scanner.finish()
+            status_code = completion.status(status_code, exhausted)
             if scanner.error and status_code < 400:
                 logger.warning("openrouter: erro no meio do stream em %s: %s", label, scanner.error)
                 status_code = 502
@@ -5377,6 +5398,13 @@ def log_gateway_request(
         row["upstream"] = upstream
     if cost_usd is not None:
         row["cost_usd"] = cost_usd
+    if product_analytics.enabled():
+        purpose = trigger_snapshot("analytics").get("purpose")
+        row["analytics_origin"] = purpose if purpose in {"customer", "playground"} else "unknown"
+        row["analytics_outcome"] = (
+            "aborted" if status_code == 499 else
+            "completed" if 200 <= status_code < 300 else "error"
+        )
     spawn_tracked(_write_gateway_request(row))
 
 
@@ -5405,7 +5433,29 @@ async def _write_gateway_request(row: dict) -> None:
     try:
         await supa.insert_gateway_request(row)
     except httpx.HTTPError as e:
-        logger.warning("gateway_requests: falha ao gravar log (%s)", e)
+        missing_column = False
+        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 400:
+            try:
+                detail = e.response.json()
+                missing_column = detail.get("code") == "PGRST204" and any(
+                    field in str(detail.get("message", ""))
+                    for field in ("analytics_origin", "analytics_outcome")
+                )
+            except (ValueError, AttributeError):
+                pass
+        if "analytics_outcome" in row and missing_column:
+            # Schema sem as colunas da migration: preservar o ledger sem
+            # campos opcionais. Timeout/5xx não admite retry desse INSERT.
+            try:
+                await supa.insert_gateway_request({
+                    key: value for key, value in row.items()
+                    if key not in {"analytics_origin", "analytics_outcome"}
+                })
+                logger.warning("gateway analytics unavailable; request ledger preserved")
+                return
+            except httpx.HTTPError:
+                pass
+        logger.warning("gateway_requests: falha ao gravar log (%s)", type(e).__name__)
 
 
 def machine_capacity(machine: dict) -> int:
@@ -7293,6 +7343,8 @@ async def _proxy(
             try:
                 payload = json.loads(raw)
                 usage = payload.get("usage")
+                if payload.get("error") and status_logico < 400:
+                    status_logico = 502
                 payload, resposta_vazia = clean_completion_payload(
                     payload,
                     status_code=upstream.status_code,
@@ -7302,7 +7354,10 @@ async def _proxy(
                     status_logico = 502
                 raw = json.dumps(payload).encode()
             except Exception:
-                pass  # resposta não é o JSON de chat completion esperado -> repassa como veio
+                # Mantém a resposta recebida; só o ledger registra que o corpo
+                # não é o JSON de completion esperado, sem contar conclusão.
+                if status_logico < 400:
+                    status_logico = 502
         finally:
             await upstream.aclose()
             release_flight(flight_key)
@@ -7350,6 +7405,8 @@ async def _proxy(
         # carrega "usage" (o chunk final do chat, o evento response.completed
         # do Responses) — os deltas de conteúdo nunca chegam a ser parseados.
         scanner = SseUsageScanner()
+        completion = product_analytics.StreamCompletion()
+        exhausted = False
         usage = None
         status_code = upstream.status_code
         try:
@@ -7363,11 +7420,19 @@ async def _proxy(
                 idle_s=CHAT_STREAM_IDLE_TIMEOUT_S if is_stream_request else 0,
                 log_label=str(flight_key),
             ):
+                if is_stream_request:
+                    completion.feed(chunk)
                 yield chunk
                 if collect_full:
                     full += chunk
                     continue
                 scanner.feed(chunk)
+                if completion.terminal:
+                    break
+            exhausted = True
+        except (asyncio.CancelledError, GeneratorExit):
+            status_code = 499
+            raise
         except UpstreamStreamTimeout as e:
             # mesmo raciocínio do filtered_reasoning_stream: o 200 já foi junto
             # com o cabeçalho, então o erro só cabe no corpo — e o log tem que
@@ -7411,11 +7476,18 @@ async def _proxy(
         finally:
             if collect_full:
                 try:
-                    usage = usage_from_event(json.loads(full)) if full else None
+                    payload = json.loads(full) if full else None
+                    usage = usage_from_event(payload)
+                    if not isinstance(payload, dict) or payload.get("error"):
+                        if status_code < 400:
+                            status_code = 502
                 except Exception:
                     usage = None
+                    if status_code < 400:
+                        status_code = 502
             else:
                 usage = scanner.finish()
+                status_code = completion.status(status_code, exhausted)
             await upstream.aclose()
             release_flight(flight_key)
             log_gateway_request(

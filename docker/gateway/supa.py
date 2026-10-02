@@ -578,6 +578,23 @@ class SupaClient:
         r = await self._rest.post("/gateway_requests", json=row)
         r.raise_for_status()
 
+    async def prepare_gateway_analytics_exports(self) -> None:
+        r = await self._rest.post("/rpc/prepare_gateway_analytics_exports", json={})
+        r.raise_for_status()
+
+    async def claim_gateway_analytics_exports(self, monthly_limit: int, batch_size: int) -> list[dict]:
+        r = await self._rest.post("/rpc/claim_gateway_analytics_exports", json={
+            "monthly_limit": monthly_limit, "batch_size": batch_size,
+        })
+        r.raise_for_status()
+        return r.json()
+
+    async def ack_gateway_analytics_exports(self, ids: list[str]) -> None:
+        r = await self._rest.patch("/gateway_analytics_outbox", params={
+            "id": "in.(" + ",".join(ids) + ")", "sent_at": "is.null",
+        }, json={"sent_at": datetime.now(timezone.utc).isoformat(), "lease_until": None})
+        r.raise_for_status()
+
     async def insert_provision_decision(self, row: dict) -> None:
         """Uma linha por decisão do ciclo de vida (migration 0070) — concedida,
         negada ou 503 servido sem criar nada. Fire-and-forget via
