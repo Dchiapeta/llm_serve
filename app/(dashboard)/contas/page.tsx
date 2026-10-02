@@ -1,4 +1,5 @@
 import { createSupabaseAdmin } from "@/lib/supabase/server"
+import { fetchStackRequestQuotas } from "@/lib/request-quota"
 import type { Account, Machine, Stack } from "@/lib/types"
 import {
   Card,
@@ -25,6 +26,7 @@ export default async function ContasPage() {
     { data: keysData },
     { data: usageData },
     { data: imageUsageData },
+    quotaByStack,
   ] = await Promise.all([
     db.from("accounts").select("*").order("created_at", { ascending: false }),
     db
@@ -36,6 +38,7 @@ export default async function ContasPage() {
     // image_usage_rollup (migration 0067) já vem com account_id direto — sem
     // a indirection por chave que usage_metrics precisa aqui embaixo.
     db.from("image_usage_rollup").select("account_id, images"),
+    fetchStackRequestQuotas(db),
   ])
 
   const accounts = (accountsData ?? []) as Account[]
@@ -71,6 +74,7 @@ export default async function ContasPage() {
       billingStatus: s.billing_status,
       machineName: machine?.name ?? null,
       machineStatus: machine?.status ?? null,
+      quota: quotaByStack.get(s.id) ?? null,
     })
     stacksByAccount.set(s.account_id, list)
   }

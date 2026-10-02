@@ -2045,6 +2045,28 @@ export async function updateStackSystemPrompt(formData: FormData) {
   revalidatePath("/accounts")
 }
 
+// Limite mensal de requisições da stack no lugar do padrão do plano (migration
+// 0077). null volta ao padrão. O gateway lê o limite de stack_request_quota com
+// cache de 60s, então a troca vale em até um minuto — sem flush, porque o
+// cache da cota não tem endpoint e um minuto de atraso não muda nada aqui.
+export async function setStackRequestQuota(
+  stackId: string,
+  limit: number | null
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
+    return { error: "O limite precisa ser um número inteiro maior que zero" }
+  }
+  const db = createSupabaseAdmin()
+  const { error } = await db
+    .from("stacks")
+    .update({ request_quota_override: limit })
+    .eq("id", stackId)
+  if (error) return { error: error.message }
+  revalidatePath("/contas")
+  revalidatePath("/stacks")
+}
+
 // Gera uma chave HEX para uma conta numa máquina.
 // Retorna a chave em texto puro UMA única vez.
 export async function createKey(input: {

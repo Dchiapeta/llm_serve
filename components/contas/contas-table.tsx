@@ -9,7 +9,12 @@ import { cn } from "@/lib/utils"
 import { type Account, type ApiKey, type Machine, type RoutingState, type Stack } from "@/lib/types"
 import { BILLING_BADGE, graceRemaining } from "@/lib/billing-status"
 import { PLAN_BADGE_VARIANT } from "@/lib/plan-badge"
-import { formatCycleDate, quotaRatio, type RequestQuota } from "@/lib/request-quota"
+import {
+  QUOTA_WARNING_RATIO,
+  formatCycleDate,
+  quotaRatio,
+  type RequestQuota,
+} from "@/lib/request-quota"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -339,10 +344,6 @@ export function ContasTable({
     </div>
   )
 }
-
-// A partir daqui o uso aparece em destaque — mesma faixa de aviso do painel
-// do cliente, para os dois lados enxergarem "perto do fim" no mesmo ponto.
-const QUOTA_WARNING_RATIO = 0.8
 
 function QuotaCell({ quota }: { quota: RequestQuota | null }) {
   if (!quota) return <span className="text-sm text-muted-foreground">—</span>

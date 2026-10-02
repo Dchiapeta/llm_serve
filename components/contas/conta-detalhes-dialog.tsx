@@ -4,8 +4,17 @@ import { Info } from "lucide-react"
 
 import { BILLING_BADGE } from "@/lib/billing-status"
 import { PLAN_BADGE_VARIANT } from "@/lib/plan-badge"
+import {
+  QUOTA_WARNING_RATIO,
+  formatCycleDate,
+  quotaIsCustom,
+  quotaRatio,
+  type RequestQuota,
+} from "@/lib/request-quota"
+import { cn } from "@/lib/utils"
 import { Badge } from "@/components/reui/badge"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
+import { EditRequestQuotaPopover } from "@/components/contas/edit-request-quota-popover"
 import type { UsuarioRow } from "@/components/contas/usuarios-table"
 
 // Info da conta vista de /contas. Arquivo separado do conta-info-dialog.tsx:
@@ -83,29 +92,35 @@ export function ContaDetalhesDialog({
             {conta.stackList.map((stack) => {
               const billing = BILLING_BADGE[stack.billingStatus]
               return (
-                <div
-                  key={stack.id}
-                  className="flex items-start justify-between gap-2 text-sm"
-                >
-                  <div className="min-w-0">
-                    <p className="truncate font-medium">{stack.name}</p>
-                    <code className="text-muted-foreground block truncate font-mono text-xs">
-                      {stack.slug}
-                    </code>
-                    <p className="text-muted-foreground text-xs">
-                      {stack.machineName ?? "Desativada"}
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 flex-col items-end gap-1">
-                    <Badge variant={PLAN_BADGE_VARIANT[stack.plan]} size="sm">
-                      {stack.plan} · {stack.category === "image" ? "Imagem" : "LLM"}
-                    </Badge>
-                    {billing && (
-                      <Badge variant={billing.variant} size="sm">
-                        {billing.label}
+                <div key={stack.id} className="space-y-1.5 text-sm">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="truncate font-medium">{stack.name}</p>
+                      <code className="text-muted-foreground block truncate font-mono text-xs">
+                        {stack.slug}
+                      </code>
+                      <p className="text-muted-foreground text-xs">
+                        {stack.machineName ?? "Desativada"}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 flex-col items-end gap-1">
+                      <Badge variant={PLAN_BADGE_VARIANT[stack.plan]} size="sm">
+                        {stack.plan} · {stack.category === "image" ? "Imagem" : "LLM"}
                       </Badge>
-                    )}
+                      {billing && (
+                        <Badge variant={billing.variant} size="sm">
+                          {billing.label}
+                        </Badge>
+                      )}
+                    </div>
                   </div>
+                  {stack.quota && (
+                    <QuotaUsage
+                      stackId={stack.id}
+                      stackName={stack.name}
+                      quota={stack.quota}
+                    />
+                  )}
                 </div>
               )
             })}
@@ -113,5 +128,59 @@ export function ContaDetalhesDialog({
         </div>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// A cota é por stack (migration 0076), não por conta: cada stack tem o próprio
+// ciclo ancorado na sua purchase_date, então somar entre stacks não daria um
+// número com significado.
+function QuotaUsage({
+  stackId,
+  stackName,
+  quota,
+}: {
+  stackId: string
+  stackName: string
+  quota: RequestQuota
+}) {
+  const ratio = quotaRatio(quota)
+  const { defaultLimit } = quota
+  return (
+    <div
+      className="bg-muted/50 flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-xs"
+      title={`Ciclo ${formatCycleDate(quota.cycleStart)} – ${formatCycleDate(quota.cycleEnd)}`}
+    >
+      <span>
+        <span
+          className={cn(
+            "font-medium tabular-nums",
+            ratio >= 1
+              ? "text-destructive"
+              : ratio >= QUOTA_WARNING_RATIO
+                ? "text-amber-700 dark:text-amber-300"
+                : "text-foreground"
+          )}
+        >
+          {quota.used.toLocaleString("pt-BR")}
+        </span>
+        <span className="text-muted-foreground">
+          {" "}
+          de {quota.limit.toLocaleString("pt-BR")} requisições
+          {quotaIsCustom(quota) && " (personalizado)"}
+        </span>
+      </span>
+      <span className="flex items-center gap-1">
+        <span className="text-muted-foreground whitespace-nowrap">
+          renova {formatCycleDate(quota.cycleEnd)}
+        </span>
+        {defaultLimit !== null && (
+          <EditRequestQuotaPopover
+            stackId={stackId}
+            stackName={stackName}
+            quota={{ ...quota, defaultLimit }}
+          />
+        )}
+      </span>
+    </div>
   )
 }

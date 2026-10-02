@@ -14,6 +14,9 @@ export type RequestQuota = {
   used: number
   cycleStart: string
   cycleEnd: string
+  /** Limite do plano, sem o override da stack (0077). null = função ainda na
+   *  versão da 0076, que não informa o padrão — o painel esconde a edição. */
+  defaultLimit: number | null
 }
 
 type QuotaRow = {
@@ -22,6 +25,7 @@ type QuotaRow = {
   used: number | string
   cycle_start: string
   cycle_end: string
+  quota_default?: number | null
 }
 
 /**
@@ -48,6 +52,8 @@ export async function fetchStackRequestQuotas(
       used: Number(row.used),
       cycleStart: row.cycle_start,
       cycleEnd: row.cycle_end,
+      defaultLimit:
+        row.quota_default == null ? null : Number(row.quota_default),
     })
   }
   return quotas
@@ -60,6 +66,15 @@ export async function fetchStackRequestQuotas(
  */
 export function formatCycleDate(iso: string): string {
   return new Date(iso).toLocaleDateString("pt-BR", { timeZone: "UTC" })
+}
+
+// A partir daqui o uso aparece em destaque — mesma faixa de aviso do painel
+// do cliente, para os dois lados enxergarem "perto do fim" no mesmo ponto.
+export const QUOTA_WARNING_RATIO = 0.8
+
+/** Limite trocado na stack (stacks.request_quota_override), não o do plano. */
+export function quotaIsCustom(quota: RequestQuota): boolean {
+  return quota.defaultLimit !== null && quota.limit !== quota.defaultLimit
 }
 
 export function quotaRatio(quota: RequestQuota): number {

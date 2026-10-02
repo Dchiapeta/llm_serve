@@ -195,6 +195,9 @@ export type Stack = {
   name: string
   // Override de system prompt da stack; null = sem override.
   system_prompt: string | null
+  // Limite mensal de requisições no lugar do padrão do plano (migration
+  // 0077); null = padrão. Lido via stack_request_quota, nunca direto.
+  request_quota_override?: number | null
   // Defaults de sampling aplicados pelo gateway quando o cliente não manda o
   // parâmetro na requisição (temperature/top_p: migration 0035;
   // max_tokens/presence_penalty: migration 0056). Null = passthrough puro,

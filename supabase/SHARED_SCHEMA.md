@@ -113,6 +113,12 @@ RLS de `stacks`/`gateway_requests`/`api_keys` que já existe lá, sem grant
 novo. `purchase_date` é definida na criação da stack pelo manager e é o que
 ancora o ciclo.
 
+`stacks.request_quota_override` (`0077`) troca o limite de uma stack
+específica (NULL = padrão do plano, inteiro > 0 = limite da stack), editado
+pelo manager. É aplicado dentro de `stack_request_quota`, que passa a devolver
+também `quota_default` (o limite do plano sem o override) — quem lê a função
+já recebe o limite efetivo e não deve ler a coluna direto.
+
 ## Convenção usada pelo TryStac (pra não colidir nomes/policies)
 
 - Grants de UPDATE são sempre **por coluna** (`grant update (col) on table to authenticated`), nunca a tabela inteira — o resto das colunas (`plan`, `machine_id`, `account_id`, `usage_class`, etc.) continua sem grant nenhum pra `authenticated`.
