@@ -25,12 +25,14 @@ Ou a resposta entrega conteúdo, ou sai UM erro dizendo por quê — nunca os do
 nunca nenhum, e nunca o raciocínio bruto como consolo.
 """
 
+import asyncio
 import json
 import logging
 
 import httpx
 
 from stream_watchdog import UpstreamStreamTimeout, aiter_bytes_watchdog
+from product_analytics import StreamCompletion
 
 logger = logging.getLogger("gateway.reasoning")
 
@@ -426,13 +428,19 @@ async def filtered_reasoning_stream(
     filtro = ChatReasoningFilter(thinking_esperado=thinking_esperado)
     status_code = getattr(upstream, "status_code", 200)
     erro_cliente = None
+    completion = StreamCompletion()
+    exhausted = False
     try:
         try:
             async for raw in aiter_bytes_watchdog(
                 upstream, ttft_s=ttft_s, idle_s=idle_s, log_label=log_label
             ):
+                completion.feed(raw)
                 for saida in filtro.feed(raw):
                     yield saida
+                if completion.terminal:
+                    break
+            exhausted = True
         except UpstreamStreamTimeout as e:
             # o upstream estourou o teto sem mandar byte. NÃO é fim de stream:
             # o cliente precisa saber que falhou, senão recebe um [DONE] limpo
@@ -477,7 +485,11 @@ async def filtered_reasoning_stream(
             # gateway, o upstream devolveu resposta inaproveitável. Distingue-se
             # de queda de conexão pelo tokens_out, que neste caso vem cheio.
             status_code = 502
+    except (asyncio.CancelledError, GeneratorExit):
+        status_code = 499
+        raise
     finally:
+        status_code = completion.status(status_code, exhausted)
         await upstream.aclose()
         if on_close is not None:
             on_close(status_code, filtro.usage)
