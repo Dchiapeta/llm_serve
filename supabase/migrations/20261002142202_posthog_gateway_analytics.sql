@@ -18,10 +18,15 @@ create table public.gateway_analytics_outbox (
   sent_at timestamptz,
   lease_until timestamptz,
   budget_month date,
+  -- Linha que nunca deve ir ao PostHog: envelope inválido (não trava a fila)
+  -- ou marcador de conta que já usava a API antes do tracking (dedupe).
+  discarded_at timestamptz,
+  discard_reason text check (discard_reason in ('preexisting_usage', 'invalid_envelope')),
+  check ((discarded_at is null) = (discard_reason is null)),
   created_at timestamptz not null default now()
 );
 create index gateway_analytics_pending_idx on public.gateway_analytics_outbox (event_timestamp)
-  where sent_at is null;
+  where sent_at is null and discarded_at is null;
 create table public.gateway_analytics_state (
   singleton boolean primary key default true check (singleton),
   next_day date not null default (now() at time zone 'UTC')::date,
@@ -39,7 +44,7 @@ grant select, insert, update, delete on public.gateway_analytics_outbox, public.
 -- função privilegiada exposta ao browser. Não modifica autorização de contas.
 create function public.queue_gateway_first_inference(account_uuid uuid) returns void
 language plpgsql security invoker set search_path = '' as $$
-declare identity record; first_row public.gateway_requests;
+declare identity record; first_row public.gateway_requests; preexisting boolean;
 begin
   if exists (select 1 from public.gateway_analytics_outbox where resource_key = 'first:' || account_uuid::text)
     then return; end if;
@@ -52,6 +57,27 @@ begin
   select a.user_id, coalesce(lower(btrim(a.email)) like '%@trystac.com', false) as internal
     into identity from public.accounts a where a.id = account_uuid;
   if identity.user_id is null then return; end if;
+  -- Sucesso de cliente gravado sem os campos de analytics (antes da migration
+  -- ou com a integração desligada) = a conta já tinha usado a API. Grava só o
+  -- marcador descartado: dedupe sem enviar um falso "primeiro uso". Roda uma
+  -- vez por conta; daí em diante o resource_key acima encerra cedo.
+  select exists (
+    select 1 from public.gateway_requests r
+      left join public.api_keys k on k.id = r.api_key_id
+    where r.account_id = account_uuid and r.analytics_origin is null
+      and r.status_code between 200 and 299
+      and coalesce(k.purpose, 'customer') = 'customer'
+      and r.path in ('chat/completions','completions','responses','messages','embeddings',
+        'documents/extract','images/extract','images/generations','images/edits')
+  ) into preexisting;
+  if preexisting then
+    insert into public.gateway_analytics_outbox
+      (resource_key, event, distinct_id, event_timestamp, properties, discarded_at, discard_reason)
+    values ('first:' || account_uuid::text, 'first_inference_completed', identity.user_id,
+      first_row.created_at, jsonb_build_object('account_id', account_uuid), now(), 'preexisting_usage')
+    on conflict (resource_key) do nothing;
+    return;
+  end if;
   insert into public.gateway_analytics_outbox (resource_key, event, distinct_id, event_timestamp, properties)
   values (
     'first:' || account_uuid::text, 'first_inference_completed', identity.user_id, first_row.created_at,
@@ -168,7 +194,7 @@ begin
     state.budget_month := month; state.reserved_events := 0;
   end if;
   for item in select * from public.gateway_analytics_outbox
-    where sent_at is null and (lease_until is null or lease_until < now())
+    where sent_at is null and discarded_at is null and (lease_until is null or lease_until < now())
     order by case when event = 'first_inference_completed' then 0 else 1 end, event_timestamp, id
     for update skip locked limit 500
   loop

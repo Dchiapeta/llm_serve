@@ -192,14 +192,27 @@ async def export_once(supa, client, env=None) -> int:
     rows = await supa.claim_gateway_analytics_exports(limit, batch_size=100)
     if not rows:
         return 0
-    batch = [capture_event(row) for row in rows]
+    batch, sent_ids, invalid_ids = [], [], []
+    for row in rows:
+        try:
+            batch.append(capture_event(row))
+            sent_ids.append(row["id"])
+        except Exception:
+            # Uma linha inválida não pode reprovar o lote inteiro para sempre:
+            # sai da fila antes do POST e fica no banco para inspeção.
+            invalid_ids.append(row.get("id"))
+    if invalid_ids:
+        await supa.discard_gateway_analytics_exports([_uuid(i) for i in invalid_ids if _uuid(i)])
+        logger.warning("analytics export discarded %d invalid envelope(s)", len(invalid_ids))
+    if not batch:
+        return len(rows)
     host = "https://eu.i.posthog.com" if env.get("POSTHOG_REGION") == "eu" else "https://us.i.posthog.com"
     response = await client.post(
         host + "/batch/",
         json={"api_key": env["POSTHOG_PROJECT_TOKEN"], "batch": batch},
     )
     response.raise_for_status()
-    await supa.ack_gateway_analytics_exports([row["id"] for row in rows])
+    await supa.ack_gateway_analytics_exports(sent_ids)
     return len(rows)
 
 
@@ -210,9 +223,13 @@ async def export_loop(supa):
         while True:
             try:
                 sent = await export_once(supa, client)
-            except (httpx.HTTPError, ValueError, KeyError):
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
                 # Exceções de rede podem carregar URLs/headers/payloads:
-                # registrar só a categoria, nunca o objeto da exceção.
-                logger.warning("analytics export failed; persisted batch will retry")
+                # registrar só a categoria, nunca o objeto da exceção. Qualquer
+                # erro inesperado também não pode matar o loop em silêncio.
+                logger.warning("analytics export failed (%s); persisted batch will retry",
+                    type(e).__name__)
                 sent = 0
             await asyncio.sleep(1 if sent else 60)

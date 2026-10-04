@@ -4,6 +4,7 @@ import json
 import httpx
 import pytest
 
+import product_analytics
 from product_analytics import StreamCompletion, capture_event, enabled, export_once
 from reasoning_filter import filtered_reasoning_stream
 from anthropic_compat import anthropic_sse_from_openai_stream
@@ -260,6 +261,9 @@ class FakeSupa:
     async def ack_gateway_analytics_exports(self, ids):
         self.acked.extend(ids)
 
+    async def discard_gateway_analytics_exports(self, ids):
+        self.discarded = getattr(self, "discarded", []) + ids
+
 
 def test_failed_delivery_retries_identical_envelope_and_only_acks_success():
     supa = FakeSupa()
@@ -281,3 +285,71 @@ def test_failed_delivery_retries_identical_envelope_and_only_acks_success():
     assert sent[0] == sent[1]
     assert supa.prepared == 2
     assert supa.acked == [EVENT_ID]
+
+
+BAD_ID = "44444444-4444-4444-8444-444444444444"
+
+
+@pytest.mark.parametrize("breakage", [
+    {"event_timestamp": "2026-10-01T12:34:56"}, {"event_timestamp": None},
+    {"properties": "not-an-object"}, {"properties": {}},
+])
+def test_invalid_row_is_discarded_without_blocking_the_rest_of_the_batch(breakage):
+    class Mixed(FakeSupa):
+        async def claim_gateway_analytics_exports(self, limit, batch_size):
+            return [{**row(), "id": BAD_ID, **breakage}, row()]
+
+    supa = Mixed()
+    sent = []
+
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"status": 1})
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            assert await export_once(supa, client, ENV) == 2
+
+    asyncio.run(go())
+    assert supa.discarded == [BAD_ID]
+    assert [event["uuid"] for event in sent[0]["batch"]] == [EVENT_ID]
+    assert supa.acked == [EVENT_ID]
+
+
+def test_batch_with_only_invalid_rows_discards_without_network():
+    class AllBad(FakeSupa):
+        async def claim_gateway_analytics_exports(self, limit, batch_size):
+            return [{**row(), "event_timestamp": None}]
+
+    supa = AllBad()
+
+    def handler(request):
+        raise AssertionError("nothing valid to send")
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            assert await export_once(supa, client, ENV) == 1
+
+    asyncio.run(go())
+    assert supa.discarded == [EVENT_ID] and supa.acked == []
+
+
+def test_export_loop_survives_unexpected_errors(monkeypatch):
+    calls = []
+
+    async def flaky(supa, client):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TypeError("unexpected")
+        raise asyncio.CancelledError
+
+    async def no_sleep(_):
+        pass
+
+    monkeypatch.setenv("POSTHOG_GATEWAY_ENVIRONMENT", "production")
+    monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", "test-token")
+    monkeypatch.setattr(product_analytics, "export_once", flaky)
+    monkeypatch.setattr(product_analytics.asyncio, "sleep", no_sleep)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(product_analytics.export_loop(object()))
+    assert len(calls) == 2

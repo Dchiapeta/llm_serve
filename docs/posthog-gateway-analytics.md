@@ -23,8 +23,24 @@ um evento por chamada. Não muda a cobrança ou o provisionamento da Stac.
 
 O desligamento exige só `POSTHOG_GATEWAY_ENVIRONMENT=disabled`. O exportador não
 consulta a outbox nem usa a rede enquanto desligado; novas linhas do ledger
-ficam sem os campos opcionais de analytics. As correções de classificação de
-stream incompleto/abortado continuam preservando o status lógico do ledger.
+ficam sem os campos opcionais de analytics.
+
+**Mudança no `status_code` do ledger, independente da flag.** Este PR também
+corrige a classificação gravada em `gateway_requests.status_code`, com a
+integração ligada ou não:
+
+- desconexão do cliente no meio do stream passa a gravar **499** (antes, o
+  status do upstream, normalmente 200);
+- stream que termina sem marcador terminal (`[DONE]`, `message_stop`,
+  `response.completed`) ou com frame de erro passa a gravar **502**;
+- resposta não-stream com HTTP 200 cujo corpo não é o JSON esperado, ou traz
+  `error`, passa a gravar **502**. A resposta ao cliente não muda.
+
+Quem lê esse campo hoje: a página interna "Requisições" (badge e filtro
+ok/erro), que vai mostrar mais 499/502 após o deploy, e o trigger de
+`usage_metrics` do OpenRouter, que só exclui 401/402/503 e não é afetado. Um
+upstream que transmita sem marcador terminal passaria a aparecer como 502:
+vLLM e OpenRouter enviam os marcadores nos caminhos cobertos.
 
 ## Contrato dos eventos
 
@@ -36,9 +52,12 @@ A mesma classificação é enviada por `$set` à pessoa, para o filtro de equipe
 O modelo vem do catálogo/máquina efetiva do gateway; um alias inválido vira
 `unknown`, sem aceitar uma string arbitrária do corpo do cliente.
 
-- `first_inference_completed`: primeiro sucesso de API de cliente observado
-  após ativar esta integração, uma vez por conta. Não representa o primeiro uso
-  histórico da vida da conta. Usa o horário durável da linha do ledger e inclui
+- `first_inference_completed`: primeiro sucesso de API de cliente de uma conta
+  **sem uso anterior**, uma vez por conta. Se o ledger já tem um sucesso de
+  cliente gravado sem os campos de analytics (antes da migration ou com a
+  integração desligada; chaves de Playground não contam), a conta recebe só um
+  marcador descartado (`discard_reason = 'preexisting_usage'`) e nenhum evento é
+  enviado. Contas antigas, portanto, nunca aparecem como ativação nova. Usa o horário durável da linha do ledger e inclui
   modelo, caminho, stack e tokens/duração quando conhecidos. Streaming exige
   marcador terminal válido, frame SSE completo e ausência de cancelamento,
   timeout ou erro; EOF sem o marcador não é sucesso.
@@ -82,7 +101,11 @@ lotes de até 100, lease de cinco minutos, retry sem reservar outra unidade no
 mesmo mês e ack somente após HTTP 2xx. Um ack perdido pode reenviar o mesmo
 envelope, que mantém todos os campos exigidos pela deduplicação do PostHog.
 Isso não promete entrega exactly-once. Backlog sem orçamento retoma no mês
-seguinte; falhas de entrega ficam persistidas.
+seguinte; falhas de entrega ficam persistidas. Uma linha que não passa na
+validação antes da rede é marcada com `discard_reason = 'invalid_envelope'` e
+sai da fila sem bloquear o resto do lote; ela continua no banco para inspeção
+(`select * from gateway_analytics_outbox where discarded_at is not null`).
+Linhas descartadas nunca são reservadas nem enviadas.
 
 O checkpoint do resumo avança na mesma transação da outbox. Uma falha no trigger
 de analytics não desfaz a linha do ledger de negócio; o processamento recupera

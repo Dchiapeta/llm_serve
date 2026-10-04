@@ -595,6 +595,17 @@ class SupaClient:
         }, json={"sent_at": datetime.now(timezone.utc).isoformat(), "lease_until": None})
         r.raise_for_status()
 
+    async def discard_gateway_analytics_exports(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        r = await self._rest.patch("/gateway_analytics_outbox", params={
+            "id": "in.(" + ",".join(ids) + ")", "sent_at": "is.null",
+        }, json={
+            "discarded_at": datetime.now(timezone.utc).isoformat(),
+            "discard_reason": "invalid_envelope", "lease_until": None,
+        })
+        r.raise_for_status()
+
     async def insert_provision_decision(self, row: dict) -> None:
         """Uma linha por decisão do ciclo de vida (migration 0070) — concedida,
         negada ou 503 servido sem criar nada. Fire-and-forget via

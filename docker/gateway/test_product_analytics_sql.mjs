@@ -7,11 +7,12 @@ const db = new PGlite();
 await db.exec(`
   create role anon; create role authenticated; create role service_role bypassrls;
   create table accounts (id uuid primary key, user_id uuid, email text);
+  create table api_keys (id uuid primary key, purpose text not null default 'customer');
   create table gateway_requests (id uuid primary key default gen_random_uuid(), account_id uuid,
-    stack_id uuid, path text, model text, status_code integer, stream boolean default false,
+    stack_id uuid, api_key_id uuid, path text, model text, status_code integer, stream boolean default false,
     tokens_in integer, tokens_out integer, duration_ms integer, cost_usd numeric,
     created_at timestamptz default now());
-  grant select, insert on accounts, gateway_requests to service_role;
+  grant select, insert on accounts, api_keys, gateway_requests to service_role;
 `);
 const migration = new URL('../../supabase/migrations/20261002142202_posthog_gateway_analytics.sql', import.meta.url);
 await db.exec(await fs.readFile(migration, 'utf8'));
@@ -121,7 +122,39 @@ assert.equal((await db.query("select count(*)::int as n from gateway_analytics_o
 assert.equal((await db.query("select count(*)::int as n from gateway_analytics_outbox where resource_key='daily:retention-unsent'")).rows[0].n,1);
 assert.equal((await db.query('select count(*)::int as n from gateway_analytics_outbox where id=$1',[first[0].id])).rows[0].n,1);
 assert.deepEqual((await db.query('select next_day from gateway_analytics_state')).rows[0].next_day,checkpoint);
+// Conta que já usava a API antes do tracking: só um marcador descartado,
+// nunca um falso primeiro uso, e o marcador nunca é reservado/enviado.
+const oldAccount = '66666666-6666-4666-8666-666666666666';
+const playAccount = '77777777-7777-4777-8777-777777777777';
+const playKey = '88888888-8888-4888-8888-888888888888';
+await db.query('insert into accounts values ($1,$2,$3),($4,$5,$6)', [oldAccount, user, 'old@example.test',
+  playAccount, recoveryUser, 'play@example.test']);
+await db.query("insert into api_keys values ($1,'playground')", [playKey]);
+await db.query(`insert into gateway_requests (account_id,api_key_id,path,model,status_code,created_at) values
+  ($1,null,'chat/completions','qwen3.5',200,now()-interval '30 days'),
+  ($2,$3,'chat/completions','qwen3.5',200,now()-interval '30 days'),
+  ($2,null,'models',null,200,now()-interval '30 days')`, [oldAccount, playAccount, playKey]);
+for (const acc of [oldAccount, playAccount]) {
+  await db.exec('set role service_role');
+  await db.query(`insert into gateway_requests (account_id,path,model,status_code,analytics_origin,analytics_outcome)
+    values ($1,'chat/completions','qwen3.5',200,'customer','completed')`, [acc]);
+  await db.exec('reset role');
+}
+const oldMarker = (await db.query('select * from gateway_analytics_outbox where resource_key=$1', ['first:'+oldAccount])).rows;
+assert.equal(oldMarker.length, 1);
+assert.equal(oldMarker[0].discard_reason, 'preexisting_usage');
+assert.ok(oldMarker[0].discarded_at);
+const playFirst = (await db.query('select * from gateway_analytics_outbox where resource_key=$1', ['first:'+playAccount])).rows;
+assert.equal(playFirst.length, 1);
+assert.equal(playFirst[0].discarded_at, null, 'histórico só de Playground/listagem não é uso de cliente');
+// Envelope inválido descartado pelo exportador sai da fila.
+await db.query("update gateway_analytics_outbox set discarded_at=now(), discard_reason='invalid_envelope' where id=$1", [playFirst[0].id]);
+await db.exec("update gateway_analytics_state set reserved_events=0");
+const drained = (await db.query('select * from claim_gateway_analytics_exports(200000,100)')).rows.map((r) => r.id);
+assert.ok(!drained.includes(oldMarker[0].id) && !drained.includes(playFirst[0].id), 'descartados nunca são reservados');
+await assert.rejects(db.query("update gateway_analytics_outbox set discarded_at=now() where id=$1", [first[0].id]), /check/);
+
 await db.exec("update gateway_analytics_state set budget_month=date_trunc('month',now() at time zone 'UTC')::date,reserved_events=200000");
 assert.equal((await db.query('select * from claim_gateway_analytics_exports(2147483647,100)')).rows.length,0,'cap de 200k não aceita override maior');
-console.log('PostgreSQL: first-use, privacy, closed windows, checkpoint rollback, stable retry, leases, monthly budget/cap, fail-open recovery, retention and service-only permissions passed');
+console.log('PostgreSQL: first-use, privacy, closed windows, checkpoint rollback, stable retry, leases, monthly budget/cap, fail-open recovery, retention, preexisting-usage suppression, discarded rows and service-only permissions passed');
 await db.close();
