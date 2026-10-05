@@ -75,6 +75,9 @@ type Phase = "form" | "confirm" | "done"
 // Sentinela do select de destino: provisiona uma máquina nova em vez de usar
 // uma existente (Radix Select não aceita item com value vazio).
 const NEW_MACHINE = "__new__"
+// Sentinela: cria a stack sem máquina — o gateway a aloca na primeira
+// requisição (place_base_stack), como as stacks criadas pelo checkout.
+const NO_MACHINE = "__none__"
 
 // Capacidade de uma máquina segundo o template dela (mesma conta do painel
 // de máquinas).
@@ -95,6 +98,7 @@ type StackResult = {
   slug: string
   machineId: string | null
   machineCreated: boolean
+  machineSkipped: boolean
 }
 
 export function CreateStackDialog({
@@ -188,7 +192,7 @@ export function CreateStackDialog({
       toast.error(`Nenhum produto ${plan} cadastrado`)
       return
     }
-    setMachineId(eligible[0]?.id ?? "")
+    setMachineId(eligible[0]?.id ?? NEW_MACHINE)
     setPhase("confirm")
   }
 
@@ -236,7 +240,9 @@ export function CreateStackDialog({
               {result.machineCreated &&
                 " A máquina está subindo — fica pronta em ~1 min."}
               {!result.machineId &&
-                " Sem máquina: as máquinas estão desligadas, e ela é alocada na primeira requisição depois de religadas."}
+                (result.machineSkipped
+                  ? " Sem máquina: ela é alocada na primeira requisição."
+                  : " Sem máquina: as máquinas estão desligadas, e ela é alocada na primeira requisição depois de religadas.")}
             </p>
             <Button onClick={() => setOpen(false)}>Concluir</Button>
           </div>
@@ -386,56 +392,51 @@ export function CreateStackDialog({
 
             {phase === "confirm" && (
               <div className="flex flex-col gap-4">
-                {eligible.length > 0 ? (
-                  <div className="flex flex-col gap-2">
-                    <div className="flex items-center justify-between">
-                      <Label>Máquina de destino</Label>
-                      <MachineSlotsDialog
-                        machines={machines}
-                        templates={templates}
-                        currentTemplateId={template?.id}
-                      />
-                    </div>
-                    <Select value={machineId} onValueChange={setMachineId}>
-                      <SelectTrigger className="w-fit max-w-full self-start">
-                        <SelectValue placeholder="Escolha a máquina" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {eligible.map((m) => (
-                          <SelectItem key={m.id} value={m.id}>
-                            {m.name} — {m.model_name}
-                            {slotsLabel(m)}
-                          </SelectItem>
-                        ))}
-                        <SelectSeparator />
-                        <SelectItem value={NEW_MACHINE}>
-                          <Plus className="size-4" /> Criar nova máquina
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs text-muted-foreground">
-                      {machineId === NEW_MACHINE
-                        ? `Uma máquina nova será provisionada com o produto ${template?.name ?? "selecionado"} (~1 min).`
-                        : "Máquinas rodando com o produto selecionado e vaga livre."}
-                    </p>
-                  </div>
-                ) : (
-                  <>
-                    <Alert>
-                      <TriangleAlert />
-                      <AlertTitle>Nenhuma máquina disponível</AlertTitle>
-                      <AlertDescription>
-                        Será criada uma nova máquina com o produto{" "}
-                        {template?.name ?? "selecionado"}.
-                      </AlertDescription>
-                    </Alert>
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <Label>Máquina de destino</Label>
                     <MachineSlotsDialog
                       machines={machines}
                       templates={templates}
                       currentTemplateId={template?.id}
                     />
-                  </>
-                )}
+                  </div>
+                  {eligible.length === 0 && (
+                    <Alert>
+                      <TriangleAlert />
+                      <AlertTitle>Nenhuma máquina disponível</AlertTitle>
+                      <AlertDescription>
+                        Nenhuma máquina rodando com o produto{" "}
+                        {template?.name ?? "selecionado"} tem vaga livre.
+                      </AlertDescription>
+                    </Alert>
+                  )}
+                  <Select value={machineId} onValueChange={setMachineId}>
+                    <SelectTrigger className="w-fit max-w-full self-start">
+                      <SelectValue placeholder="Escolha a máquina" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {eligible.map((m) => (
+                        <SelectItem key={m.id} value={m.id}>
+                          {m.name} — {m.model_name}
+                          {slotsLabel(m)}
+                        </SelectItem>
+                      ))}
+                      {eligible.length > 0 && <SelectSeparator />}
+                      <SelectItem value={NEW_MACHINE}>
+                        <Plus className="size-4" /> Criar nova máquina
+                      </SelectItem>
+                      <SelectItem value={NO_MACHINE}>Sem máquina</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    {machineId === NEW_MACHINE
+                      ? `Uma máquina nova será provisionada com o produto ${template?.name ?? "selecionado"} (~1 min).`
+                      : machineId === NO_MACHINE
+                        ? "A stack nasce sem máquina e é alocada na primeira requisição."
+                        : "Máquinas rodando com o produto selecionado e vaga livre."}
+                  </p>
+                </div>
                 <div className="flex gap-2">
                   <Button
                     type="button"
@@ -449,12 +450,12 @@ export function CreateStackDialog({
                   <Button
                     type="submit"
                     className="flex-1"
-                    disabled={pending || (eligible.length > 0 && !machineId)}
+                    disabled={pending || !machineId}
                   >
                     {pending
-                      ? machineId && machineId !== NEW_MACHINE
-                        ? "Criando…"
-                        : "Criando máquina… (~1 min)"
+                      ? machineId === NEW_MACHINE
+                        ? "Criando máquina… (~1 min)"
+                        : "Criando…"
                       : "Confirmar"}
                   </Button>
                 </div>
@@ -466,13 +467,19 @@ export function CreateStackDialog({
             <input type="hidden" name="plan" value={plan} />
             <input type="hidden" name="template_id" value={templateId} />
             <input type="hidden" name="slug" value={slug} />
-            {phase === "confirm" && eligible.length > 0 && (
-              <input
-                type="hidden"
-                name="machine_id"
-                // vazio = createStack provisiona uma máquina nova
-                value={machineId === NEW_MACHINE ? "" : machineId}
-              />
+            {phase === "confirm" && (
+              <>
+                <input
+                  type="hidden"
+                  name="machine_id"
+                  // vazio = createStack provisiona uma máquina nova (ou nenhuma,
+                  // com no_machine)
+                  value={machineId === NEW_MACHINE || machineId === NO_MACHINE ? "" : machineId}
+                />
+                {machineId === NO_MACHINE && (
+                  <input type="hidden" name="no_machine" value="1" />
+                )}
+              </>
             )}
           </form>
         )}

@@ -1558,6 +1558,7 @@ export async function createStack(formData: FormData): Promise<{
   slug: string
   machineId: string | null
   machineCreated: boolean
+  machineSkipped: boolean
 }> {
   const db = createSupabaseAdmin()
   const name = String(formData.get("name") || "").trim()
@@ -1566,6 +1567,10 @@ export async function createStack(formData: FormData): Promise<{
   const purchaseDate = String(formData.get("purchase_date") || "")
   const templateId = String(formData.get("template_id") || "")
   const chosenMachineId = String(formData.get("machine_id") || "")
+  // Escolha explícita do admin de não alocar agora: a stack nasce sem casa,
+  // como a do checkout, e o gateway a aloca na primeira request
+  // (place_base_stack).
+  const skipMachine = formData.get("no_machine") === "1"
   let slug = String(formData.get("slug") || "").trim()
 
   if (!name) throw new Error("Informe o nome do cliente")
@@ -1647,14 +1652,17 @@ export async function createStack(formData: FormData): Promise<{
   // Máquinas desligadas (migration 0071): a stack nasce sem casa, como uma
   // liberada por ociosidade. O gateway a aloca na primeira request depois que
   // as máquinas forem religadas (place_base_stack) — alocar aqui ligaria GPU.
-  if (!machineId && (await getMachinesEnabled())) {
+  if (!machineId && !skipMachine && (await getMachinesEnabled())) {
     try {
       const alloc = await allocateMachineForTemplate(db, tpl)
       machineId = alloc.machineId
       machineCreated = alloc.created
     } catch (e) {
+      // Desfaz a stack: o admin vê o erro e tenta de novo, e cada tentativa
+      // deixava uma stack órfã (sem máquina e sem chave) na conta.
+      await db.from("stacks").delete().eq("id", stackId)
       const msg = e instanceof Error ? e.message : String(e)
-      throw new Error(`Stack ${slug} criada, mas falhou ao alocar máquina: ${msg}`)
+      throw new Error(`Falha ao alocar máquina; a stack não foi criada: ${msg}`)
     }
   }
 
@@ -1674,7 +1682,7 @@ export async function createStack(formData: FormData): Promise<{
   revalidatePath("/stacks")
   revalidatePath("/accounts")
   if (machineCreated) revalidatePath("/machines")
-  return { slug, machineId, machineCreated }
+  return { slug, machineId, machineCreated, machineSkipped: skipMachine }
 }
 
 // Remove uma stack do painel. A máquina que a hospeda (se houver) não é
