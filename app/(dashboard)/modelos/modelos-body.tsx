@@ -29,6 +29,12 @@ import {
   OpenRouterModelRowActions,
 } from "@/components/openrouter/openrouter-model-row-actions"
 
+const KIND_LABEL: Record<OpenRouterModel["kind"], string> = {
+  text: "Texto",
+  image: "Imagem",
+  decisions: "Decisão",
+}
+
 // Corpo da página /modelos: interruptor do repasse + allowlist. Preço e
 // contexto vêm do catálogo público do OpenRouter (cache de 1h); se ele estiver
 // fora do ar a tabela aparece sem essas colunas, nunca quebra a página.
@@ -123,8 +129,8 @@ export async function ModelosBody() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <Badge variant={m.kind === "image" ? "secondary" : "outline"}>
-                        {m.kind === "image" ? "Imagem" : "Texto"}
+                      <Badge variant={m.kind === "text" ? "outline" : "secondary"}>
+                        {KIND_LABEL[m.kind]}
                       </Badge>
                     </TableCell>
                     <TableCell>

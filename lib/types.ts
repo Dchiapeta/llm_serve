@@ -455,7 +455,8 @@ export type ProvisionDecision = {
 export type OpenRouterModel = {
   id: string
   slug: string
-  kind: "text" | "image"
+  // decisions (0078): modelos de decisão tipada (Jev), só pelo /v1/decisions
+  kind: "text" | "image" | "decisions"
   label: string | null
   enabled: boolean
   // planos (stacks.plan) com acesso ao modelo (migration 0074). Fora deles o

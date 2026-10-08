@@ -36,6 +36,10 @@ from usage_norm import normalize_usage
 
 TEXT_KIND = "text"
 IMAGE_KIND = "image"
+# Modelos de decisão tipada (Jev, da TypeSafe): não geram texto, respondem
+# perguntas (choice/noul/score) sobre um `state`. Só existem no OpenRouter e só
+# pelo POST /v1/decisions, repassado ao /api/alpha/decisions de lá.
+DECISIONS_KIND = "decisions"
 
 # /v1/<path> do catch-all que podem ir para o OpenRouter → path de lá. Os que
 # ficam de fora (embeddings) seguem só para máquina.
@@ -225,6 +229,26 @@ def prepare_anthropic_body(body: dict, slug: str, max_tokens_cap: int) -> dict:
             thinking["budget_tokens"] = max_tokens - 1
         else:
             body.pop("thinking", None)
+    return body
+
+
+def decisions_url(base_url: str) -> str:
+    """URL do Decisions a partir da base do client (…/api/v1). A API é alpha e
+    mora FORA do /v1 (/api/alpha/decisions), então não dá para usar um path
+    relativo ao base_url como nos outros repasses."""
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return f"{base}/alpha/decisions"
+
+
+def prepare_decisions_body(body: dict, slug: str) -> dict:
+    """Corpo do /v1/decisions pronto para o OpenRouter: trava o modelo e tira
+    `stream` — a API devolve um JSON só, e um `stream: true` faria o
+    openrouter_forward esperar SSE. O resto (state, questions, session_id,
+    trace, user) segue como veio; quem valida o formato é o OpenRouter."""
+    body["model"] = slug
+    body.pop("stream", None)
     return body
 
 

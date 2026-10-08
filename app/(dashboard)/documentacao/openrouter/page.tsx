@@ -14,7 +14,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 
-// Documentação do repasse ao OpenRouter (migrations 0071–0074). Existe para
+// Documentação do repasse ao OpenRouter (migrations 0071–0074 e 0078). Existe para
 // não esquecer que isto está no ar: é um arranjo TEMPORÁRIO, e a seção "Como
 // remover" é o checklist do dia em que ele sair.
 
@@ -229,6 +229,30 @@ export default function OpenRouterDocPage() {
           </li>
           <li>Qualquer outro modelo de imagem segue para a máquina de imagem, como sempre.</li>
           <li>Não existe reserva de imagem.</li>
+        </List>
+      </Section>
+
+      <Section title="Modelos de decisão (Jev)">
+        <List>
+          <li>
+            Modelos que geram <Strong>decisions</Strong> no catálogo do
+            OpenRouter (<code>typesafe/jev-1.13</code>) não respondem chat: o
+            cliente manda um <code>state</code> e <code>questions</code>{" "}
+            tipadas (<code>choice</code>, <code>noul</code>,{" "}
+            <code>score</code>) e recebe <code>answers</code> com
+            probabilidades.
+          </li>
+          <li>
+            Rota própria: <code>POST /v1/decisions</code>, repassada sem
+            tradução ao <code>/api/alpha/decisions</code> do OpenRouter (API
+            alpha; o destino muda pela env <code>OPENROUTER_DECISIONS_URL</code>{" "}
+            sem deploy de código).
+          </li>
+          <li>
+            Só OpenRouter: nenhuma máquina serve decisão, não existe reserva, e
+            modelo fora da lista do plano é 404 com os aceitos. Um modelo de
+            decisão também não atende o chat.
+          </li>
         </List>
       </Section>
 

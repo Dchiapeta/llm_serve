@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from openrouter import (  # noqa: E402
     ANTHROPIC_SSE_PING,
     CostStripper,
+    DECISIONS_KIND,
     ModelNameRewriter,
     IMAGE_KIND,
     TEXT_KIND,
@@ -25,6 +26,7 @@ from openrouter import (  # noqa: E402
     accepted_models,
     anthropic_system_text,
     data_url,
+    decisions_url,
     error_of,
     image_body,
     pick_slug,
@@ -32,6 +34,7 @@ from openrouter import (  # noqa: E402
     plan_catalog,
     plan_denial,
     prepare_anthropic_body,
+    prepare_decisions_body,
     prepare_openai_body,
     requested_model,
     stream_error_frame,
@@ -45,6 +48,7 @@ CATALOG = {
     "anthropic/claude-sonnet-4.5": TEXT_KIND,
     "qwen/qwen3-coder": TEXT_KIND,
     "google/gemini-2.5-flash-image": IMAGE_KIND,
+    "typesafe/jev-1.13": DECISIONS_KIND,
 }
 
 
@@ -68,6 +72,10 @@ def test_pick_slug_respeita_tipo():
     # modelo de imagem não atende chat, e vice-versa
     assert pick_slug("google/gemini-2.5-flash-image", TEXT_KIND, CATALOG) is None
     assert pick_slug("qwen/qwen3-coder", IMAGE_KIND, CATALOG) is None
+    # o Jev só atende o /v1/decisions, e o /v1/decisions só atende o Jev
+    assert pick_slug("typesafe/jev-1.13", TEXT_KIND, CATALOG) is None
+    assert pick_slug("typesafe/jev-1.13", DECISIONS_KIND, CATALOG) == "typesafe/jev-1.13"
+    assert pick_slug("qwen/qwen3-coder", DECISIONS_KIND, CATALOG) is None
     assert pick_slug("fora/da-lista", TEXT_KIND, CATALOG) is None
     assert pick_slug(None, TEXT_KIND, CATALOG) is None
 
@@ -208,6 +216,31 @@ def test_image_body_edits_converte_form_e_referencias():
     assert body["input_references"] == [{"type": "image_url", "image_url": {"url": ref}}]
     assert ref.startswith("data:image/jpeg;base64,")
     assert base64.b64decode(ref.split(",", 1)[1]) == b"\xff\xd8abc"
+
+
+def test_decisions_url_sai_do_v1():
+    assert decisions_url("https://openrouter.ai/api/v1") == "https://openrouter.ai/api/alpha/decisions"
+    # httpx normaliza o base_url com barra no fim
+    assert decisions_url("https://openrouter.test/api/v1/") == "https://openrouter.test/api/alpha/decisions"
+
+
+def test_prepare_decisions_body_trava_modelo_e_tira_stream():
+    body = prepare_decisions_body(
+        {"model": "qualquer", "stream": True, "state": "s", "questions": {"q": {}},
+         "session_id": "abc"},
+        "typesafe/jev-1.13",
+    )
+    assert body == {"model": "typesafe/jev-1.13", "state": "s", "questions": {"q": {}},
+                    "session_id": "abc"}
+
+
+def test_decisions_usage_vira_formato_chat_com_custo():
+    raw = json.dumps({"answers": {}, "usage": {
+        "input_tokens": 476, "output_tokens": 70, "cost": 0.000019992}}).encode()
+    usage, cost = usage_and_cost(raw)
+    assert usage["prompt_tokens"] == 476 and usage["completion_tokens"] == 70
+    assert cost == 0.000019992
+    assert b"cost" not in strip_cost_body(raw)
 
 
 # ---------- resposta ----------

@@ -562,6 +562,9 @@ OPENROUTER_NONSTREAM_TIMEOUT_S = float(os.environ.get("OPENROUTER_NONSTREAM_TIME
 # (a doc cita 94s para um gpt-image em 16:9)
 OPENROUTER_IMAGE_TIMEOUT_S = float(os.environ.get("OPENROUTER_IMAGE_TIMEOUT_S", "240"))
 OPENROUTER_MAX_IMAGES = int(os.environ.get("OPENROUTER_MAX_IMAGES", "4"))
+# A API de Decisions (Jev) é alpha e pode mudar de path. Vazio = derivado da
+# base do openrouter_client (openrouter.decisions_url): /api/alpha/decisions.
+OPENROUTER_DECISIONS_URL = os.environ.get("OPENROUTER_DECISIONS_URL", "")
 # Chave espelho no OpenRouter por chave da Stac (ver openrouter_keys.py). As
 # duas são necessárias; sem qualquer uma, o repasse segue só com a chave
 # compartilhada (OPENROUTER_API_KEY) e o custo por chave fica só em
@@ -4614,7 +4617,7 @@ def _openrouter_error_response(
 
 async def openrouter_forward(
     *, upstream_path: str, payload: dict, log_ctx: dict, anthropic: bool = False,
-    secret: str | None = None,
+    secret: str | None = None, url: str | None = None,
 ) -> Response:
     """Manda `payload` ao OpenRouter e repassa a resposta ao cliente no mesmo
     protocolo, registrando tokens e custo em gateway_requests.
@@ -4624,7 +4627,10 @@ async def openrouter_forward(
     — só que com prazos próprios (OPENROUTER_STREAM_*).
 
     `secret`: chave espelho da chave da Stac (openrouter_key_for); None usa a
-    compartilhada, que é o header default do openrouter_client."""
+    compartilhada, que é o header default do openrouter_client.
+
+    `url`: destino absoluto, para o que mora fora do /api/v1 (Decisions);
+    None = `upstream_path` relativo ao base_url do client."""
     is_stream = payload.get("stream") is True
     label = f"{upstream_path}/{log_ctx.get('model')}"
     if not secret and not OPENROUTER_API_KEY:
@@ -4637,7 +4643,7 @@ async def openrouter_forward(
     )
     try:
         upstream_req = openrouter_client.build_request(
-            "POST", f"/{upstream_path}", json=payload, timeout=timeout,
+            "POST", url or f"/{upstream_path}", json=payload, timeout=timeout,
             headers=_openrouter_auth(secret),
         )
         upstream = await openrouter_client.send(upstream_req, stream=True)
@@ -7060,6 +7066,64 @@ class _EchoedUpstream:
 
     async def aclose(self) -> None:
         await self._upstream.aclose()
+
+
+DECISIONS_PATH = "decisions"
+
+
+@app.post("/v1/decisions")
+async def openrouter_decisions_route(request: Request, authorization: str | None = Header(None)):
+    """Decisões tipadas (Jev, da TypeSafe) repassadas ao /api/alpha/decisions
+    do OpenRouter, no formato de lá: {model, state, questions} → {answers,
+    usage}.
+
+    Handler próprio, e não uma entrada em ALLOWED_V1: o catch-all reescreve o
+    corpo para chat (validate_body) e cai em máquina, e nenhuma máquina serve
+    este tipo — sem o modelo na lista do plano, a resposta é 404 com os aceitos.
+    System prompt, RAG e defaults de sampling não se aplicam: não há mensagens
+    nem geração. Chave de stack de imagem leva o 403 do authenticate (path fora
+    de IMAGE_STACK_ALLOWED_PATHS)."""
+    started = time.monotonic()
+    body = await request.body()
+    if len(body) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
+
+    entry, key_hash = await authenticate(authorization, request.headers, DECISIONS_PATH)
+    key_stack, key_plan = resolve_key_stack(entry)
+    check_rate_limit(key_hash, key_plan)
+    purpose = entry.get("purpose", "customer")
+    await check_token_quota(entry["account_id"], key_plan, purpose)
+    await check_request_quota(key_stack, key_plan, purpose)
+
+    requested = openrouter.requested_model(body)
+    await require_plan_model(requested, openrouter.DECISIONS_KIND, key_plan)
+    catalog = await openrouter_catalog(key_plan)
+    slug = openrouter.pick_slug(requested, openrouter.DECISIONS_KIND, catalog)
+    if not slug:
+        raise HTTPException(
+            status_code=404,
+            detail=openrouter.unavailable_detail(
+                requested, openrouter.accepted_models(catalog, openrouter.DECISIONS_KIND)
+            ),
+        )
+    try:
+        body_json = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="corpo inválido")
+    if not isinstance(body_json, dict):
+        raise HTTPException(status_code=400, detail="corpo inválido")
+
+    return await openrouter_forward(
+        upstream_path=DECISIONS_PATH,
+        url=OPENROUTER_DECISIONS_URL
+        or openrouter.decisions_url(str(openrouter_client.base_url)),
+        payload=openrouter.prepare_decisions_body(body_json, slug),
+        secret=await openrouter_key_for(entry),
+        log_ctx=_openrouter_log_ctx(
+            entry=entry, stack_id=(key_stack or {}).get("id"), path=DECISIONS_PATH,
+            slug=slug, request=request, started=started,
+        ),
+    )
 
 
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])

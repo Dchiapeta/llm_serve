@@ -25,14 +25,18 @@ export async function getOpenRouterCatalog(): Promise<Map<string, OpenRouterCata
 }
 
 // Mesmo critério do gateway (openrouter_models.kind): quem GERA imagem atende
-// as rotas /v1/images/*; quem gera texto atende chat/messages/responses. O
-// resto (decisions, embeddings, rerank, transcription, speech...) não tem rota
-// no gateway: null, e o cadastro recusa — senão o cliente leva o erro do
-// OpenRouter mandando usar um endpoint que a Stac não expõe.
-export function openRouterModelKind(model: OpenRouterCatalogModel): "text" | "image" | null {
+// as rotas /v1/images/*; quem gera texto atende chat/messages/responses; quem
+// gera decisões (Jev, 0078) atende o /v1/decisions. O resto (embeddings,
+// rerank, transcription, speech...) não tem rota no gateway: null, e o cadastro
+// recusa — senão o cliente leva o erro do OpenRouter mandando usar um endpoint
+// que a Stac não expõe.
+export function openRouterModelKind(
+  model: OpenRouterCatalogModel
+): "text" | "image" | "decisions" | null {
   const outputs = model.architecture?.output_modalities ?? []
   if (outputs.includes("image")) return "image"
   if (outputs.includes("text")) return "text"
+  if (outputs.includes("decisions")) return "decisions"
   return null
 }
 

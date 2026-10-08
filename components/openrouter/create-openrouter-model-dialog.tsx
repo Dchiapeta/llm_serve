@@ -48,8 +48,8 @@ export function CreateOpenRouterModelDialog() {
           <DialogDescription>
             Use o ID exato do modelo no OpenRouter (o que aparece em
             openrouter.ai/models). É esse ID que o cliente manda no campo
-            &quot;model&quot;. Se é de texto ou de imagem, o painel descobre sozinho
-            pelo catálogo.
+            &quot;model&quot;. Se é de texto, de imagem ou de decisão (Jev), o painel
+            descobre sozinho pelo catálogo.
           </DialogDescription>
         </DialogHeader>
         <form action={onSubmit} className="flex flex-col gap-4">

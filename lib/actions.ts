@@ -2467,7 +2467,7 @@ export async function createOpenRouterModel(
   if (!kind) {
     const outputs = model.architecture?.output_modalities?.join(", ") || "desconhecida"
     return {
-      error: `"${slug}" gera ${outputs}, e o gateway só serve modelos de texto (chat/messages/responses) ou de imagem`,
+      error: `"${slug}" gera ${outputs}, e o gateway só serve modelos de texto (chat/messages/responses), de imagem ou de decisão (/v1/decisions)`,
     }
   }
 

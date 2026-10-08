@@ -1037,3 +1037,110 @@ def test_pro_acima_de_256k_no_openrouter_e_400_no_formato_anthropic(planos):
     assert r.status_code == 400
     assert r.json()["type"] == "error" and "262144" in r.json()["error"]["message"]
     assert planos["sent"] == []
+
+
+# ---------------------------------------------------------------------------
+# /v1/decisions (Jev, da TypeSafe): só OpenRouter, no /api/alpha/decisions
+# ---------------------------------------------------------------------------
+
+JEV = "typesafe/jev-1.13"
+PERGUNTAS = {
+    "time": {
+        "type": "choice",
+        "instructions": "Qual time deve cuidar do ticket?",
+        "criteria": {"pagamentos": "checkout e cobrança", "frontend": "renderização"},
+    },
+}
+
+
+@pytest.fixture
+def decisao(rota):
+    rota["catalog"][JEV] = "decisions"
+    rota["resposta"] = lambda r: httpx.Response(200, json={
+        "id": "gen-dec-1", "model": "typesafe/jev-1.13-20260917", "provider": "TypeSafe",
+        "answers": {"time": {"type": "choice", "choice": "pagamentos", "confidence": 0.67,
+                             "probabilities": {"pagamentos": 0.78, "frontend": 0.22}}},
+        "usage": {"input_tokens": 476, "output_tokens": 70, "cost": 0.000019992},
+    })
+    return rota
+
+
+def _decidir(estado, **body):
+    return estado["client"].post(
+        "/v1/decisions",
+        json={"state": {"ticket": "a tela fica branca no Pagar"}, "questions": PERGUNTAS, **body},
+        headers={"Authorization": "Bearer sk-cliente"},
+    )
+
+
+def test_decisions_vai_para_o_alpha_do_openrouter_sem_custo(decisao):
+    r = _decidir(decisao, model=JEV, stream=True)
+    assert r.status_code == 200
+    assert r.json()["answers"]["time"]["choice"] == "pagamentos"
+    assert "cost" not in r.json()["usage"]
+
+    request, sent = decisao["sent"][0]
+    # fora do /api/v1: a API de Decisions é alpha e mora em /api/alpha
+    assert str(request.url) == "https://openrouter.test/api/alpha/decisions"
+    assert request.headers["authorization"] == "Bearer sk-or-da-stac"
+    assert sent["model"] == JEV and "stream" not in sent
+    assert sent["questions"] == PERGUNTAS
+
+    log = decisao["logged"][0]
+    assert log["path"] == "decisions" and log["model"] == JEV
+    assert log["upstream"] == "openrouter" and log["machine_id"] is None
+    assert log["stream"] is False and log["status_code"] == 200
+    assert log["usage"]["prompt_tokens"] == 476 and log["cost_usd"] == 0.000019992
+    # nenhuma máquina serve decisões: nem é consultada
+    assert decisao["resolve_calls"] == []
+
+
+def test_decisions_url_configuravel(decisao, monkeypatch):
+    monkeypatch.setattr(main, "OPENROUTER_DECISIONS_URL", "https://openrouter.test/api/beta/decisions")
+    assert _decidir(decisao, model=JEV).status_code == 200
+    assert decisao["sent"][0][0].url.path == "/api/beta/decisions"
+
+
+def test_decisions_com_modelo_de_texto_e_404_com_os_aceitos(decisao):
+    r = _decidir(decisao, model=TEXT_SLUG)
+    assert r.status_code == 404
+    assert JEV in r.json()["detail"] and TEXT_SLUG not in r.json()["detail"].split("aceitos:")[1]
+    assert decisao["sent"] == [] and decisao["resolve_calls"] == []
+
+
+def test_decisions_sem_modelo_e_404(decisao):
+    r = _decidir(decisao)
+    assert r.status_code == 404 and JEV in r.json()["detail"]
+    assert decisao["sent"] == []
+
+
+def test_decisions_com_repasse_desligado_e_404(decisao):
+    decisao["settings"]["openrouter_enabled"] = False
+    r = _decidir(decisao, model=JEV)
+    assert r.status_code == 404 and "não está disponível no momento" in r.json()["detail"]
+    assert decisao["sent"] == []
+
+
+def test_decisions_fora_do_plano_e_403(decisao):
+    decisao["plans"] = {TEXT_SLUG: ["Go"], IMAGE_SLUG: ["Go"], JEV: ["Pro"]}
+    decisao["fallback_plans"] = {}
+    r = _decidir(decisao, model=JEV)
+    assert r.status_code == 403 and "plano Go" in r.json()["detail"]
+    assert decisao["sent"] == []
+
+
+def test_decisions_erro_do_cliente_passa_com_o_status(decisao):
+    decisao["resposta"] = lambda r: httpx.Response(400, json={
+        "error": {"code": 400, "message": "questions is required"},
+    })
+    r = _decidir(decisao, model=JEV)
+    assert r.status_code == 400 and r.json()["error"]["message"] == "questions is required"
+    assert decisao["logged"][0]["status_code"] == 400
+
+
+def test_jev_no_chat_nao_e_repassado_como_texto(decisao):
+    decisao["settings"]["machines_enabled"] = False
+    r = _chat(decisao, model=JEV)
+    assert r.status_code == 404
+    assert TEXT_SLUG in r.json()["detail"] and JEV not in r.json()["detail"].split("aceitos:")[1]
+    assert decisao["sent"] == []
