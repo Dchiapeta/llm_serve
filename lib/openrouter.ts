@@ -25,9 +25,15 @@ export async function getOpenRouterCatalog(): Promise<Map<string, OpenRouterCata
 }
 
 // Mesmo critério do gateway (openrouter_models.kind): quem GERA imagem atende
-// as rotas /v1/images/*; o resto atende chat/messages/responses.
-export function openRouterModelKind(model: OpenRouterCatalogModel): "text" | "image" {
-  return model.architecture?.output_modalities?.includes("image") ? "image" : "text"
+// as rotas /v1/images/*; quem gera texto atende chat/messages/responses. O
+// resto (decisions, embeddings, rerank, transcription, speech...) não tem rota
+// no gateway: null, e o cadastro recusa — senão o cliente leva o erro do
+// OpenRouter mandando usar um endpoint que a Stac não expõe.
+export function openRouterModelKind(model: OpenRouterCatalogModel): "text" | "image" | null {
+  const outputs = model.architecture?.output_modalities ?? []
+  if (outputs.includes("image")) return "image"
+  if (outputs.includes("text")) return "text"
+  return null
 }
 
 // "US$ 3,00 / 15,00 por 1M tokens" a partir do preço por token.

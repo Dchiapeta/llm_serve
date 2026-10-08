@@ -2463,11 +2463,18 @@ export async function createOpenRouterModel(
   }
   const model = catalog.get(slug)
   if (!model) return { error: `Modelo "${slug}" não existe no OpenRouter` }
+  const kind = openRouterModelKind(model)
+  if (!kind) {
+    const outputs = model.architecture?.output_modalities?.join(", ") || "desconhecida"
+    return {
+      error: `"${slug}" gera ${outputs}, e o gateway só serve modelos de texto (chat/messages/responses) ou de imagem`,
+    }
+  }
 
   const db = createSupabaseAdmin()
   const { error } = await db.from("openrouter_models").insert({
     slug,
-    kind: openRouterModelKind(model),
+    kind,
     label: label ?? model.name,
     enabled: true,
     plans,
