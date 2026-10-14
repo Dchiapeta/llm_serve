@@ -560,7 +560,8 @@ class SupaClient:
         recém-coletada. Chamado por collect_usage_metrics_once com o mesmo
         window_start de usage_metrics — todas as chaves do batch levam o
         mesmo timestamp, então um único PATCH com filtro `in` cobre o
-        batch inteiro."""
+        batch inteiro. Também chamado, uma chave por vez, no log de cada
+        request repassada ao OpenRouter, que não passa por coletor nenhum."""
         if not api_key_ids:
             return
         ids = ",".join(dict.fromkeys(api_key_ids))

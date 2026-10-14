@@ -4,6 +4,7 @@ import { DollarSign, KeyRound, Server } from "lucide-react"
 
 import { computeCapacity } from "@/lib/capacity"
 import { reconcileMachineStatuses } from "@/lib/machines"
+import { fetchAll, type PagedQuery } from "@/lib/paged-query"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import type {
   Machine,
@@ -80,10 +81,13 @@ export async function DashboardBody({
   const machines = reconciled.filter((m) => m.status !== "terminated")
   const templates = (templatesData ?? []) as Template[]
 
-  const usageQuery = db.from("usage_metrics").select("*")
-  const { data: usageData } = since
-    ? await usageQuery.gte("window_start", since)
-    : await usageQuery
+  // Paginado: em "Total" usage_metrics passa de 1000 linhas e um select cru
+  // trunca em silêncio nas mais antigas — todo o uso recente (inclusive o
+  // OpenRouter) sumia. Ordem por `id` pelo motivo do comentário de fetchAll.
+  const { rows: usage } = await fetchAll<UsageMetric>(() => {
+    const q = db.from("usage_metrics").select("*").order("id")
+    return (since ? q.gte("window_start", since) : q) as unknown as PagedQuery
+  })
 
   // image_usage_rollup (migration 0067): mesma janela do usage_metrics acima,
   // para os dois somarem o mesmo período. Tokens já incluem imagem (o pod
@@ -97,7 +101,6 @@ export async function DashboardBody({
     : await imageUsageQuery
 
   const templateById = new Map(templates.map((t) => [t.id, t]))
-  const usage = (usageData ?? []) as UsageMetric[]
   const imageUsage = (imageUsageData ?? []) as {
     machine_id: string | null
     window_start: string

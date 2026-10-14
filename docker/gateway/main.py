@@ -5404,6 +5404,8 @@ def log_gateway_request(
         row["upstream"] = upstream
     if cost_usd is not None:
         row["cost_usd"] = cost_usd
+    if upstream == OPENROUTER_UPSTREAM:
+        _touch_openrouter_key_last_used(api_key_id)
     if product_analytics.enabled():
         purpose = trigger_snapshot("analytics").get("purpose")
         row["analytics_origin"] = purpose if purpose in {"customer", "playground"} else "unknown"
@@ -5433,6 +5435,34 @@ def _log_estimate_drift(budget: PromptBudget | None, usage: dict, path: str) -> 
         path, budget.est_tokens, budget.kind.value, budget.reserved, real,
         drift * 100, budget.max_model_len,
     )
+
+
+# api_keys.last_used_at (migration 0046) só era tocado pelo coletor das
+# máquinas (collect_usage_metrics_once): chave usada só pelo repasse ficava
+# null, ou parada na última vez que passou por máquina, no "último uso" do
+# TryStac. Toque no máximo uma vez por janela por chave — cliente agêntico
+# manda dezenas de requests por minuto e cada toque é um PATCH no Supabase;
+# a precisão já é a mesma do coletor (METRICS_COLLECTION_INTERVAL_S).
+OPENROUTER_LAST_USED_INTERVAL_S = 60.0
+openrouter_key_last_touch: dict[str, float] = {}
+
+
+def _touch_openrouter_key_last_used(api_key_id: str | None) -> None:
+    if not api_key_id:
+        return
+    now = time.monotonic()
+    last = openrouter_key_last_touch.get(api_key_id)
+    if last is not None and now - last < OPENROUTER_LAST_USED_INTERVAL_S:
+        return
+    openrouter_key_last_touch[api_key_id] = now
+    spawn_tracked(_write_key_last_used(api_key_id, datetime.now(timezone.utc).isoformat()))
+
+
+async def _write_key_last_used(api_key_id: str, ts: str) -> None:
+    try:
+        await supa.touch_keys_last_used([api_key_id], ts)
+    except Exception as e:
+        logger.warning("last_used_at: falha ao tocar a chave %s (%s)", api_key_id, type(e).__name__)
 
 
 async def _write_gateway_request(row: dict) -> None:

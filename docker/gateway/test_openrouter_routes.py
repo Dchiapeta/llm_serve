@@ -1144,3 +1144,84 @@ def test_jev_no_chat_nao_e_repassado_como_texto(decisao):
     assert r.status_code == 404
     assert TEXT_SLUG in r.json()["detail"] and JEV not in r.json()["detail"].split("aceitos:")[1]
     assert decisao["sent"] == []
+
+
+# ---------------------------------------------------------------------------
+# api_keys.last_used_at — o coletor das máquinas não vê o repasse
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def toques(monkeypatch):
+    """log_gateway_request REAL (o fixture `rota` troca por um duplo), com a
+    gravação da linha anulada e os toques de last_used_at capturados."""
+    import asyncio
+
+    touched = []
+    pending = []
+
+    class Supa:
+        async def touch_keys_last_used(self, api_key_ids, ts):
+            touched.append((api_key_ids, ts))
+
+    async def no_row(row):
+        return None
+
+    monkeypatch.setattr(main, "supa", Supa(), raising=False)
+    monkeypatch.setattr(main, "_write_gateway_request", no_row)
+    monkeypatch.setattr(main, "spawn_tracked", pending.append)
+    main.openrouter_key_last_touch.clear()
+
+    def log(upstream, api_key_id="key-1"):
+        main.log_gateway_request(
+            account_id="acc-1", stack_id="stack-1", api_key_id=api_key_id,
+            machine_id=None, path="chat/completions", model=TEXT_SLUG,
+            status_code=200, stream=False, started=main.time.monotonic(),
+            upstream=upstream,
+        )
+
+        async def run():
+            while pending:
+                await pending.pop(0)
+
+        asyncio.run(run())
+
+    yield log, touched
+    main.openrouter_key_last_touch.clear()
+
+
+def test_repasse_toca_last_used_at_da_chave(toques):
+    log, touched = toques
+    log(main.OPENROUTER_UPSTREAM)
+    assert [ids for ids, _ in touched] == [["key-1"]]
+
+
+def test_toque_e_no_maximo_um_por_janela_por_chave(toques, monkeypatch):
+    log, touched = toques
+    log(main.OPENROUTER_UPSTREAM)
+    log(main.OPENROUTER_UPSTREAM)
+    log(main.OPENROUTER_UPSTREAM, api_key_id="key-2")  # outra chave não espera
+    assert [ids for ids, _ in touched] == [["key-1"], ["key-2"]]
+
+    passado = main.time.monotonic() - main.OPENROUTER_LAST_USED_INTERVAL_S - 1
+    main.openrouter_key_last_touch["key-1"] = passado
+    log(main.OPENROUTER_UPSTREAM)
+    assert [ids for ids, _ in touched][-1] == ["key-1"] and len(touched) == 3
+
+
+def test_request_de_maquina_nao_toca_last_used_at(toques):
+    # da máquina quem toca é o coletor, com o uso que o agent contou
+    log, touched = toques
+    log(None)
+    assert touched == []
+
+
+def test_falha_ao_tocar_nao_escapa(monkeypatch):
+    import asyncio
+
+    class Supa:
+        async def touch_keys_last_used(self, api_key_ids, ts):
+            raise httpx.ConnectError("supabase fora")
+
+    monkeypatch.setattr(main, "supa", Supa(), raising=False)
+    asyncio.run(main._write_key_last_used("key-1", "2026-10-14T00:00:00+00:00"))
