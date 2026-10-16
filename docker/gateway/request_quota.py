@@ -30,7 +30,7 @@ aparece para ele, então a mensagem de quota_message também não o cita. Os tok
 log_gateway_request (main.py) soma o resto do peso (`QuotaCache.add`) — a
 requisição que atravessa o limite passa, e o corte vale a partir da próxima.
 
-Módulo puro, como plan_limits.py: o I/O (RPC, exceção HTTP) fica em main.py.
+Módulo puro, como cli_policy.py: o I/O (RPC, exceção HTTP) fica em main.py.
 """
 
 import os

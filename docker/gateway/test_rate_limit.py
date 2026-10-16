@@ -65,7 +65,7 @@ def test_go_llm_e_go_image_tem_limites_independentes():
     assert main.image_rate_limit_burst("Go") == 3.0
 
 
-@pytest.mark.parametrize("plano", ["Go", "Pro", "Max", "Enterprise", "VibeCoder"])
+@pytest.mark.parametrize("plano", ["Go", "Pro", "Max", "Enterprise"])
 def test_planos_de_llm_mantem_burst_igual_a_taxa(plano):
     # RATE_LIMIT_BURST é opt-in: quem não está lá tem o comportamento de sempre
     assert main.rate_limit_burst(plano) == main.rate_limit_rpm(plano)

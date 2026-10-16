@@ -66,11 +66,11 @@ const ROUTING = [
   },
   {
     when: "Conversa maior que a janela da máquina",
-    who: "OpenRouter (evita matar a sessão do Claude Code), se ainda couber na janela do plano.",
+    who: "OpenRouter (evita matar a sessão do Claude Code).",
   },
   {
-    when: "Conversa maior que a janela do plano (Go 32K, Pro 256K)",
-    who: "Ninguém: 400 de contexto, com ou sem máquina.",
+    when: "Conversa maior que a janela do modelo no OpenRouter",
+    who: "Ninguém: 400 de contexto do próprio OpenRouter.",
   },
 ]
 
@@ -206,11 +206,11 @@ export default function OpenRouterDocPage() {
             os planos.
           </li>
           <li>
-            <Strong>Contexto</Strong>: Go 32K, Pro 256K, entrada + saída
-            (<code>docker/gateway/plan_limits.py</code>, envs{" "}
-            <code>PLAN_CONTEXT_TOKENS_GO</code>/<code>_PRO</code>). Na máquina
-            vale o menor entre a janela dela e a do plano; no OpenRouter, a do
-            plano. O Pro passa dos 128K da máquina pelo desvio ao OpenRouter.
+            <Strong>Contexto</Strong>: sem teto por plano desde 16/10/2026.
+            Na máquina vale a janela dela (<code>--max-model-len</code>); no
+            OpenRouter, a do próprio modelo. Conversa maior que a máquina
+            desvia ao OpenRouter em qualquer plano. O custo de uma request
+            grande é cobrado pela cota ponderada (migration 0079).
             Max e Enterprise não têm teto próprio.
           </li>
           <li>
@@ -411,11 +411,13 @@ export default function OpenRouterDocPage() {
             corta-custo de emergência.
           </li>
           <li>
-            O teto de contexto por plano (<code>plan_limits.py</code>){" "}
-            <Strong>não</Strong> é do repasse: fica. Já o acesso a modelo por
-            plano mora em <code>openrouter_models.plans</code> e some junto com
-            a tabela — com só máquinas, cada plano só tem o modelo da própria
-            máquina, então a trava deixa de ser necessária.
+            Contexto: não há teto por plano desde 16/10/2026; com só máquinas,
+            a janela de cada stack volta a ser a do pod (
+            <code>--max-model-len</code>), sem código novo. Rever nessa hora se
+            o Go volta a ter teto próprio. Já o acesso a modelo por plano mora
+            em <code>openrouter_models.plans</code> e some junto com a tabela
+            — com só máquinas, cada plano só tem o modelo da própria máquina,
+            então a trava deixa de ser necessária.
           </li>
           <li>
             Banco: migration nova que apaga <code>openrouter_keys</code>,{" "}

@@ -59,8 +59,6 @@ import image_proxy
 import image_retention
 import openrouter
 import openrouter_keys
-import plan_limits
-from plan_unification import feature_plan
 import request_quota
 from anthropic_compat import (
     anthropic_error_body,
@@ -167,7 +165,6 @@ MAX_LORAS_PER_MACHINE = int(os.environ.get("MAX_LORAS_PER_MACHINE", "8"))
 # valor abaixo é só o ponto de partida até o contrato pedir mais.
 RATE_LIMIT_RPM = {
     "Go": 60.0,
-    "VibeCoder": 60.0,
     "Pro": 120.0,
     "Max": 300.0,
     "Enterprise": 600.0,
@@ -217,10 +214,9 @@ IMAGE_RATE_LIMIT_BURST = {
 
 
 def rate_limit_rpm(plan: str | None) -> float:
-    """Taxa de reposição do bucket, em requisições por minuto. Com
-    GO_PRO_UNIFIED o Go vale a taxa do Pro (plan_unification.py); só rota de
+    """Taxa de reposição do bucket, em requisições por minuto. Só rota de
     LLM chega aqui — imagem usa image_rate_limit_rpm."""
-    return RATE_LIMIT_RPM.get(feature_plan(plan) or "", DEFAULT_RATE_LIMIT_RPM)
+    return RATE_LIMIT_RPM.get(plan or "", DEFAULT_RATE_LIMIT_RPM)
 
 
 def rate_limit_burst(plan: str | None) -> float:
@@ -228,7 +224,7 @@ def rate_limit_burst(plan: str | None) -> float:
 
     Cai em rate_limit_rpm quando o plano não declara burst próprio, que é o
     comportamento que todo plano teve até existir esta tabela."""
-    return RATE_LIMIT_BURST.get(feature_plan(plan) or "", rate_limit_rpm(plan))
+    return RATE_LIMIT_BURST.get(plan or "", rate_limit_rpm(plan))
 
 
 def image_rate_limit_rpm(plan: str | None) -> float:
@@ -410,9 +406,6 @@ CHAT_STREAM_IDLE_TIMEOUT_S = float(os.environ.get("CHAT_STREAM_IDLE_TIMEOUT_S", 
 # evita 1 round-trip ao Supabase por request na hot path.
 DAILY_TOKEN_BUDGET = {
     "Go": int(os.environ.get("DAILY_TOKEN_BUDGET_GO", "0")),
-    # TRANSIÇÃO: nome antigo do plano "Go", aceito até a migration 0049 rodar
-    # em produção. Remover junto com as outras entradas "VibeCoder" daqui.
-    "VibeCoder": int(os.environ.get("DAILY_TOKEN_BUDGET_GO", "0")),
     "Pro": int(os.environ.get("DAILY_TOKEN_BUDGET_PRO", "0")),
     "Max": int(os.environ.get("DAILY_TOKEN_BUDGET_MAX", "0")),
     "Enterprise": int(os.environ.get("DAILY_TOKEN_BUDGET_ENTERPRISE", "0")),
@@ -2326,24 +2319,15 @@ async def _openrouter_rows() -> list[dict]:
     return rows
 
 
-def catalog_plan(plan: str | None, kind: str) -> str | None:
-    """Plano cujo catálogo de modelos (openrouter_models.plans, 0074) vale
-    para uma request do tipo `kind`. Com GO_PRO_UNIFIED, o Go de LLM enxerga
-    os modelos e o reserva do Pro (plan_unification.py). Imagem fica de fora:
-    só stack de imagem chega às rotas de imagem (_require_image_product), e
-    ela é outro produto, que segue no catálogo do Go."""
-    return plan if kind == openrouter.IMAGE_KIND else feature_plan(plan)
-
-
 async def _openrouter_models(
     plan: str | None, kind: str,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """({slug: kind}, {kind: slug do reserva}) que uma chave do `plan`
-    alcança no OpenRouter para requests do tipo `kind` (ver catalog_plan);
-    vazios com o repasse desligado."""
+    alcança no OpenRouter para requests do tipo `kind` (openrouter_models.plans,
+    0074); vazios com o repasse desligado."""
     if not await openrouter_enabled():
         return {}, {}
-    return openrouter.plan_catalog(await _openrouter_rows(), catalog_plan(plan, kind))
+    return openrouter.plan_catalog(await _openrouter_rows(), plan)
 
 
 async def openrouter_catalog(plan: str | None, kind: str) -> dict[str, str]:
@@ -2370,9 +2354,7 @@ async def require_plan_model(model: str | None, kind: str, plan: str | None) -> 
     27B. Modelo da lista sem plano nenhum (Kimi K3, ainda não lançado) é
     barrado para todos. Modelo fora da lista não é barrado aqui (segue a regra
     de destino)."""
-    detail = openrouter.plan_denial(
-        model, kind, await _openrouter_rows(), catalog_plan(plan, kind), label=plan,
-    )
+    detail = openrouter.plan_denial(model, kind, await _openrouter_rows(), plan)
     if detail:
         raise HTTPException(status_code=403, detail=detail)
 
@@ -4529,10 +4511,7 @@ async def validate_responses_body(
 # Pro (Qwen3.6-27B) validado em 17/07/2026: 14/15 respostas fecham com
 # </think> (a exceção foi truncada por length — coberta pelo fallback do
 # filtro, que devolve o buffer acumulado no fim do stream).
-# "VibeCoder" é o nome antigo de "Go": fica aceito até a migration 0049 rodar
-# em produção, senão o plano sai do set na janela entre deploy e migration e o
-# filtro de <think> desliga sozinho. Remover depois.
-REASONING_LEAK_PLANS = {"Go", "VibeCoder", "Pro"}
+REASONING_LEAK_PLANS = {"Go", "Pro"}
 
 def thinking_esperado_de(body_json) -> bool:
     """A request pediu raciocínio?
@@ -4557,7 +4536,7 @@ def thinking_esperado_de(body_json) -> bool:
 # check_concurrency) — hoje coincide em membros com REASONING_LEAK_PLANS, mas
 # são eixos diferentes (parser de reasoning vs. topologia do pod) que podem
 # divergir; não reaproveitar um pelo outro.
-SHARED_POD_PLANS = {"Go", "VibeCoder", "Pro"}
+SHARED_POD_PLANS = {"Go", "Pro"}
 
 
 # ---------- Claude Code (Anthropic Messages API) ----------
@@ -4815,27 +4794,6 @@ def estimate_openai_prompt(path: str, body: dict) -> int:
     return estimate_prompt_tokens(extra_texts=[prompt])
 
 
-def enforce_plan_context(
-    body: dict, field: str, est_tokens: int, plan: str | None, *, shape: str = "openai",
-) -> None:
-    """Teto de contexto do plano (plan_limits) numa request que vai ao
-    OpenRouter: a mesma admissão e o mesmo clamp de saída do caminho de
-    máquina, contra a janela do PLANO. Sem tokenizer aqui, então a margem é a
-    de "não deu para contar" (EstimateKind.FALLBACK). Plano sem teto: no-op."""
-    window = plan_limits.plan_window(plan)
-    try:
-        apply_context_budget(
-            body, window, field, est_tokens=est_tokens, kind=EstimateKind.FALLBACK
-        )
-    except ContextWindowExceeded as exc:
-        logger.warning(
-            "contexto do plano estourado no repasse: est=%s plano=%s janela=%s",
-            est_tokens, plan, window.get("max_model_len"),
-        )
-        exc.shape = shape
-        raise
-
-
 async def openrouter_text(
     *, path: str, body: bytes, entry: dict, stack: dict | None, slug: str,
     request: Request, started: float,
@@ -4864,10 +4822,9 @@ async def openrouter_text(
         body_json["messages"] = await apply_system_prompt_and_rag(messages, entry, stack)
     if "max_completion_tokens" in body_json and max_tokens_field == "max_tokens":
         max_tokens_field = "max_completion_tokens"
-    enforce_plan_context(
-        body_json, max_tokens_field, estimate_openai_prompt(path, body_json),
-        (stack or {}).get("plan"),
-    )
+    # Sem teto de contexto por plano (16/10/2026): no repasse vale a janela do
+    # próprio modelo, e quem a estoura recebe o 400 do OpenRouter. O custo de
+    # uma request grande é cobrado pela cota ponderada (request_quota.py).
     openrouter.prepare_openai_body(body_json, slug, OPENROUTER_MAX_TOKENS)
 
     return await openrouter_forward(
@@ -4904,13 +4861,7 @@ async def openrouter_messages(
         )
         if new_system and new_system != system_text:
             anthropic_body["system"] = new_system
-    # estimado sobre a versão OpenAI do corpo (a conta do caminho de máquina,
-    # e a que sabe pesar imagem), mas o clamp é no max_tokens do Anthropic
-    enforce_plan_context(
-        anthropic_body, "max_tokens",
-        estimate_openai_prompt("chat/completions", anthropic_to_openai_request(anthropic_body)[0]),
-        (stack or {}).get("plan"), shape="anthropic",
-    )
+    # Sem teto de contexto por plano: vale a janela do modelo (ver openrouter_text)
     openrouter.prepare_anthropic_body(anthropic_body, slug, OPENROUTER_MAX_TOKENS)
 
     return await openrouter_forward(
@@ -4989,8 +4940,6 @@ async def anthropic_messages(
             if desviada is not None:
                 return desviada
         raise
-    # janela efetiva = min(máquina, plano) — ver plan_limits.py
-    machine, plan_capped = plan_limits.capped_machine(machine, effective_plan)
     await maybe_touch(stack_id, machine["id"])
 
     flight_key = (stack_id, machine["id"])
@@ -5033,9 +4982,8 @@ async def anthropic_messages(
         release_flight(flight_key)
         # conversa maior que a janela da máquina (ex.: cresceu no OpenRouter
         # antes de a máquina ligar) continua no OpenRouter em vez de matar a
-        # sessão — só cai no erro abaixo com o repasse desligado. Maior que a
-        # janela do PLANO não é desviada: no OpenRouter também não caberia.
-        desviada = None if plan_capped else await _desvio("maior que a janela da máquina")
+        # sessão — só cai no erro abaixo com o repasse desligado.
+        desviada = await _desvio("maior que a janela da máquina")
         if desviada is not None:
             return desviada
         # O estouro de contexto é o evento mais importante deste endpoint (mata
@@ -7273,8 +7221,6 @@ async def _proxy(
                     ),
                 })
         raise
-    # janela efetiva = min(máquina, plano) — ver plan_limits.py
-    machine, plan_capped = plan_limits.capped_machine(machine, effective_plan)
     await maybe_touch(stack_id, machine["id"])
 
     # incrementa ANTES dos awaits lentos (leitura do body, embeddings do RAG):
@@ -7332,9 +7278,8 @@ async def _proxy(
             except ContextWindowExceeded:
                 # conversa maior que a janela da máquina (ex.: cresceu no
                 # OpenRouter antes de a máquina ligar): continua lá. O
-                # except BaseException abaixo devolve a vaga. Maior que a
-                # janela do PLANO não: no OpenRouter também não caberia.
-                fallback = None if plan_capped else await _text_fallback(
+                # except BaseException abaixo devolve a vaga.
+                fallback = await _text_fallback(
                     path, requested, "maior que a janela da máquina", key_plan
                 )
                 if fallback:

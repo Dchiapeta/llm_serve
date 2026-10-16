@@ -84,7 +84,7 @@ type ReportRow = {
 }
 
 function quotaPlan(plan: string | null | undefined): QuotaPlan | null {
-  if (plan === "Go" || plan === "VibeCoder") return "Go"
+  if (plan === "Go") return "Go"
   if (plan === "Pro") return "Pro"
   return null
 }

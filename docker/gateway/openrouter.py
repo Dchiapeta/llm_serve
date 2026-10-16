@@ -126,7 +126,7 @@ def plan_denial(
     0074): a mensagem diz isso, em vez de sugerir um upgrade que não resolve.
 
     `label` é o plano que a mensagem nomeia, quando difere do `plan` cujo
-    catálogo decide (Go lendo o catálogo do Pro, plan_unification.py)."""
+    catálogo decide; hoje nenhum call-site precisa disso."""
     if not model:
         return None
     row = next((r for r in rows if r["slug"] == model and r["kind"] == kind), None)

@@ -1,8 +1,22 @@
 """Quais PLANOS podem usar a stack para codar — o corte de CLI por plano.
 
-O Go deixou de servir para codar. Um cliente Go usa a Stac por requests de API
-(chat, imagem, extração de documento); CLI e assistente de código (Claude Code,
-Codex, Cursor, Cline, Roo, Continue) passaram a ser do Pro para cima.
+Desde 16/10/2026 todos os planos de LLM (Go, Pro, Max, Enterprise) têm acesso à
+CLI e a assistentes de código (Claude Code, Codex, Cursor, Cline, Roo,
+Continue). O que separa Go de Pro é a cota mensal de requisições, ponderada
+pelo tamanho da entrada (request_quota.py, migration 0079), e os demais limites
+por plano (rate limit, ambientes, extração, catálogo de modelos) — não a
+ferramenta. O Go esteve sem CLI de 11/08/2026 a 16/10/2026, quando a requisição
+contava 1 independentemente do tamanho; com a cota ponderada, uma requisição
+de agente de código paga pelo contexto que usa, e o corte deixou de ter razão
+comercial.
+
+O único plano barrado é "Image": não é uma decisão comercial, é que um pod de
+difusão não fala /v1/chat/completions. Apontar Claude Code ou Cursor para uma
+stack de imagem daria erro em toda requisição — o 403 daqui pelo menos explica
+por quê. O ramo existe só para entradas legadas (stacks ainda cacheadas como
+plan=Image durante a migration 0060); as stacks atuais de imagem são
+plan=Go/category=image e são barradas antes, pelo guard de categoria em
+authenticate.
 
 ## Por que duas camadas, com forças diferentes
 
@@ -18,10 +32,9 @@ e eles têm garantias muito diferentes:
      chat/completions de um SDK qualquer, então só o UA os distingue — e o UA é
      string do cliente, forjável com uma variável de ambiente.
 
-A camada 2 existe porque sem ela metade das ferramentas de código passaria
-batido; ela não existe pra ser inescapável. Tem exatamente a mesma força do UA
-em lib/request-origin.ts: acionável, jamais controle de segurança. Quem sustenta
-o contrato comercial é o plano na fatura, não o header.
+A camada 2 tem exatamente a mesma força do UA em lib/request-origin.ts:
+acionável, jamais controle de segurança. Quem sustenta o contrato comercial é
+o plano na fatura, não o header.
 
 ## Onde erra, e para que lado
 
@@ -42,7 +55,6 @@ de billing_blocked e enforce_client_limit.
 import os
 
 from client_identity import normalize_tool
-from plan_unification import feature_plan
 
 # Rotas que SÓ um cliente de código fala. Os nomes são os mesmos que
 # log_gateway_request grava em gateway_requests.path (migration 0038) e que
@@ -52,21 +64,15 @@ CLI_ONLY_PATHS = frozenset({"messages", "messages/count_tokens", "responses"})
 
 # Slugs de normalize_tool (client_identity.py) que são ferramenta de CÓDIGO.
 # Deliberadamente NÃO é a lista inteira de TOOL_PATTERNS: "sdk" e "http" são
-# justamente o uso que o Go continua tendo. Importar de lá em vez de repetir os
-# padrões de UA é de propósito — a lista já vive em dois lugares (Python + TS) e
-# um terceiro seria o que garante que eles divirjam.
+# uso de API, não de assistente. Importar de lá em vez de repetir os padrões
+# de UA é de propósito — a lista já vive em dois lugares (Python + TS) e um
+# terceiro seria o que garante que eles divirjam.
 CODING_TOOLS = frozenset({"claude-code", "codex", "cursor", "cline", "roo", "continue"})
 
-# Planos sem CLI. "VibeCoder" é o nome antigo de "Go": entrada mantida como nos
-# outros dicts por plano do gateway (RATE_LIMIT_RPM, DAILY_TOKEN_BUDGET,
-# MAX_CLIENTS_BY_PLAN) até a migration 0049 rodar em produção.
-#
-# "Image" está aqui por um motivo diferente dos outros dois: não é uma decisão
-# comercial, é que um pod de difusão não fala /v1/chat/completions. Apontar
-# Claude Code ou Cursor para uma stack de imagem daria erro em toda requisição —
-# o 403 daqui pelo menos explica por quê. Espelha CLI_BLOCKED_PLANS de
-# lib/types.ts, que é quem impede o painel de ENSINAR essa configuração.
-CLI_BLOCKED_PLANS = frozenset({"Go", "VibeCoder", "Image"})
+# Planos sem CLI. Só "Image" (ver docstring do módulo). Espelha
+# CLI_BLOCKED_PLANS de playground-limits.ts no TryStac, que é quem impede o
+# painel de ENSINAR essa configuração.
+CLI_BLOCKED_PLANS = frozenset({"Image"})
 
 # Corte x observação. Sobe LIGADO — diferente de CLIENT_LIMIT_ENFORCE, aqui não
 # há fingerprint a calibrar: o corte por path é exato, e o corte por UA erra só
@@ -80,10 +86,7 @@ def cli_block_reason(plan: str | None, path: str | None, user_agent: str | None)
 
     Só decide; não levanta e não loga — main.py faz as duas coisas, porque é
     lá que fica a diferença entre corte e observação."""
-    # Com GO_PRO_UNIFIED o Go lê a política do Pro (plan_unification.py).
-    # Stack de imagem nem chega aqui: authenticate a barra antes, nas rotas
-    # de LLM, pelo guard de categoria.
-    if feature_plan(plan) not in CLI_BLOCKED_PLANS:
+    if plan not in CLI_BLOCKED_PLANS:
         return None
 
     if path in CLI_ONLY_PATHS:
@@ -98,18 +101,14 @@ def cli_block_reason(plan: str | None, path: str | None, user_agent: str | None)
 
 def _detail(plan: str | None) -> str:
     """Mensagem ao cliente. Mesmo tom de _client_limit_detail (main.py): diz o
-    que aconteceu e o que fazer a respeito, sem culpar a credencial.
-
-    O ramo Image existe só para entradas legadas durante a migration 0060. As
-    stacks atuais Go/image são barradas antes, pelo guard de categoria em
-    authenticate, porque Go sozinho já não identifica o workload."""
+    que aconteceu e o que fazer a respeito, sem culpar a credencial."""
     if plan == "Image":
         return (
             "o plano Image serve geração de imagem (/v1/images/*), não conversa "
             "nem código — uma CLI ou assistente de código precisa de uma stack "
-            "de um plano de LLM (Pro ou Max)"
+            "de um plano de LLM (Go, Pro ou Max)"
         )
     return (
         f"o plano {plan} não tem acesso à CLI nem a assistentes de código — "
-        "para liberar o acesso, faça upgrade para o Pro ou o Max em app.trystac.com"
+        "para liberar o acesso, troque para um plano de LLM em app.trystac.com"
     )

@@ -27,8 +27,6 @@ rejeição acontece ANTES do OCR (custo zero pra documento que não passa).
 
 import io
 
-from plan_unification import feature_plan
-
 # Tetos por plano. Dois eixos porque medem custos diferentes: bytes protege
 # memória/transferência (um PDF de 100 MB não deve nem ser aberto), páginas
 # protegem CPU (é o número de páginas, não o tamanho do arquivo, que decide
@@ -38,22 +36,18 @@ from plan_unification import feature_plan
 # Plano ausente do dict cai no default conservador: um plano novo nunca herda
 # um teto alto por esquecimento.
 #
-# "VibeCoder" é o nome antigo de "Go" — entrada mantida só até a migration 0049
-# rodar em produção; sem ela o plano cairia no default na janela de transição.
 # Enterprise é negociado por contrato ("Custom" na página de preços); os
 # valores abaixo são o ponto de partida aplicado até o contrato pedir mais —
 # não há ainda um mecanismo de override por conta, então um teto maior exige
 # alterar esta constante manualmente.
 MAX_DOCUMENT_BYTES = {
     "Go": 8 * 1024 * 1024,
-    "VibeCoder": 8 * 1024 * 1024,
     "Pro": 15 * 1024 * 1024,
     "Max": 25 * 1024 * 1024,
     "Enterprise": 50 * 1024 * 1024,
 }
 MAX_DOCUMENT_PAGES = {
     "Go": 15,
-    "VibeCoder": 15,
     "Pro": 30,
     "Max": 50,
     "Enterprise": 100,
@@ -70,7 +64,6 @@ DEFAULT_MAX_DOCUMENT_PAGES = 15
 # PDF, mesmo pesando pouco em disco).
 MAX_IMAGE_BYTES = {
     "Go": 5 * 1024 * 1024,
-    "VibeCoder": 5 * 1024 * 1024,
     "Pro": 10 * 1024 * 1024,
     "Max": 15 * 1024 * 1024,
     "Enterprise": 25 * 1024 * 1024,
@@ -93,7 +86,6 @@ MAX_IMAGE_MEGAPIXELS = 20_000_000
 # de cada arquivo já é policiado pelos eixos próprios de cada tipo).
 MAX_FILES_PER_REQUEST = {
     "Go": 1,
-    "VibeCoder": 1,
     "Pro": 5,
     "Max": 10,
     "Enterprise": 20,
@@ -143,7 +135,7 @@ class EmptyDocument(DocumentError):
 
 
 def limit_bytes(plan: str | None) -> int:
-    return MAX_DOCUMENT_BYTES.get(feature_plan(plan) or "", DEFAULT_MAX_DOCUMENT_BYTES)
+    return MAX_DOCUMENT_BYTES.get(plan or "", DEFAULT_MAX_DOCUMENT_BYTES)
 
 
 def max_limit_bytes() -> int:
@@ -158,7 +150,7 @@ def max_limit_bytes() -> int:
 
 
 def limit_pages(plan: str | None) -> int:
-    return MAX_DOCUMENT_PAGES.get(feature_plan(plan) or "", DEFAULT_MAX_DOCUMENT_PAGES)
+    return MAX_DOCUMENT_PAGES.get(plan or "", DEFAULT_MAX_DOCUMENT_PAGES)
 
 
 def check_size(size: int, plan: str | None) -> None:
@@ -174,7 +166,7 @@ def check_size(size: int, plan: str | None) -> None:
 
 
 def limit_image_bytes(plan: str | None) -> int:
-    return MAX_IMAGE_BYTES.get(feature_plan(plan) or "", DEFAULT_MAX_IMAGE_BYTES)
+    return MAX_IMAGE_BYTES.get(plan or "", DEFAULT_MAX_IMAGE_BYTES)
 
 
 def max_limit_image_bytes() -> int:
@@ -195,7 +187,7 @@ def check_image_size(size: int, plan: str | None) -> None:
 
 
 def limit_files(plan: str | None) -> int:
-    return MAX_FILES_PER_REQUEST.get(feature_plan(plan) or "", DEFAULT_MAX_FILES_PER_REQUEST)
+    return MAX_FILES_PER_REQUEST.get(plan or "", DEFAULT_MAX_FILES_PER_REQUEST)
 
 
 def max_limit_files() -> int:

@@ -34,8 +34,6 @@ de rede.
 import io
 import re
 
-from plan_unification import feature_plan
-
 # Tetos por plano. Dois eixos, como em document_extract.py: bytes de entrada
 # protegem memória/transferência do HTML recebido, páginas do PDF resultante
 # protegem CPU (é o número de páginas renderizadas, não o tamanho do HTML,
@@ -45,22 +43,17 @@ from plan_unification import feature_plan
 # Plano ausente do dict cai no default conservador: um plano novo nunca herda
 # um teto alto por esquecimento.
 #
-# "VibeCoder" é o nome antigo de "Go" — entrada mantida só até a migration
-# 0049 rodar em produção; sem ela o plano cairia no default na janela de
-# transição (mesmo raciocínio de document_extract.py).
 # Enterprise é negociado por contrato ("Custom" na página de preços); os
 # valores abaixo são o ponto de partida aplicado até o contrato pedir mais —
 # ver mesma observação em document_extract.py.
 MAX_HTML_BYTES = {
     "Go": 2 * 1024 * 1024,
-    "VibeCoder": 2 * 1024 * 1024,
     "Pro": 5 * 1024 * 1024,
     "Max": 8 * 1024 * 1024,
     "Enterprise": 15 * 1024 * 1024,
 }
 MAX_PDF_PAGES = {
     "Go": 20,
-    "VibeCoder": 20,
     "Pro": 50,
     "Max": 75,
     "Enterprise": 150,
@@ -87,7 +80,7 @@ class RenderError(DocumentGenerateError):
 
 
 def limit_bytes(plan: str | None) -> int:
-    return MAX_HTML_BYTES.get(feature_plan(plan) or "", DEFAULT_MAX_HTML_BYTES)
+    return MAX_HTML_BYTES.get(plan or "", DEFAULT_MAX_HTML_BYTES)
 
 
 def max_limit_bytes() -> int:
@@ -100,7 +93,7 @@ def max_limit_bytes() -> int:
 
 
 def limit_pages(plan: str | None) -> int:
-    return MAX_PDF_PAGES.get(feature_plan(plan) or "", DEFAULT_MAX_PDF_PAGES)
+    return MAX_PDF_PAGES.get(plan or "", DEFAULT_MAX_PDF_PAGES)
 
 
 def check_size(size: int, plan: str | None) -> None:

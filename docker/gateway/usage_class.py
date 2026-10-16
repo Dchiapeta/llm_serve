@@ -43,10 +43,8 @@ DEFAULT_REQ_PCT_HIGH = 0.40
 # fator 2: tokens por dia ativo (medium, high) — por plano. Chutes iniciais
 # razoáveis; calibrar com a distribuição real de usage_metrics após ~2
 # semanas de Go-64k (override sem deploy via usage_class_config).
-# "VibeCoder" é o nome antigo de "Go" — remover quando a migration 0049 rodar.
 DEFAULT_DAILY_THRESHOLDS = {
     "Go": (300_000, 1_500_000),
-    "VibeCoder": (300_000, 1_500_000),
     "Pro": (600_000, 3_000_000),
     "Max": (1_000_000, 5_000_000),
     "Enterprise": (1_000_000, 5_000_000),
