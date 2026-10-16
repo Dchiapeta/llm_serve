@@ -119,6 +119,14 @@ pelo manager. É aplicado dentro de `stack_request_quota`, que passa a devolver
 também `quota_default` (o limite do plano sem o override) — quem lê a função
 já recebe o limite efetivo e não deve ler a coluna direto.
 
+A `0079` acrescenta `used_weighted` no fim do retorno das duas funções: o uso
+com a request ponderada, `request_weight(tokens_in)` = ceil(tokens_in / 32768),
+mínimo 1. É o número que o gateway usa para cortar, e é o que o TryStac deve
+mostrar ao cliente como "requisições usadas" a partir do corte — sem exibir o
+peso nem a regra dos 32K na interface (decisão de 15/10/2026), para a barra,
+os avisos e o bloqueio baterem. `used` continua sendo a contagem crua, só para
+análise interna. Ler `used_weighted` daqui, nunca recalcular o peso.
+
 ## Convenção usada pelo TryStac (pra não colidir nomes/policies)
 
 - Grants de UPDATE são sempre **por coluna** (`grant update (col) on table to authenticated`), nunca a tabela inteira — o resto das colunas (`plan`, `machine_id`, `account_id`, `usage_class`, etc.) continua sem grant nenhum pra `authenticated`.

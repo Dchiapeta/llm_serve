@@ -1225,3 +1225,44 @@ def test_falha_ao_tocar_nao_escapa(monkeypatch):
 
     monkeypatch.setattr(main, "supa", Supa(), raising=False)
     asyncio.run(main._write_key_last_used("key-1", "2026-10-14T00:00:00+00:00"))
+
+
+# ---------- GO_PRO_UNIFIED: o Go enxerga os modelos do Pro ----------
+
+
+@pytest.fixture
+def unificado(planos, monkeypatch):
+    import plan_unification
+
+    monkeypatch.setattr(plan_unification, "GO_PRO_UNIFIED", True)
+    return planos
+
+
+def test_unificado_go_alcanca_o_27b(unificado):
+    r = _chat(unificado, model=QWEN)
+    assert r.status_code == 200 and unificado["sent"][0][1]["model"] == QWEN
+
+
+def test_unificado_go_sem_maquina_cai_no_reserva_do_pro(unificado):
+    _chat(unificado, model="go-base")
+    assert unificado["sent"][0][1]["model"] == QWEN
+
+
+def test_unificado_models_do_go_lista_o_27b(unificado):
+    r = unificado["client"].get("/v1/models", headers={"Authorization": "Bearer sk-cliente"})
+    assert QWEN in [m["id"] for m in r.json()["data"]]
+
+
+def test_unificado_mensagem_de_negado_nomeia_o_plano_real(unificado):
+    # modelo que nem o Pro tem: o 403 fala do plano do cliente, não do Pro
+    unificado["catalog"]["vendor/so-do-max"] = "text"
+    unificado["plans"]["vendor/so-do-max"] = ["Max"]
+    r = _chat(unificado, model="vendor/so-do-max")
+    assert r.status_code == 403
+    assert "plano Go" in r.json()["detail"] and "plano Pro" not in r.json()["detail"]
+
+
+def test_unificado_imagem_segue_no_catalogo_do_go(unificado):
+    assert main.catalog_plan("Go", main.openrouter.IMAGE_KIND) == "Go"
+    assert main.catalog_plan("Go", main.openrouter.TEXT_KIND) == "Pro"
+    assert main.catalog_plan("Go", main.openrouter.DECISIONS_KIND) == "Pro"

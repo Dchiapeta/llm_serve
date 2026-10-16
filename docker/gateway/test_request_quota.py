@@ -11,6 +11,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import request_quota  # noqa: E402
@@ -146,3 +148,35 @@ def test_corpo_no_protocolo_do_cliente():
     assert anth["type"] == "error" and anth["error"]["type"] == "rate_limit_error"
     # shape desconhecido cai no OpenAI, como error_body_for
     assert "error" in quota_body_for("outro", "x") and "type" not in quota_body_for("outro", "x")
+
+
+# ---------- request ponderada (0079) ----------
+
+
+@pytest.mark.parametrize(
+    "tokens_in,peso",
+    [(None, 1), (0, 1), (-5, 1), (True, 1), (1, 1), (32768, 1), (32769, 2),
+     (65536, 2), (100_000, 4), (262_144, 8)],
+)
+def test_peso_da_requisicao(tokens_in, peso):
+    assert request_quota.request_weight(tokens_in) == peso
+
+
+def test_corte_usa_o_uso_ponderado():
+    snap = snapshot_from_rpc(_row(used=10, used_weighted=4000), NOW)
+    assert snap.used == 4000 and snap.exhausted()
+
+
+def test_sem_used_weighted_cai_no_uso_cru():
+    # função ainda na versão da 0077
+    assert snapshot_from_rpc(_row(used=10), NOW).used == 10
+    assert snapshot_from_rpc(_row(used=10, used_weighted=None), NOW).used == 10
+
+
+def test_add_soma_no_snapshot_guardado_e_ignora_ausente():
+    cache = QuotaCache()
+    cache.add("nao-existe", 3)  # sem snapshot: nada a fazer, nem erro
+    cache.put("s1", snapshot_from_rpc(_row(used=10), NOW))
+    cache.add("s1", 3)
+    cache.add("s1", 0)
+    assert cache.get("s1", NOW).used == 13

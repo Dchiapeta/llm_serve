@@ -27,6 +27,8 @@ rejeição acontece ANTES do OCR (custo zero pra documento que não passa).
 
 import io
 
+from plan_unification import feature_plan
+
 # Tetos por plano. Dois eixos porque medem custos diferentes: bytes protege
 # memória/transferência (um PDF de 100 MB não deve nem ser aberto), páginas
 # protegem CPU (é o número de páginas, não o tamanho do arquivo, que decide
@@ -141,7 +143,7 @@ class EmptyDocument(DocumentError):
 
 
 def limit_bytes(plan: str | None) -> int:
-    return MAX_DOCUMENT_BYTES.get(plan or "", DEFAULT_MAX_DOCUMENT_BYTES)
+    return MAX_DOCUMENT_BYTES.get(feature_plan(plan) or "", DEFAULT_MAX_DOCUMENT_BYTES)
 
 
 def max_limit_bytes() -> int:
@@ -156,7 +158,7 @@ def max_limit_bytes() -> int:
 
 
 def limit_pages(plan: str | None) -> int:
-    return MAX_DOCUMENT_PAGES.get(plan or "", DEFAULT_MAX_DOCUMENT_PAGES)
+    return MAX_DOCUMENT_PAGES.get(feature_plan(plan) or "", DEFAULT_MAX_DOCUMENT_PAGES)
 
 
 def check_size(size: int, plan: str | None) -> None:
@@ -172,7 +174,7 @@ def check_size(size: int, plan: str | None) -> None:
 
 
 def limit_image_bytes(plan: str | None) -> int:
-    return MAX_IMAGE_BYTES.get(plan or "", DEFAULT_MAX_IMAGE_BYTES)
+    return MAX_IMAGE_BYTES.get(feature_plan(plan) or "", DEFAULT_MAX_IMAGE_BYTES)
 
 
 def max_limit_image_bytes() -> int:
@@ -193,7 +195,7 @@ def check_image_size(size: int, plan: str | None) -> None:
 
 
 def limit_files(plan: str | None) -> int:
-    return MAX_FILES_PER_REQUEST.get(plan or "", DEFAULT_MAX_FILES_PER_REQUEST)
+    return MAX_FILES_PER_REQUEST.get(feature_plan(plan) or "", DEFAULT_MAX_FILES_PER_REQUEST)
 
 
 def max_limit_files() -> int:

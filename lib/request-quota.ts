@@ -17,6 +17,11 @@ export type RequestQuota = {
   /** Limite do plano, sem o override da stack (0077). null = função ainda na
    *  versão da 0076, que não informa o padrão — o painel esconde a edição. */
   defaultLimit: number | null
+  /** Uso com a request ponderada por tokens (0079): ceil(tokens_in / 32768),
+   *  mínimo 1. É o número que o gateway usa para cortar e o que o cliente vê
+   *  como "requisições usadas" (sem o peso exposto). null = função anterior
+   *  à 0079. */
+  usedWeighted: number | null
 }
 
 type QuotaRow = {
@@ -26,6 +31,7 @@ type QuotaRow = {
   cycle_start: string
   cycle_end: string
   quota_default?: number | null
+  used_weighted?: number | string | null
 }
 
 /**
@@ -54,6 +60,8 @@ export async function fetchStackRequestQuotas(
       cycleEnd: row.cycle_end,
       defaultLimit:
         row.quota_default == null ? null : Number(row.quota_default),
+      usedWeighted:
+        row.used_weighted == null ? null : Number(row.used_weighted),
     })
   }
   return quotas

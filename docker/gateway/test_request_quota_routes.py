@@ -210,3 +210,52 @@ def test_documents_generate_html_tambem_conta(cliente):
         json={"html": "<p>oi</p>"},
     )
     assert r.status_code == 429
+
+
+# ---------- peso somado no fim da requisição (0079) ----------
+
+
+def _logar(monkeypatch, tokens_in, stack_id=GO["id"]):
+    # a gravação em gateway_requests não interessa aqui
+    monkeypatch.setattr(main, "spawn_tracked", lambda coro: coro.close())
+    main.log_gateway_request(
+        account_id="acc-1", stack_id=stack_id, api_key_id="key-1", machine_id="m-1",
+        path="chat/completions", model="m", status_code=200, stream=False,
+        started=main.time.monotonic(), usage={"prompt_tokens": tokens_in, "completion_tokens": 10},
+    )
+
+
+def test_request_grande_soma_o_resto_do_peso(monkeypatch):
+    monkeypatch.setattr(main, "supa", FakeSupa(used=100), raising=False)
+    _check(GO)  # admissão: 101
+    _logar(monkeypatch, 100_000)  # peso 4: soma mais 3
+    assert main.request_quota_cache.get(GO["id"], main.time.time()).used == 104
+
+
+def test_request_pequena_nao_soma_nada_alem_da_admissao(monkeypatch):
+    monkeypatch.setattr(main, "supa", FakeSupa(used=100), raising=False)
+    _check(GO)
+    _logar(monkeypatch, 32_768)
+    _logar(monkeypatch, None)
+    assert main.request_quota_cache.get(GO["id"], main.time.time()).used == 101
+
+
+def test_playground_nao_soma_peso(monkeypatch):
+    import trigger_ctx
+
+    monkeypatch.setattr(main, "supa", FakeSupa(used=100), raising=False)
+    _check(GO)
+    token = trigger_ctx.trigger_ctx.set({"purpose": "playground"})
+    try:
+        _logar(monkeypatch, 200_000)
+    finally:
+        trigger_ctx.trigger_ctx.reset(token)
+    assert main.request_quota_cache.get(GO["id"], main.time.time()).used == 101
+
+
+def test_peso_atravessa_o_limite_e_corta_a_proxima(monkeypatch):
+    monkeypatch.setattr(main, "supa", FakeSupa(used=3998), raising=False)
+    _check(GO)  # 3999: admitida
+    _logar(monkeypatch, 100_000)  # +3 → 4002
+    with pytest.raises(main.RequestQuotaExceeded):
+        _check(GO)

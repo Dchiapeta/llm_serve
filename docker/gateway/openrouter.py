@@ -113,14 +113,20 @@ def plan_catalog(rows: list[dict], plan: str | None) -> tuple[dict[str, str], di
     return catalog, fallbacks
 
 
-def plan_denial(model: str | None, kind: str, rows: list[dict], plan: str | None) -> str | None:
+def plan_denial(
+    model: str | None, kind: str, rows: list[dict], plan: str | None,
+    label: str | None = None,
+) -> str | None:
     """Mensagem do 403 quando o `model` pedido está na lista, é do tipo da
     rota, mas não é do plano da chave; None = não negado. Fora da lista não é
     negado aqui: segue a regra de destino de sempre (a máquina responde
     qualquer nome).
 
     Modelo da lista sem plano NENHUM é um modelo ainda não lançado (o Kimi K3,
-    0074): a mensagem diz isso, em vez de sugerir um upgrade que não resolve."""
+    0074): a mensagem diz isso, em vez de sugerir um upgrade que não resolve.
+
+    `label` é o plano que a mensagem nomeia, quando difere do `plan` cujo
+    catálogo decide (Go lendo o catálogo do Pro, plan_unification.py)."""
     if not model:
         return None
     row = next((r for r in rows if r["slug"] == model and r["kind"] == kind), None)
@@ -130,7 +136,8 @@ def plan_denial(model: str | None, kind: str, rows: list[dict], plan: str | None
     if not plans:
         return f"o modelo '{model}' ainda não está disponível"
     accepted = accepted_models(plan_catalog(rows, plan)[0], kind)
-    plano = f"no plano {plan}" if plan else "no seu plano"
+    shown = label if label is not None else plan
+    plano = f"no plano {shown}" if shown else "no seu plano"
     if not accepted:
         return f"o modelo '{model}' não está incluído {plano}"
     return (

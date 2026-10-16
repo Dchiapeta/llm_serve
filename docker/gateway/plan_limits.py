@@ -27,6 +27,8 @@ Módulo puro, como cli_policy.py: o I/O de resolver o plano fica em main.py.
 
 import os
 
+from plan_unification import feature_plan
+
 PLAN_CONTEXT_TOKENS: dict[str, int] = {
     "Go": int(os.environ.get("PLAN_CONTEXT_TOKENS_GO", "32768")),
     "Pro": int(os.environ.get("PLAN_CONTEXT_TOKENS_PRO", "262144")),
@@ -34,8 +36,9 @@ PLAN_CONTEXT_TOKENS: dict[str, int] = {
 
 
 def context_cap(plan: str | None) -> int | None:
-    """Teto de janela do plano, ou None se o plano não tem teto próprio."""
-    cap = PLAN_CONTEXT_TOKENS.get(plan or "")
+    """Teto de janela do plano, ou None se o plano não tem teto próprio.
+    Com GO_PRO_UNIFIED o Go vale o teto do Pro (plan_unification.py)."""
+    cap = PLAN_CONTEXT_TOKENS.get(feature_plan(plan) or "")
     return cap if isinstance(cap, int) and cap > 0 else None
 
 

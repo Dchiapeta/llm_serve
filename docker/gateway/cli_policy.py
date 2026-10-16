@@ -42,6 +42,7 @@ de billing_blocked e enforce_client_limit.
 import os
 
 from client_identity import normalize_tool
+from plan_unification import feature_plan
 
 # Rotas que SÓ um cliente de código fala. Os nomes são os mesmos que
 # log_gateway_request grava em gateway_requests.path (migration 0038) e que
@@ -79,7 +80,10 @@ def cli_block_reason(plan: str | None, path: str | None, user_agent: str | None)
 
     Só decide; não levanta e não loga — main.py faz as duas coisas, porque é
     lá que fica a diferença entre corte e observação."""
-    if plan not in CLI_BLOCKED_PLANS:
+    # Com GO_PRO_UNIFIED o Go lê a política do Pro (plan_unification.py).
+    # Stack de imagem nem chega aqui: authenticate a barra antes, nas rotas
+    # de LLM, pelo guard de categoria.
+    if feature_plan(plan) not in CLI_BLOCKED_PLANS:
         return None
 
     if path in CLI_ONLY_PATHS:

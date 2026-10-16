@@ -60,6 +60,7 @@ import image_retention
 import openrouter
 import openrouter_keys
 import plan_limits
+from plan_unification import feature_plan
 import request_quota
 from anthropic_compat import (
     anthropic_error_body,
@@ -216,8 +217,10 @@ IMAGE_RATE_LIMIT_BURST = {
 
 
 def rate_limit_rpm(plan: str | None) -> float:
-    """Taxa de reposição do bucket, em requisições por minuto."""
-    return RATE_LIMIT_RPM.get(plan or "", DEFAULT_RATE_LIMIT_RPM)
+    """Taxa de reposição do bucket, em requisições por minuto. Com
+    GO_PRO_UNIFIED o Go vale a taxa do Pro (plan_unification.py); só rota de
+    LLM chega aqui — imagem usa image_rate_limit_rpm."""
+    return RATE_LIMIT_RPM.get(feature_plan(plan) or "", DEFAULT_RATE_LIMIT_RPM)
 
 
 def rate_limit_burst(plan: str | None) -> float:
@@ -225,7 +228,7 @@ def rate_limit_burst(plan: str | None) -> float:
 
     Cai em rate_limit_rpm quando o plano não declara burst próprio, que é o
     comportamento que todo plano teve até existir esta tabela."""
-    return RATE_LIMIT_BURST.get(plan or "", rate_limit_rpm(plan))
+    return RATE_LIMIT_BURST.get(feature_plan(plan) or "", rate_limit_rpm(plan))
 
 
 def image_rate_limit_rpm(plan: str | None) -> float:
@@ -1229,7 +1232,7 @@ async def enforce_client_limit(entry: dict, stack: dict, plan: str | None, heade
         return
 
     fingerprint, label, user_agent, bucket = client_fingerprint(headers)
-    cap = client_cap(plan)
+    cap = client_cap(plan, stack.get("category"))
     now = time.time()
     seen = client_seen[stack_id]
 
@@ -1521,7 +1524,9 @@ async def check_request_quota(
     uma rota nova que registre e não passe por aqui seria uso grátis. Fica
     fora o /v1/messages/count_tokens, que é métrica interna e não registra.
 
-    Admitir soma 1 no snapshot (ver request_quota.py). Recusar não soma: o 429
+    Admitir soma 1 no snapshot (ver request_quota.py); o resto do peso da
+    request ponderada (0079) entra em log_gateway_request, quando os tokens
+    de entrada são conhecidos. Recusar não soma: o 429
     sai antes de existir linha em gateway_requests, então também não conta no
     banco. `stack` None (conta sem stack) e a chave interna de playground
     passam sem consulta; stack de imagem também, sem gastar a RPC numa
@@ -1553,8 +1558,8 @@ async def check_request_quota(
         if warn_key not in request_quota_warned:
             request_quota_warned.add(warn_key)
             logger.warning(
-                "cota de requisições: stack %s (%s) excederia %d/%d — só registro "
-                "(REQUEST_QUOTA_ENFORCE desligado)",
+                "cota de requisições: stack %s (%s) excederia %d/%d (ponderado por "
+                "tokens) — só registro (REQUEST_QUOTA_ENFORCE desligado)",
                 stack.get("slug") or stack_id, plan, snap.used, snap.limit,
             )
     snap.used += 1
@@ -2321,24 +2326,36 @@ async def _openrouter_rows() -> list[dict]:
     return rows
 
 
-async def _openrouter_models(plan: str | None) -> tuple[dict[str, str], dict[str, str]]:
+def catalog_plan(plan: str | None, kind: str) -> str | None:
+    """Plano cujo catálogo de modelos (openrouter_models.plans, 0074) vale
+    para uma request do tipo `kind`. Com GO_PRO_UNIFIED, o Go de LLM enxerga
+    os modelos e o reserva do Pro (plan_unification.py). Imagem fica de fora:
+    só stack de imagem chega às rotas de imagem (_require_image_product), e
+    ela é outro produto, que segue no catálogo do Go."""
+    return plan if kind == openrouter.IMAGE_KIND else feature_plan(plan)
+
+
+async def _openrouter_models(
+    plan: str | None, kind: str,
+) -> tuple[dict[str, str], dict[str, str]]:
     """({slug: kind}, {kind: slug do reserva}) que uma chave do `plan`
-    alcança no OpenRouter; vazios com o repasse desligado."""
+    alcança no OpenRouter para requests do tipo `kind` (ver catalog_plan);
+    vazios com o repasse desligado."""
     if not await openrouter_enabled():
         return {}, {}
-    return openrouter.plan_catalog(await _openrouter_rows(), plan)
+    return openrouter.plan_catalog(await _openrouter_rows(), catalog_plan(plan, kind))
 
 
-async def openrouter_catalog(plan: str | None) -> dict[str, str]:
+async def openrouter_catalog(plan: str | None, kind: str) -> dict[str, str]:
     """{slug: kind} dos modelos do plano (vazio com o repasse desligado)."""
-    return (await _openrouter_models(plan))[0]
+    return (await _openrouter_models(plan, kind))[0]
 
 
 async def openrouter_text_target(model: str | None, plan: str | None) -> str | None:
     """Modelo do OpenRouter que atende uma request de TEXTO que vai para lá: o
     pedido, se está na lista do plano; senão o reserva de texto do plano
     (0073/0074). Imagem não tem reserva — fica fora da regra, ver a 0073."""
-    catalog, fallbacks = await _openrouter_models(plan)
+    catalog, fallbacks = await _openrouter_models(plan, openrouter.TEXT_KIND)
     return openrouter.pick_target(
         model, openrouter.TEXT_KIND, catalog,
         {k: v for k, v in fallbacks.items() if k == openrouter.TEXT_KIND},
@@ -2353,7 +2370,9 @@ async def require_plan_model(model: str | None, kind: str, plan: str | None) -> 
     27B. Modelo da lista sem plano nenhum (Kimi K3, ainda não lançado) é
     barrado para todos. Modelo fora da lista não é barrado aqui (segue a regra
     de destino)."""
-    detail = openrouter.plan_denial(model, kind, await _openrouter_rows(), plan)
+    detail = openrouter.plan_denial(
+        model, kind, await _openrouter_rows(), catalog_plan(plan, kind), label=plan,
+    )
     if detail:
         raise HTTPException(status_code=403, detail=detail)
 
@@ -2456,7 +2475,7 @@ def _openrouter_auth(secret: str | None) -> dict[str, str] | None:
 
 async def openrouter_slug_for(model: str | None, kind: str, plan: str | None) -> str | None:
     """Slug do OpenRouter que atende este `model`, ou None (vai pra máquina)."""
-    return openrouter.pick_slug(model, kind, await openrouter_catalog(plan))
+    return openrouter.pick_slug(model, kind, await openrouter_catalog(plan, kind))
 
 
 async def require_machines(model: str | None, kind: str, plan: str | None) -> None:
@@ -2468,7 +2487,7 @@ async def require_machines(model: str | None, kind: str, plan: str | None) -> No
     if await machines_enabled():
         return
     if await openrouter_enabled():
-        accepted = openrouter.accepted_models(await openrouter_catalog(plan), kind)
+        accepted = openrouter.accepted_models(await openrouter_catalog(plan, kind), kind)
         raise HTTPException(
             status_code=404, detail=openrouter.unavailable_detail(model, accepted)
         )
@@ -5406,6 +5425,12 @@ def log_gateway_request(
         row["cost_usd"] = cost_usd
     if upstream == OPENROUTER_UPSTREAM:
         _touch_openrouter_key_last_used(api_key_id)
+    # Resto do peso da request ponderada (migration 0079): check_request_quota
+    # já somou 1 na admissão, e só aqui os tokens de entrada são conhecidos.
+    # Playground fica fora como lá — não soma nem na admissão.
+    weight = request_quota.request_weight(row["tokens_in"])
+    if stack_id and weight > 1 and trigger_snapshot("quota").get("purpose") != "playground":
+        request_quota_cache.add(stack_id, weight - 1)
     if product_analytics.enabled():
         purpose = trigger_snapshot("analytics").get("purpose")
         row["analytics_origin"] = purpose if purpose in {"customer", "playground"} else "unknown"
@@ -6944,7 +6969,9 @@ async def images_edits(request: Request, authorization: str | None = Header(None
     # como sempre (ver a docstring acima). Lido, o corpo vai inteiro para a
     # máquina se o modelo não for do OpenRouter.
     buffered: bytes | None = None
-    if openrouter.accepted_models(await openrouter_catalog(key_plan), openrouter.IMAGE_KIND):
+    if openrouter.accepted_models(
+        await openrouter_catalog(key_plan, openrouter.IMAGE_KIND), openrouter.IMAGE_KIND
+    ):
         buffered = await _read_capped(request, image_proxy.max_edit_bytes())
         fields, references = await _parse_edit_form(request, buffered)
         requested = openrouter.requested_model(fields)
@@ -7127,7 +7154,7 @@ async def openrouter_decisions_route(request: Request, authorization: str | None
 
     requested = openrouter.requested_model(body)
     await require_plan_model(requested, openrouter.DECISIONS_KIND, key_plan)
-    catalog = await openrouter_catalog(key_plan)
+    catalog = await openrouter_catalog(key_plan, openrouter.DECISIONS_KIND)
     slug = openrouter.pick_slug(requested, openrouter.DECISIONS_KIND, catalog)
     if not slug:
         raise HTTPException(
@@ -7220,7 +7247,7 @@ async def _proxy(
         return JSONResponse(content={
             "object": "list",
             "data": openrouter.model_list_entries(
-                openrouter.accepted_models(await openrouter_catalog(key_plan), key_kind)
+                openrouter.accepted_models(await openrouter_catalog(key_plan, key_kind), key_kind)
             ),
         })
 
@@ -7242,7 +7269,7 @@ async def _proxy(
                 return JSONResponse(content={
                     "object": "list",
                     "data": openrouter.model_list_entries(
-                        openrouter.accepted_models(await openrouter_catalog(key_plan), key_kind)
+                        openrouter.accepted_models(await openrouter_catalog(key_plan, key_kind), key_kind)
                     ),
                 })
         raise
@@ -7405,7 +7432,7 @@ async def _proxy(
                     if not str(m.get("id", "")).startswith("acct-")
                 ] + openrouter.model_list_entries(
                     # os modelos do OpenRouter aceitos para esta chave
-                    openrouter.accepted_models(await openrouter_catalog(key_plan), key_kind)
+                    openrouter.accepted_models(await openrouter_catalog(key_plan, key_kind), key_kind)
                 )
                 raw = json.dumps(payload).encode()
             except Exception:

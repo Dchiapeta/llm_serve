@@ -48,6 +48,8 @@ import hashlib
 import ipaddress
 import os
 
+from plan_unification import feature_plan
+
 # Muda junto com a FÓRMULA do fingerprint, nunca com a lista de ferramentas.
 # Bumpar isto invalida todos os ambientes conhecidos de uma vez: cada um vira
 # "novo" e disputa vaga do zero, o que num plano lotado significa 403 para
@@ -214,11 +216,15 @@ def client_fingerprint(headers) -> tuple[str, str, str, str | None]:
     return hashlib.sha256(material.encode()).hexdigest(), label, user_agent, bucket
 
 
-def client_cap(plan: str | None) -> int | None:
+def client_cap(plan: str | None, category: str | None = None) -> int | None:
     """Teto de ambientes do plano. None = sem teto.
 
     Plano fora do dict cai em None (fail-open), pelo mesmo motivo de
     usage_class.high_cap: o pior caso de fail-open é um cliente com ambientes
     demais, o de fail-closed seria cliente pagante sem conseguir conectar
-    porque alguém criou um plano novo e esqueceu deste dict."""
-    return MAX_CLIENTS_BY_PLAN.get(plan or "")
+    porque alguém criou um plano novo e esqueceu deste dict.
+
+    `category` porque este teto vale para LLM e imagem, e só o Go de LLM é
+    unificado com o Pro (plan_unification.py) — a stack Go de imagem segue
+    com o teto do Go."""
+    return MAX_CLIENTS_BY_PLAN.get(feature_plan(plan, category) or "")

@@ -22,6 +22,14 @@ REQUEST_QUOTA_ERROR_TTL_S.
 REQUEST_QUOTA_ENFORCE desligado (o default) só registra no log quem
 estouraria — é o modo de conferir a contagem em produção antes de cortar.
 
+Request ponderada (15/10/2026, migration 0079): uma requisição vale
+ceil(tokens_in / REQUEST_WEIGHT_TOKENS), mínimo 1 — até 32K tokens de entrada
+conta 1, como antes. O corte usa o uso PONDERADO (`used_weighted` da RPC), o
+mesmo número que o cliente vê como "requisições usadas" — o peso em si nunca
+aparece para ele, então a mensagem de quota_message também não o cita. Os tokens só existem no fim da requisição, então a admissão soma 1 e
+log_gateway_request (main.py) soma o resto do peso (`QuotaCache.add`) — a
+requisição que atravessa o limite passa, e o corte vale a partir da próxima.
+
 Módulo puro, como plan_limits.py: o I/O (RPC, exceção HTTP) fica em main.py.
 """
 
@@ -39,6 +47,19 @@ def _env_flag(name: str) -> bool:
 REQUEST_QUOTA_ENFORCE = _env_flag("REQUEST_QUOTA_ENFORCE")
 REQUEST_QUOTA_CACHE_TTL_S = float(os.environ.get("REQUEST_QUOTA_CACHE_TTL_S") or "60")
 REQUEST_QUOTA_ERROR_TTL_S = float(os.environ.get("REQUEST_QUOTA_ERROR_TTL_S") or "10")
+
+# Tokens de entrada que valem UMA requisição. Espelha public.request_weight
+# (migration 0079) — sem env de propósito: um número diferente aqui e no banco
+# faria a soma local e a contagem do ciclo discordarem a cada releitura.
+REQUEST_WEIGHT_TOKENS = 32768
+
+
+def request_weight(tokens_in) -> int:
+    """Quantas requisições da cota esta requisição consome. Sem tokens
+    conhecidos (erro antes do upstream, rota sem usage) vale 1."""
+    if not isinstance(tokens_in, int) or isinstance(tokens_in, bool) or tokens_in <= 0:
+        return 1
+    return max(1, -(-tokens_in // REQUEST_WEIGHT_TOKENS))
 
 
 @dataclass
@@ -81,8 +102,14 @@ def snapshot_from_rpc(rows, now: float) -> QuotaSnapshot:
     limit = row.get("quota_limit") if isinstance(row, dict) else None
     if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
         limit = None
-    used = row.get("used") if isinstance(row, dict) else None
-    if not isinstance(used, int) or used < 0:
+    # used_weighted (0079) é o que corta; sem ela (migration ainda por
+    # aplicar) cai no `used` cru, o comportamento da 0077
+    used = None
+    if isinstance(row, dict):
+        used = row.get("used_weighted")
+        if not isinstance(used, int) or isinstance(used, bool):
+            used = row.get("used")
+    if not isinstance(used, int) or isinstance(used, bool) or used < 0:
         used = 0
     cycle_end = _parse_ts(row.get("cycle_end")) if isinstance(row, dict) else None
     return QuotaSnapshot(
@@ -116,6 +143,14 @@ class QuotaCache:
 
     def put(self, stack_id: str, snap: QuotaSnapshot) -> None:
         self._items[stack_id] = snap
+
+    def add(self, stack_id: str, amount: int) -> None:
+        """Soma `amount` no snapshot guardado (o resto do peso de uma
+        requisição já admitida). Sem snapshot, não faz nada: a próxima leitura
+        do banco já traz a linha de gateway_requests com os tokens."""
+        snap = self._items.get(stack_id)
+        if snap is not None and amount > 0:
+            snap.used += amount
 
     def clear(self) -> None:
         self._items.clear()

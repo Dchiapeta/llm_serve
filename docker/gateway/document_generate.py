@@ -34,6 +34,8 @@ de rede.
 import io
 import re
 
+from plan_unification import feature_plan
+
 # Tetos por plano. Dois eixos, como em document_extract.py: bytes de entrada
 # protegem memória/transferência do HTML recebido, páginas do PDF resultante
 # protegem CPU (é o número de páginas renderizadas, não o tamanho do HTML,
@@ -85,7 +87,7 @@ class RenderError(DocumentGenerateError):
 
 
 def limit_bytes(plan: str | None) -> int:
-    return MAX_HTML_BYTES.get(plan or "", DEFAULT_MAX_HTML_BYTES)
+    return MAX_HTML_BYTES.get(feature_plan(plan) or "", DEFAULT_MAX_HTML_BYTES)
 
 
 def max_limit_bytes() -> int:
@@ -98,7 +100,7 @@ def max_limit_bytes() -> int:
 
 
 def limit_pages(plan: str | None) -> int:
-    return MAX_PDF_PAGES.get(plan or "", DEFAULT_MAX_PDF_PAGES)
+    return MAX_PDF_PAGES.get(feature_plan(plan) or "", DEFAULT_MAX_PDF_PAGES)
 
 
 def check_size(size: int, plan: str | None) -> None:
