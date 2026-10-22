@@ -998,6 +998,66 @@ class SupaClient:
         rows = r.json()
         return rows[0]["value"] if rows else default
 
+    # ---------- stack_integrations (observabilidade) ----------
+    # Tabela da migration 0052 do TryStac: o painel grava a conexão (segredos
+    # cifrados com Fernet), observability_export.py lê o ledger da stack e
+    # avança o cursor. Toda escrita daqui é condicionada a `updated_at`: se a
+    # pessoa pausou, retomou ou editou no meio do envio, o PATCH não casa e o
+    # exportador larga a linha em vez de pisar no que ela fez.
+
+    async def list_exportable_stack_integrations(self, now_iso: str, limit: int) -> list[dict]:
+        r = await self._rest.get("/stack_integrations", params={
+            "select": "*",
+            "enabled": "eq.true",
+            "or": f'(lease_until.is.null,lease_until.lt."{now_iso}")',
+            "order": "lease_until.asc.nullsfirst",
+            "limit": str(limit),
+        })
+        r.raise_for_status()
+        return r.json()
+
+    async def lease_stack_integration(
+        self, integration_id: str, updated_at: str, now_iso: str, until_iso: str,
+    ) -> dict | None:
+        """Lease entre réplicas: só uma pega a linha por vez. None = outra
+        réplica pegou, ou a linha mudou desde a listagem."""
+        r = await self._rest.patch(
+            "/stack_integrations",
+            params={
+                "id": f"eq.{integration_id}",
+                "updated_at": f"eq.{updated_at}",
+                "enabled": "eq.true",
+                "or": f'(lease_until.is.null,lease_until.lt."{now_iso}")',
+            },
+            json={"lease_until": until_iso},
+            headers={"Prefer": "return=representation"},
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    async def update_stack_integration(self, integration_id: str, updated_at: str, patch: dict) -> bool:
+        """True se a linha ainda era a mesma (`updated_at`) e foi atualizada."""
+        r = await self._rest.patch(
+            "/stack_integrations",
+            params={"id": f"eq.{integration_id}", "updated_at": f"eq.{updated_at}"},
+            json=patch,
+            headers={"Prefer": "return=minimal, count=exact"},
+        )
+        r.raise_for_status()
+        total = r.headers.get("content-range", "").rsplit("/", 1)[-1]
+        return total.isdigit() and int(total) > 0
+
+    async def stack_integration_pending_requests(
+        self, stack_id: str, after_at: str, after_id: str | None, until_iso: str, limit: int,
+    ) -> list[dict]:
+        r = await self._rest.post("/rpc/stack_integration_pending_requests", json={
+            "p_stack_id": stack_id, "p_after_at": after_at, "p_after_id": after_id,
+            "p_until": until_iso, "p_limit": limit,
+        })
+        r.raise_for_status()
+        return r.json()
+
     # ---------- openrouter_keys ----------
 
     async def get_openrouter_key(self, api_key_id: str) -> dict | None:

@@ -109,6 +109,7 @@ from recovery import (
 from usage_class import classify_stack
 from usage_norm import SseUsageScanner, normalize_usage, usage_from_event
 import product_analytics
+import observability_export
 from routing import RoutingStore
 from runpod_api import RunPodClient
 from reasoning_filter import (
@@ -935,6 +936,8 @@ async def lifespan(app: FastAPI):
     )
     decisions_task = asyncio.create_task(decisions.decisions_retention_loop(supa))
     analytics_task = asyncio.create_task(product_analytics.export_loop(supa))
+    # integrações de observabilidade das stacks (TryStac, migration 0052)
+    observability_task = asyncio.create_task(observability_export.export_loop(supa))
     yield
     reaper_task.cancel()
     machine_task.cancel()
@@ -945,10 +948,12 @@ async def lifespan(app: FastAPI):
     image_retention_task.cancel()
     decisions_task.cancel()
     analytics_task.cancel()
-    try:
-        await analytics_task
-    except asyncio.CancelledError:
-        pass
+    observability_task.cancel()
+    for task in (analytics_task, observability_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await proxy_client.aclose()
     await document_client.aclose()
     await openai_client.aclose()
