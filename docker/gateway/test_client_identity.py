@@ -147,7 +147,6 @@ def test_sem_rede_ainda_gera_fingerprint_estavel():
 
 def test_cap_por_plano():
     assert client_cap("Go") == 5
-    assert client_cap("VibeCoder") == client_cap("Go")  # nome antigo, migration 0049
     assert client_cap("Pro") == 25
     assert client_cap("Max") == 50
     assert client_cap("Enterprise") is None

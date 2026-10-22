@@ -100,6 +100,33 @@ path (`{stack_id}/...`), o que é mais frágil que assinar no servidor.
 existe ⇒ imagem existe" vai mostrar link quebrado — o campo a checar é
 `file_deleted_at is null`.
 
+### Cota mensal de requisições (`0076`)
+
+`stack_request_quota(p_stack_id)` é a fonte única do limite (Go 4.000, Pro
+10.000, demais sem teto), do ciclo (aniversário de `stacks.purchase_date`) e do
+uso no ciclo. O gateway corta com ela e o manager mostra o uso pela irmã
+`stack_request_quotas()` (todas as stacks, só service_role). O TryStac ainda
+não exibe a cota (decisão de 01/10/2026); quando exibir, deve ler de
+`stack_request_quota` — nunca recontar `gateway_requests` nem copiar o limite
+numa constante. `security invoker`: do lado do TryStac quem isola tenant é a
+RLS de `stacks`/`gateway_requests`/`api_keys` que já existe lá, sem grant
+novo. `purchase_date` é definida na criação da stack pelo manager e é o que
+ancora o ciclo.
+
+`stacks.request_quota_override` (`0077`) troca o limite de uma stack
+específica (NULL = padrão do plano, inteiro > 0 = limite da stack), editado
+pelo manager. É aplicado dentro de `stack_request_quota`, que passa a devolver
+também `quota_default` (o limite do plano sem o override) — quem lê a função
+já recebe o limite efetivo e não deve ler a coluna direto.
+
+A `0079` acrescenta `used_weighted` no fim do retorno das duas funções: o uso
+com a request ponderada, `request_weight(tokens_in)` = ceil(tokens_in / 32768),
+mínimo 1. É o número que o gateway usa para cortar, e é o que o TryStac deve
+mostrar ao cliente como "requisições usadas" a partir do corte — sem exibir o
+peso nem a regra dos 32K na interface (decisão de 15/10/2026), para a barra,
+os avisos e o bloqueio baterem. `used` continua sendo a contagem crua, só para
+análise interna. Ler `used_weighted` daqui, nunca recalcular o peso.
+
 ## Convenção usada pelo TryStac (pra não colidir nomes/policies)
 
 - Grants de UPDATE são sempre **por coluna** (`grant update (col) on table to authenticated`), nunca a tabela inteira — o resto das colunas (`plan`, `machine_id`, `account_id`, `usage_class`, etc.) continua sem grant nenhum pra `authenticated`.

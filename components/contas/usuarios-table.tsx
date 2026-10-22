@@ -11,6 +11,7 @@ import {
   type TemplatePlan,
 } from "@/lib/types"
 import { formatConsumption } from "@/lib/consumption"
+import type { RequestQuota } from "@/lib/request-quota"
 import { Button } from "@/components/ui/button"
 import {
   InputGroup,
@@ -47,6 +48,9 @@ export type ContaStackSummary = {
   billingStatus: BillingStatus
   machineName: string | null
   machineStatus: Machine["status"] | null
+  /** Cota mensal de requisições do ciclo (migration 0076); null = stack sem
+   *  cota (imagem, Max, Enterprise) ou 0076 ainda não aplicada. */
+  quota: RequestQuota | null
 }
 
 export type UsuarioRow = {

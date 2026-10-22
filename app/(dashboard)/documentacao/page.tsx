@@ -1,4 +1,6 @@
 import type { ReactNode } from "react"
+import Link from "next/link"
+import { Clock } from "lucide-react"
 
 import {
   Accordion,
@@ -6,6 +8,7 @@ import {
   AccordionItem,
   AccordionTrigger,
 } from "@/components/ui/accordion"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Card, CardContent } from "@/components/ui/card"
 import { ApiReference } from "@/components/documentacao/api-reference"
 import { MachineAbout } from "@/components/machines/machine-about"
@@ -32,6 +35,19 @@ export default function DocumentacaoPage() {
           imagem docker, planos e o gateway que liga tudo isso.
         </p>
       </div>
+
+      <Alert>
+        <Clock />
+        <AlertTitle>Temporário: repasse ao OpenRouter</AlertTitle>
+        <AlertDescription>
+          Desde 28/09/2026 o OpenRouter responde quando não há máquina disponível
+          (e pode substituir as máquinas por completo). É provisório —{" "}
+          <Link href="/documentacao/openrouter" className="underline underline-offset-4">
+            ver como funciona e como remover
+          </Link>
+          .
+        </AlertDescription>
+      </Alert>
 
       <Card>
         <CardContent>

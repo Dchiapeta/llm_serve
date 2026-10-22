@@ -195,6 +195,9 @@ export type Stack = {
   name: string
   // Override de system prompt da stack; null = sem override.
   system_prompt: string | null
+  // Limite mensal de requisições no lugar do padrão do plano (migration
+  // 0077); null = padrão. Lido via stack_request_quota, nunca direto.
+  request_quota_override?: number | null
   // Defaults de sampling aplicados pelo gateway quando o cliente não manda o
   // parâmetro na requisição (temperature/top_p: migration 0035;
   // max_tokens/presence_penalty: migration 0056). Null = passthrough puro,
@@ -345,7 +348,11 @@ export type RoutingHistory = {
 export type UsageMetric = {
   id: string
   api_key_id: string | null
-  machine_id: string
+  // nulo no uso repassado ao OpenRouter, que não passa por máquina (0075)
+  machine_id: string | null
+  // null = coletado do agent de uma máquina; "openrouter" = repasse,
+  // agregado por hora a partir de gateway_requests (0075)
+  upstream?: string | null
   window_start: string
   requests: number
   tokens_in: number
@@ -448,9 +455,19 @@ export type ProvisionDecision = {
 export type OpenRouterModel = {
   id: string
   slug: string
-  kind: "text" | "image"
+  // decisions (0078): modelos de decisão tipada (Jev), só pelo /v1/decisions
+  kind: "text" | "image" | "decisions"
   label: string | null
   enabled: boolean
+  // planos (stacks.plan) com acesso ao modelo (migration 0074). Fora deles o
+  // gateway responde 403. Ausente só antes da migration.
+  plans?: TemplatePlan[]
+  // planos dos quais o modelo é o reserva de texto (0074): responde pelo
+  // OpenRouter quando o modelo pedido não está na lista do plano e não há
+  // máquina disponível. Subconjunto de `plans`; um reserva por plano.
+  fallback_plans?: TemplatePlan[]
+  // OBSOLETA desde a 0074 (era o reserva único da 0073); o painel não usa.
+  fallback?: boolean
   created_at: string
   updated_at: string
 }

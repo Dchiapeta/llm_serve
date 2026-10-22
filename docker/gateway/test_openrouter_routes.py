@@ -35,7 +35,7 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"conteudo da imagem"
 PNG_B64 = base64.b64encode(PNG).decode()
 
 
-def _entry(category="llm", system_prompt="Você é o assistente da Loja X."):
+def _entry(category="llm", system_prompt="Você é o assistente da Loja X.", plan="Go"):
     return {
         "account_id": "acc-1",
         "api_key_id": "key-1",
@@ -43,7 +43,7 @@ def _entry(category="llm", system_prompt="Você é o assistente da Loja X."):
         "purpose": "customer",
         "enable_knowledge_base": False,  # RAG desligado: nada de rede no teste
         "stacks": [{
-            "id": "stack-1", "plan": "Go", "category": category,
+            "id": "stack-1", "plan": plan, "category": category,
             "system_prompt": system_prompt,
         }],
     }
@@ -59,13 +59,46 @@ class FakeSupa:
         return self.estado["settings"].get(key, default)
 
     async def list_enabled_openrouter_models(self):
-        return [{"slug": s, "kind": k} for s, k in self.estado["catalog"].items()]
+        rows = []
+        for s, k in self.estado["catalog"].items():
+            row = {"slug": s, "kind": k, "fallback": s == self.estado["fallback"]}
+            # sem "plans" no estado: linha de antes da 0074 (aberta a todos)
+            if self.estado.get("plans") is not None:
+                row["plans"] = self.estado["plans"].get(s, [])
+                row["fallback_plans"] = self.estado["fallback_plans"].get(s, [])
+            rows.append(row)
+        return rows
 
     async def upload_image_object(self, storage_path, data, content_type):
         self.uploaded[storage_path] = data
 
     async def insert_image_generations(self, rows):
         self.rows.extend(rows)
+
+    # chaves espelho (0072)
+    async def get_openrouter_key(self, api_key_id):
+        return self.estado["or_keys"].get(api_key_id)
+
+    async def insert_openrouter_key(self, row):
+        if row["api_key_id"] in self.estado["or_keys"]:
+            return False
+        self.estado["or_keys"][row["api_key_id"]] = row
+        return True
+
+    async def delete_openrouter_key(self, api_key_id):
+        self.estado["or_keys"].pop(api_key_id, None)
+
+    async def list_keys_without_openrouter_key(self):
+        return [
+            {"api_key_id": k, "account_id": "acc-1", "key_prefix": f"stac_{k}", "account_name": "Loja X"}
+            for k in ("key-1", "key-2") if k not in self.estado["or_keys"]
+        ]
+
+    async def get_api_key_identity(self, api_key_id):
+        if api_key_id != "key-1":
+            return None
+        return {"api_key_id": "key-1", "account_id": "acc-1",
+                "key_prefix": "stac_ab", "account_name": "Loja X"}
 
 
 @pytest.fixture
@@ -77,6 +110,11 @@ def rota(monkeypatch):
         "logged": [],
         "sent": [],
         "resposta": None,
+        "or_keys": {},
+        "fallback": None,
+        "machine": None,
+        "plan": "Max",
+        "resolve_calls": [],
     }
     supa = FakeSupa(estado)
     estado["supa"] = supa
@@ -91,7 +129,14 @@ def rota(monkeypatch):
         return estado["entry"], "hash", "Bearer sk-cliente"
 
     async def fake_resolve_route(account_id, entry):
-        raise AssertionError("request repassada não pode resolver máquina")
+        # default: nenhuma máquina disponível (o real dispara o wake e dá 503)
+        estado["resolve_calls"].append(entry["stack_id"])
+        machine = estado["machine"]
+        if machine is None:
+            raise main.HTTPException(status_code=503, detail="máquina ligando, tente novamente")
+        # plano fora de REASONING_LEAK_PLANS: o filtro de <think> do Qwen não
+        # é o assunto destes testes
+        return machine, False, estado["plan"], "stack-1"
 
     async def fake_quota(*a, **k):
         return None
@@ -102,6 +147,7 @@ def rota(monkeypatch):
     monkeypatch.setattr(main, "check_rate_limit", lambda *a, **k: None)
     monkeypatch.setattr(main, "check_image_rate_limit", lambda *a, **k: None)
     monkeypatch.setattr(main, "check_token_quota", fake_quota)
+    monkeypatch.setattr(main, "check_request_quota", fake_quota)
     monkeypatch.setattr(main, "log_gateway_request", lambda **kw: estado["logged"].append(kw))
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -119,6 +165,12 @@ def rota(monkeypatch):
     )
     main.settings_cache.clear()
     monkeypatch.setattr(main, "openrouter_catalog_cache", None)
+    monkeypatch.setattr(main, "OPENROUTER_API_KEY", "sk-or-da-stac")
+    # chaves espelho desligadas por padrão; o fixture `espelho` liga
+    monkeypatch.setattr(main, "openrouter_mgmt_client", None)
+    monkeypatch.setattr(main, "openrouter_secret_box", None)
+    main.openrouter_key_secrets.clear()
+    main.openrouter_key_failures.clear()
     estado["client"] = TestClient(main.app)
     yield estado
     main.settings_cache.clear()
@@ -369,6 +421,8 @@ def test_generations_vai_para_o_images_do_openrouter(rota):
     assert list(rota["supa"].uploaded.values()) == [PNG]
     assert rota["supa"].rows[0]["machine_id"] is None
     assert rota["logged"][0]["cost_usd"] == 0.04
+    # imagem fica FORA da regra de reserva: modelo da lista nem consulta máquina
+    assert rota["resolve_calls"] == []
 
 
 def test_edits_manda_as_referencias_como_data_url(rota):
@@ -440,3 +494,735 @@ def test_recriacao_negada_com_maquinas_desligadas(maquinas_desligadas):
     machine = {"id": "m-2", "name": "m"}
     assert asyncio.run(main.try_recreate_machine(machine, "teste")) is False
     assert maquinas_desligadas == ["recreate_denied.machines_disabled"]
+
+
+# ---------------------------------------------------------------------------
+# chave espelho no OpenRouter por chave da Stac (0072)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def espelho(rota, monkeypatch):
+    from cryptography.fernet import Fernet
+
+    import openrouter_keys
+
+    box = openrouter_keys.SecretBox(Fernet.generate_key().decode())
+    mgmt = {"criadas": [], "apagadas": [], "falhar": False, "n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer sk-or-mgmt"
+        if request.method == "DELETE":
+            mgmt["apagadas"].append(request.url.path)
+            return httpx.Response(200, json={"deleted": True})
+        if mgmt["falhar"]:
+            return httpx.Response(500, json={"error": {"message": "boom"}})
+        mgmt["n"] += 1
+        body = json.loads(await request.aread())
+        mgmt["criadas"].append(body["name"])
+        return httpx.Response(201, json={
+            "data": {"hash": f"hash-{mgmt['n']}", "name": body["name"]},
+            "key": f"sk-or-v1-espelho-{mgmt['n']}",
+        })
+
+    monkeypatch.setattr(main, "openrouter_secret_box", box)
+    monkeypatch.setattr(main, "openrouter_mgmt_client", httpx.AsyncClient(
+        base_url="https://openrouter.test/api/v1",
+        headers={"Authorization": "Bearer sk-or-mgmt"},
+        transport=httpx.MockTransport(handler),
+    ))
+    rota["entry"] = {**rota["entry"], "account_name": "Loja X", "key_prefix": "stac_ab"}
+    rota["resposta"] = lambda r: httpx.Response(200, json={"choices": [], "usage": {
+        "prompt_tokens": 1, "completion_tokens": 1, "cost": 0.001}})
+    rota["mgmt"] = mgmt
+    rota["box"] = box
+    return rota
+
+
+def test_primeira_request_cria_a_espelho_e_as_seguintes_reusam(espelho):
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    assert espelho["mgmt"]["criadas"] == ["acc-1/key-1"]
+    for request, _body in espelho["sent"]:
+        assert request.headers["authorization"] == "Bearer sk-or-v1-espelho-1"
+    row = espelho["or_keys"]["key-1"]
+    assert row["openrouter_hash"] == "hash-1"
+    # o segredo vai cifrado para o banco
+    assert "espelho" not in row["secret_encrypted"]
+    assert espelho["box"].decrypt(row["secret_encrypted"]) == "sk-or-v1-espelho-1"
+
+
+def test_espelho_ja_gravada_e_lida_do_banco(espelho):
+    espelho["or_keys"]["key-1"] = {
+        "openrouter_hash": "hash-antiga",
+        "secret_encrypted": espelho["box"].encrypt("sk-or-v1-antiga"),
+    }
+    _chat(espelho, model=TEXT_SLUG)
+    assert espelho["mgmt"]["criadas"] == []
+    assert espelho["sent"][0][0].headers["authorization"] == "Bearer sk-or-v1-antiga"
+
+
+def test_falha_ao_criar_usa_a_compartilhada_e_nao_martela(espelho):
+    espelho["mgmt"]["falhar"] = True
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    for request, _body in espelho["sent"]:
+        assert request.headers["authorization"] == "Bearer sk-or-da-stac"
+    # a segunda request caiu no cooldown, sem nova tentativa
+    assert espelho["mgmt"]["n"] == 0 and "key-1" in main.openrouter_key_failures
+
+
+def test_401_na_espelho_esquece_para_recriar(espelho):
+    _chat(espelho, model=TEXT_SLUG)
+    espelho["resposta"] = lambda r: httpx.Response(401, json={"error": {"message": "User not found"}})
+    r = _chat(espelho, model=TEXT_SLUG)
+    assert r.status_code == 503
+    assert "key-1" not in main.openrouter_key_secrets
+    assert "key-1" not in espelho["or_keys"]
+
+
+def test_admin_provision_cria_a_espelho_da_chave_nova(espelho, monkeypatch):
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+    r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
+    assert r.json() == {"ok": True}
+    assert espelho["mgmt"]["criadas"] == ["acc-1/key-1"]
+    r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "outra"})
+    assert r.status_code == 404
+
+
+def test_provision_nao_cria_com_o_repasse_desligado(espelho, monkeypatch):
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+    espelho["settings"]["openrouter_enabled"] = False
+    r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
+    assert r.json() == {"ok": False, "reason": "repasse ao OpenRouter desligado na página Modelos"}
+    assert espelho["mgmt"]["criadas"] == []
+
+
+def test_provision_diz_qual_variavel_falta(rota, monkeypatch):
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+    monkeypatch.setattr(
+        main, "openrouter_keys_disabled_reason",
+        "variável ausente no processo do gateway: OPENROUTER_MANAGEMENT_KEY",
+    )
+    r = rota["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
+    assert r.json()["reason"].endswith("OPENROUTER_MANAGEMENT_KEY")
+
+
+def test_backfill_cria_so_as_que_faltam(espelho, monkeypatch):
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+    espelho["or_keys"]["key-1"] = {
+        "openrouter_hash": "h", "secret_encrypted": espelho["box"].encrypt("sk-or-v1-x"),
+    }
+
+    async def sem_espera(_):
+        return None
+
+    monkeypatch.setattr(main.asyncio, "sleep", sem_espera)
+    r = espelho["client"].post("/admin/openrouter-keys/backfill")
+    assert r.json() == {"ok": True, "queued": 1}
+    assert espelho["mgmt"]["criadas"] == ["acc-1/key-2"]
+
+
+def test_sem_compartilhada_usa_so_a_espelho(espelho, monkeypatch):
+    monkeypatch.setattr(main, "OPENROUTER_API_KEY", "")
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    assert espelho["sent"][0][0].headers["authorization"] == "Bearer sk-or-v1-espelho-1"
+
+
+def test_sem_compartilhada_e_sem_espelho_e_503(espelho, monkeypatch):
+    monkeypatch.setattr(main, "OPENROUTER_API_KEY", "")
+    espelho["mgmt"]["falhar"] = True
+    r = _chat(espelho, model=TEXT_SLUG)
+    assert r.status_code == 503
+    assert espelho["sent"] == []
+    assert espelho["logged"][0]["status_code"] == 503
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter como reserva das máquinas (30/09, migration 0073)
+# ---------------------------------------------------------------------------
+
+QWEN = "qwen/qwen3.8-27b"
+POD = {
+    "id": "m-pro", "public_url": "https://pod.test", "served_model_name": "pro-base",
+    "model_name": "Qwen/Qwen3.8-27B", "max_model_len": 131072, "max_concurrent_seqs": 16,
+}
+
+
+@pytest.fixture
+def reserva(rota, monkeypatch):
+    rota["catalog"][QWEN] = "text"
+    rota["fallback"] = QWEN
+    rota["resposta"] = lambda r: httpx.Response(200, json={"choices": [], "usage": {
+        "prompt_tokens": 1, "completion_tokens": 1}})
+    rota["pod"] = []
+
+    async def pod_handler(request: httpx.Request) -> httpx.Response:
+        rota["pod"].append(json.loads(await request.aread()))
+        return rota["pod_resposta"](request)
+
+    async def no_touch(*a, **k):
+        return None
+
+    monkeypatch.setattr(main, "maybe_touch", no_touch)
+    monkeypatch.setattr(main, "proxy_client",
+                        httpx.AsyncClient(transport=httpx.MockTransport(pod_handler)),
+                        raising=False)
+    main.in_flight.clear()
+    yield rota
+    assert sum(main.in_flight.values()) == 0  # nenhum desvio vaza vaga
+    main.in_flight.clear()
+
+
+def test_sem_maquina_modelo_da_lista_responde_pelo_openrouter(reserva):
+    r = _chat(reserva, model=TEXT_SLUG)
+    assert r.status_code == 200
+    assert reserva["resolve_calls"] == ["stack-1"]  # a máquina foi pedida (wake)
+    assert reserva["sent"][0][1]["model"] == TEXT_SLUG
+
+
+def test_sem_maquina_pro_base_cai_no_reserva(reserva):
+    _chat(reserva, model="pro-base")
+    assert reserva["sent"][0][1]["model"] == QWEN
+
+
+def test_maquina_disponivel_responde_qualquer_modelo_com_o_nome_pedido(reserva):
+    reserva["machine"] = POD
+    reserva["pod_resposta"] = lambda r: httpx.Response(200, json={
+        "id": "x", "model": "pro-base",
+        "choices": [{"message": {"role": "assistant", "content": "olá"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+    })
+    r = _chat(reserva, model=TEXT_SLUG)
+    assert r.status_code == 200
+    assert reserva["sent"] == []  # nada foi pro OpenRouter
+    assert reserva["pod"][0]["model"] == "pro-base"  # a máquina recebe o nome dela
+    assert r.json()["model"] == TEXT_SLUG  # o cliente vê o que pediu
+    assert r.json()["choices"][0]["message"]["content"] == "olá"
+
+
+def test_maquina_disponivel_stream_tambem_mostra_o_nome_pedido(reserva):
+    reserva["machine"] = POD
+    sse = (
+        b'data: {"id":"x","model":"pro-base","choices":[{"delta":{"content":"ol"}}]}\n\n'
+        b'data: {"id":"x","model":"pro-base","choices":[{"delta":{"content":"\xc3\xa1"},"finish_reason":"stop"}],'
+        b'"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    reserva["pod_resposta"] = lambda r: httpx.Response(
+        200, content=sse, headers={"content-type": "text/event-stream"}
+    )
+    r = _chat(reserva, model=TEXT_SLUG, stream=True)
+    assert b'"model":"pro-base"' not in r.content
+    assert r.content.count(('"model":"' + TEXT_SLUG + '"').encode()) == 2
+
+
+def test_maquina_lotada_desvia(reserva, monkeypatch):
+    reserva["machine"] = POD
+
+    def lotada(flight_key, *a, **k):
+        main.release_flight(flight_key)
+        raise main.HTTPException(status_code=429, detail="lotada")
+
+    monkeypatch.setattr(main, "check_concurrency", lotada)
+    r = _chat(reserva, model="pro-base")
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == QWEN and reserva["pod"] == []
+
+
+def test_conversa_maior_que_a_maquina_continua_no_openrouter(reserva, monkeypatch):
+    reserva["machine"] = POD
+
+    async def estourou(*a, **k):
+        raise main.ContextWindowExceeded("não cabe")
+
+    monkeypatch.setattr(main, "validate_body", estourou)
+    r = _chat(reserva, model=TEXT_SLUG)
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == TEXT_SLUG and reserva["pod"] == []
+    # o corpo desviado é o ORIGINAL do cliente, não o reescrito para a máquina
+    assert reserva["sent"][0][1]["messages"][-1] == {"role": "user", "content": "oi"}
+
+
+def test_maquinas_desligadas_pro_base_vai_pro_reserva(reserva):
+    reserva["settings"]["machines_enabled"] = False
+    r = _chat(reserva, model="pro-base")
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == QWEN
+    assert reserva["resolve_calls"] == []
+
+
+def test_sem_reserva_e_sem_maquina_segue_o_503_da_maquina(reserva):
+    reserva["fallback"] = None
+    r = _chat(reserva, model="pro-base")
+    assert r.status_code == 503 and reserva["sent"] == []
+
+
+def test_messages_sem_maquina_desvia_e_com_maquina_nao(reserva):
+    corpo = {"model": TEXT_SLUG, "max_tokens": 100,
+             "messages": [{"role": "user", "content": "oi"}]}
+    r = reserva["client"].post("/v1/messages", json=corpo, headers={"x-api-key": "sk-cliente"})
+    assert r.status_code == 200
+    assert reserva["sent"][0][0].url.path == "/api/v1/messages"
+    assert reserva["sent"][0][1]["model"] == TEXT_SLUG
+
+
+def test_messages_contexto_maior_que_a_maquina_desvia(reserva, monkeypatch):
+    reserva["machine"] = POD
+
+    async def estourou(*a, **k):
+        raise main.ContextWindowExceeded("não cabe")
+
+    monkeypatch.setattr(main, "validate_body", estourou)
+    r = reserva["client"].post(
+        "/v1/messages",
+        json={"model": "pro-base", "max_tokens": 100, "messages": [{"role": "user", "content": "oi"}]},
+        headers={"x-api-key": "sk-cliente"},
+    )
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == QWEN and reserva["pod"] == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_nome_pedido_sobrevive_ao_filtro_de_think_do_pro(reserva, stream):
+    reserva["machine"] = POD
+    reserva["plan"] = "Pro"  # REASONING_LEAK_PLANS: resposta passa pelo filtro de <think>
+    if stream:
+        sse = (
+            b'data: {"id":"x","model":"pro-base","choices":[{"index":0,"delta":{"content":"<think>hmm</think>"}}]}\n\n'
+            b'data: {"id":"x","model":"pro-base","choices":[{"index":0,"delta":{"content":"ol\xc3\xa1"},"finish_reason":"stop"}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        reserva["pod_resposta"] = lambda r: httpx.Response(
+            200, content=sse, headers={"content-type": "text/event-stream"})
+    else:
+        reserva["pod_resposta"] = lambda r: httpx.Response(200, json={
+            "id": "x", "model": "pro-base",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "<think>hmm</think>olá"},
+                         "finish_reason": "stop"}],
+        })
+    r = _chat(reserva, model=TEXT_SLUG, stream=stream)
+    assert r.status_code == 200
+    assert b"pro-base" not in r.content
+    assert TEXT_SLUG.encode() in r.content
+    if not stream:
+        assert r.json()["choices"][0]["message"]["content"] == "olá"
+
+
+def test_models_sem_maquina_lista_o_openrouter(reserva):
+    r = reserva["client"].get("/v1/models", headers={"Authorization": "Bearer sk-cliente"})
+    assert r.status_code == 200
+    assert QWEN in [m["id"] for m in r.json()["data"]]
+
+
+@pytest.mark.parametrize("rota_", ["chat", "messages"])
+def test_maquina_inalcancavel_desvia(reserva, rota_):
+    reserva["machine"] = POD
+
+    def cai(request):
+        raise httpx.ConnectError("pod fora do ar")
+
+    reserva["pod_resposta"] = cai
+    if rota_ == "chat":
+        r = _chat(reserva, model="pro-base")
+    else:
+        r = reserva["client"].post(
+            "/v1/messages",
+            json={"model": "pro-base", "max_tokens": 100, "messages": [{"role": "user", "content": "oi"}]},
+            headers={"x-api-key": "sk-cliente"},
+        )
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == QWEN
+
+
+@pytest.mark.parametrize("rota_", ["chat", "messages"])
+def test_maquina_503_antes_do_primeiro_byte_desvia(reserva, rota_):
+    reserva["machine"] = POD
+    reserva["pod_resposta"] = lambda r: httpx.Response(503, json={"detail": "vLLM reiniciando"})
+    if rota_ == "chat":
+        r = _chat(reserva, model="pro-base", stream=True)
+    else:
+        r = reserva["client"].post(
+            "/v1/messages",
+            json={"model": "pro-base", "max_tokens": 100, "stream": True,
+                  "messages": [{"role": "user", "content": "oi"}]},
+            headers={"x-api-key": "sk-cliente"},
+        )
+    assert r.status_code == 200
+    assert reserva["sent"][0][1]["model"] == QWEN
+
+
+def test_maquina_503_sem_reserva_repassa_o_erro(reserva):
+    reserva["machine"] = POD
+    reserva["fallback"] = None
+    reserva["pod_resposta"] = lambda r: httpx.Response(503, json={"detail": "vLLM reiniciando"})
+    r = _chat(reserva, model="pro-base")
+    assert r.status_code == 503 and reserva["sent"] == []
+
+
+# ---------------------------------------------------------------------------
+# acesso a modelo e teto de contexto por plano (01/10, migration 0074)
+# ---------------------------------------------------------------------------
+
+QWEN9 = "qwen/qwen3.5-9b"
+GLM = "z-ai/glm-5.3-flash"
+TODOS = ["Go", "Pro", "Max", "Enterprise"]
+GO_POD = {
+    "id": "m-go", "public_url": "https://pod-go.test", "served_model_name": "go-base",
+    "model_name": "Qwen/Qwen3.5-9B", "max_model_len": 65536, "max_concurrent_seqs": 16,
+    "admin_secret": "segredo-do-pod",
+}
+
+
+@pytest.fixture
+def planos(reserva):
+    reserva["catalog"].update({QWEN9: "text", GLM: "text"})
+    reserva["plans"] = {
+        QWEN9: TODOS, GLM: TODOS, TEXT_SLUG: TODOS, IMAGE_SLUG: TODOS,
+        QWEN: ["Pro", "Max", "Enterprise"],
+    }
+    reserva["fallback_plans"] = {QWEN9: ["Go"], QWEN: ["Pro", "Max", "Enterprise"]}
+    reserva["plan"] = "Go"
+    return reserva
+
+
+def _texto_de_tokens(n: int) -> str:
+    # estimate_prompt_tokens: ~4 caracteres por token
+    return "abcd" * n
+
+
+def _pod_que_conta(tokens: int):
+    """Pod que responde o /admin/tokenize com `tokens` e o chat com 200."""
+    def resposta(request):
+        if request.url.path == "/admin/tokenize":
+            return httpx.Response(200, json={"count": tokens})
+        return httpx.Response(200, json={
+            "id": "x", "model": "go-base",
+            # Go/Pro passam pelo filtro de <think> (REASONING_LEAK_PLANS)
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                                                 "content": "<think>hmm</think>olá"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": tokens, "completion_tokens": 1},
+        })
+    return resposta
+
+
+def _chamadas_de_chat(estado):
+    return [b for b in estado["pod"] if "messages" in b]
+
+
+@pytest.mark.parametrize("repasse", [True, False])
+def test_go_pedindo_modelo_do_pro_e_403_sem_ligar_maquina(planos, repasse):
+    planos["settings"]["openrouter_enabled"] = repasse
+    r = _chat(planos, model=QWEN)
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert "plano Go" in detail and QWEN9 in detail and GLM in detail
+    assert planos["resolve_calls"] == [] and planos["sent"] == []
+
+
+def test_go_pedindo_modelo_do_pro_no_messages_e_403(planos):
+    r = planos["client"].post(
+        "/v1/messages",
+        json={"model": QWEN, "max_tokens": 100, "messages": [{"role": "user", "content": "oi"}]},
+        headers={"x-api-key": "sk-cliente"},
+    )
+    assert r.status_code == 403 and planos["sent"] == []
+
+
+@pytest.mark.parametrize("plano", ["Go", "Pro", "Max"])
+def test_kimi_k3_bloqueado_para_todos_mesmo_com_maquina(planos, plano):
+    # sem plano nenhum: nem a máquina (que responderia qualquer nome) atende
+    planos["catalog"]["moonshotai/kimi-k3"] = "text"
+    planos["plans"]["moonshotai/kimi-k3"] = []
+    planos["entry"] = _entry(plan=plano)
+    planos["plan"] = plano
+    planos["machine"] = GO_POD
+    r = _chat(planos, model="moonshotai/kimi-k3")
+    assert r.status_code == 403
+    assert r.json()["detail"] == "o modelo 'moonshotai/kimi-k3' ainda não está disponível"
+    assert planos["resolve_calls"] == [] and planos["sent"] == [] and planos["pod"] == []
+
+
+def test_pro_alcanca_o_27b(planos):
+    planos["entry"] = _entry(plan="Pro")
+    r = _chat(planos, model=QWEN)
+    assert r.status_code == 200 and planos["sent"][0][1]["model"] == QWEN
+
+
+def test_go_sem_maquina_cai_no_reserva_do_go(planos):
+    _chat(planos, model="go-base")
+    assert planos["sent"][0][1]["model"] == QWEN9
+
+
+def test_pro_sem_maquina_cai_no_reserva_do_pro(planos):
+    planos["entry"] = _entry(plan="Pro")
+    _chat(planos, model="pro-base")
+    assert planos["sent"][0][1]["model"] == QWEN
+
+
+def test_models_do_go_nao_lista_o_27b(planos):
+    r = planos["client"].get("/v1/models", headers={"Authorization": "Bearer sk-cliente"})
+    ids = [m["id"] for m in r.json()["data"]]
+    assert QWEN9 in ids and GLM in ids and QWEN not in ids
+
+
+# Sem teto de contexto por plano (16/10/2026): na máquina vale a janela dela
+# (Go: 64K), e o que não cabe desvia para o OpenRouter como sempre fez o Pro;
+# no OpenRouter vale a janela do próprio modelo. O custo de uma request grande
+# é cobrado pela cota ponderada (request_quota.py), não por um teto de tokens.
+
+
+def test_go_usa_a_janela_inteira_da_maquina(planos):
+    # 40K cabe nos 64K do pod do Go — antes era 400 pelo teto de 32K do plano
+    planos["machine"] = GO_POD
+    planos["pod_resposta"] = _pod_que_conta(40000)
+    r = _chat(planos, model="go-base", max_tokens=30000, messages=[
+        {"role": "user", "content": _texto_de_tokens(40000)},
+    ])
+    assert r.status_code == 200
+    enviado = _chamadas_de_chat(planos)[0]
+    # saída clampada ao que sobra da MÁQUINA (64K), não de um teto de plano
+    assert 32768 - 40000 < enviado["max_tokens"] <= 65536 - 40000
+    assert planos["sent"] == []
+
+
+def test_go_acima_da_maquina_desvia_para_o_openrouter(planos):
+    # mesma regra que o Pro sempre teve: estourou a máquina, segue no reserva
+    planos["machine"] = GO_POD
+    planos["pod_resposta"] = _pod_que_conta(70000)
+    r = _chat(planos, model="go-base", messages=[
+        {"role": "user", "content": _texto_de_tokens(70000)},
+    ])
+    assert r.status_code == 200
+    assert planos["sent"][0][1]["model"] == QWEN9 and _chamadas_de_chat(planos) == []
+
+
+def test_pro_acima_da_maquina_desvia_e_cabe_nos_256k(planos):
+    planos["entry"] = _entry(plan="Pro")
+    planos["plan"] = "Pro"
+    planos["machine"] = {**POD, "admin_secret": "segredo-do-pod"}  # 128K
+    planos["pod_resposta"] = _pod_que_conta(140000)
+    r = _chat(planos, model="pro-base", messages=[
+        {"role": "user", "content": _texto_de_tokens(140000)},
+    ])
+    assert r.status_code == 200
+    assert planos["sent"][0][1]["model"] == QWEN and _chamadas_de_chat(planos) == []
+
+
+def test_go_no_openrouter_nao_tem_teto_de_contexto(planos):
+    planos["settings"]["machines_enabled"] = False
+    r = _chat(planos, model=QWEN9, messages=[
+        {"role": "user", "content": _texto_de_tokens(40000)},
+    ])
+    assert r.status_code == 200 and planos["sent"][0][1]["model"] == QWEN9
+
+
+def test_go_no_openrouter_so_clampa_a_saida_ao_teto_do_repasse(planos):
+    planos["settings"]["machines_enabled"] = False
+    r = _chat(planos, model=QWEN9, max_tokens=30000, messages=[
+        {"role": "user", "content": _texto_de_tokens(20000)},
+    ])
+    assert r.status_code == 200
+    # 30000 < OPENROUTER_MAX_TOKENS (32000): ninguém corta
+    assert planos["sent"][0][1]["max_tokens"] == 30000
+
+
+def test_pro_acima_de_256k_no_openrouter_passa_no_formato_anthropic(planos):
+    planos["entry"] = _entry(plan="Pro")
+    planos["settings"]["machines_enabled"] = False
+    r = planos["client"].post(
+        "/v1/messages",
+        json={"model": "pro-base", "max_tokens": 100,
+              "messages": [{"role": "user", "content": _texto_de_tokens(270000)}]},
+        headers={"x-api-key": "sk-cliente"},
+    )
+    assert r.status_code == 200 and planos["sent"][0][1]["model"] == QWEN
+
+
+# ---------------------------------------------------------------------------
+# /v1/decisions (Jev, da TypeSafe): só OpenRouter, no /api/alpha/decisions
+# ---------------------------------------------------------------------------
+
+JEV = "typesafe/jev-1.13"
+PERGUNTAS = {
+    "time": {
+        "type": "choice",
+        "instructions": "Qual time deve cuidar do ticket?",
+        "criteria": {"pagamentos": "checkout e cobrança", "frontend": "renderização"},
+    },
+}
+
+
+@pytest.fixture
+def decisao(rota):
+    rota["catalog"][JEV] = "decisions"
+    rota["resposta"] = lambda r: httpx.Response(200, json={
+        "id": "gen-dec-1", "model": "typesafe/jev-1.13-20260917", "provider": "TypeSafe",
+        "answers": {"time": {"type": "choice", "choice": "pagamentos", "confidence": 0.67,
+                             "probabilities": {"pagamentos": 0.78, "frontend": 0.22}}},
+        "usage": {"input_tokens": 476, "output_tokens": 70, "cost": 0.000019992},
+    })
+    return rota
+
+
+def _decidir(estado, **body):
+    return estado["client"].post(
+        "/v1/decisions",
+        json={"state": {"ticket": "a tela fica branca no Pagar"}, "questions": PERGUNTAS, **body},
+        headers={"Authorization": "Bearer sk-cliente"},
+    )
+
+
+def test_decisions_vai_para_o_alpha_do_openrouter_sem_custo(decisao):
+    r = _decidir(decisao, model=JEV, stream=True)
+    assert r.status_code == 200
+    assert r.json()["answers"]["time"]["choice"] == "pagamentos"
+    assert "cost" not in r.json()["usage"]
+
+    request, sent = decisao["sent"][0]
+    # fora do /api/v1: a API de Decisions é alpha e mora em /api/alpha
+    assert str(request.url) == "https://openrouter.test/api/alpha/decisions"
+    assert request.headers["authorization"] == "Bearer sk-or-da-stac"
+    assert sent["model"] == JEV and "stream" not in sent
+    assert sent["questions"] == PERGUNTAS
+
+    log = decisao["logged"][0]
+    assert log["path"] == "decisions" and log["model"] == JEV
+    assert log["upstream"] == "openrouter" and log["machine_id"] is None
+    assert log["stream"] is False and log["status_code"] == 200
+    assert log["usage"]["prompt_tokens"] == 476 and log["cost_usd"] == 0.000019992
+    # nenhuma máquina serve decisões: nem é consultada
+    assert decisao["resolve_calls"] == []
+
+
+def test_decisions_url_configuravel(decisao, monkeypatch):
+    monkeypatch.setattr(main, "OPENROUTER_DECISIONS_URL", "https://openrouter.test/api/beta/decisions")
+    assert _decidir(decisao, model=JEV).status_code == 200
+    assert decisao["sent"][0][0].url.path == "/api/beta/decisions"
+
+
+def test_decisions_com_modelo_de_texto_e_404_com_os_aceitos(decisao):
+    r = _decidir(decisao, model=TEXT_SLUG)
+    assert r.status_code == 404
+    assert JEV in r.json()["detail"] and TEXT_SLUG not in r.json()["detail"].split("aceitos:")[1]
+    assert decisao["sent"] == [] and decisao["resolve_calls"] == []
+
+
+def test_decisions_sem_modelo_e_404(decisao):
+    r = _decidir(decisao)
+    assert r.status_code == 404 and JEV in r.json()["detail"]
+    assert decisao["sent"] == []
+
+
+def test_decisions_com_repasse_desligado_e_404(decisao):
+    decisao["settings"]["openrouter_enabled"] = False
+    r = _decidir(decisao, model=JEV)
+    assert r.status_code == 404 and "não está disponível no momento" in r.json()["detail"]
+    assert decisao["sent"] == []
+
+
+def test_decisions_fora_do_plano_e_403(decisao):
+    decisao["plans"] = {TEXT_SLUG: ["Go"], IMAGE_SLUG: ["Go"], JEV: ["Pro"]}
+    decisao["fallback_plans"] = {}
+    r = _decidir(decisao, model=JEV)
+    assert r.status_code == 403 and "plano Go" in r.json()["detail"]
+    assert decisao["sent"] == []
+
+
+def test_decisions_erro_do_cliente_passa_com_o_status(decisao):
+    decisao["resposta"] = lambda r: httpx.Response(400, json={
+        "error": {"code": 400, "message": "questions is required"},
+    })
+    r = _decidir(decisao, model=JEV)
+    assert r.status_code == 400 and r.json()["error"]["message"] == "questions is required"
+    assert decisao["logged"][0]["status_code"] == 400
+
+
+def test_jev_no_chat_nao_e_repassado_como_texto(decisao):
+    decisao["settings"]["machines_enabled"] = False
+    r = _chat(decisao, model=JEV)
+    assert r.status_code == 404
+    assert TEXT_SLUG in r.json()["detail"] and JEV not in r.json()["detail"].split("aceitos:")[1]
+    assert decisao["sent"] == []
+
+
+# ---------------------------------------------------------------------------
+# api_keys.last_used_at — o coletor das máquinas não vê o repasse
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def toques(monkeypatch):
+    """log_gateway_request REAL (o fixture `rota` troca por um duplo), com a
+    gravação da linha anulada e os toques de last_used_at capturados."""
+    import asyncio
+
+    touched = []
+    pending = []
+
+    class Supa:
+        async def touch_keys_last_used(self, api_key_ids, ts):
+            touched.append((api_key_ids, ts))
+
+    async def no_row(row):
+        return None
+
+    monkeypatch.setattr(main, "supa", Supa(), raising=False)
+    monkeypatch.setattr(main, "_write_gateway_request", no_row)
+    monkeypatch.setattr(main, "spawn_tracked", pending.append)
+    main.openrouter_key_last_touch.clear()
+
+    def log(upstream, api_key_id="key-1"):
+        main.log_gateway_request(
+            account_id="acc-1", stack_id="stack-1", api_key_id=api_key_id,
+            machine_id=None, path="chat/completions", model=TEXT_SLUG,
+            status_code=200, stream=False, started=main.time.monotonic(),
+            upstream=upstream,
+        )
+
+        async def run():
+            while pending:
+                await pending.pop(0)
+
+        asyncio.run(run())
+
+    yield log, touched
+    main.openrouter_key_last_touch.clear()
+
+
+def test_repasse_toca_last_used_at_da_chave(toques):
+    log, touched = toques
+    log(main.OPENROUTER_UPSTREAM)
+    assert [ids for ids, _ in touched] == [["key-1"]]
+
+
+def test_toque_e_no_maximo_um_por_janela_por_chave(toques, monkeypatch):
+    log, touched = toques
+    log(main.OPENROUTER_UPSTREAM)
+    log(main.OPENROUTER_UPSTREAM)
+    log(main.OPENROUTER_UPSTREAM, api_key_id="key-2")  # outra chave não espera
+    assert [ids for ids, _ in touched] == [["key-1"], ["key-2"]]
+
+    passado = main.time.monotonic() - main.OPENROUTER_LAST_USED_INTERVAL_S - 1
+    main.openrouter_key_last_touch["key-1"] = passado
+    log(main.OPENROUTER_UPSTREAM)
+    assert [ids for ids, _ in touched][-1] == ["key-1"] and len(touched) == 3
+
+
+def test_request_de_maquina_nao_toca_last_used_at(toques):
+    # da máquina quem toca é o coletor, com o uso que o agent contou
+    log, touched = toques
+    log(None)
+    assert touched == []
+
+
+def test_falha_ao_tocar_nao_escapa(monkeypatch):
+    import asyncio
+
+    class Supa:
+        async def touch_keys_last_used(self, api_key_ids, ts):
+            raise httpx.ConnectError("supabase fora")
+
+    monkeypatch.setattr(main, "supa", Supa(), raising=False)
+    asyncio.run(main._write_key_last_used("key-1", "2026-10-14T00:00:00+00:00"))

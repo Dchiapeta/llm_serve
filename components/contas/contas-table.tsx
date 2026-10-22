@@ -5,9 +5,16 @@ import Link from "next/link"
 import { Copy, Search } from "lucide-react"
 import { toast } from "sonner"
 
+import { cn } from "@/lib/utils"
 import { type Account, type ApiKey, type Machine, type RoutingState, type Stack } from "@/lib/types"
 import { BILLING_BADGE, graceRemaining } from "@/lib/billing-status"
 import { PLAN_BADGE_VARIANT } from "@/lib/plan-badge"
+import {
+  QUOTA_WARNING_RATIO,
+  formatCycleDate,
+  quotaRatio,
+  type RequestQuota,
+} from "@/lib/request-quota"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -107,6 +114,9 @@ export type StackInfo = Stack & {
      *  de LLM. Tokens valem para as duas categorias (lib/consumption.ts). */
     images: number
   }
+  /** Cota mensal de requisições do ciclo (migration 0076); null = stack sem
+   *  cota (imagem, Max, Enterprise) ou 0076 ainda não aplicada. */
+  quota: RequestQuota | null
 }
 
 export type StackRow = {
@@ -217,6 +227,7 @@ export function ContasTable({
             <TableHead>Cobrança</TableHead>
             <TableHead>Status</TableHead>
             <TableHead>Máquina</TableHead>
+            <TableHead>Cota do ciclo</TableHead>
             <TableHead>Criada em</TableHead>
             <TableHead className="w-10" />
           </TableRow>
@@ -224,7 +235,7 @@ export function ContasTable({
         <TableBody>
           {filteredRows.length === 0 && (
             <TableRow>
-              <TableCell colSpan={10} className="text-center text-muted-foreground">
+              <TableCell colSpan={11} className="text-center text-muted-foreground">
                 {rows.length === 0
                   ? "Nenhuma stack ainda."
                   : "Nenhuma stack encontrada."}
@@ -307,6 +318,9 @@ export function ContasTable({
                     <span className="text-sm text-muted-foreground">—</span>
                   )}
                 </TableCell>
+                <TableCell>
+                  <QuotaCell quota={stack.quota} />
+                </TableCell>
                 <TableCell
                   className="text-sm whitespace-nowrap text-muted-foreground"
                   title={new Date(stack.created_at).toLocaleString("pt-BR")}
@@ -327,6 +341,33 @@ export function ContasTable({
           })}
         </TableBody>
       </Table>
+    </div>
+  )
+}
+
+function QuotaCell({ quota }: { quota: RequestQuota | null }) {
+  if (!quota) return <span className="text-sm text-muted-foreground">—</span>
+  const ratio = quotaRatio(quota)
+  return (
+    <div
+      className="flex flex-col items-start gap-0.5"
+      title={`Ciclo ${formatCycleDate(quota.cycleStart)} – ${formatCycleDate(quota.cycleEnd)}`}
+    >
+      <span
+        className={cn(
+          "text-sm whitespace-nowrap tabular-nums",
+          ratio >= 1
+            ? "font-medium text-destructive"
+            : ratio >= QUOTA_WARNING_RATIO
+              ? "font-medium text-amber-700 dark:text-amber-300"
+              : undefined
+        )}
+      >
+        {quota.used.toLocaleString("pt-BR")} / {quota.limit.toLocaleString("pt-BR")}
+      </span>
+      <span className="text-[11px] whitespace-nowrap text-muted-foreground">
+        renova {formatCycleDate(quota.cycleEnd)}
+      </span>
     </div>
   )
 }

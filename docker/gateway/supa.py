@@ -304,7 +304,9 @@ class SupaClient:
             "/machines",
             params={
                 "id": f"eq.{machine_id}",
-                "select": "*,templates(is_enabled,is_test)",
+                # plan/category: o lifecycle e a recriação precisam saber o
+                # pool da máquina (recreating_pool, pending_recreates)
+                "select": "*,templates(plan,category,is_enabled,is_test)",
                 "limit": "1",
             },
         )
@@ -408,6 +410,31 @@ class SupaClient:
             "/machines",
             params={
                 "status": "eq.creating",
+                "public_url": "not.is.null",
+                "runpod_pod_id": "not.is.null",
+                "select": "*,templates!inner(plan,category,is_enabled,is_test)",
+                "templates.plan": f"eq.{plan}",
+                "templates.category": f"eq.{category}",
+                "templates.is_enabled": "eq.true",
+                "templates.is_test": "eq.false",
+                "order": "created_at.asc",
+            },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def list_wakeable_machines_for_plan(
+        self, plan: str, category: str = "llm"
+    ) -> list[dict]:
+        """creating + stopped do plano/categoria numa consulta só — o snapshot
+        que wake_some_machine_for_plan precisa. Em duas consultas (creating,
+        depois stopped), uma máquina que mudava de stopped para creating entre
+        elas não aparecia em nenhuma, e a cascata provisionava por cima dela.
+        Mesmos filtros de list_creating/list_stopped_machines_for_plan."""
+        r = await self._rest.get(
+            "/machines",
+            params={
+                "status": "in.(creating,stopped)",
                 "public_url": "not.is.null",
                 "runpod_pod_id": "not.is.null",
                 "select": "*,templates!inner(plan,category,is_enabled,is_test)",
@@ -533,7 +560,8 @@ class SupaClient:
         recém-coletada. Chamado por collect_usage_metrics_once com o mesmo
         window_start de usage_metrics — todas as chaves do batch levam o
         mesmo timestamp, então um único PATCH com filtro `in` cobre o
-        batch inteiro."""
+        batch inteiro. Também chamado, uma chave por vez, no log de cada
+        request repassada ao OpenRouter, que não passa por coletor nenhum."""
         if not api_key_ids:
             return
         ids = ",".join(dict.fromkeys(api_key_ids))
@@ -549,6 +577,34 @@ class SupaClient:
         fire-and-forget (spawn_tracked) no fechamento de cada requisição —
         nunca no caminho crítico da resposta ao cliente."""
         r = await self._rest.post("/gateway_requests", json=row)
+        r.raise_for_status()
+
+    async def prepare_gateway_analytics_exports(self) -> None:
+        r = await self._rest.post("/rpc/prepare_gateway_analytics_exports", json={})
+        r.raise_for_status()
+
+    async def claim_gateway_analytics_exports(self, monthly_limit: int, batch_size: int) -> list[dict]:
+        r = await self._rest.post("/rpc/claim_gateway_analytics_exports", json={
+            "monthly_limit": monthly_limit, "batch_size": batch_size,
+        })
+        r.raise_for_status()
+        return r.json()
+
+    async def ack_gateway_analytics_exports(self, ids: list[str]) -> None:
+        r = await self._rest.patch("/gateway_analytics_outbox", params={
+            "id": "in.(" + ",".join(ids) + ")", "sent_at": "is.null",
+        }, json={"sent_at": datetime.now(timezone.utc).isoformat(), "lease_until": None})
+        r.raise_for_status()
+
+    async def discard_gateway_analytics_exports(self, ids: list[str]) -> None:
+        if not ids:
+            return
+        r = await self._rest.patch("/gateway_analytics_outbox", params={
+            "id": "in.(" + ",".join(ids) + ")", "sent_at": "is.null",
+        }, json={
+            "discarded_at": datetime.now(timezone.utc).isoformat(),
+            "discard_reason": "invalid_envelope", "lease_until": None,
+        })
         r.raise_for_status()
 
     async def insert_provision_decision(self, row: dict) -> None:
@@ -627,6 +683,14 @@ class SupaClient:
         )
         r.raise_for_status()
         return r.json() or 0
+
+    async def stack_request_quota(self, stack_id: str) -> list[dict]:
+        """Limite, uso e ciclo da cota mensal de requisições da stack
+        (migration 0076). Lista de 0 ou 1 linha; quem interpreta é
+        request_quota.snapshot_from_rpc."""
+        r = await self._rest.post("/rpc/stack_request_quota", json={"p_stack_id": stack_id})
+        r.raise_for_status()
+        return r.json() or []
 
     # ---------- stacks ----------
 
@@ -934,14 +998,104 @@ class SupaClient:
         rows = r.json()
         return rows[0]["value"] if rows else default
 
+    # ---------- openrouter_keys ----------
+
+    async def get_openrouter_key(self, api_key_id: str) -> dict | None:
+        """Chave espelho do OpenRouter desta chave da Stac (migration 0072),
+        {openrouter_hash, secret_encrypted}, ou None."""
+        r = await self._rest.get(
+            "/openrouter_keys",
+            params={
+                "api_key_id": f"eq.{api_key_id}",
+                "select": "openrouter_hash,secret_encrypted",
+                "limit": "1",
+            },
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    async def insert_openrouter_key(self, row: dict) -> bool:
+        """Grava a chave espelho. False se já existia uma para a mesma chave da
+        Stac (corrida entre duas criações) — quem chama apaga a sua no
+        OpenRouter e usa a que ficou."""
+        r = await self._rest.post(
+            "/openrouter_keys",
+            params={"on_conflict": "api_key_id"},
+            json=row,
+            headers={"Prefer": "resolution=ignore-duplicates,return=representation"},
+        )
+        r.raise_for_status()
+        return bool(r.json())
+
+    async def delete_openrouter_key(self, api_key_id: str) -> None:
+        r = await self._rest.delete(
+            "/openrouter_keys", params={"api_key_id": f"eq.{api_key_id}"}
+        )
+        r.raise_for_status()
+
+    async def list_keys_without_openrouter_key(self) -> list[dict]:
+        """Chaves ativas de cliente que ainda não têm chave espelho no
+        OpenRouter, no mesmo formato de get_api_key_identity. É o backfill de
+        quando o repasse é ligado."""
+        r = await self._rest.get(
+            "/api_keys",
+            params={
+                "status": "eq.active",
+                "purpose": "eq.customer",
+                "select": "id,account_id,key_prefix,accounts(name),openrouter_keys(api_key_id)",
+                "openrouter_keys": "is.null",
+            },
+        )
+        r.raise_for_status()
+        return [
+            {
+                "api_key_id": row["id"],
+                "account_id": row.get("account_id"),
+                "key_prefix": row.get("key_prefix"),
+                "account_name": (row.get("accounts") or {}).get("name"),
+            }
+            for row in r.json()
+        ]
+
+    async def get_api_key_identity(self, api_key_id: str) -> dict | None:
+        """{api_key_id, account_id, key_prefix, account_name} de uma chave
+        ativa — o mínimo para nomear a chave espelho quando a criação vem do
+        painel, sem uma request do cliente (e sem o entry do key_cache)."""
+        r = await self._rest.get(
+            "/api_keys",
+            params={
+                "id": f"eq.{api_key_id}",
+                "status": "eq.active",
+                "select": "id,account_id,key_prefix,accounts(name)",
+                "limit": "1",
+            },
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "api_key_id": row["id"],
+            "account_id": row.get("account_id"),
+            "key_prefix": row.get("key_prefix"),
+            "account_name": (row.get("accounts") or {}).get("name"),
+        }
+
     # ---------- openrouter_models ----------
 
     async def list_enabled_openrouter_models(self) -> list[dict]:
         """Allowlist do repasse ao OpenRouter (migration 0071): só os
-        habilitados, [{slug, kind}]. Chamador é responsável por cachear."""
+        habilitados, [{slug, kind, fallback?}]. Chamador é responsável por
+        cachear. `select=*` e não a lista de colunas: `fallback` (0073) e
+        `plans`/`fallback_plans` (0074) só existem depois das migrations, e
+        pedi-las antes derrubaria o repasse inteiro com um 400 do PostgREST.
+        Ordenado para o desempate de reserva (openrouter.plan_catalog) ser
+        sempre o mesmo."""
         r = await self._rest.get(
             "/openrouter_models",
-            params={"enabled": "is.true", "select": "slug,kind"},
+            params={"enabled": "is.true", "select": "*", "order": "created_at.asc"},
         )
         r.raise_for_status()
         return r.json()

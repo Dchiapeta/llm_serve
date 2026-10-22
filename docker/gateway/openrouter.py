@@ -36,6 +36,10 @@ from usage_norm import normalize_usage
 
 TEXT_KIND = "text"
 IMAGE_KIND = "image"
+# Modelos de decisão tipada (Jev, da TypeSafe): não geram texto, respondem
+# perguntas (choice/noul/score) sobre um `state`. Só existem no OpenRouter e só
+# pelo POST /v1/decisions, repassado ao /api/alpha/decisions de lá.
+DECISIONS_KIND = "decisions"
 
 # /v1/<path> do catch-all que podem ir para o OpenRouter → path de lá. Os que
 # ficam de fora (embeddings) seguem só para máquina.
@@ -82,6 +86,66 @@ def requested_model(body: bytes | dict | None) -> str | None:
     return model.strip() if isinstance(model, str) and model.strip() else None
 
 
+def plan_catalog(rows: list[dict], plan: str | None) -> tuple[dict[str, str], dict[str, str]]:
+    """({slug: kind}, {kind: slug do reserva}) que uma chave do `plan`
+    alcança, a partir das linhas habilitadas de openrouter_models.
+
+    `plans` (0074) lista os planos com acesso ao modelo; `fallback_plans`, de
+    quais planos ele é o reserva. Linha sem essas colunas (gateway novo antes
+    da migration) vale para todos os planos, com o `fallback` da 0073 — o
+    comportamento de antes. Com dois reservas do mesmo tipo para um plano, vale
+    o primeiro da lista (o painel não deixa isso acontecer)."""
+    catalog: dict[str, str] = {}
+    fallbacks: dict[str, str] = {}
+    for row in rows:
+        plans = row.get("plans")
+        if plans is not None and plan not in plans:
+            continue
+        slug, kind = row["slug"], row["kind"]
+        catalog[slug] = kind
+        fallback_plans = row.get("fallback_plans")
+        if fallback_plans is not None:
+            is_fallback = plan in fallback_plans
+        else:
+            is_fallback = bool(row.get("fallback"))
+        if is_fallback:
+            fallbacks.setdefault(kind, slug)
+    return catalog, fallbacks
+
+
+def plan_denial(
+    model: str | None, kind: str, rows: list[dict], plan: str | None,
+    label: str | None = None,
+) -> str | None:
+    """Mensagem do 403 quando o `model` pedido está na lista, é do tipo da
+    rota, mas não é do plano da chave; None = não negado. Fora da lista não é
+    negado aqui: segue a regra de destino de sempre (a máquina responde
+    qualquer nome).
+
+    Modelo da lista sem plano NENHUM é um modelo ainda não lançado (o Kimi K3,
+    0074): a mensagem diz isso, em vez de sugerir um upgrade que não resolve.
+
+    `label` é o plano que a mensagem nomeia, quando difere do `plan` cujo
+    catálogo decide; hoje nenhum call-site precisa disso."""
+    if not model:
+        return None
+    row = next((r for r in rows if r["slug"] == model and r["kind"] == kind), None)
+    plans = row.get("plans") if row else None
+    if plans is None or plan in plans:
+        return None
+    if not plans:
+        return f"o modelo '{model}' ainda não está disponível"
+    accepted = accepted_models(plan_catalog(rows, plan)[0], kind)
+    shown = label if label is not None else plan
+    plano = f"no plano {shown}" if shown else "no seu plano"
+    if not accepted:
+        return f"o modelo '{model}' não está incluído {plano}"
+    return (
+        f"o modelo '{model}' não está incluído {plano}. "
+        f"Modelos do seu plano: {', '.join(accepted)}"
+    )
+
+
 def pick_slug(model: str | None, kind: str, catalog: dict[str, str]) -> str | None:
     """Slug do OpenRouter para o `model` pedido, ou None se ele não está na
     allowlist (ou está, mas é de outro tipo — um modelo de imagem não atende
@@ -93,6 +157,15 @@ def pick_slug(model: str | None, kind: str, catalog: dict[str, str]) -> str | No
     if not model:
         return None
     return model if catalog.get(model) == kind else None
+
+
+def pick_target(
+    model: str | None, kind: str, catalog: dict[str, str], fallbacks: dict[str, str]
+) -> str | None:
+    """Modelo do OpenRouter que atende a request quando ela vai para lá: o
+    PEDIDO, se está na lista; senão o reserva do tipo (ex.: `go-base`, que só
+    existe nas máquinas, é atendido pelo Qwen3.8 27B). None = nenhum dos dois."""
+    return pick_slug(model, kind, catalog) or fallbacks.get(kind)
 
 
 def accepted_models(catalog: dict[str, str], kind: str) -> list[str]:
@@ -163,6 +236,26 @@ def prepare_anthropic_body(body: dict, slug: str, max_tokens_cap: int) -> dict:
             thinking["budget_tokens"] = max_tokens - 1
         else:
             body.pop("thinking", None)
+    return body
+
+
+def decisions_url(base_url: str) -> str:
+    """URL do Decisions a partir da base do client (…/api/v1). A API é alpha e
+    mora FORA do /v1 (/api/alpha/decisions), então não dá para usar um path
+    relativo ao base_url como nos outros repasses."""
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return f"{base}/alpha/decisions"
+
+
+def prepare_decisions_body(body: dict, slug: str) -> dict:
+    """Corpo do /v1/decisions pronto para o OpenRouter: trava o modelo e tira
+    `stream` — a API devolve um JSON só, e um `stream: true` faria o
+    openrouter_forward esperar SSE. O resto (state, questions, session_id,
+    trace, user) segue como veio; quem valida o formato é o OpenRouter."""
+    body["model"] = slug
+    body.pop("stream", None)
     return body
 
 
@@ -414,6 +507,48 @@ class CostStripper:
     def flush(self) -> bytes:
         out, self._pending = _strip_cost_line(self._pending), b""
         return out
+
+
+class ModelNameRewriter:
+    """Troca o nome do modelo servido pela máquina pelo que o cliente PEDIU,
+    nas respostas de máquina (regra de 30/09/2026: com máquina disponível, ela
+    responde qualquer modelo pedido — o cliente que pediu o Kimi K3 continua
+    vendo "Kimi K3", mesmo respondido pelo modelo da máquina).
+
+    Linha a linha, como o CostStripper, e só no par `"model":"<servido>"`: as
+    aspas de dentro de uma string JSON vêm escapadas (\\"), então esse par
+    literal só existe como CAMPO, nunca no meio do texto gerado."""
+
+    __slots__ = ("_pending", "_pairs")
+
+    def __init__(self, served: str, requested: str) -> None:
+        self._pending = b""
+        old, new = json.dumps(served).encode(), json.dumps(requested).encode()
+        self._pairs = [
+            (b'"model":' + old, b'"model":' + new),
+            (b'"model": ' + old, b'"model": ' + new),
+        ]
+
+    def _line(self, line: bytes) -> bytes:
+        for old, new in self._pairs:
+            if old in line:
+                line = line.replace(old, new)
+        return line
+
+    def feed(self, chunk: bytes) -> bytes:
+        self._pending += chunk
+        if b"\n" not in self._pending:
+            return b""
+        head, _, self._pending = self._pending.rpartition(b"\n")
+        return b"\n".join(self._line(line) for line in head.split(b"\n")) + b"\n"
+
+    def flush(self) -> bytes:
+        out, self._pending = self._line(self._pending), b""
+        return out
+
+    def whole(self, raw: bytes) -> bytes:
+        """Corpo não-streamed inteiro."""
+        return self._line(raw)
 
 
 def stream_error_frame(message: str, code: str, *, anthropic: bool) -> bytes:

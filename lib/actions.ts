@@ -807,7 +807,7 @@ export async function provisionMachineForPlan(input: {
   // sobrevive mesmo que o gateway morra antes do log dele.
   trigger?: TriggerEnvelope | null
 }): Promise<
-  | { machineId: string; name: string; publicUrl: string | null }
+  | { machineId: string; name: string; publicUrl: string | null; reused?: boolean }
   | { error: string }
 > {
   const db = createSupabaseAdmin()
@@ -847,21 +847,32 @@ export async function provisionMachineForPlan(input: {
   // Se já há uma máquina do mesmo template em 'creating' criada há poucos
   // segundos, devolve ela em vez de criar outra. Seguro porque o provisionamento
   // é serializado por plano no gateway (nunca dispara 2 de propósito na janela).
+  //
+  // "Há poucos segundos" vale também para a máquina que acabou de ser
+  // RECRIADA ou religada: é a mesma linha, com created_at antigo, mas
+  // recreateMachine/startMachine/o wake do gateway zeram last_activity_at ao
+  // gravar 'creating'. Só por created_at, a llm-stack-704 recriada às
+  // 14:26:55 de 01/10 passou despercebida e a 705 foi criada 2 s depois.
   const dedupSince = new Date(Date.now() - PROVISION_DEDUP_WINDOW_MS).toISOString()
   const { data: recent } = await db
     .from("machines")
     .select("id, name, public_url, created_at")
     .eq("template_id", tpl.id)
     .eq("status", "creating")
-    .gte("created_at", dedupSince)
+    .or(`created_at.gte.${dedupSince},last_activity_at.gte.${dedupSince}`)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle<Pick<Machine, "id" | "name" | "public_url">>()
   if (recent) {
     console.warn(
-      `provisionMachineForPlan: máquina ${recent.id} do template ${tpl.id} criada há pouco ainda em 'creating' — retorna ela (dedup de retry) em vez de criar outra`
+      `provisionMachineForPlan: máquina ${recent.id} do template ${tpl.id} entrou em 'creating' há pouco — retorna ela (dedup) em vez de criar outra`
     )
-    return { machineId: recent.id, name: recent.name, publicUrl: recent.public_url ?? null }
+    return {
+      machineId: recent.id,
+      name: recent.name,
+      publicUrl: recent.public_url ?? null,
+      reused: true,
+    }
   }
 
   let viableGpuIds: string[]
@@ -1547,6 +1558,7 @@ export async function createStack(formData: FormData): Promise<{
   slug: string
   machineId: string | null
   machineCreated: boolean
+  machineSkipped: boolean
 }> {
   const db = createSupabaseAdmin()
   const name = String(formData.get("name") || "").trim()
@@ -1555,6 +1567,10 @@ export async function createStack(formData: FormData): Promise<{
   const purchaseDate = String(formData.get("purchase_date") || "")
   const templateId = String(formData.get("template_id") || "")
   const chosenMachineId = String(formData.get("machine_id") || "")
+  // Escolha explícita do admin de não alocar agora: a stack nasce sem casa,
+  // como a do checkout, e o gateway a aloca na primeira request
+  // (place_base_stack).
+  const skipMachine = formData.get("no_machine") === "1"
   let slug = String(formData.get("slug") || "").trim()
 
   if (!name) throw new Error("Informe o nome do cliente")
@@ -1636,14 +1652,17 @@ export async function createStack(formData: FormData): Promise<{
   // Máquinas desligadas (migration 0071): a stack nasce sem casa, como uma
   // liberada por ociosidade. O gateway a aloca na primeira request depois que
   // as máquinas forem religadas (place_base_stack) — alocar aqui ligaria GPU.
-  if (!machineId && (await getMachinesEnabled())) {
+  if (!machineId && !skipMachine && (await getMachinesEnabled())) {
     try {
       const alloc = await allocateMachineForTemplate(db, tpl)
       machineId = alloc.machineId
       machineCreated = alloc.created
     } catch (e) {
+      // Desfaz a stack: o admin vê o erro e tenta de novo, e cada tentativa
+      // deixava uma stack órfã (sem máquina e sem chave) na conta.
+      await db.from("stacks").delete().eq("id", stackId)
       const msg = e instanceof Error ? e.message : String(e)
-      throw new Error(`Stack ${slug} criada, mas falhou ao alocar máquina: ${msg}`)
+      throw new Error(`Falha ao alocar máquina; a stack não foi criada: ${msg}`)
     }
   }
 
@@ -1663,7 +1682,7 @@ export async function createStack(formData: FormData): Promise<{
   revalidatePath("/stacks")
   revalidatePath("/accounts")
   if (machineCreated) revalidatePath("/machines")
-  return { slug, machineId, machineCreated }
+  return { slug, machineId, machineCreated, machineSkipped: skipMachine }
 }
 
 // Remove uma stack do painel. A máquina que a hospeda (se houver) não é
@@ -2034,6 +2053,28 @@ export async function updateStackSystemPrompt(formData: FormData) {
   revalidatePath("/accounts")
 }
 
+// Limite mensal de requisições da stack no lugar do padrão do plano (migration
+// 0077). null volta ao padrão. O gateway lê o limite de stack_request_quota com
+// cache de 60s, então a troca vale em até um minuto — sem flush, porque o
+// cache da cota não tem endpoint e um minuto de atraso não muda nada aqui.
+export async function setStackRequestQuota(
+  stackId: string,
+  limit: number | null
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
+    return { error: "O limite precisa ser um número inteiro maior que zero" }
+  }
+  const db = createSupabaseAdmin()
+  const { error } = await db
+    .from("stacks")
+    .update({ request_quota_override: limit })
+    .eq("id", stackId)
+  if (error) return { error: error.message }
+  revalidatePath("/contas")
+  revalidatePath("/stacks")
+}
+
 // Gera uma chave HEX para uma conta numa máquina.
 // Retorna a chave em texto puro UMA única vez.
 export async function createKey(input: {
@@ -2149,20 +2190,33 @@ export async function createKey(input: {
   // lugares é o teto de ambientes do gateway (client_identity.py).
   const plainKey = generateHexKey()
 
-  const { error } = await db.from("api_keys").insert({
-    account_id: input.accountId,
-    machine_id: input.machineId,
-    stack_id: stackId,
-    name: input.name ?? null,
-    key_hash: hashKey(plainKey),
-    key_prefix: keyPrefix(plainKey),
-    plain_key: plainKey,
-    status: "active",
-    expires_at: input.expiresAt ?? null,
-    purpose,
-    enable_knowledge_base: input.enableKnowledgeBase ?? null,
-  })
+  const { data: inserted, error } = await db
+    .from("api_keys")
+    .insert({
+      account_id: input.accountId,
+      machine_id: input.machineId,
+      stack_id: stackId,
+      name: input.name ?? null,
+      key_hash: hashKey(plainKey),
+      key_prefix: keyPrefix(plainKey),
+      plain_key: plainKey,
+      status: "active",
+      expires_at: input.expiresAt ?? null,
+      purpose,
+      enable_knowledge_base: input.enableKnowledgeBase ?? null,
+    })
+    .select("id")
+    .single<{ id: string }>()
   if (error) throw new Error(error.message)
+
+  // Chave espelho no OpenRouter (migration 0072): criada já aqui para a chave
+  // aparecer na Activity de lá desde o primeiro dia. Best-effort — se falhar,
+  // o gateway cria na primeira request dela que for para o OpenRouter.
+  after(() =>
+    provisionOpenRouterKey(inserted.id).catch((e) =>
+      console.error("Criação da chave no OpenRouter falhou (o gateway cobre na 1ª request):", e)
+    )
+  )
 
   await logEvent(
     input.machineId,
@@ -2208,6 +2262,22 @@ export async function flushGatewayKeyCache() {
     headers: { "X-Admin-Secret": secret },
     signal: AbortSignal.timeout(5_000),
   })
+}
+
+// Pede ao gateway a chave espelho do OpenRouter de uma chave recém-criada
+// (best-effort). Vive no gateway, e não aqui, porque é ele quem guarda a chave
+// de gerenciamento do OpenRouter e a cifra dos segredos.
+async function provisionOpenRouterKey(apiKeyId: string) {
+  const url = process.env.GATEWAY_URL
+  const secret = process.env.GATEWAY_ADMIN_SECRET
+  if (!url || !secret) return // gateway ainda não configurado
+  const res = await fetch(`${url.replace(/\/$/, "")}/admin/openrouter-keys/provision`, {
+    method: "POST",
+    headers: { "X-Admin-Secret": secret, "Content-Type": "application/json" },
+    body: JSON.stringify({ api_key_id: apiKeyId }),
+    signal: AbortSignal.timeout(20_000),
+  })
+  if (!res.ok) throw new Error(`gateway respondeu ${res.status}`)
 }
 
 // Pede ao gateway pra reenviar as chaves da máquina ao agent quando o pod
@@ -2348,7 +2418,25 @@ export async function setOpenRouterEnabled(
 ): Promise<{ error: string } | void> {
   const result = await setSystemFlag("openrouter_enabled", enabled)
   if (result) return result
+  // Repasse ligado = toda chave tem a sua no OpenRouter (migration 0072),
+  // inclusive as criadas enquanto ele estava desligado. Depois do flush do
+  // setSystemFlag: o gateway precisa ver o interruptor já ligado.
+  if (enabled) after(() => backfillOpenRouterKeys())
   revalidatePath("/modelos")
+}
+
+async function backfillOpenRouterKeys() {
+  const url = process.env.GATEWAY_URL
+  const secret = process.env.GATEWAY_ADMIN_SECRET
+  if (!url || !secret) return // gateway ainda não configurado
+  await flushGatewaySettings()
+  await fetch(`${url.replace(/\/$/, "")}/admin/openrouter-keys/backfill`, {
+    method: "POST",
+    headers: { "X-Admin-Secret": secret },
+    signal: AbortSignal.timeout(10_000),
+  }).catch((e) =>
+    console.error("Backfill das chaves no OpenRouter falhou (a 1ª request de cada chave cobre):", e)
+  )
 }
 
 // ---------- Allowlist do OpenRouter (openrouter_models, migration 0071) ----------
@@ -2359,7 +2447,9 @@ export async function createOpenRouterModel(
   await requireAdminSession()
   const slug = String(formData.get("slug") || "").trim()
   const label = String(formData.get("label") || "").trim() || null
+  const plans = parseModelPlans(formData.getAll("plans"))
   if (!slug) return { error: "Informe o ID do modelo no OpenRouter" }
+  if (plans.length === 0) return { error: "Escolha ao menos um plano" }
 
   // O slug tem que existir no catálogo: um erro de digitação aqui viraria um
   // 400 do OpenRouter para o cliente, que não tem como saber a causa.
@@ -2373,13 +2463,21 @@ export async function createOpenRouterModel(
   }
   const model = catalog.get(slug)
   if (!model) return { error: `Modelo "${slug}" não existe no OpenRouter` }
+  const kind = openRouterModelKind(model)
+  if (!kind) {
+    const outputs = model.architecture?.output_modalities?.join(", ") || "desconhecida"
+    return {
+      error: `"${slug}" gera ${outputs}, e o gateway só serve modelos de texto (chat/messages/responses), de imagem ou de decisão (/v1/decisions)`,
+    }
+  }
 
   const db = createSupabaseAdmin()
   const { error } = await db.from("openrouter_models").insert({
     slug,
-    kind: openRouterModelKind(model),
+    kind,
     label: label ?? model.name,
     enabled: true,
+    plans,
   })
   if (error) {
     if (error.code === "23505") return { error: `"${slug}" já está na lista` }
@@ -2398,6 +2496,92 @@ export async function setOpenRouterModelEnabled(
   const { error } = await db
     .from("openrouter_models")
     .update({ enabled, updated_at: new Date().toISOString() })
+    .eq("id", id)
+  if (error) return { error: error.message }
+  after(() => flushGatewaySettings())
+  revalidatePath("/modelos")
+}
+
+// Planos válidos de um form/lista, na ordem da escada (TEMPLATE_PLANS).
+function parseModelPlans(raw: unknown[]): TemplatePlan[] {
+  const wanted = new Set(raw.map((v) => String(v)))
+  return TEMPLATE_PLANS.filter((plan) => wanted.has(plan))
+}
+
+// Acesso por plano (migration 0074): fora destes planos o gateway responde 403
+// para o modelo. Tirar um plano tira junto o papel de reserva dele — o check
+// da tabela exige reserva ⊆ planos.
+export async function setOpenRouterModelPlans(
+  id: string,
+  rawPlans: string[]
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const plans = parseModelPlans(rawPlans)
+  const db = createSupabaseAdmin()
+  const { data: model } = await db
+    .from("openrouter_models")
+    .select("fallback_plans")
+    .eq("id", id)
+    .maybeSingle<{ fallback_plans: TemplatePlan[] | null }>()
+  if (!model) return { error: "Modelo não encontrado" }
+  const { error } = await db
+    .from("openrouter_models")
+    .update({
+      plans,
+      fallback_plans: (model.fallback_plans ?? []).filter((p) => plans.includes(p)),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", id)
+  if (error) return { error: error.message }
+  after(() => flushGatewaySettings())
+  revalidatePath("/modelos")
+}
+
+// Reserva de texto do plano (migrations 0073/0074): quem responde pelo
+// OpenRouter quando o modelo pedido não está na lista do plano (ex.:
+// go-base/pro-base) e não há máquina disponível. Um por plano; imagem não tem
+// reserva.
+export async function setOpenRouterFallback(
+  id: string,
+  plan: string
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  const [target] = parseModelPlans([plan])
+  if (!target) return { error: `Plano inválido: ${plan}` }
+  const db = createSupabaseAdmin()
+  const { data: model } = await db
+    .from("openrouter_models")
+    .select("kind, plans, fallback_plans")
+    .eq("id", id)
+    .maybeSingle<{ kind: string; plans: TemplatePlan[] | null; fallback_plans: TemplatePlan[] | null }>()
+  if (!model) return { error: "Modelo não encontrado" }
+  if (model.kind !== "text") return { error: "Só modelos de texto podem ser o reserva" }
+  if (!(model.plans ?? []).includes(target)) {
+    return { error: `O modelo não está liberado para o plano ${target}` }
+  }
+  // tira o plano do reserva atual ANTES: um reserva por plano
+  const now = new Date().toISOString()
+  const { data: current, error: readError } = await db
+    .from("openrouter_models")
+    .select("id, fallback_plans")
+    .eq("kind", "text")
+    .contains("fallback_plans", [target])
+    .neq("id", id)
+  if (readError) return { error: readError.message }
+  for (const row of (current ?? []) as { id: string; fallback_plans: TemplatePlan[] }[]) {
+    const { error: unsetError } = await db
+      .from("openrouter_models")
+      .update({
+        fallback_plans: row.fallback_plans.filter((p) => p !== target),
+        updated_at: now,
+      })
+      .eq("id", row.id)
+    if (unsetError) return { error: unsetError.message }
+  }
+  const fallbackPlans = parseModelPlans([...(model.fallback_plans ?? []), target])
+  const { error } = await db
+    .from("openrouter_models")
+    .update({ fallback_plans: fallbackPlans, enabled: true, updated_at: now })
     .eq("id", id)
   if (error) return { error: error.message }
   after(() => flushGatewaySettings())

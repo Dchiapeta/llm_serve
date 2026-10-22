@@ -1,11 +1,13 @@
 # Claude Code no plano Pro (janela 128k)
 
-> **O Go saiu deste doc.** Ferramenta de código passou a ser do Pro para cima: o
-> gateway responde `403` em `/v1/messages`, `/v1/responses` e em
-> `chat/completions` com User-Agent de CLI quando o plano é Go
-> (`docker/gateway/cli_policy.py`). A config do template Go abaixo fica como
-> **registro histórico** — foi dimensionada para o Claude Code, e é justamente o
-> que a torna superdimensionada para o perfil de requests de API que sobrou.
+> **Histórico do Go.** O Go ficou sem ferramenta de código de 11/08/2026 a
+> 16/10/2026 (`403` em `/v1/messages`, `/v1/responses` e em `chat/completions`
+> com User-Agent de CLI). Desde 16/10/2026 todo plano de LLM tem CLI
+> (`docker/gateway/cli_policy.py` só barra `Image`), e não há mais teto de
+> contexto por plano: na máquina vale a janela dela, no OpenRouter a do
+> modelo, e o custo de uma request grande é cobrado pela cota ponderada
+> (migration 0079). A config do template Go abaixo fica como **registro
+> histórico** do dimensionamento.
 
 Por que existe: o Claude Code CLI manda ~26k tokens só de system prompt +
 tool schemas antes de qualquer trabalho — numa janela de 16k ele nem abre

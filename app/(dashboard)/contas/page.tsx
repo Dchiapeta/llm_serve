@@ -1,4 +1,6 @@
+import { fetchAll, type PagedQuery } from "@/lib/paged-query"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
+import { fetchStackRequestQuotas } from "@/lib/request-quota"
 import type { Account, Machine, Stack } from "@/lib/types"
 import {
   Card,
@@ -23,8 +25,9 @@ export default async function ContasPage() {
     { data: stacksData },
     { data: machinesData },
     { data: keysData },
-    { data: usageData },
+    usageRes,
     { data: imageUsageData },
+    quotaByStack,
   ] = await Promise.all([
     db.from("accounts").select("*").order("created_at", { ascending: false }),
     db
@@ -32,10 +35,25 @@ export default async function ContasPage() {
       .select("id, account_id, name, slug, plan, category, billing_status, machine_id"),
     db.from("machines").select("id, name, status"),
     db.from("api_keys").select("id, account_id"),
-    db.from("usage_metrics").select("api_key_id, tokens_in, tokens_out, requests"),
+    // Paginado: usage_metrics passa de 1000 linhas e um select cru trunca em
+    // silêncio nas mais antigas — todo o uso recente (inclusive o OpenRouter)
+    // sumia da tabela. Ordem por `id` pelo motivo do comentário de fetchAll.
+    fetchAll<{
+      api_key_id: string | null
+      tokens_in: number
+      tokens_out: number
+      requests: number
+    }>(
+      () =>
+        db
+          .from("usage_metrics")
+          .select("api_key_id, tokens_in, tokens_out, requests")
+          .order("id") as unknown as PagedQuery
+    ),
     // image_usage_rollup (migration 0067) já vem com account_id direto — sem
     // a indirection por chave que usage_metrics precisa aqui embaixo.
     db.from("image_usage_rollup").select("account_id, images"),
+    fetchStackRequestQuotas(db),
   ])
 
   const accounts = (accountsData ?? []) as Account[]
@@ -45,12 +63,7 @@ export default async function ContasPage() {
   >[]
   const machines = (machinesData ?? []) as Pick<Machine, "id" | "name" | "status">[]
   const keys = (keysData ?? []) as { id: string; account_id: string }[]
-  const usage = (usageData ?? []) as {
-    api_key_id: string | null
-    tokens_in: number
-    tokens_out: number
-    requests: number
-  }[]
+  const usage = usageRes.rows
   const imageUsage = (imageUsageData ?? []) as {
     account_id: string | null
     images: number
@@ -71,6 +84,7 @@ export default async function ContasPage() {
       billingStatus: s.billing_status,
       machineName: machine?.name ?? null,
       machineStatus: machine?.status ?? null,
+      quota: quotaByStack.get(s.id) ?? null,
     })
     stacksByAccount.set(s.account_id, list)
   }

@@ -18,16 +18,23 @@ sys.path.insert(0, str(Path(__file__).parent))
 from openrouter import (  # noqa: E402
     ANTHROPIC_SSE_PING,
     CostStripper,
+    DECISIONS_KIND,
+    ModelNameRewriter,
     IMAGE_KIND,
     TEXT_KIND,
     UsageCostScanner,
     accepted_models,
     anthropic_system_text,
     data_url,
+    decisions_url,
     error_of,
     image_body,
     pick_slug,
+    pick_target,
+    plan_catalog,
+    plan_denial,
     prepare_anthropic_body,
+    prepare_decisions_body,
     prepare_openai_body,
     requested_model,
     stream_error_frame,
@@ -41,6 +48,7 @@ CATALOG = {
     "anthropic/claude-sonnet-4.5": TEXT_KIND,
     "qwen/qwen3-coder": TEXT_KIND,
     "google/gemini-2.5-flash-image": IMAGE_KIND,
+    "typesafe/jev-1.13": DECISIONS_KIND,
 }
 
 
@@ -64,8 +72,69 @@ def test_pick_slug_respeita_tipo():
     # modelo de imagem não atende chat, e vice-versa
     assert pick_slug("google/gemini-2.5-flash-image", TEXT_KIND, CATALOG) is None
     assert pick_slug("qwen/qwen3-coder", IMAGE_KIND, CATALOG) is None
+    # o Jev só atende o /v1/decisions, e o /v1/decisions só atende o Jev
+    assert pick_slug("typesafe/jev-1.13", TEXT_KIND, CATALOG) is None
+    assert pick_slug("typesafe/jev-1.13", DECISIONS_KIND, CATALOG) == "typesafe/jev-1.13"
+    assert pick_slug("qwen/qwen3-coder", DECISIONS_KIND, CATALOG) is None
     assert pick_slug("fora/da-lista", TEXT_KIND, CATALOG) is None
     assert pick_slug(None, TEXT_KIND, CATALOG) is None
+
+
+TODOS = ["Go", "Pro", "Max", "Enterprise"]
+ROWS = [
+    {"slug": "z-ai/glm-5.3-flash", "kind": TEXT_KIND, "plans": TODOS, "fallback_plans": []},
+    {"slug": "qwen/qwen3.8-27b", "kind": TEXT_KIND, "plans": ["Pro", "Max", "Enterprise"],
+     "fallback_plans": ["Pro", "Max", "Enterprise"], "fallback": True},
+    {"slug": "qwen/qwen3.5-9b", "kind": TEXT_KIND, "plans": TODOS, "fallback_plans": ["Go"]},
+    {"slug": "qwen/qwen-image-3", "kind": IMAGE_KIND, "plans": TODOS, "fallback_plans": []},
+    # ainda não lançado: na lista, sem plano nenhum
+    {"slug": "moonshotai/kimi-k3", "kind": TEXT_KIND, "plans": [], "fallback_plans": []},
+]
+
+
+def test_plan_catalog_recorta_modelos_e_reserva_por_plano():
+    catalog, fallbacks = plan_catalog(ROWS, "Go")
+    assert accepted_models(catalog, TEXT_KIND) == ["qwen/qwen3.5-9b", "z-ai/glm-5.3-flash"]
+    # o reserva do Go é o modelo da máquina do Go, não o 27B (que não é do Go)
+    assert fallbacks == {TEXT_KIND: "qwen/qwen3.5-9b"}
+    catalog, fallbacks = plan_catalog(ROWS, "Pro")
+    assert "qwen/qwen3.8-27b" in catalog
+    assert fallbacks == {TEXT_KIND: "qwen/qwen3.8-27b"}
+    # chave sem plano não alcança modelo nenhum que declare planos
+    assert plan_catalog(ROWS, None) == ({}, {})
+
+
+def test_plan_catalog_linha_anterior_a_0074_vale_para_todos():
+    legado = [{"slug": "qwen/qwen3.8-27b", "kind": TEXT_KIND, "fallback": True}]
+    assert plan_catalog(legado, "Go") == (
+        {"qwen/qwen3.8-27b": TEXT_KIND}, {TEXT_KIND: "qwen/qwen3.8-27b"}
+    )
+
+
+def test_plan_denial_so_nega_modelo_da_lista_fora_do_plano():
+    assert plan_denial("qwen/qwen3.8-27b", TEXT_KIND, ROWS, "Pro") is None
+    assert plan_denial("qwen/qwen3.5-9b", TEXT_KIND, ROWS, "Go") is None
+    # fora da lista não é negado: segue a regra de destino (máquina responde)
+    assert plan_denial("go-base", TEXT_KIND, ROWS, "Go") is None
+    assert plan_denial(None, TEXT_KIND, ROWS, "Go") is None
+    # modelo de outro tipo não é o pedido desta rota
+    assert plan_denial("qwen/qwen-image-3", TEXT_KIND, ROWS, None) is None
+    # linha anterior à 0074 (sem plans) vale para todos
+    assert plan_denial("x/y", TEXT_KIND, [{"slug": "x/y", "kind": TEXT_KIND}], "Go") is None
+
+
+def test_plan_denial_lista_o_que_o_plano_tem():
+    msg = plan_denial("qwen/qwen3.8-27b", TEXT_KIND, ROWS, "Go")
+    assert "'qwen/qwen3.8-27b'" in msg and "plano Go" in msg
+    assert "qwen/qwen3.5-9b, z-ai/glm-5.3-flash" in msg
+
+
+def test_modelo_sem_plano_nenhum_nao_esta_disponivel_para_ninguem():
+    for plan in TODOS + [None]:
+        msg = plan_denial("moonshotai/kimi-k3", TEXT_KIND, ROWS, plan)
+        assert msg == "o modelo 'moonshotai/kimi-k3' ainda não está disponível"
+    # e não aparece no catálogo de plano nenhum (nem em /v1/models)
+    assert all("moonshotai/kimi-k3" not in plan_catalog(ROWS, p)[0] for p in TODOS)
 
 
 def test_accepted_models_e_mensagem():
@@ -147,6 +216,31 @@ def test_image_body_edits_converte_form_e_referencias():
     assert body["input_references"] == [{"type": "image_url", "image_url": {"url": ref}}]
     assert ref.startswith("data:image/jpeg;base64,")
     assert base64.b64decode(ref.split(",", 1)[1]) == b"\xff\xd8abc"
+
+
+def test_decisions_url_sai_do_v1():
+    assert decisions_url("https://openrouter.ai/api/v1") == "https://openrouter.ai/api/alpha/decisions"
+    # httpx normaliza o base_url com barra no fim
+    assert decisions_url("https://openrouter.test/api/v1/") == "https://openrouter.test/api/alpha/decisions"
+
+
+def test_prepare_decisions_body_trava_modelo_e_tira_stream():
+    body = prepare_decisions_body(
+        {"model": "qualquer", "stream": True, "state": "s", "questions": {"q": {}},
+         "session_id": "abc"},
+        "typesafe/jev-1.13",
+    )
+    assert body == {"model": "typesafe/jev-1.13", "state": "s", "questions": {"q": {}},
+                    "session_id": "abc"}
+
+
+def test_decisions_usage_vira_formato_chat_com_custo():
+    raw = json.dumps({"answers": {}, "usage": {
+        "input_tokens": 476, "output_tokens": 70, "cost": 0.000019992}}).encode()
+    usage, cost = usage_and_cost(raw)
+    assert usage["prompt_tokens"] == 476 and usage["completion_tokens"] == 70
+    assert cost == 0.000019992
+    assert b"cost" not in strip_cost_body(raw)
 
 
 # ---------- resposta ----------
@@ -296,3 +390,25 @@ def test_heartbeat_propaga_erro_da_fonte():
         return False
 
     assert asyncio.run(run())
+
+
+# ---------- reserva e troca de nome (30/09) ----------
+
+
+def test_pick_target_pedido_ganha_do_reserva():
+    fallbacks = {TEXT_KIND: "qwen/qwen3.8-27b"}
+    assert pick_target("qwen/qwen3-coder", TEXT_KIND, CATALOG, fallbacks) == "qwen/qwen3-coder"
+    assert pick_target("pro-base", TEXT_KIND, CATALOG, fallbacks) == "qwen/qwen3.8-27b"
+    assert pick_target(None, TEXT_KIND, CATALOG, fallbacks) == "qwen/qwen3.8-27b"
+    # sem reserva de imagem configurado, modelo fora da lista não tem destino
+    assert pick_target("go-image", IMAGE_KIND, CATALOG, fallbacks) is None
+
+
+def test_model_name_rewriter_sse_e_corpo_inteiro():
+    rw = ModelNameRewriter("pro-base", "moonshotai/kimi-k3")
+    chunk1 = b'data: {"id":"x","model":"pro-base","choices":[{"delta":{"content":"o \\"model\\":\\"pro-base\\""}}]}\n\n'
+    out = rw.feed(chunk1[:25]) + rw.feed(chunk1[25:]) + rw.flush()
+    assert b'"model":"moonshotai/kimi-k3"' in out
+    # o texto gerado (aspas escapadas) não é tocado
+    assert b'\\"model\\":\\"pro-base\\"' in out
+    assert rw.whole(b'{"model": "pro-base", "x": 1}') == b'{"model": "moonshotai/kimi-k3", "x": 1}'

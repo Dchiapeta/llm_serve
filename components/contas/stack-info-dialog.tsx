@@ -7,6 +7,7 @@ import { toast } from "sonner"
 
 import { PLAN_BADGE_VARIANT } from "@/lib/plan-badge"
 import { formatImageCount } from "@/lib/consumption"
+import { formatCycleDate } from "@/lib/request-quota"
 import { Badge } from "@/components/reui/badge"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
@@ -178,6 +179,25 @@ export function StackInfoDialog({
                 <dd>{stack.usage.requests.toLocaleString("pt-BR")}</dd>
               </dl>
             </div>
+
+            {stack.quota && (
+              <div className="text-sm">
+                <p className="text-muted-foreground mb-1">
+                  Cota do ciclo ({formatCycleDate(stack.quota.cycleStart)} –{" "}
+                  {formatCycleDate(stack.quota.cycleEnd)})
+                </p>
+                <dl className="grid grid-cols-2 gap-y-2">
+                  <dt className="text-muted-foreground">Requisições</dt>
+                  <dd className="tabular-nums">
+                    {stack.quota.used.toLocaleString("pt-BR")} /{" "}
+                    {stack.quota.limit.toLocaleString("pt-BR")}
+                  </dd>
+                </dl>
+                <p className="text-muted-foreground mt-1 text-xs">
+                  Só requisições contam para a cota; tokens são informativos.
+                </p>
+              </div>
+            )}
 
             {stack.system_prompt && (
               <div className="text-sm">

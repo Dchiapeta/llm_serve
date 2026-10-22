@@ -20,6 +20,7 @@ const LABELS: Record<string, string> = {
   "provision_denied.panel_unconfigured": "Negado: painel não configurado no gateway",
   "provision_denied.lock_active": "Negado: já há uma criação em andamento",
   "provision_denied.cooldown": "Negado: tentativa recente (cooldown)",
+  "provision_denied.pool_recovering": "Negado: outra máquina do plano está sendo recriada",
   "provision_denied.panel_error": "Negado: o painel recusou ou falhou",
   "provision_denied.machines_disabled": "Negado: máquinas desligadas no painel",
   // decisões gravadas pelo próprio painel (recordDecision em lib/actions.ts)

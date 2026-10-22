@@ -48,6 +48,7 @@ import hashlib
 import ipaddress
 import os
 
+
 # Muda junto com a FÓRMULA do fingerprint, nunca com a lista de ferramentas.
 # Bumpar isto invalida todos os ambientes conhecidos de uma vez: cada um vira
 # "novo" e disputa vaga do zero, o que num plano lotado significa 403 para
@@ -120,12 +121,9 @@ def _cap_from_env(name: str, default: int | None) -> int | None:
 # lib/types.ts, que é o que o painel exibe — divergir faz a UI mentir sobre o
 # número que o gateway aplica.
 #
-# "VibeCoder" é o nome antigo de "Go": entrada mantida como nos outros dicts
-# por plano deste gateway, até a migration 0049 rodar em produção.
 # Enterprise = None (sem teto), mesma convenção de RAG_FILE_LIMIT_BY_PLAN.
 MAX_CLIENTS_BY_PLAN: dict[str, int | None] = {
     "Go": _cap_from_env("MAX_CLIENTS_GO", 5),
-    "VibeCoder": _cap_from_env("MAX_CLIENTS_GO", 5),
     "Pro": _cap_from_env("MAX_CLIENTS_PRO", 25),
     "Max": _cap_from_env("MAX_CLIENTS_MAX", 50),
     "Enterprise": _cap_from_env("MAX_CLIENTS_ENTERPRISE", None),
@@ -214,11 +212,15 @@ def client_fingerprint(headers) -> tuple[str, str, str, str | None]:
     return hashlib.sha256(material.encode()).hexdigest(), label, user_agent, bucket
 
 
-def client_cap(plan: str | None) -> int | None:
+def client_cap(plan: str | None, category: str | None = None) -> int | None:
     """Teto de ambientes do plano. None = sem teto.
 
     Plano fora do dict cai em None (fail-open), pelo mesmo motivo de
     usage_class.high_cap: o pior caso de fail-open é um cliente com ambientes
     demais, o de fail-closed seria cliente pagante sem conseguir conectar
-    porque alguém criou um plano novo e esqueceu deste dict."""
+    porque alguém criou um plano novo e esqueceu deste dict.
+
+    `category` é aceita (o teto vale para LLM e imagem) mas hoje não muda o
+    resultado: os dois produtos do Go têm o mesmo teto."""
+    del category
     return MAX_CLIENTS_BY_PLAN.get(plan or "")

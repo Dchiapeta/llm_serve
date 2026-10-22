@@ -12,7 +12,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
-from recovery import machine_was_lost
+from recovery import machine_boot_stalled, machine_was_lost
 
 logger = logging.getLogger("gateway.lifecycle")
 
@@ -38,6 +38,7 @@ class LifecycleManager:
         runpod=None,
         machine_idle_stop_minutes: float = 0.0,
         creating_grace_s: float = 900.0,
+        creating_stale_after_s: float = 1800.0,
         consolidation_max_origin_routes: int = 2,
         stop_recheck_grace_s: float = 5.0,
         try_provision_for_pool=None,
@@ -66,6 +67,10 @@ class LifecycleManager:
         # janela em que uma máquina 'creating' cujo pod reporta EXITED NÃO é
         # rebaixada a 'stopped' pelo reconcile (ver reconcile_statuses_once)
         self.creating_grace_s = creating_grace_s
+        # a partir de quando uma 'creating' é tratada como presa (mesmo
+        # CREATING_STALE_AFTER_S da cascata do gateway): uma presa não conta
+        # como "o pool já tem máquina subindo" em process_pending_recreates_once
+        self.creating_stale_after_s = creating_stale_after_s
         self.consolidation_max_origin_routes = consolidation_max_origin_routes
         self.stop_recheck_grace_s = stop_recheck_grace_s
         # reposição proativa (ensure_capacity_once) — callbacks injetados por
@@ -495,9 +500,17 @@ class LifecycleManager:
                 # que filtra status=running) mata a máquina antes de ela servir —
                 # foi o que derrubou o 1º pod do Pro 2×A40 (boot > 30 min). Enquanto
                 # o vLLM está vivo mas não-ready, mantém em creating/stopped
-                # (invisível ao reaper). Crash (vllm_alive=false) ou /health
-                # inacessível caem no comportamento antigo (promove; o reaper
-                # reclama depois) pra não deixar pod preso cobrando GPU.
+                # (invisível ao reaper). Crash (vllm_alive=false) cai no
+                # comportamento antigo (promove; o reaper reclama depois) pra não
+                # deixar pod preso cobrando GPU.
+                #
+                # /health inacessível numa 'creating' dentro do prazo de boot
+                # também SEGURA: num pod recém-criado o contêiner ainda está
+                # baixando a imagem/subindo o agent e o /health não responde.
+                # Promover aí marcava a máquina pronta minutos antes do vLLM —
+                # o gateway mandava as requests para ela e todas caíam no
+                # OpenRouter (llm-stack-704, 01/10: running às 14:29:34, zero
+                # requests servidas). Passado o prazo, volta a promover.
                 if self.vllm_health_check is not None:
                     health = await self.vllm_health_check(m)
                     loading = (
@@ -505,7 +518,12 @@ class LifecycleManager:
                         and not health.get("vllm_ready")
                         and health.get("vllm_alive")
                     )
-                    if loading:
+                    unreachable_while_booting = (
+                        health is None
+                        and m["status"] == "creating"
+                        and self._within_creating_grace(m)
+                    )
+                    if loading or unreachable_while_booting:
                         continue
                 # o relógio de ociosidade zera em QUALQUER promoção a running
                 # (creating→running ou stopped→running via console do RunPod):
@@ -670,7 +688,13 @@ class LifecycleManager:
         rede uma vez pra ela nunca mais ser recriada.
 
         O que continua de fora é o 'terminated' SEM pod_id: encerramento manual,
-        que ninguém quer de volta."""
+        que ninguém quer de volta.
+
+        Nem toda pendência ainda é necessária: ela nasce de UMA request sem
+        máquina, e se outra máquina do mesmo pool já está running ou subindo, a
+        demanda que a criou está coberta. Recriar mesmo assim põe uma 2ª/3ª
+        máquina de pé para ninguém (Pro, 01/10: 699 recriada às 13:20 com 703 e
+        Pro já subindo). Nesse caso a pendência sai da fila sem recriar."""
         if self.try_recreate_machine is None or not self.pending_recreates:
             return []
         retried: list[str] = []
@@ -681,11 +705,42 @@ class LifecycleManager:
                 self.pending_recreates.discard(machine_id)
                 continue
             try:
+                if await self._pool_covered(m):
+                    self.pending_recreates.discard(machine_id)
+                    logger.info(
+                        "recriação pendente de %s descartada: o pool já tem outra "
+                        "máquina running ou subindo", machine_id,
+                    )
+                    continue
+            except Exception as e:
+                # sem conseguir ler o pool, segue o comportamento antigo (recria):
+                # deixar a máquina de um cliente sem volta é o erro mais caro
+                logger.warning("recriação pendente: pool de %s ilegível (%s)", machine_id, e)
+            try:
                 if await self.try_recreate_machine(m, "lifecycle: retry de recriação pendente"):
                     retried.append(machine_id)
             except Exception as e:
                 logger.warning("recriação pendente: %s falhou (%s)", machine_id, e)
         return retried
+
+    async def _pool_covered(self, m: dict) -> bool:
+        """Há OUTRA máquina do pool de `m` running, ou subindo sem estar presa?
+        Pool vem do template embutido por get_machine; sem ele, False (não dá
+        pra afirmar que está coberto)."""
+        tpl = m.get("templates")
+        if not isinstance(tpl, dict) or not tpl.get("plan"):
+            return False
+        plan, category = tpl["plan"], tpl.get("category") or "llm"
+        running = await self.supa.list_running_machines_for_plan(plan, category)
+        if any(r["id"] != m["id"] for r in running):
+            return True
+        wakeable = await self.supa.list_wakeable_machines_for_plan(plan, category)
+        return any(
+            w["id"] != m["id"]
+            and w.get("status") == "creating"
+            and not machine_boot_stalled(w, self.creating_stale_after_s)
+            for w in wakeable
+        )
 
     async def machine_lifecycle_loop(self, interval_s: float = 300.0):
         while True:

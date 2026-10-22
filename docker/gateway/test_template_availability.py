@@ -56,7 +56,24 @@ def test_get_machine_traz_flags_para_bloquear_recriacao_automatica():
 
     assert result["id"] == "m1"
     _path, params = client._rest.calls[0]
-    assert "templates(is_enabled,is_test)" in params["select"]
+    assert "templates(plan,category,is_enabled,is_test)" in params["select"]
+
+
+def test_wakeable_le_creating_e_stopped_numa_consulta_so():
+    # uma consulta só: com duas, a máquina que passava de stopped para creating
+    # entre elas sumia das duas listas (llm-stack-705, 01/10)
+    client = client_with_rest()
+
+    asyncio.run(client.list_wakeable_machines_for_plan("Go", "llm"))
+
+    assert len(client._rest.calls) == 1
+    path, params = client._rest.calls[0]
+    assert path == "/machines"
+    assert params["status"] == "in.(creating,stopped)"
+    assert params["templates.plan"] == "eq.Go"
+    assert params["templates.category"] == "eq.llm"
+    assert params["runpod_pod_id"] == "not.is.null"
+    assert_production_filters(params)
 
 
 def test_picks_running_e_stopped_por_produto_excluem_teste_e_desabilitado():

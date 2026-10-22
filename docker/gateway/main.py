@@ -58,6 +58,8 @@ import image_gen
 import image_proxy
 import image_retention
 import openrouter
+import openrouter_keys
+import request_quota
 from anthropic_compat import (
     anthropic_error_body,
     anthropic_nonstreaming_body,
@@ -106,6 +108,7 @@ from recovery import (
 )
 from usage_class import classify_stack
 from usage_norm import SseUsageScanner, normalize_usage, usage_from_event
+import product_analytics
 from routing import RoutingStore
 from runpod_api import RunPodClient
 from reasoning_filter import (
@@ -162,7 +165,6 @@ MAX_LORAS_PER_MACHINE = int(os.environ.get("MAX_LORAS_PER_MACHINE", "8"))
 # valor abaixo é só o ponto de partida até o contrato pedir mais.
 RATE_LIMIT_RPM = {
     "Go": 60.0,
-    "VibeCoder": 60.0,
     "Pro": 120.0,
     "Max": 300.0,
     "Enterprise": 600.0,
@@ -212,7 +214,8 @@ IMAGE_RATE_LIMIT_BURST = {
 
 
 def rate_limit_rpm(plan: str | None) -> float:
-    """Taxa de reposição do bucket, em requisições por minuto."""
+    """Taxa de reposição do bucket, em requisições por minuto. Só rota de
+    LLM chega aqui — imagem usa image_rate_limit_rpm."""
     return RATE_LIMIT_RPM.get(plan or "", DEFAULT_RATE_LIMIT_RPM)
 
 
@@ -403,9 +406,6 @@ CHAT_STREAM_IDLE_TIMEOUT_S = float(os.environ.get("CHAT_STREAM_IDLE_TIMEOUT_S", 
 # evita 1 round-trip ao Supabase por request na hot path.
 DAILY_TOKEN_BUDGET = {
     "Go": int(os.environ.get("DAILY_TOKEN_BUDGET_GO", "0")),
-    # TRANSIÇÃO: nome antigo do plano "Go", aceito até a migration 0049 rodar
-    # em produção. Remover junto com as outras entradas "VibeCoder" daqui.
-    "VibeCoder": int(os.environ.get("DAILY_TOKEN_BUDGET_GO", "0")),
     "Pro": int(os.environ.get("DAILY_TOKEN_BUDGET_PRO", "0")),
     "Max": int(os.environ.get("DAILY_TOKEN_BUDGET_MAX", "0")),
     "Enterprise": int(os.environ.get("DAILY_TOKEN_BUDGET_ENTERPRISE", "0")),
@@ -558,6 +558,19 @@ OPENROUTER_NONSTREAM_TIMEOUT_S = float(os.environ.get("OPENROUTER_NONSTREAM_TIME
 # (a doc cita 94s para um gpt-image em 16:9)
 OPENROUTER_IMAGE_TIMEOUT_S = float(os.environ.get("OPENROUTER_IMAGE_TIMEOUT_S", "240"))
 OPENROUTER_MAX_IMAGES = int(os.environ.get("OPENROUTER_MAX_IMAGES", "4"))
+# A API de Decisions (Jev) é alpha e pode mudar de path. Vazio = derivado da
+# base do openrouter_client (openrouter.decisions_url): /api/alpha/decisions.
+OPENROUTER_DECISIONS_URL = os.environ.get("OPENROUTER_DECISIONS_URL", "")
+# Chave espelho no OpenRouter por chave da Stac (ver openrouter_keys.py). As
+# duas são necessárias; sem qualquer uma, o repasse segue só com a chave
+# compartilhada (OPENROUTER_API_KEY) e o custo por chave fica só em
+# gateway_requests.cost_usd.
+OPENROUTER_MANAGEMENT_KEY = os.environ.get("OPENROUTER_MANAGEMENT_KEY", "")
+OPENROUTER_KEYS_ENCRYPTION_KEY = os.environ.get("OPENROUTER_KEYS_ENCRYPTION_KEY", "")
+# depois de uma falha ao criar a chave espelho de uma chave da Stac, quanto
+# tempo esperar antes de tentar de novo (as requests nesse meio tempo usam a
+# chave compartilhada, sem martelar a API de gerenciamento)
+OPENROUTER_KEY_RETRY_S = float(os.environ.get("OPENROUTER_KEY_RETRY_S", "300"))
 # TTL do cache "chave já upsertada no agent X" — o agent perde as chaves em
 # memória a cada restart do pod, então o fluxo base garante a chave via
 # upsert lazy antes do proxy; o cache evita 1 round-trip ao agent por request
@@ -631,10 +644,27 @@ auto_provision_cache: tuple[bool, float] | None = None
 # demais flags de system_settings (machines_enabled, openrouter_enabled):
 # key -> (valor, expira_em). Mesmo TTL do auto_provision_cache.
 settings_cache: dict[str, tuple[bool, float]] = {}
-# allowlist do OpenRouter (openrouter_models habilitados): ({slug: kind}, expira_em)
-openrouter_catalog_cache: tuple[dict[str, str], float] | None = None
+# allowlist do OpenRouter (openrouter_models habilitados), as linhas cruas:
+# (linhas, expira_em). O recorte por plano sai delas a cada request
+# (openrouter.plan_catalog), que é barato perto de um cache por plano.
+openrouter_catalog_cache: tuple[list[dict], float] | None = None
 # None quando OPENROUTER_API_KEY não está configurada (repasse desligado)
 openrouter_client: httpx.AsyncClient | None = None
+# chaves espelho (openrouter_keys.py): client da API de gerenciamento e a cifra.
+# Os dois None = mecanismo desligado.
+openrouter_mgmt_client: httpx.AsyncClient | None = None
+openrouter_secret_box: openrouter_keys.SecretBox | None = None
+# por que o mecanismo ficou desligado no boot (None = ligado). Devolvido pelo
+# /admin/openrouter-keys/provision: diz QUAL variável faltou ou por que o valor
+# foi recusado, sem expor valor nenhum.
+openrouter_keys_disabled_reason: str | None = "gateway ainda não terminou de subir"
+# api_key_id -> segredo já decifrado. Não expira: o segredo de uma chave
+# espelho não muda; quem invalida é _forget_openrouter_key (401 do OpenRouter).
+openrouter_key_secrets: dict[str, str] = {}
+# api_key_id -> momento da última falha ao criar (ver OPENROUTER_KEY_RETRY_S)
+openrouter_key_failures: dict[str, float] = {}
+# uma criação por chave da Stac de cada vez
+openrouter_key_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 # requests em voo por (account_id, machine_id) — base do drain da Fase 5.
 # Em memória: válido apenas com réplica única do gateway.
@@ -646,6 +676,12 @@ rate_buckets: dict[str, tuple[float, float]] = {}  # key_hash -> (tokens, last_r
 
 # cache curto da quota diária de tokens: account_id -> (tokens_usados, expira_em)
 token_usage_cache: dict[str, tuple[int, float]] = {}
+
+# cota mensal de requisições por stack (migration 0076, ver request_quota.py)
+request_quota_cache = request_quota.QuotaCache()
+# (stack_id, fim do ciclo) já avisados no log em modo só-registro — sem isso
+# cada requisição de uma stack acima da cota repetiria a mesma linha
+request_quota_warned: set[tuple[str, str]] = set()
 
 # rate limit da demo pública: por IP e um teto global na mesma janela (ver
 # DEMO_LIMIT_GLOBAL). Janela deslizante, não token bucket — o motivo está no
@@ -676,12 +712,15 @@ last_stack_touch: dict[str, float] = {}
 # última tentativa de auto-wake por máquina — evita tempestade de startPod
 # com requests concorrentes ou falhas repetidas (ex.: host sem GPU livre)
 last_wake_attempt: dict[str, float] = {}
-# resultado da última tentativa ('woke' | 'failed'): dentro do cooldown, só
-# uma tentativa que DEU CERTO justifica dizer ao cliente "sua máquina está
-# subindo". Sem isto, um startPod que falhou (RunPod 500, pod inválido) virava
-# 'cooldown' → 'waking' por WAKE_COOLDOWN_S, e a cascata nunca chegava ao
-# provisionamento — o cliente ficava em loop de 503 "sendo iniciada" com nada
-# subindo.
+# resultado da última tentativa ('pending' | 'woke' | 'failed'): dentro do
+# cooldown, só uma tentativa que DEU CERTO justifica dizer ao cliente "sua
+# máquina está subindo". Sem isto, um startPod que falhou (RunPod 500, pod
+# inválido) virava 'cooldown' → 'waking' por WAKE_COOLDOWN_S, e a cascata nunca
+# chegava ao provisionamento — o cliente ficava em loop de 503 "sendo iniciada"
+# com nada subindo.
+# 'pending' = startPod em voo. Conta como subindo: até 01/10 a marca prévia era
+# 'failed', e uma request concorrente lia o wake em andamento como falha e
+# provisionava outra máquina por cima (llm-stack-703, Pro, 01/10 13:12).
 last_wake_outcome: dict[str, str] = {}
 
 # chaves já garantidas no agent: (key_hash, machine_id) -> expira_em.
@@ -708,6 +747,11 @@ last_provision_attempt: dict[str, float] = {}
 # a GPU do pod pausado e só recriar num host novo o traz de volta.
 recreating_in_progress: dict[str, float] = {}
 last_recreate_attempt: dict[str, float] = {}
+# pool (product_pool_key) de cada máquina em recreating_in_progress. A trava é
+# por máquina, mas quem decide provisionar pensa por pool: sem este mapa a
+# cascata não sabia que o pool já tinha uma máquina sendo recriada e criava
+# outra por cima (llm-stack-705, Go, 01/10 14:26).
+recreating_pool: dict[str, str] = {}
 # fila de recriações pendentes: máquinas que o caminho reativo (no_gpu) marcou
 # pra recriar e ainda não confirmaram sucesso. O lifecycle loop reprocessa
 # (process_pending_recreates_once) — mesma disciplina do pending_unloads —
@@ -728,7 +772,7 @@ runpod_client: RunPodClient | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global supa, store, proxy_client, document_client, openai_client, panel_client, demo_client, lifecycle_mgr, runpod_client, openrouter_client
+    global supa, store, proxy_client, document_client, openai_client, panel_client, demo_client, lifecycle_mgr, runpod_client, openrouter_client, openrouter_mgmt_client, openrouter_secret_box, openrouter_keys_disabled_reason
     supa = SupaClient(SUPABASE_URL, SERVICE_ROLE_KEY, LORA_BUCKET, IMAGE_BUCKET)
     store = RoutingStore(SUPABASE_URL, SERVICE_ROLE_KEY)
     # read curto (60s): o Cloudflare na frente do RunPod às vezes derruba (RST)
@@ -788,18 +832,52 @@ async def lifespan(app: FastAPI):
         transport=httpx.AsyncHTTPTransport(retries=2),
     )
     await assert_demo_pod_is_dedicated()
-    if OPENROUTER_API_KEY:
-        # client próprio: a Bearer é a NOSSA chave do OpenRouter (nunca a do
-        # cliente) e o pool não disputa conexão com o tráfego das máquinas.
-        # O read de cada request é definido na chamada (stream x não-stream x
-        # imagem); o daqui é só o default.
+    openrouter_mgmt_client = None
+    openrouter_secret_box = None
+    missing = [
+        name for name, value in (
+            ("OPENROUTER_MANAGEMENT_KEY", OPENROUTER_MANAGEMENT_KEY),
+            ("OPENROUTER_KEYS_ENCRYPTION_KEY", OPENROUTER_KEYS_ENCRYPTION_KEY),
+        ) if not value
+    ]
+    openrouter_keys_disabled_reason = (
+        f"variável ausente no processo do gateway: {', '.join(missing)}" if missing else None
+    )
+    if not missing:
+        try:
+            # strip: valor colado com espaço/quebra de linha no fim é o erro mais
+            # comum, e não muda a chave
+            openrouter_secret_box = openrouter_keys.SecretBox(
+                OPENROUTER_KEYS_ENCRYPTION_KEY.strip()
+            )
+        except ValueError as e:
+            openrouter_keys_disabled_reason = str(e)
+            logger.error("chaves espelho do OpenRouter DESLIGADAS: %s", e)
+        else:
+            openrouter_mgmt_client = httpx.AsyncClient(
+                base_url=OPENROUTER_BASE_URL,
+                headers={"Authorization": f"Bearer {OPENROUTER_MANAGEMENT_KEY.strip()}"},
+                timeout=httpx.Timeout(15.0, connect=5.0),
+            )
+    else:
+        logger.info(
+            "chaves do OpenRouter por chave da Stac desligadas (%s)",
+            openrouter_keys_disabled_reason,
+        )
+    # Client do repasse: existe se há COMO autenticar — a chave espelho de cada
+    # chave da Stac (acima) e/ou a compartilhada. A compartilhada é opcional:
+    # com as espelhos ligadas ela é só plano B (ver openrouter_forward). O read
+    # de cada request é definido na chamada; o daqui é só o default.
+    if OPENROUTER_API_KEY or openrouter_mgmt_client is not None:
+        headers = {
+            "HTTP-Referer": OPENROUTER_APP_URL,
+            "X-OpenRouter-Title": OPENROUTER_APP_TITLE,
+        }
+        if OPENROUTER_API_KEY:
+            headers["Authorization"] = f"Bearer {OPENROUTER_API_KEY}"
         openrouter_client = httpx.AsyncClient(
             base_url=OPENROUTER_BASE_URL,
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "HTTP-Referer": OPENROUTER_APP_URL,
-                "X-OpenRouter-Title": OPENROUTER_APP_TITLE,
-            },
+            headers=headers,
             timeout=httpx.Timeout(OPENROUTER_NONSTREAM_TIMEOUT_S, connect=10.0, write=30.0, pool=10.0),
             limits=httpx.Limits(
                 max_connections=200, max_keepalive_connections=40, keepalive_expiry=30.0
@@ -808,7 +886,7 @@ async def lifespan(app: FastAPI):
         )
     else:
         openrouter_client = None
-        logger.info("OPENROUTER_API_KEY ausente — repasse para o OpenRouter desligado")
+        logger.info("sem OPENROUTER_API_KEY nem chaves espelho — repasse ao OpenRouter desligado")
     if RUNPOD_API_KEY:
         runpod_client = RunPodClient(RUNPOD_API_KEY)
     else:
@@ -833,6 +911,7 @@ async def lifespan(app: FastAPI):
         runpod=runpod_client,
         machine_idle_stop_minutes=MACHINE_IDLE_STOP_MINUTES,
         creating_grace_s=MACHINE_HEALTH_TIMEOUT_S,
+        creating_stale_after_s=CREATING_STALE_AFTER_S,
         consolidation_max_origin_routes=CONSOLIDATION_MAX_ORIGIN_ROUTES,
         stop_recheck_grace_s=STOP_RECHECK_GRACE_S,
         try_provision_for_pool=try_provision_for_pool,
@@ -855,6 +934,7 @@ async def lifespan(app: FastAPI):
         image_retention.image_retention_loop(supa, IMAGE_RETENTION_INTERVAL_S)
     )
     decisions_task = asyncio.create_task(decisions.decisions_retention_loop(supa))
+    analytics_task = asyncio.create_task(product_analytics.export_loop(supa))
     yield
     reaper_task.cancel()
     machine_task.cancel()
@@ -864,6 +944,11 @@ async def lifespan(app: FastAPI):
     billing_task.cancel()
     image_retention_task.cancel()
     decisions_task.cancel()
+    analytics_task.cancel()
+    try:
+        await analytics_task
+    except asyncio.CancelledError:
+        pass
     await proxy_client.aclose()
     await document_client.aclose()
     await openai_client.aclose()
@@ -871,6 +956,8 @@ async def lifespan(app: FastAPI):
     await demo_client.aclose()
     if openrouter_client is not None:
         await openrouter_client.aclose()
+    if openrouter_mgmt_client is not None:
+        await openrouter_mgmt_client.aclose()
     await store.aclose()
     await supa.aclose()
     if runpod_client:
@@ -878,6 +965,28 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+class RequestQuotaExceeded(HTTPException):
+    """429 da cota mensal de requisições, com o corpo no protocolo do cliente.
+
+    Subclasse pelo mesmo motivo de ContextWindowExceeded: os `except
+    HTTPException` dos call sites continuam valendo, e o handler dedicado
+    abaixo (resolvido por MRO) troca o {"detail": ...} pelo shape de erro que
+    os SDKs OpenAI/Anthropic sabem ler."""
+
+    def __init__(self, message: str, headers: dict[str, str], shape: str = "openai"):
+        super().__init__(status_code=429, detail=message, headers=headers)
+        self.shape = shape
+
+
+@app.exception_handler(RequestQuotaExceeded)
+async def request_quota_exceeded_handler(request: Request, exc: RequestQuotaExceeded):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=request_quota.quota_body_for(exc.shape, exc.detail),
+        headers=exc.headers,
+    )
 
 
 @app.exception_handler(ContextWindowExceeded)
@@ -1116,7 +1225,7 @@ async def enforce_client_limit(entry: dict, stack: dict, plan: str | None, heade
         return
 
     fingerprint, label, user_agent, bucket = client_fingerprint(headers)
-    cap = client_cap(plan)
+    cap = client_cap(plan, stack.get("category"))
     now = time.time()
     seen = client_seen[stack_id]
 
@@ -1398,6 +1507,57 @@ async def check_token_quota(account_id: str, plan: str | None, purpose: str = "c
         )
 
 
+async def check_request_quota(
+    stack: dict | None, plan: str | None, purpose: str = "customer", shape: str = "openai",
+) -> None:
+    """Cota mensal de requisições da stack da chave (migration 0076).
+
+    Chamada ao lado de check_token_quota em toda rota que registra em
+    gateway_requests — a regra é "toda requisição registrada conta", então
+    uma rota nova que registre e não passe por aqui seria uso grátis. Fica
+    fora o /v1/messages/count_tokens, que é métrica interna e não registra.
+
+    Admitir soma 1 no snapshot (ver request_quota.py); o resto do peso da
+    request ponderada (0079) entra em log_gateway_request, quando os tokens
+    de entrada são conhecidos. Recusar não soma: o 429
+    sai antes de existir linha em gateway_requests, então também não conta no
+    banco. `stack` None (conta sem stack) e a chave interna de playground
+    passam sem consulta; stack de imagem também, sem gastar a RPC numa
+    categoria que a 0076 já devolve sem teto."""
+    if purpose == "playground" or not stack:
+        return
+    if (stack.get("category") or LLM_CATEGORY) != LLM_CATEGORY:
+        return
+    stack_id = stack["id"]
+    now = time.time()
+    snap = request_quota_cache.get(stack_id, now)
+    if snap is None:
+        try:
+            rows = await supa.stack_request_quota(stack_id)
+            snap = request_quota.snapshot_from_rpc(rows, now)
+        except (httpx.HTTPError, ValueError) as e:
+            # ValueError: corpo que não é JSON (r.json()) — falha aberta também
+            logger.warning("cota de requisições indisponível (stack %s): %s — liberando", stack_id, e)
+            snap = request_quota.unavailable_snapshot(now)
+        request_quota_cache.put(stack_id, snap)
+    if snap.exhausted():
+        if request_quota.REQUEST_QUOTA_ENFORCE:
+            raise RequestQuotaExceeded(
+                request_quota.quota_message(plan, snap),
+                request_quota.quota_headers(snap, now),
+                shape=shape,
+            )
+        warn_key = (stack_id, snap.cycle_end.isoformat() if snap.cycle_end else "")
+        if warn_key not in request_quota_warned:
+            request_quota_warned.add(warn_key)
+            logger.warning(
+                "cota de requisições: stack %s (%s) excederia %d/%d (ponderado por "
+                "tokens) — só registro (REQUEST_QUOTA_ENFORCE desligado)",
+                stack.get("slug") or stack_id, plan, snap.used, snap.limit,
+            )
+    snap.used += 1
+
+
 async def authenticate_anthropic(
     authorization: str | None, x_api_key: str | None, headers, path: str | None = None
 ) -> tuple[dict, str, str]:
@@ -1551,11 +1711,14 @@ def build_usage_metric_rows(
 
 
 async def collect_usage_metrics_once() -> None:
-    """Único escritor de usage_metrics: puxa os contadores acumulados do
-    agent de cada máquina running (zerando-os na leitura) e grava o delta
-    em usage_metrics. Roda sozinha no processo do gateway — antes de existir,
-    usage_metrics só era populado quando um admin abria o painel, o que
-    deixava a quota diária de tokens (check_token_quota) cega a qualquer
+    """Escritor do uso de MÁQUINA em usage_metrics: puxa os contadores
+    acumulados do agent de cada máquina running (zerando-os na leitura) e
+    grava o delta em usage_metrics. O uso repassado ao OpenRouter não passa
+    por agent e entra por outro caminho: um trigger em gateway_requests
+    (migration 0075), linhas com machine_id nulo. Roda sozinha no processo
+    do gateway — antes de existir, usage_metrics só era populado quando um
+    admin abria o painel, o que deixava a quota diária de tokens
+    (check_token_quota) cega a qualquer
     uso entre duas visitas (esse coletor do painel foi removido depois que
     causou atribuição incorreta a api_key_id=NULL por divergir do esquema
     de chave do agent).
@@ -2139,31 +2302,165 @@ async def openrouter_enabled() -> bool:
     return await _cached_setting("openrouter_enabled", False)
 
 
-async def openrouter_catalog() -> dict[str, str]:
-    """{slug: kind} dos modelos habilitados na página Modelos (OpenRouter),
-    vazio com o repasse desligado. Falha de leitura mantém o último catálogo."""
+async def _openrouter_rows() -> list[dict]:
+    """Linhas habilitadas da página Modelos (OpenRouter), com cache curto.
+    Lidas mesmo com o repasse desligado: o acesso a modelo por plano (0074)
+    vale também no caminho de máquina. Falha de leitura mantém as últimas."""
     global openrouter_catalog_cache
-    if not await openrouter_enabled():
-        return {}
     now = time.time()
     if openrouter_catalog_cache and openrouter_catalog_cache[1] > now:
         return openrouter_catalog_cache[0]
     try:
         rows = await supa.list_enabled_openrouter_models()
-        catalog = {row["slug"]: row["kind"] for row in rows}
     except Exception as e:
         logger.warning("openrouter: falha ao ler a allowlist de modelos (%s)", e)
-        catalog = openrouter_catalog_cache[0] if openrouter_catalog_cache else {}
-    openrouter_catalog_cache = (catalog, now + SETTINGS_CACHE_TTL_S)
-    return catalog
+        rows = openrouter_catalog_cache[0] if openrouter_catalog_cache else []
+    openrouter_catalog_cache = (rows, now + SETTINGS_CACHE_TTL_S)
+    return rows
 
 
-async def openrouter_slug_for(model: str | None, kind: str) -> str | None:
+async def _openrouter_models(
+    plan: str | None, kind: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """({slug: kind}, {kind: slug do reserva}) que uma chave do `plan`
+    alcança no OpenRouter para requests do tipo `kind` (openrouter_models.plans,
+    0074); vazios com o repasse desligado."""
+    if not await openrouter_enabled():
+        return {}, {}
+    return openrouter.plan_catalog(await _openrouter_rows(), plan)
+
+
+async def openrouter_catalog(plan: str | None, kind: str) -> dict[str, str]:
+    """{slug: kind} dos modelos do plano (vazio com o repasse desligado)."""
+    return (await _openrouter_models(plan, kind))[0]
+
+
+async def openrouter_text_target(model: str | None, plan: str | None) -> str | None:
+    """Modelo do OpenRouter que atende uma request de TEXTO que vai para lá: o
+    pedido, se está na lista do plano; senão o reserva de texto do plano
+    (0073/0074). Imagem não tem reserva — fica fora da regra, ver a 0073."""
+    catalog, fallbacks = await _openrouter_models(plan, openrouter.TEXT_KIND)
+    return openrouter.pick_target(
+        model, openrouter.TEXT_KIND, catalog,
+        {k: v for k, v in fallbacks.items() if k == openrouter.TEXT_KIND},
+    )
+
+
+async def require_plan_model(model: str | None, kind: str, plan: str | None) -> None:
+    """403 quando o modelo pedido está na página Modelos mas não no plano da
+    chave (0074: Go sem o Qwen 3.8 27B). Antes de qualquer destino, e com o
+    repasse ligado ou não: a máquina responde qualquer nome pedido (0073), e
+    sem esta trava o cliente Go que pedisse o 27B receberia o 9B com o nome do
+    27B. Modelo da lista sem plano nenhum (Kimi K3, ainda não lançado) é
+    barrado para todos. Modelo fora da lista não é barrado aqui (segue a regra
+    de destino)."""
+    detail = openrouter.plan_denial(model, kind, await _openrouter_rows(), plan)
+    if detail:
+        raise HTTPException(status_code=403, detail=detail)
+
+
+async def openrouter_key_for(entry: dict) -> str | None:
+    """Segredo da chave espelho do OpenRouter desta chave da Stac, criando-a
+    se ainda não existe (ver openrouter_keys.py). None = usar a chave
+    compartilhada — com o mecanismo desligado, em cooldown depois de uma
+    falha, ou em qualquer erro. Nunca levanta: o repasse não pode falhar por
+    causa do acompanhamento de custo."""
+    api_key_id = entry.get("api_key_id")
+    if openrouter_mgmt_client is None or openrouter_secret_box is None or not api_key_id:
+        return None
+    cached = openrouter_key_secrets.get(api_key_id)
+    if cached:
+        return cached
+    if time.time() - openrouter_key_failures.get(api_key_id, 0) < OPENROUTER_KEY_RETRY_S:
+        return None
+    async with openrouter_key_locks[api_key_id]:
+        cached = openrouter_key_secrets.get(api_key_id)  # outra request criou
+        if cached:
+            return cached
+        try:
+            row = await supa.get_openrouter_key(api_key_id)
+            if row is None:
+                row = await _create_openrouter_key(entry)
+            secret = openrouter_secret_box.decrypt(row["secret_encrypted"])
+        except Exception as e:
+            openrouter_key_failures[api_key_id] = time.time()
+            logger.warning(
+                "openrouter: sem chave espelho para %s, usando a compartilhada (%s)",
+                api_key_id, e,
+            )
+            return None
+        openrouter_key_secrets[api_key_id] = secret
+        openrouter_key_failures.pop(api_key_id, None)
+        return secret
+
+
+async def _create_openrouter_key(entry: dict) -> dict:
+    """Cria a chave espelho no OpenRouter e grava a linha. Devolve a linha que
+    ficou no banco (a nossa, ou a de uma criação concorrente que venceu)."""
+    api_key_id = entry["api_key_id"]
+    name = openrouter_keys.key_name(entry)
+    r = await openrouter_mgmt_client.post("/keys", json={"name": name})
+    r.raise_for_status()
+    key_hash, secret = openrouter_keys.parse_created(r.json())
+    row = {
+        "api_key_id": api_key_id,
+        "openrouter_hash": key_hash,
+        "secret_encrypted": openrouter_secret_box.encrypt(secret),
+        "name": name,
+    }
+    try:
+        inserted = await supa.insert_openrouter_key(row)
+    except Exception:
+        await _delete_remote_openrouter_key(key_hash)  # não deixa órfã
+        raise
+    if not inserted:
+        # outra réplica/processo gravou antes: a dela vale, a nossa é apagada
+        await _delete_remote_openrouter_key(key_hash)
+        existing = await supa.get_openrouter_key(api_key_id)
+        if existing is None:
+            raise RuntimeError("chave espelho sumiu depois do conflito")
+        return existing
+    logger.info("openrouter: chave espelho criada para %s (%s)", api_key_id, name)
+    return row
+
+
+async def _delete_remote_openrouter_key(key_hash: str) -> None:
+    try:
+        r = await openrouter_mgmt_client.delete(f"/keys/{key_hash}")
+        r.raise_for_status()
+    except Exception as e:
+        logger.warning("openrouter: não deu para apagar a chave órfã %s (%s)", key_hash, e)
+
+
+def _forget_openrouter_key(api_key_id: str | None) -> None:
+    """O OpenRouter recusou (401) a chave espelho — apagada ou desativada à mão
+    no painel de lá. Esquece o segredo e a linha: a próxima request cria outra.
+    A request atual já foi respondida com o 503 genérico."""
+    if not api_key_id:
+        return
+    openrouter_key_secrets.pop(api_key_id, None)
+    logger.error("openrouter: chave espelho de %s recusada — será recriada", api_key_id)
+
+    async def _drop():
+        try:
+            await supa.delete_openrouter_key(api_key_id)
+        except Exception as e:
+            logger.warning("openrouter: falha ao apagar a linha da chave espelho %s (%s)", api_key_id, e)
+
+    spawn_tracked(_drop())
+
+
+def _openrouter_auth(secret: str | None) -> dict[str, str] | None:
+    """Header que troca a chave compartilhada (default do client) pela espelho."""
+    return {"Authorization": f"Bearer {secret}"} if secret else None
+
+
+async def openrouter_slug_for(model: str | None, kind: str, plan: str | None) -> str | None:
     """Slug do OpenRouter que atende este `model`, ou None (vai pra máquina)."""
-    return openrouter.pick_slug(model, kind, await openrouter_catalog())
+    return openrouter.pick_slug(model, kind, await openrouter_catalog(plan, kind))
 
 
-async def require_machines(model: str | None, kind: str) -> None:
+async def require_machines(model: str | None, kind: str, plan: str | None) -> None:
     """Barra a request que iria pra máquina com as máquinas desligadas.
 
     Com o repasse ligado, o erro é de MODELO (404, com a lista do que é
@@ -2172,7 +2469,7 @@ async def require_machines(model: str | None, kind: str) -> None:
     if await machines_enabled():
         return
     if await openrouter_enabled():
-        accepted = openrouter.accepted_models(await openrouter_catalog(), kind)
+        accepted = openrouter.accepted_models(await openrouter_catalog(plan, kind), kind)
         raise HTTPException(
             status_code=404, detail=openrouter.unavailable_detail(model, accepted)
         )
@@ -2218,17 +2515,26 @@ async def wake_machine(machine: dict, reason: str, *, cause: str) -> str:
         # segurando o startPod (sem martelar a RunPod), mas o chamador precisa
         # saber que não há nada subindo — senão devolve waking_503 mentiroso e
         # nunca cai no fallback/provisionamento.
-        if last_wake_outcome.get(machine["id"]) == "woke":
+        # 'pending' (startPod de outra request ainda em voo) também é "subindo":
+        # se ele terminar em no_gpu, quem o disparou recria; se falhar de vez, a
+        # próxima request depois do desfecho vê 'failed' e segue a cascata
+        if last_wake_outcome.get(machine["id"]) in ("woke", "pending"):
             _denied("cooldown")
             return "cooldown"
         _denied("failed")
         return "failed"
     # marca a tentativa antes do primeiro await — atômico dentro do event loop
     last_wake_attempt[machine["id"]] = now
-    last_wake_outcome[machine["id"]] = "failed"
+    last_wake_outcome[machine["id"]] = "pending"
     try:
         await runpod_client.start_pod(machine["runpod_pod_id"])
+    except asyncio.CancelledError:
+        # cliente desconectou no meio: desfecho desconhecido, não pode ficar
+        # 'pending' segurando a cascata pelo cooldown inteiro
+        last_wake_outcome[machine["id"]] = "failed"
+        raise
     except Exception as e:
+        last_wake_outcome[machine["id"]] = "failed"
         if is_no_gpu_error(e):
             # host cedeu a GPU do pod pausado — religar nunca vai funcionar, o
             # chamador precisa recriar o pod num host novo. Limpa o cooldown de
@@ -2289,7 +2595,28 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
                       cliente reintenta (recriando);
       - 'waking'    : há pausada subindo (cooldown de um wake recente bem
                       encaminhado), cliente reintenta;
-      - 'none'      : não há pausada nenhuma (chamador decide provisionar)."""
+      - 'none'      : não há pausada nenhuma (chamador decide provisionar).
+
+    Uma request põe de pé no máximo UMA máquina: a primeira que começar a subir
+    (religada, recriada, ou já subindo por outra request) encerra a cascata.
+    Até 01/10 o laço seguia para a próxima pausada depois de despachar uma
+    recriação, e um único request recriava todas as pausadas sem GPU no host
+    (Pro, 01/10 10:00: 699 e Pro recriadas para um cliente)."""
+    pool_key = product_pool_key(plan, category)
+    # recriação de outra request em voo neste pool: antes de qualquer await,
+    # então nenhuma leitura do banco no meio de um recreate do painel consegue
+    # concluir "pool vazio" (era a janela da llm-stack-705)
+    if pool_recovery_in_flight(pool_key):
+        return "recreating"
+    # UMA leitura para creating e stopped: com duas consultas separadas, uma
+    # máquina que passava de stopped para creating entre elas (o UPDATE do
+    # recreateMachine do painel) ficava fora das duas listas e o pool parecia
+    # vazio.
+    pool = await supa.list_wakeable_machines_for_plan(plan, category)
+    if pool_recovery_in_flight(pool_key):
+        return "recreating"
+    subindo = [m for m in pool if m.get("status") == "creating"]
+    stopped = [m for m in pool if m.get("status") == "stopped"]
     # máquina já subindo (religada por um request anterior, ou recém-criada
     # pelo painel/provisionamento): conta como 'waking' — sem isto, com o wake
     # gravando 'creating', o pool parecia vazio e a cascata religava uma 2ª
@@ -2299,7 +2626,6 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
     # o provisionamento do plano inteiro pra sempre (503 eterno). O reconcile é
     # quem conserta o status; este filtro só evita que a disponibilidade do plano
     # dependa disso (ver recovery.machine_boot_stalled).
-    subindo = await supa.list_creating_machines_for_plan(plan, category)
     presas = [m for m in subindo if machine_boot_stalled(m, CREATING_STALE_AFTER_S)]
     if presas:
         logger.warning(
@@ -2309,36 +2635,42 @@ async def wake_some_machine_for_plan(plan: str, category: str = LLM_CATEGORY) ->
         )
     if len(subindo) > len(presas):
         return "waking"
-    stopped = await supa.list_stopped_machines_for_plan(plan, category)
     if not stopped:
         return "none"
-    recreating = False
-    waking = False
     for m in stopped:
         if lock_active(recreating_in_progress, m["id"], RECREATE_LOCK_TTL_S):
-            recreating = True
-            continue
+            return "recreating"
         outcome = await wake_machine(
             m, "requisição recebida sem máquina disponível",
             cause="wake.request.no_machine_available",
         )
         if outcome == "woke":
             return "woke"
-        if outcome == "no_gpu":
-            if await try_recreate_machine(
-                m, "host sem GPU pra religar sob demanda",
-                cause="recreate.request.no_gpu_on_wake",
-            ):
-                recreating = True
-        elif outcome == "cooldown":
-            # tentativa recente BEM-SUCEDIDA (wake_machine só devolve
-            # 'cooldown' depois de um 'woke') — o pod está subindo
-            waking = True
-        # 'failed': nada subindo nesta máquina — segue pra próxima pausada e,
-        # se nenhuma servir, devolve 'none' pro chamador provisionar
-    if recreating:
-        return "recreating"
-    return "waking" if waking else "none"
+        if outcome == "cooldown":
+            # startPod recente bem-sucedido ou ainda em voo — o pod está subindo
+            return "waking"
+        if outcome == "no_gpu" and await try_recreate_machine(
+            m, "host sem GPU pra religar sob demanda",
+            cause="recreate.request.no_gpu_on_wake", pool_key=pool_key,
+        ):
+            return "recreating"
+        # 'failed' (ou recriação negada): nada subindo nesta máquina — segue pra
+        # próxima pausada e, se nenhuma servir, devolve 'none' pro chamador
+        # provisionar
+    return "none"
+
+
+def pool_recovery_in_flight(pool_key: str) -> bool:
+    """Alguma máquina do pool está sendo recriada agora? Só memória, sem await —
+    pode ser chamada no meio de uma checagem+marcação atômica. Limpa do mapa as
+    entradas cuja trava já saiu ou expirou."""
+    for machine_id, pk in list(recreating_pool.items()):
+        if pk != pool_key:
+            continue
+        if lock_active(recreating_in_progress, machine_id, RECREATE_LOCK_TTL_S):
+            return True
+        recreating_pool.pop(machine_id, None)
+    return False
 
 
 # As seis fábricas de 503 pré-rota são chamadas no exato momento do `raise`,
@@ -2516,10 +2848,12 @@ async def _recreate_and_track(machine_id: str, reason: str, trigger: dict) -> No
             logger.info("recriação de %s disparada — %s", machine_id, reason)
     finally:
         recreating_in_progress.pop(machine_id, None)
+        recreating_pool.pop(machine_id, None)
 
 
 async def try_recreate_machine(
-    machine: dict, reason: str, *, cause: str | None = None
+    machine: dict, reason: str, *, cause: str | None = None,
+    pool_key: str | None = None,
 ) -> bool:
     """Dispara a recriação em background se o painel estiver configurado, não
     houver uma recriação em andamento pra essa máquina e o cooldown já tiver
@@ -2531,8 +2865,16 @@ async def try_recreate_machine(
 
     Enfileira a máquina em pending_recreates: se a chamada ao painel falhar (ou
     o processo cair antes de concluir), o lifecycle loop retenta. A entrada só
-    sai da fila quando uma recriação conclui com sucesso."""
+    sai da fila quando uma recriação conclui com sucesso.
+
+    `pool_key`: pool da máquina, registrado junto da trava (recreating_pool)
+    para a cascata do pool saber que há uma recriação em voo. Ausente, vem do
+    template embutido na linha (get_machine e as listagens por plano o trazem)."""
     machine_id = machine["id"]
+    if pool_key is None:
+        tpl = machine.get("templates")
+        if isinstance(tpl, dict) and tpl.get("plan"):
+            pool_key = product_pool_key(tpl["plan"], tpl.get("category") or LLM_CATEGORY)
     # cause=None é o retry do lifecycle (process_pending_recreates_once), que
     # chama com a assinatura antiga (machine, reason)
     cause = cause or "recreate.lifecycle.pending_retry"
@@ -2568,6 +2910,8 @@ async def try_recreate_machine(
     # mesma disciplina do provisioning_in_progress); record_bg é síncrona
     last_recreate_attempt[machine_id] = now
     recreating_in_progress[machine_id] = now
+    if pool_key:
+        recreating_pool[machine_id] = pool_key
     _record_decision(decisions.OUTCOME_GRANTED, cause, trig)
     spawn_tracked(_recreate_and_track(machine_id, reason, trig))
     return True
@@ -2649,6 +2993,14 @@ async def _provision_and_track(
         machine = await provision_machine_for_plan(plan, category, trigger)
         if not machine:
             _record_decision(decisions.OUTCOME_DENIED, "provision_denied.panel_error", trigger)
+            return
+        if machine.get("reused"):
+            # o dedup do painel devolveu uma máquina que já estava subindo
+            # (recém-criada, recriada ou religada) — nada nasceu aqui
+            logger.info(
+                "provisionamento: painel reaproveitou %s, que já estava subindo",
+                machine.get("machine_id"),
+            )
             return
         try:
             await supa.log_machine_event(
@@ -2736,6 +3088,7 @@ async def _try_provision_machine_for_plan(
         now=now,
         cooldown_s=PROVISION_COOLDOWN_S,
         ignore_switch=ignore_switch,
+        pool_recovering=pool_recovery_in_flight(pool_key),
     )
     if denied:
         _record_decision(decisions.OUTCOME_DENIED, denied, trig)
@@ -2797,6 +3150,8 @@ async def pick_machine_with_free_slot(plan: str, category: str = LLM_CATEGORY) -
         cause="provision.request.no_free_slot",
     ):
         raise provisioning_503()
+    if pool_recovery_in_flight(product_pool_key(plan, category)):
+        raise recreating_503()  # a provisão foi negada porque uma recriação começou
     if not machines:
         raise capacity_503(plan, "nenhuma máquina disponível")
     raise capacity_503(plan, "todas as máquinas estão cheias")
@@ -3241,6 +3596,7 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
                     if outcome == "no_gpu" and await try_recreate_machine(
                         machine, f"stack {slug}: host sem GPU pra religar",
                         cause="recreate.request.stack_home_no_gpu",
+                        pool_key=product_pool_key(effective_plan, category),
                     ):
                         # host cedeu a GPU do pod pausado → recria num host novo
                         raise recreating_503()
@@ -3272,6 +3628,9 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
             cause="provision.request.no_base_machine",
         ):
             raise provisioning_503()
+        if pool_recovery_in_flight(product_pool_key(effective_plan, category)):
+            # provisão negada porque uma recriação do pool começou no meio
+            raise recreating_503()
         # Último recurso: a máquina da stack foi PERDIDA (pod sumiu do RunPod) e
         # não há mais nada no plano pra servir. Sem isto o fluxo terminava num
         # preparing_503() mudo e permanente — nenhum caminho recriava uma
@@ -3289,6 +3648,7 @@ async def resolve_base_machine(account_id: str, entry: dict) -> tuple[dict, str]
         if lost_machine is not None and await try_recreate_machine(
             lost_machine, f"stack {stack.get('slug') or stack['id']}: pod sumiu do RunPod",
             cause="recreate.request.pod_lost",
+            pool_key=product_pool_key(effective_plan, category),
         ):
             raise recreating_503()
         raise preparing_503()
@@ -4151,10 +4511,7 @@ async def validate_responses_body(
 # Pro (Qwen3.6-27B) validado em 17/07/2026: 14/15 respostas fecham com
 # </think> (a exceção foi truncada por length — coberta pelo fallback do
 # filtro, que devolve o buffer acumulado no fim do stream).
-# "VibeCoder" é o nome antigo de "Go": fica aceito até a migration 0049 rodar
-# em produção, senão o plano sai do set na janela entre deploy e migration e o
-# filtro de <think> desliga sozinho. Remover depois.
-REASONING_LEAK_PLANS = {"Go", "VibeCoder", "Pro"}
+REASONING_LEAK_PLANS = {"Go", "Pro"}
 
 def thinking_esperado_de(body_json) -> bool:
     """A request pediu raciocínio?
@@ -4179,7 +4536,7 @@ def thinking_esperado_de(body_json) -> bool:
 # check_concurrency) — hoje coincide em membros com REASONING_LEAK_PLANS, mas
 # são eixos diferentes (parser de reasoning vs. topologia do pod) que podem
 # divergir; não reaproveitar um pelo outro.
-SHARED_POD_PLANS = {"Go", "VibeCoder", "Pro"}
+SHARED_POD_PLANS = {"Go", "Pro"}
 
 
 # ---------- Claude Code (Anthropic Messages API) ----------
@@ -4224,6 +4581,20 @@ def _openrouter_error(
     return JSONResponse(status_code=status_code, content=content)
 
 
+def _openrouter_no_key(log_ctx: dict, *, stream: bool, anthropic: bool) -> JSONResponse:
+    """Sem chave espelho (a criação falhou) e sem chave compartilhada de plano
+    B: não há com que chamar o OpenRouter. O motivo da falha está no log de
+    openrouter_key_for; o cliente recebe o 503 genérico."""
+    logger.error(
+        "openrouter: chave %s sem espelho e sem OPENROUTER_API_KEY de plano B",
+        log_ctx.get("api_key_id"),
+    )
+    log_gateway_request(**log_ctx, status_code=503, stream=stream, usage=None)
+    return _openrouter_error(
+        503, "provedor de inferência temporariamente indisponível", anthropic=anthropic
+    )
+
+
 def _openrouter_error_response(
     status_code: int, raw: bytes, *, anthropic: bool, label: str
 ) -> JSONResponse:
@@ -4244,15 +4615,24 @@ def _openrouter_error_response(
 
 async def openrouter_forward(
     *, upstream_path: str, payload: dict, log_ctx: dict, anthropic: bool = False,
+    secret: str | None = None, url: str | None = None,
 ) -> Response:
     """Manda `payload` ao OpenRouter e repassa a resposta ao cliente no mesmo
     protocolo, registrando tokens e custo em gateway_requests.
 
     Streaming: bytes repassados como chegam, com heartbeat nos silêncios (ver
     openrouter.with_heartbeat) e o mesmo watchdog de duas fases das máquinas
-    — só que com prazos próprios (OPENROUTER_STREAM_*)."""
+    — só que com prazos próprios (OPENROUTER_STREAM_*).
+
+    `secret`: chave espelho da chave da Stac (openrouter_key_for); None usa a
+    compartilhada, que é o header default do openrouter_client.
+
+    `url`: destino absoluto, para o que mora fora do /api/v1 (Decisions);
+    None = `upstream_path` relativo ao base_url do client."""
     is_stream = payload.get("stream") is True
     label = f"{upstream_path}/{log_ctx.get('model')}"
+    if not secret and not OPENROUTER_API_KEY:
+        return _openrouter_no_key(log_ctx, stream=is_stream, anthropic=anthropic)
     timeout = httpx.Timeout(
         (max(OPENROUTER_STREAM_TTFT_TIMEOUT_S, OPENROUTER_STREAM_IDLE_TIMEOUT_S) + 15.0)
         if is_stream
@@ -4261,7 +4641,8 @@ async def openrouter_forward(
     )
     try:
         upstream_req = openrouter_client.build_request(
-            "POST", f"/{upstream_path}", json=payload, timeout=timeout
+            "POST", url or f"/{upstream_path}", json=payload, timeout=timeout,
+            headers=_openrouter_auth(secret),
         )
         upstream = await openrouter_client.send(upstream_req, stream=True)
     except httpx.HTTPError as e:
@@ -4281,6 +4662,8 @@ async def openrouter_forward(
         log_gateway_request(
             **log_ctx, status_code=upstream.status_code, stream=is_stream, usage=None
         )
+        if upstream.status_code == 401 and secret:
+            _forget_openrouter_key(log_ctx.get("api_key_id"))
         return _openrouter_error_response(
             upstream.status_code, raw, anthropic=anthropic, label=label
         )
@@ -4297,9 +4680,13 @@ async def openrouter_forward(
         finally:
             await upstream.aclose()
         usage, cost = openrouter.usage_and_cost(raw)
+        invalid_body = False
         try:
-            failure = openrouter.error_of(json.loads(raw))
+            payload = json.loads(raw)
+            invalid_body = not isinstance(payload, dict)
+            failure = openrouter.error_of(payload) if not invalid_body else None
         except Exception:
+            invalid_body = True
             failure = None
         if failure:
             # 200 com só `error` no corpo: erro depois de a request ser aceita
@@ -4308,7 +4695,7 @@ async def openrouter_forward(
             )
             return _openrouter_error(502, failure, anthropic=anthropic)
         log_gateway_request(
-            **log_ctx, status_code=upstream.status_code, stream=False,
+            **log_ctx, status_code=502 if invalid_body else upstream.status_code, stream=False,
             usage=usage, cost_usd=cost,
         )
         return Response(
@@ -4332,15 +4719,24 @@ async def openrouter_forward(
 
     async def relay():
         status_code = upstream.status_code
+        completion = product_analytics.StreamCompletion()
+        exhausted = False
         try:
             async for chunk in chunks:
+                completion.feed(chunk)
                 scanner.feed(chunk)  # cru: é daqui que sai o custo do log
                 out = stripper.feed(chunk)
                 if out:
                     yield out
+                if completion.terminal:
+                    break
+            exhausted = True
             tail = stripper.flush()
             if tail:
                 yield tail
+        except (asyncio.CancelledError, GeneratorExit):
+            status_code = 499
+            raise
         except UpstreamStreamTimeout as e:
             status_code = 504
             yield openrouter.stream_error_frame(
@@ -4356,6 +4752,7 @@ async def openrouter_forward(
             )
         finally:
             usage, cost = scanner.finish()
+            status_code = completion.status(status_code, exhausted)
             if scanner.error and status_code < 400:
                 logger.warning("openrouter: erro no meio do stream em %s: %s", label, scanner.error)
                 status_code = 502
@@ -4375,6 +4772,26 @@ async def openrouter_forward(
         media_type=upstream.headers.get("content-type", "text/event-stream"),
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def estimate_openai_prompt(path: str, body: dict) -> int:
+    """Tokens de entrada de um corpo OpenAI pela heurística do context_budget,
+    nos três formatos repassados: messages (chat), prompt (completions) e
+    input + instructions (responses, mesma conta do validate_responses_body)."""
+    if path == "responses":
+        return estimate_prompt_tokens(
+            tools=body.get("tools"),
+            extra_texts=[
+                json.dumps(body.get("input") or "", ensure_ascii=False),
+                body.get("instructions") or "",
+            ],
+        )
+    if isinstance(body.get("messages"), list):
+        return estimate_prompt_tokens(messages=body["messages"], tools=body.get("tools"))
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str):
+        prompt = json.dumps(prompt or "", ensure_ascii=False)
+    return estimate_prompt_tokens(extra_texts=[prompt])
 
 
 async def openrouter_text(
@@ -4403,11 +4820,17 @@ async def openrouter_text(
         if len(messages) > MAX_MESSAGES:
             raise HTTPException(status_code=400, detail="número de mensagens excede o limite")
         body_json["messages"] = await apply_system_prompt_and_rag(messages, entry, stack)
+    if "max_completion_tokens" in body_json and max_tokens_field == "max_tokens":
+        max_tokens_field = "max_completion_tokens"
+    # Sem teto de contexto por plano (16/10/2026): no repasse vale a janela do
+    # próprio modelo, e quem a estoura recebe o 400 do OpenRouter. O custo de
+    # uma request grande é cobrado pela cota ponderada (request_quota.py).
     openrouter.prepare_openai_body(body_json, slug, OPENROUTER_MAX_TOKENS)
 
     return await openrouter_forward(
         upstream_path=openrouter.TEXT_PATHS[path],
         payload=body_json,
+        secret=await openrouter_key_for(entry),
         log_ctx=_openrouter_log_ctx(
             entry=entry, stack_id=(stack or {}).get("id"), path=path, slug=slug,
             request=request, started=started,
@@ -4438,11 +4861,13 @@ async def openrouter_messages(
         )
         if new_system and new_system != system_text:
             anthropic_body["system"] = new_system
+    # Sem teto de contexto por plano: vale a janela do modelo (ver openrouter_text)
     openrouter.prepare_anthropic_body(anthropic_body, slug, OPENROUTER_MAX_TOKENS)
 
     return await openrouter_forward(
         upstream_path="messages",
         payload=anthropic_body,
+        secret=await openrouter_key_for(entry),
         log_ctx=_openrouter_log_ctx(
             entry=entry, stack_id=(stack or {}).get("id"), path="messages", slug=slug,
             request=request, started=started,
@@ -4469,6 +4894,9 @@ async def anthropic_messages(
     key_stack, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+    await check_request_quota(
+        key_stack, key_plan, entry.get("purpose", "customer"), shape="anthropic"
+    )
 
     # parseado ANTES do resolve_route: o destino (OpenRouter x máquina) sai do
     # `model` do corpo, e decidir isso não pode acordar máquina nenhuma
@@ -4479,21 +4907,52 @@ async def anthropic_messages(
     if not isinstance(anthropic_body, dict):
         raise HTTPException(status_code=400, detail="corpo inválido")
 
+    # Destino (regra de 30/09, ver o catch-all e a migration 0073): máquinas
+    # ligadas → máquina primeiro, OpenRouter só como desvio quando não há
+    # máquina disponível; desligadas → OpenRouter direto.
     requested = openrouter.requested_model(anthropic_body)
-    slug = await openrouter_slug_for(requested, openrouter.TEXT_KIND)
-    if slug:
-        return await openrouter_messages(
-            anthropic_body=anthropic_body, entry=entry, stack=key_stack, slug=slug,
-            request=request, started=started,
-        )
-    await require_machines(requested, openrouter.TEXT_KIND)
+    await require_plan_model(requested, openrouter.TEXT_KIND, key_plan)
 
-    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    async def _desvio(reason: str) -> Response | None:
+        fallback = await _text_fallback("messages", requested, reason, key_plan)
+        if fallback is None:
+            return None
+        return await openrouter_messages(
+            anthropic_body=anthropic_body, entry=entry, stack=key_stack,
+            slug=fallback.slug, request=request, started=started,
+        )
+
+    if not await machines_enabled():
+        slug = await openrouter_text_target(requested, key_plan)
+        if slug:
+            return await openrouter_messages(
+                anthropic_body=anthropic_body, entry=entry, stack=key_stack, slug=slug,
+                request=request, started=started,
+            )
+        await require_machines(requested, openrouter.TEXT_KIND, key_plan)
+
+    try:
+        # sem máquina disponível, resolve_route já dispara o wake/criação
+        machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            desviada = await _desvio(f"sem máquina: {exc.detail}")
+            if desviada is not None:
+                return desviada
+        raise
     await maybe_touch(stack_id, machine["id"])
 
     flight_key = (stack_id, machine["id"])
     in_flight[flight_key] += 1
-    check_concurrency(flight_key, machine, effective_plan)
+    try:
+        check_concurrency(flight_key, machine, effective_plan)
+    except HTTPException as exc:
+        # check_concurrency já devolveu a vaga antes de levantar
+        if exc.status_code == 429:
+            desviada = await _desvio("máquina lotada")
+            if desviada is not None:
+                return desviada
+        raise
 
     log_ctx = dict(
         account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
@@ -4521,6 +4980,12 @@ async def anthropic_messages(
         )
     except ContextWindowExceeded as exc:
         release_flight(flight_key)
+        # conversa maior que a janela da máquina (ex.: cresceu no OpenRouter
+        # antes de a máquina ligar) continua no OpenRouter em vez de matar a
+        # sessão — só cai no erro abaixo com o repasse desligado.
+        desviada = await _desvio("maior que a janela da máquina")
+        if desviada is not None:
+            return desviada
         # O estouro de contexto é o evento mais importante deste endpoint (mata
         # a sessão do usuário) e até aqui não deixava rastro NENHUM: nem em
         # gateway_requests, nem no log de aplicação — só a linha de access log
@@ -4599,12 +5064,30 @@ async def anthropic_messages(
         # falha de conexão de verdade (recusada, DNS, pod fora do ar etc.) —
         # aqui sim "indisponível" é a descrição correta.
         release_flight(flight_key)
+        if isinstance(e, _MACHINE_UNREACHABLE):
+            desviada = await _desvio("máquina inalcançável")
+            if desviada is not None:
+                return desviada
         logger.warning("anthropic proxy: upstream indisponível para %s (%s)", flight_key, e)
         log_gateway_request(**log_ctx, status_code=503, stream=is_stream, usage=None)
         raise HTTPException(status_code=503, detail="máquina indisponível, tente novamente")
     except BaseException:
         release_flight(flight_key)
         raise
+
+    if upstream.status_code in _MACHINE_DOWN_STATUSES:
+        # pod de pé mas vLLM fora, antes do primeiro byte: mesmo desvio do
+        # catch-all. Sem desvio possível, segue o tratamento de erro de sempre.
+        fallback = await _text_fallback(
+            "messages", requested, f"máquina respondeu {upstream.status_code}", key_plan
+        )
+        if fallback is not None:
+            await upstream.aclose()
+            release_flight(flight_key)
+            return await openrouter_messages(
+                anthropic_body=anthropic_body, entry=entry, stack=key_stack,
+                slug=fallback.slug, request=request, started=started,
+            )
 
     async def _reenviar_sem_thinking(stream: bool):
         """Mesmo corpo já validado, thinking desligado — o retry de resposta vazia
@@ -4888,6 +5371,21 @@ def log_gateway_request(
         row["upstream"] = upstream
     if cost_usd is not None:
         row["cost_usd"] = cost_usd
+    if upstream == OPENROUTER_UPSTREAM:
+        _touch_openrouter_key_last_used(api_key_id)
+    # Resto do peso da request ponderada (migration 0079): check_request_quota
+    # já somou 1 na admissão, e só aqui os tokens de entrada são conhecidos.
+    # Playground fica fora como lá — não soma nem na admissão.
+    weight = request_quota.request_weight(row["tokens_in"])
+    if stack_id and weight > 1 and trigger_snapshot("quota").get("purpose") != "playground":
+        request_quota_cache.add(stack_id, weight - 1)
+    if product_analytics.enabled():
+        purpose = trigger_snapshot("analytics").get("purpose")
+        row["analytics_origin"] = purpose if purpose in {"customer", "playground"} else "unknown"
+        row["analytics_outcome"] = (
+            "aborted" if status_code == 499 else
+            "completed" if 200 <= status_code < 300 else "error"
+        )
     spawn_tracked(_write_gateway_request(row))
 
 
@@ -4912,11 +5410,61 @@ def _log_estimate_drift(budget: PromptBudget | None, usage: dict, path: str) -> 
     )
 
 
+# api_keys.last_used_at (migration 0046) só era tocado pelo coletor das
+# máquinas (collect_usage_metrics_once): chave usada só pelo repasse ficava
+# null, ou parada na última vez que passou por máquina, no "último uso" do
+# TryStac. Toque no máximo uma vez por janela por chave — cliente agêntico
+# manda dezenas de requests por minuto e cada toque é um PATCH no Supabase;
+# a precisão já é a mesma do coletor (METRICS_COLLECTION_INTERVAL_S).
+OPENROUTER_LAST_USED_INTERVAL_S = 60.0
+openrouter_key_last_touch: dict[str, float] = {}
+
+
+def _touch_openrouter_key_last_used(api_key_id: str | None) -> None:
+    if not api_key_id:
+        return
+    now = time.monotonic()
+    last = openrouter_key_last_touch.get(api_key_id)
+    if last is not None and now - last < OPENROUTER_LAST_USED_INTERVAL_S:
+        return
+    openrouter_key_last_touch[api_key_id] = now
+    spawn_tracked(_write_key_last_used(api_key_id, datetime.now(timezone.utc).isoformat()))
+
+
+async def _write_key_last_used(api_key_id: str, ts: str) -> None:
+    try:
+        await supa.touch_keys_last_used([api_key_id], ts)
+    except Exception as e:
+        logger.warning("last_used_at: falha ao tocar a chave %s (%s)", api_key_id, type(e).__name__)
+
+
 async def _write_gateway_request(row: dict) -> None:
     try:
         await supa.insert_gateway_request(row)
     except httpx.HTTPError as e:
-        logger.warning("gateway_requests: falha ao gravar log (%s)", e)
+        missing_column = False
+        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 400:
+            try:
+                detail = e.response.json()
+                missing_column = detail.get("code") == "PGRST204" and any(
+                    field in str(detail.get("message", ""))
+                    for field in ("analytics_origin", "analytics_outcome")
+                )
+            except (ValueError, AttributeError):
+                pass
+        if "analytics_outcome" in row and missing_column:
+            # Schema sem as colunas da migration: preservar o ledger sem
+            # campos opcionais. Timeout/5xx não admite retry desse INSERT.
+            try:
+                await supa.insert_gateway_request({
+                    key: value for key, value in row.items()
+                    if key not in {"analytics_origin", "analytics_outcome"}
+                })
+                logger.warning("gateway analytics unavailable; request ledger preserved")
+                return
+            except httpx.HTTPError:
+                pass
+        logger.warning("gateway_requests: falha ao gravar log (%s)", type(e).__name__)
 
 
 def machine_capacity(machine: dict) -> int:
@@ -5024,9 +5572,10 @@ async def _authenticate_for_extraction(
     authenticate seja uniforme e um endpoint novo não nasça sem o parâmetro."""
     entry, key_hash = await authenticate(authorization, headers, path)
     account_id = entry["account_id"]
-    _, key_plan = resolve_key_stack(entry)
+    key_stack, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+    await check_request_quota(key_stack, key_plan, entry.get("purpose", "customer"))
 
     if len(schema) > MAX_SCHEMA_BYTES:
         raise HTTPException(
@@ -5629,6 +6178,9 @@ async def generate_document(
     stack, plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, plan)
     account_id = entry["account_id"]
+    # antes da bifurcação: o modo `html` não chama modelo, mas registra em
+    # gateway_requests e por isso também conta
+    await check_request_quota(stack, plan, entry.get("purpose", "customer"))
 
     # ---------- modo direto: HTML já pronto, sem modelo ----------
     if body.html:
@@ -5857,6 +6409,9 @@ async def _authorize_image_key(
     # (DAILY_TOKEN_BUDGET), então uma conta com stack de texto e de imagem
     # divide o mesmo teto — hoje 0 (sem teto) para todos os planos.
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+    # sem efeito hoje (imagem não tem cota de requisições, ver 0076); fica para
+    # a regra "toda rota que registra passa pela cota" não ter exceção
+    await check_request_quota(key_stack, key_plan, entry.get("purpose", "customer"))
     return entry, account_id, key_stack, key_plan
 
 
@@ -6160,10 +6715,14 @@ async def openrouter_image(
         request=request, started=started,
     )
     fallback_meta = image_gen.request_meta({**fields, "prompt": prompt})
+    secret = await openrouter_key_for(entry)
+    if not secret and not OPENROUTER_API_KEY:
+        return _openrouter_no_key(log_ctx, stream=False, anthropic=False)
     try:
         upstream_req = openrouter_client.build_request(
             "POST", "/images", json=payload,
             timeout=httpx.Timeout(OPENROUTER_IMAGE_TIMEOUT_S, connect=10.0, write=60.0, pool=10.0),
+            headers=_openrouter_auth(secret),
         )
         upstream = await openrouter_client.send(upstream_req, stream=True)
     except httpx.HTTPError as e:
@@ -6180,6 +6739,8 @@ async def openrouter_image(
         finally:
             await upstream.aclose()
         log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=False, usage=None)
+        if upstream.status_code == 401 and secret:
+            _forget_openrouter_key(entry.get("api_key_id"))
         return _openrouter_error_response(
             upstream.status_code, raw, anthropic=False, label=f"{path}/{slug}"
         )
@@ -6235,11 +6796,12 @@ async def images_generations(
     if len(body) > image_proxy.max_generation_bytes():
         raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
 
-    entry, account_id, key_stack, _plan = await _authorize_image_key(
+    entry, account_id, key_stack, key_plan = await _authorize_image_key(
         authorization, request, GENERATIONS_PATH
     )
     requested = openrouter.requested_model(body)
-    slug = await openrouter_slug_for(requested, openrouter.IMAGE_KIND)
+    await require_plan_model(requested, openrouter.IMAGE_KIND, key_plan)
+    slug = await openrouter_slug_for(requested, openrouter.IMAGE_KIND, key_plan)
     if slug:
         try:
             fields = json.loads(body)
@@ -6251,7 +6813,7 @@ async def images_generations(
             fields=fields, references=None, path=GENERATIONS_PATH, entry=entry,
             stack=key_stack, slug=slug, request=request, started=started,
         )
-    await require_machines(requested, openrouter.IMAGE_KIND)
+    await require_machines(requested, openrouter.IMAGE_KIND, key_plan)
 
     machine, stack_id, _plan = await _reserve_image_machine(entry, account_id)
     flight_key = (stack_id, machine["id"])
@@ -6345,7 +6907,7 @@ async def images_edits(request: Request, authorization: str | None = Header(None
     entram na MESMA precedência".
     """
     started = time.monotonic()
-    entry, account_id, key_stack, _plan = await _authorize_image_key(
+    entry, account_id, key_stack, key_plan = await _authorize_image_key(
         authorization, request, EDITS_PATH
     )
 
@@ -6355,11 +6917,14 @@ async def images_edits(request: Request, authorization: str | None = Header(None
     # como sempre (ver a docstring acima). Lido, o corpo vai inteiro para a
     # máquina se o modelo não for do OpenRouter.
     buffered: bytes | None = None
-    if openrouter.accepted_models(await openrouter_catalog(), openrouter.IMAGE_KIND):
+    if openrouter.accepted_models(
+        await openrouter_catalog(key_plan, openrouter.IMAGE_KIND), openrouter.IMAGE_KIND
+    ):
         buffered = await _read_capped(request, image_proxy.max_edit_bytes())
         fields, references = await _parse_edit_form(request, buffered)
         requested = openrouter.requested_model(fields)
-        slug = await openrouter_slug_for(requested, openrouter.IMAGE_KIND)
+        await require_plan_model(requested, openrouter.IMAGE_KIND, key_plan)
+        slug = await openrouter_slug_for(requested, openrouter.IMAGE_KIND, key_plan)
         if slug:
             if not references:
                 raise HTTPException(status_code=400, detail="imagem de referência ausente")
@@ -6367,9 +6932,9 @@ async def images_edits(request: Request, authorization: str | None = Header(None
                 fields=fields, references=references, path=EDITS_PATH, entry=entry,
                 stack=key_stack, slug=slug, request=request, started=started,
             )
-        await require_machines(requested, openrouter.IMAGE_KIND)
+        await require_machines(requested, openrouter.IMAGE_KIND, key_plan)
     else:
-        await require_machines(None, openrouter.IMAGE_KIND)
+        await require_machines(None, openrouter.IMAGE_KIND, key_plan)
 
     machine, stack_id, _plan = await _reserve_image_machine(entry, account_id)
     flight_key = (stack_id, machine["id"])
@@ -6445,9 +7010,146 @@ async def images_edits(request: Request, authorization: str | None = Header(None
     return await _relay_image_response(upstream, flight_key, log_ctx)
 
 
+class _FallbackToOpenRouter(Exception):
+    """Desvio de uma request de TEXTO para o OpenRouter no meio do caminho da
+    máquina (sem máquina disponível, máquina lotada ou conversa maior que a
+    janela dela). Exceção, e não um `return`, de propósito: sobe pelos mesmos
+    except/finally que devolvem a vaga de in_flight, então o desvio nunca
+    vaza nem devolve a vaga duas vezes. Quem captura é o handler da rota."""
+
+    def __init__(self, slug: str, reason: str) -> None:
+        super().__init__(reason)
+        self.slug = slug
+        self.reason = reason
+
+
+async def _text_fallback(
+    path: str, requested: str | None, reason: str, plan: str | None,
+) -> _FallbackToOpenRouter | None:
+    """O desvio, se o repasse está ligado e há modelo para atender (o pedido
+    da lista do plano, senão o reserva do plano); None = segue o erro da
+    máquina."""
+    if path not in openrouter.TEXT_PATHS and path != "messages":
+        return None
+    slug = await openrouter_text_target(requested, plan)
+    if not slug:
+        return None
+    logger.info("openrouter: %s desviada para %s (%s)", path, slug, reason)
+    return _FallbackToOpenRouter(slug, reason)
+
+
+# Falhas da máquina que ainda permitem desviar para o OpenRouter: nenhum byte
+# da resposta foi para o cliente. ReadTimeout fica de fora de propósito — a
+# máquina pode estar gerando, e desviar repetiria a geração inteira.
+_MACHINE_UNREACHABLE = (httpx.ConnectError, httpx.ConnectTimeout, httpx.RemoteProtocolError)
+_MACHINE_DOWN_STATUSES = (502, 503, 504)
+
+
+class _EchoedUpstream:
+    """Resposta da máquina com o nome do modelo trocado pelo que o cliente
+    pediu (ver openrouter.ModelNameRewriter). Só implementa o que os caminhos
+    de relay usam: aread, aiter_bytes, aclose; o resto vem do original."""
+
+    def __init__(self, upstream, rewriter: "openrouter.ModelNameRewriter") -> None:
+        self._upstream = upstream
+        self._rewriter = rewriter
+
+    def __getattr__(self, name):
+        return getattr(self._upstream, name)
+
+    async def aread(self) -> bytes:
+        return self._rewriter.whole(await self._upstream.aread())
+
+    async def aiter_bytes(self):
+        async for chunk in self._upstream.aiter_bytes():
+            out = self._rewriter.feed(chunk)
+            if out:
+                yield out
+        tail = self._rewriter.flush()
+        if tail:
+            yield tail
+
+    async def aclose(self) -> None:
+        await self._upstream.aclose()
+
+
+DECISIONS_PATH = "decisions"
+
+
+@app.post("/v1/decisions")
+async def openrouter_decisions_route(request: Request, authorization: str | None = Header(None)):
+    """Decisões tipadas (Jev, da TypeSafe) repassadas ao /api/alpha/decisions
+    do OpenRouter, no formato de lá: {model, state, questions} → {answers,
+    usage}.
+
+    Handler próprio, e não uma entrada em ALLOWED_V1: o catch-all reescreve o
+    corpo para chat (validate_body) e cai em máquina, e nenhuma máquina serve
+    este tipo — sem o modelo na lista do plano, a resposta é 404 com os aceitos.
+    System prompt, RAG e defaults de sampling não se aplicam: não há mensagens
+    nem geração. Chave de stack de imagem leva o 403 do authenticate (path fora
+    de IMAGE_STACK_ALLOWED_PATHS)."""
+    started = time.monotonic()
+    body = await request.body()
+    if len(body) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="corpo da requisição excede o limite")
+
+    entry, key_hash = await authenticate(authorization, request.headers, DECISIONS_PATH)
+    key_stack, key_plan = resolve_key_stack(entry)
+    check_rate_limit(key_hash, key_plan)
+    purpose = entry.get("purpose", "customer")
+    await check_token_quota(entry["account_id"], key_plan, purpose)
+    await check_request_quota(key_stack, key_plan, purpose)
+
+    requested = openrouter.requested_model(body)
+    await require_plan_model(requested, openrouter.DECISIONS_KIND, key_plan)
+    catalog = await openrouter_catalog(key_plan, openrouter.DECISIONS_KIND)
+    slug = openrouter.pick_slug(requested, openrouter.DECISIONS_KIND, catalog)
+    if not slug:
+        raise HTTPException(
+            status_code=404,
+            detail=openrouter.unavailable_detail(
+                requested, openrouter.accepted_models(catalog, openrouter.DECISIONS_KIND)
+            ),
+        )
+    try:
+        body_json = json.loads(body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="corpo inválido")
+    if not isinstance(body_json, dict):
+        raise HTTPException(status_code=400, detail="corpo inválido")
+
+    return await openrouter_forward(
+        upstream_path=DECISIONS_PATH,
+        url=OPENROUTER_DECISIONS_URL
+        or openrouter.decisions_url(str(openrouter_client.base_url)),
+        payload=openrouter.prepare_decisions_body(body_json, slug),
+        secret=await openrouter_key_for(entry),
+        log_ctx=_openrouter_log_ctx(
+            entry=entry, stack_id=(key_stack or {}).get("id"), path=DECISIONS_PATH,
+            slug=slug, request=request, started=started,
+        ),
+    )
+
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
 async def proxy(path: str, request: Request, authorization: str | None = Header(None)):
     started = time.monotonic()
+    ctx: dict = {}
+    try:
+        return await _proxy(path, request, authorization, started, ctx)
+    except _FallbackToOpenRouter as fallback:
+        return await openrouter_text(
+            path=path, body=ctx["body"], entry=ctx["entry"], stack=ctx["stack"],
+            slug=fallback.slug, request=request, started=started,
+        )
+
+
+async def _proxy(
+    path: str, request: Request, authorization: str | None, started: float, ctx: dict,
+):
+    """Corpo do catch-all. `ctx` devolve ao handler o que o desvio para o
+    OpenRouter precisa (corpo ORIGINAL, chave, stack) — o corpo daqui em
+    diante é reescrito para a máquina."""
     allowed_methods = ALLOWED_V1.get(path)
     if not allowed_methods or request.method not in allowed_methods:
         raise HTTPException(status_code=404, detail="not found")
@@ -6463,33 +7165,62 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     key_stack, key_plan = resolve_key_stack(entry)
     check_rate_limit(key_hash, key_plan)
     await check_token_quota(account_id, key_plan, entry.get("purpose", "customer"))
+    await check_request_quota(key_stack, key_plan, entry.get("purpose", "customer"))
 
-    # Destino da request (ver openrouter.py): modelo da allowlist vai para o
-    # OpenRouter; o resto segue para máquina, se as máquinas estiverem ligadas.
+    # Destino da request (regra de 30/09, ver migration 0073). Com as máquinas
+    # LIGADAS a máquina vem primeiro, qualquer que seja o modelo pedido, e o
+    # OpenRouter só entra como desvio (_FallbackToOpenRouter) quando não há
+    # máquina disponível. Com elas DESLIGADAS, texto vai direto para o
+    # OpenRouter: o modelo pedido se está na lista, senão o reserva.
     key_kind = (
         openrouter.IMAGE_KIND
         if (key_stack or {}).get("category") == IMAGE_CATEGORY
         else openrouter.TEXT_KIND
     )
+    requested = openrouter.requested_model(body) if path in openrouter.TEXT_PATHS else None
     if path in openrouter.TEXT_PATHS:
-        requested = openrouter.requested_model(body)
-        slug = await openrouter_slug_for(requested, openrouter.TEXT_KIND)
+        await require_plan_model(requested, openrouter.TEXT_KIND, key_plan)
+    ctx.update(body=body, entry=entry, stack=key_stack)
+    machines_on = await machines_enabled()
+    if path in openrouter.TEXT_PATHS and not machines_on:
+        slug = await openrouter_text_target(requested, key_plan)
         if slug:
             return await openrouter_text(
                 path=path, body=body, entry=entry, stack=key_stack, slug=slug,
                 request=request, started=started,
             )
-        await require_machines(requested, openrouter.TEXT_KIND)
-    elif path == "models" and not await machines_enabled():
+        await require_machines(requested, openrouter.TEXT_KIND, key_plan)
+    elif path == "models" and not machines_on:
         # sem máquinas, a lista é só a allowlist (vazia com o repasse desligado)
         return JSONResponse(content={
             "object": "list",
             "data": openrouter.model_list_entries(
-                openrouter.accepted_models(await openrouter_catalog(), key_kind)
+                openrouter.accepted_models(await openrouter_catalog(key_plan, key_kind), key_kind)
             ),
         })
 
-    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    try:
+        # sem máquina disponível, resolve_route já DISPARA o wake/criação da
+        # máquina do plano antes do 503 — o desvio atende enquanto ela sobe
+        machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            fallback = await _text_fallback(
+                path, requested, f"sem máquina: {exc.detail}", key_plan
+            )
+            if fallback:
+                raise fallback from None
+            if path == "models" and await openrouter_enabled():
+                # ferramentas (Cursor, Continue, n8n) chamam /v1/models ao
+                # conectar: sem máquina, a lista é a do OpenRouter, em vez de um
+                # 503 que as faria desistir antes da primeira request
+                return JSONResponse(content={
+                    "object": "list",
+                    "data": openrouter.model_list_entries(
+                        openrouter.accepted_models(await openrouter_catalog(key_plan, key_kind), key_kind)
+                    ),
+                })
+        raise
     await maybe_touch(stack_id, machine["id"])
 
     # incrementa ANTES dos awaits lentos (leitura do body, embeddings do RAG):
@@ -6504,12 +7235,20 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
     # derrubaria o /v1/models em 429. As rotas de imagem passam IMAGE_CATEGORY
     # pelo mesmo motivo; os outros call-sites são exclusivos de LLM, onde o
     # guard de categoria em authenticate já barrou a stack de imagem.
-    check_concurrency(
-        flight_key,
-        machine,
-        effective_plan,
-        (key_stack or {}).get("category") or LLM_CATEGORY,
-    )
+    try:
+        check_concurrency(
+            flight_key,
+            machine,
+            effective_plan,
+            (key_stack or {}).get("category") or LLM_CATEGORY,
+        )
+    except HTTPException as exc:
+        # check_concurrency já devolveu a vaga antes de levantar
+        if exc.status_code == 429:
+            fallback = await _text_fallback(path, requested, "máquina lotada", key_plan)
+            if fallback:
+                raise fallback from None
+        raise
 
     log_ctx = dict(
         account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
@@ -6536,6 +7275,16 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                         body_json, entry, rewrite_model, machine, stack_id
                     )
                 body = json.dumps(body_json).encode()
+            except ContextWindowExceeded:
+                # conversa maior que a janela da máquina (ex.: cresceu no
+                # OpenRouter antes de a máquina ligar): continua lá. O
+                # except BaseException abaixo devolve a vaga.
+                fallback = await _text_fallback(
+                    path, requested, "maior que a janela da máquina", key_plan
+                )
+                if fallback:
+                    raise fallback from None
+                raise
             except HTTPException:
                 raise  # rejeição explícita (ex.: limite de mensagens) não pode virar "segue como está"
             except Exception:
@@ -6577,6 +7326,11 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # detalhe da exceção (pode conter a public_url interna do pod) só no
         # log do servidor — o cliente recebe uma mensagem genérica
         logger.warning("proxy: upstream indisponível para %s (%s)", flight_key, e)
+        if isinstance(e, _MACHINE_UNREACHABLE):
+            # máquina "running" no banco mas fora do ar, antes de qualquer byte
+            fallback = await _text_fallback(path, requested, "máquina inalcançável", key_plan)
+            if fallback:
+                raise fallback from None
         # Inclui o ReadTimeout de MESSAGES_NONSTREAM_TIMEOUT_S: a request sem
         # stream que passa dos 90s morria sem linha em gateway_requests, então a
         # página de Requisições só mostrava as que sobreviveram (foi assim que
@@ -6589,6 +7343,23 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # in_flight > 0 pra sempre e a auto-pausa nunca mais dispara
         release_flight(flight_key)
         raise
+
+    if upstream.status_code in _MACHINE_DOWN_STATUSES and path in openrouter.TEXT_PATHS:
+        # pod de pé mas vLLM fora (reiniciando, sem memória): nada foi para o
+        # cliente ainda, então dá para atender pelo OpenRouter
+        fallback = await _text_fallback(
+            path, requested, f"máquina respondeu {upstream.status_code}", key_plan
+        )
+        if fallback:
+            await upstream.aclose()
+            release_flight(flight_key)
+            raise fallback
+
+    # A máquina responde qualquer modelo pedido (regra de 30/09): quem pediu o
+    # Kimi K3 continua vendo "Kimi K3" no campo `model`, não o alias do pod.
+    served = log_ctx["model"]
+    if requested and served and requested != served:
+        upstream = _EchoedUpstream(upstream, openrouter.ModelNameRewriter(served, requested))
 
     if path == "models":
         # lista também os adapters LoRA carregados na máquina ("acct-<uuid>")
@@ -6606,7 +7377,7 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                     if not str(m.get("id", "")).startswith("acct-")
                 ] + openrouter.model_list_entries(
                     # os modelos do OpenRouter aceitos para esta chave
-                    openrouter.accepted_models(await openrouter_catalog(), key_kind)
+                    openrouter.accepted_models(await openrouter_catalog(key_plan, key_kind), key_kind)
                 )
                 raw = json.dumps(payload).encode()
             except Exception:
@@ -6638,6 +7409,8 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
             try:
                 payload = json.loads(raw)
                 usage = payload.get("usage")
+                if payload.get("error") and status_logico < 400:
+                    status_logico = 502
                 payload, resposta_vazia = clean_completion_payload(
                     payload,
                     status_code=upstream.status_code,
@@ -6647,7 +7420,10 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                     status_logico = 502
                 raw = json.dumps(payload).encode()
             except Exception:
-                pass  # resposta não é o JSON de chat completion esperado -> repassa como veio
+                # Mantém a resposta recebida; só o ledger registra que o corpo
+                # não é o JSON de completion esperado, sem contar conclusão.
+                if status_logico < 400:
+                    status_logico = 502
         finally:
             await upstream.aclose()
             release_flight(flight_key)
@@ -6695,6 +7471,8 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         # carrega "usage" (o chunk final do chat, o evento response.completed
         # do Responses) — os deltas de conteúdo nunca chegam a ser parseados.
         scanner = SseUsageScanner()
+        completion = product_analytics.StreamCompletion()
+        exhausted = False
         usage = None
         status_code = upstream.status_code
         try:
@@ -6708,11 +7486,19 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
                 idle_s=CHAT_STREAM_IDLE_TIMEOUT_S if is_stream_request else 0,
                 log_label=str(flight_key),
             ):
+                if is_stream_request:
+                    completion.feed(chunk)
                 yield chunk
                 if collect_full:
                     full += chunk
                     continue
                 scanner.feed(chunk)
+                if completion.terminal:
+                    break
+            exhausted = True
+        except (asyncio.CancelledError, GeneratorExit):
+            status_code = 499
+            raise
         except UpstreamStreamTimeout as e:
             # mesmo raciocínio do filtered_reasoning_stream: o 200 já foi junto
             # com o cabeçalho, então o erro só cabe no corpo — e o log tem que
@@ -6756,11 +7542,18 @@ async def proxy(path: str, request: Request, authorization: str | None = Header(
         finally:
             if collect_full:
                 try:
-                    usage = usage_from_event(json.loads(full)) if full else None
+                    payload = json.loads(full) if full else None
+                    usage = usage_from_event(payload)
+                    if not isinstance(payload, dict) or payload.get("error"):
+                        if status_code < 400:
+                            status_code = 502
                 except Exception:
                     usage = None
+                    if status_code < 400:
+                        status_code = 502
             else:
                 usage = scanner.finish()
+                status_code = completion.status(status_code, exhausted)
             await upstream.aclose()
             release_flight(flight_key)
             log_gateway_request(
@@ -7075,6 +7868,68 @@ async def flush_settings(x_admin_secret: str | None = Header(None)):
     auto_provision_cache = None
     openrouter_catalog_cache = None
     return {"ok": True}
+
+
+async def _openrouter_keys_blocked() -> str | None:
+    """Por que as chaves espelho não podem ser criadas agora, ou None."""
+    if openrouter_mgmt_client is None:
+        return openrouter_keys_disabled_reason or "desligado"
+    if not await openrouter_enabled():
+        return "repasse ao OpenRouter desligado na página Modelos"
+    return None
+
+
+async def _backfill_openrouter_keys(identities: list[dict]) -> None:
+    """Uma de cada vez e com folga: a API de gerenciamento tem rate limit
+    (sem número documentado) e ninguém está esperando por isto."""
+    created = 0
+    for identity in identities:
+        if await openrouter_key_for(identity):
+            created += 1
+        await asyncio.sleep(0.5)
+    logger.info("openrouter: backfill de chaves espelho — %d de %d", created, len(identities))
+
+
+@app.post("/admin/openrouter-keys/backfill")
+async def admin_backfill_openrouter_keys(x_admin_secret: str | None = Header(None)):
+    """Cria, em background, a chave espelho de toda chave ativa de cliente que
+    ainda não tem uma. O painel chama ao LIGAR o repasse: a regra é "repasse
+    ligado = toda chave tem espelho", inclusive as criadas enquanto ele estava
+    desligado. Idempotente — chave que já tem espelho não entra na lista."""
+    require_admin(x_admin_secret)
+    blocked = await _openrouter_keys_blocked()
+    if blocked:
+        return {"ok": False, "reason": blocked}
+    identities = await supa.list_keys_without_openrouter_key()
+    spawn_tracked(_backfill_openrouter_keys(identities))
+    return {"ok": True, "queued": len(identities)}
+
+
+@app.post("/admin/openrouter-keys/provision")
+async def admin_provision_openrouter_key(
+    request: Request, x_admin_secret: str | None = Header(None)
+):
+    """Cria a chave espelho do OpenRouter de uma chave da Stac recém-criada.
+    Chamado pelo painel (createKey) em background: a chave nasce aqui, e não
+    na primeira request, para já aparecer na Activity do OpenRouter. Se falhar,
+    a primeira request que for para o OpenRouter tenta de novo.
+
+    Só com o repasse LIGADO (interruptor da página /modelos): é ele que decide
+    se as chaves ganham espelho. Com ele desligado nada é criado — ao ligar, o
+    backfill abaixo cobre as chaves criadas nesse meio tempo."""
+    require_admin(x_admin_secret)
+    body = await request.json()
+    api_key_id = body.get("api_key_id") if isinstance(body, dict) else None
+    if not isinstance(api_key_id, str) or not api_key_id:
+        raise HTTPException(status_code=400, detail="api_key_id obrigatório")
+    blocked = await _openrouter_keys_blocked()
+    if blocked:
+        return {"ok": False, "reason": blocked}
+    identity = await supa.get_api_key_identity(api_key_id)
+    if identity is None:
+        raise HTTPException(status_code=404, detail="chave não encontrada ou inativa")
+    secret = await openrouter_key_for(identity)
+    return {"ok": secret is not None}
 
 
 @app.post("/admin/sync-machine-keys")
