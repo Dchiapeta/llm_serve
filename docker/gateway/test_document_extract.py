@@ -27,11 +27,13 @@ from document_extract import (
     DocumentTooLarge,
     EmptyDocument,
     UnreadableDocument,
+    append_json_only_instruction,
     build_messages,
     check_size,
     extract_text,
     limit_bytes,
     limit_pages,
+    strip_code_fence,
 )
 
 
@@ -265,3 +267,27 @@ def test_build_messages_numera_blocos_com_varios_documentos():
 def test_build_messages_lista_de_um_documento_e_o_bloco_de_sempre():
     """O modelo não precisa saber que a rota aceita vários quando só veio um."""
     assert build_messages([("nota.pdf", "DOC")]) == build_messages("DOC")
+
+
+# ---------- sem structured outputs (repetição no OpenRouter) ----------
+
+
+def test_append_json_only_instruction_vai_na_ultima_mensagem_user_depois_do_documento():
+    messages = [{"role": "system", "content": "SYS"}] + build_messages("DOC")
+    append_json_only_instruction(messages, {"type": "object", "properties": {"x": {"type": "string"}}})
+    assert messages[0] == {"role": "system", "content": "SYS"}  # system intocado
+    content = messages[1]["content"]
+    assert content.index("DOC") < content.index("Responda SOMENTE com um objeto JSON")
+    assert '"properties": {"x": {"type": "string"}}' in content
+
+
+@pytest.mark.parametrize("text,expected", [
+    ('```json\n{"a": 1}\n```', '{"a": 1}'),
+    ('```\n{"a": 1}\n```', '{"a": 1}'),
+    ('  ```json\n{"a": 1}\n```  ', '{"a": 1}'),
+    ('{"a": 1}', '{"a": 1}'),  # sem cerca: intacto
+    ('{"a": "```"}', '{"a": "```"}'),  # cerca dentro do JSON: não é cerca
+    ('texto ```json\n{"a": 1}\n```', 'texto ```json\n{"a": 1}\n```'),  # cerca só em parte
+])
+def test_strip_code_fence(text, expected):
+    assert strip_code_fence(text) == expected
