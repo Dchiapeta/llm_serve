@@ -26,6 +26,7 @@ rejeição acontece ANTES do OCR (custo zero pra documento que não passa).
 """
 
 import io
+import json
 
 # Tetos por plano. Dois eixos porque medem custos diferentes: bytes protege
 # memória/transferência (um PDF de 100 MB não deve nem ser aberto), páginas
@@ -463,6 +464,49 @@ MULTI_DOCUMENT_NOTE = (
 MULTI_DOCUMENT_BLOCK = (
     "\n\n--- DOCUMENTO {i} DE {n}{name} ---\n{text}\n--- FIM DO DOCUMENTO {i} ---"
 )
+
+
+# Quando o provedor por trás do OpenRouter não aceita `response_format`
+# (structured outputs), a garantia de JSON aderente deixa de ser gramática e
+# passa a ser instrução: o schema vai no prompt, e a validação da saída
+# (validate_extraction_output, no gateway) vira a garantia em vez de rede de
+# segurança. Só entra nessa repetição — com guided decoding seria redundante
+# e gastaria tokens de prompt em todo request.
+JSON_ONLY_BLOCK = (
+    "\n\nResponda SOMENTE com um objeto JSON válido, sem nenhum texto antes ou "
+    "depois e sem cerca de código (```). O JSON deve aderir a este JSON Schema:\n"
+    "{schema}"
+)
+
+
+def append_json_only_instruction(messages: list[dict], schema: dict) -> None:
+    """Acrescenta JSON_ONLY_BLOCK à última mensagem `user` (a da extração), in
+    place. Na última, e não numa mensagem nova: a instrução precisa ficar
+    junto do documento, depois dele — é a posição em que o modelo mais a
+    respeita."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            msg["content"] += JSON_ONLY_BLOCK.format(
+                schema=json.dumps(schema, ensure_ascii=False)
+            )
+            return
+
+
+def strip_code_fence(text: str) -> str:
+    """Tira a cerca de código markdown de uma resposta INTEIRAMENTE cercada
+    ("```json\n{...}\n```" → "{...}"). Sem guided decoding o modelo às vezes
+    cerca o JSON mesmo instruído a não cercar, e json.loads falharia num JSON
+    perfeitamente válido. Cerca só em parte do texto (string com ``` dentro
+    do JSON) não é tocada: aí não há o que consertar."""
+    stripped = text.strip()
+    if not (stripped.startswith("```") and stripped.endswith("```") and len(stripped) >= 6):
+        return text
+    inner = stripped[3:-3]
+    first_newline = inner.find("\n")
+    # rótulo de linguagem ("json") sozinho na primeira linha
+    if first_newline != -1 and inner[:first_newline].strip().isalpha():
+        inner = inner[first_newline + 1:]
+    return inner.strip()
 
 
 def build_messages(
