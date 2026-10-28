@@ -102,8 +102,7 @@ existe ⇒ imagem existe" vai mostrar link quebrado — o campo a checar é
 
 ### Cota mensal de requisições (`0076`)
 
-`stack_request_quota(p_stack_id)` é a fonte única do limite (Go 4.000, Pro
-10.000, demais sem teto), do ciclo (aniversário de `stacks.purchase_date`) e do
+`stack_request_quota(p_stack_id)` é a fonte única do limite, do ciclo (aniversário de `stacks.purchase_date`) e do
 uso no ciclo. O gateway corta com ela e o manager mostra o uso pela irmã
 `stack_request_quotas()` (todas as stacks, só service_role). O TryStac ainda
 não exibe a cota (decisão de 01/10/2026); quando exibir, deve ler de
@@ -112,6 +111,11 @@ numa constante. `security invoker`: do lado do TryStac quem isola tenant é a
 RLS de `stacks`/`gateway_requests`/`api_keys` que já existe lá, sem grant
 novo. `purchase_date` é definida na criação da stack pelo manager e é o que
 ancora o ciclo.
+
+Desde a `0080` o padrão de cada plano mora em `plan_request_quotas` (Go e Pro;
+plano sem linha = sem teto), editada pela página Uso do manager. A leitura é
+pública porque o site do TryStac monta os textos de planos com esses números
+— nunca copiar o limite numa constante nem em texto fixo.
 
 `stacks.request_quota_override` (`0077`) troca o limite de uma stack
 específica (NULL = padrão do plano, inteiro > 0 = limite da stack), editado

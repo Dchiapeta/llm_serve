@@ -7,7 +7,11 @@
 // gravados para dar peso, e como os tokens por requisição se distribuem.
 
 import type { createSupabaseAdmin } from "@/lib/supabase/server"
-import { fetchStackRequestQuotas, type RequestQuota } from "@/lib/request-quota"
+import {
+  fetchStackRequestQuotas,
+  quotaIsCustom,
+  type RequestQuota,
+} from "@/lib/request-quota"
 
 type Db = ReturnType<typeof createSupabaseAdmin>
 
@@ -53,6 +57,8 @@ export type StackQuotaRow = {
 export type PlanSummary = {
   plan: QuotaPlan
   stacks: number
+  /** Stacks do plano com request_quota_override — não seguem o padrão. */
+  overrides: number
   raw: number
   weighted: number
   hitRawNow: number
@@ -69,6 +75,8 @@ export type WeightReport = {
   available: boolean
   plans: PlanSummary[]
   atRisk: StackQuotaRow[]
+  /** Stacks com limite próprio (request_quota_override), maior uso primeiro. */
+  custom: StackQuotaRow[]
   distribution: Record<QuotaPlan, Record<BucketKey, DistributionCell>>
   heavyShare: Record<QuotaPlan, number>
   missingTokens: { upstream: string; requests: number; missing: number }[]
@@ -84,7 +92,8 @@ type ReportRow = {
 }
 
 function quotaPlan(plan: string | null | undefined): QuotaPlan | null {
-  if (plan === "Go") return "Go"
+  // VibeCoder segue o limite do Go em stack_request_quota (0080)
+  if (plan === "Go" || plan === "VibeCoder") return "Go"
   if (plan === "Pro") return "Pro"
   return null
 }
@@ -155,6 +164,7 @@ export async function fetchWeightReport(db: Db): Promise<WeightReport> {
     return {
       plan,
       stacks: mine.length,
+      overrides: mine.filter((r) => quotaIsCustom(r.quota)).length,
       raw: mine.reduce((s, r) => s + r.quota.used, 0),
       weighted: mine.reduce((s, r) => s + r.usedWeighted, 0),
       hitRawNow: mine.filter((r) => hit(r.quota.used, r.quota.limit)).length,
@@ -180,6 +190,10 @@ export async function fetchWeightReport(db: Db): Promise<WeightReport> {
         (b.projectedWeighted ?? b.usedWeighted) / b.quota.limit -
         (a.projectedWeighted ?? a.usedWeighted) / a.quota.limit
     )
+
+  const custom = rows
+    .filter((r) => quotaIsCustom(r.quota))
+    .sort((a, b) => b.usedWeighted / b.quota.limit - a.usedWeighted / a.quota.limit)
 
   const distribution = { Go: emptyDistribution(), Pro: emptyDistribution() }
   const missing = new Map<string, { requests: number; missing: number }>()
@@ -212,6 +226,7 @@ export async function fetchWeightReport(db: Db): Promise<WeightReport> {
     available: available && !reportRes.error,
     plans,
     atRisk,
+    custom,
     distribution,
     heavyShare,
     missingTokens: [...missing.entries()]
