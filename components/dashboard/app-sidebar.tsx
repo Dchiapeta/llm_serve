@@ -9,6 +9,7 @@ import {
   Boxes,
   ChevronsUpDown,
   Cpu,
+  Gauge,
   GitBranch,
   Handshake,
   KeyRound,
@@ -17,7 +18,6 @@ import {
   LogOut,
   Monitor,
   Moon,
-  Scale,
   Server,
   Sparkles,
   Sun,
@@ -74,8 +74,8 @@ const navGroups = [
       { href: "/templates", label: "Produtos", icon: Boxes },
       { href: "/stacks", label: "Stacks", icon: Layers },
       { href: "/requisicoes", label: "Requisições", icon: Activity },
-      // simulação da cota com a request ponderada (0079), antes do corte
-      { href: "/cota-ponderada", label: "Cota ponderada", icon: Scale },
+      // limites da cota por plano e por stack + análise da request ponderada
+      { href: "/uso", label: "Uso", icon: Gauge },
       // por que o gateway criou/religou/recriou máquina — e por que não
       { href: "/decisoes", label: "Decisões", icon: GitBranch },
     ],

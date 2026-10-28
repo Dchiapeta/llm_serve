@@ -1,5 +1,5 @@
-// Cota mensal de requisições por stack (migration 0076): Go 4.000, Pro 10.000,
-// no ciclo que começa no dia de stacks.purchase_date. O limite, o ciclo e a
+// Cota mensal de requisições por stack (migration 0076). O padrão de cada
+// plano vem de plan_request_quotas (0080, editada na página Uso), no ciclo que começa no dia de stacks.purchase_date. O limite, o ciclo e a
 // contagem vêm do banco — a mesma função que o gateway usa para cortar com
 // 429 —, então o número mostrado aqui e o corte nunca discordam.
 //

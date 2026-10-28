@@ -1,6 +1,7 @@
 """Cota mensal de requisições por stack (01/10/2026).
 
-O TryStac anuncia 4.000 requisições/mês no Go e 10.000 no Pro. O número, o
+O limite de cada plano mora em `plan_request_quotas` (0080), editada pela
+página Uso do manager. O número, o
 ciclo e a contagem moram no banco (`stack_request_quota`, migration 0076), que
 é a mesma regra que o manager lê para mostrar o uso — este módulo não
 conhece limite nenhum, só o que a função devolve. Regras do que conta e de

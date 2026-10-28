@@ -11,6 +11,7 @@ import { currentAdminEmail, requireAdminSession } from "./auth-admin-server"
 import { computeCapacity, vramSlots } from "./capacity"
 import { generateHexKey, hashKey, keyPrefix } from "./keys"
 import { type EventMeta } from "./machine-events"
+import { isLimitedPlan } from "./plan-request-quotas"
 import { vllmFlagsFromTemplate } from "./machines"
 import { getClientLocation, listRoutesByMachine, setClientLocation } from "./routing"
 import { insertStack } from "./stacks"
@@ -2071,6 +2072,36 @@ export async function setStackRequestQuota(
     .update({ request_quota_override: limit })
     .eq("id", stackId)
   if (error) return { error: error.message }
+  revalidatePath("/contas")
+  revalidatePath("/stacks")
+  revalidatePath("/uso")
+}
+
+// Limite mensal padrão de um plano (migration 0080). Vale para toda stack do
+// plano sem request_quota_override: no gateway em até 1 minuto (cache da cota
+// por stack) e nos textos do site do TryStac em até 5 (cache dos limites).
+export async function setPlanRequestQuota(
+  plan: string,
+  limit: number
+): Promise<{ error: string } | void> {
+  await requireAdminSession()
+  if (!isLimitedPlan(plan)) {
+    return { error: "Só Go e Pro têm limite mensal" }
+  }
+  if (!Number.isInteger(limit) || limit <= 0) {
+    return { error: "O limite precisa ser um número inteiro maior que zero" }
+  }
+  const db = createSupabaseAdmin()
+  const { error } = await db
+    .from("plan_request_quotas")
+    .update({
+      quota_limit: limit,
+      updated_at: new Date().toISOString(),
+      updated_by: await currentAdminEmail(),
+    })
+    .eq("plan", plan)
+  if (error) return { error: error.message }
+  revalidatePath("/uso")
   revalidatePath("/contas")
   revalidatePath("/stacks")
 }
