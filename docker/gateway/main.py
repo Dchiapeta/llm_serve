@@ -555,6 +555,14 @@ OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "32000"))
 OPENROUTER_STREAM_TTFT_TIMEOUT_S = float(os.environ.get("OPENROUTER_STREAM_TTFT_TIMEOUT_S", "180"))
 OPENROUTER_STREAM_IDLE_TIMEOUT_S = float(os.environ.get("OPENROUTER_STREAM_IDLE_TIMEOUT_S", "120"))
 OPENROUTER_NONSTREAM_TIMEOUT_S = float(os.environ.get("OPENROUTER_NONSTREAM_TIMEOUT_S", "300"))
+# Janela de contexto assumida para a extração (documents/extract,
+# images/extract) repassada ao OpenRouter. Lá não existe machines.max_model_len
+# para o apply_context_budget consultar, e o OpenRouter não expõe a janela do
+# provedor na hora da request; sem um teto, um PDF no limite do plano viraria
+# um 400 do provedor → 502 genérico, em vez do 400 explicando o tamanho. Os
+# modelos de texto da allowlist (Qwen 3.x, GLM) têm janela de 128K ou mais —
+# daí o default; reduzir se um provedor com janela menor entrar na lista.
+OPENROUTER_EXTRACT_CONTEXT_TOKENS = int(os.environ.get("OPENROUTER_EXTRACT_CONTEXT_TOKENS", "131072"))
 # geração de imagem no OpenRouter passa de 90s em modelo de qualidade alta
 # (a doc cita 94s para um gpt-image em 16:9)
 OPENROUTER_IMAGE_TIMEOUT_S = float(os.environ.get("OPENROUTER_IMAGE_TIMEOUT_S", "240"))
@@ -3730,6 +3738,15 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str, 
     nos branches de adapter LoRA quanto no modelo base. Adapter LoRA também
     é resolvido por stack (`latest_ready_adapter_for_stack`, migration 0026)
     — cada stack pode ter (ou não) seu próprio fine-tune.
+
+    Com as máquinas desligadas (system_settings.machines_enabled, 0071) levanta
+    503 ANTES de consultar rota ou máquina: é a rede de segurança do
+    interruptor, e vale para quem chama direto. As rotas que têm repasse ao
+    OpenRouter decidem antes de chegar aqui — chat/completions, completions,
+    responses e /v1/messages pelo catch-all (require_machines/_text_fallback),
+    documents/extract e images/extract por resolve_extraction_route. Só
+    embeddings, documents/generate por prompt e imagem fora da allowlist ainda
+    dependem de máquina.
     """
     stack, effective_plan = resolve_key_stack(entry)
     if effective_plan is None:
@@ -3737,9 +3754,8 @@ async def resolve_route(account_id: str, entry: dict) -> tuple[dict, bool, str, 
     stack_id = stack["id"]
 
     # Rede de segurança do interruptor das máquinas: toda rota que chega numa
-    # máquina passa por aqui. As rotas com repasse ao OpenRouter já barraram
-    # antes com a mensagem de modelo (require_machines); as que só existem em
-    # máquina (documents/*, images/extract, embeddings) param aqui.
+    # máquina passa por aqui. As rotas com repasse ao OpenRouter já desviaram
+    # antes (ver docstring); o que ainda só existe em máquina para aqui.
     if not await machines_enabled():
         raise HTTPException(
             status_code=503,
@@ -5634,115 +5650,81 @@ async def _authenticate_for_extraction(
     return entry, key_hash, account_id, parsed_schema
 
 
-async def _run_extraction_pipeline(
-    *,
-    documents: list[tuple[str, str]],
-    pages: int,
-    ocr_used: bool,
-    parsed_schema: dict,
-    user: str | None,
-    system: str | None,
-    entry: dict,
-    stack_id: str,
-    machine: dict,
-    rewrite_model: str | None,
-    max_tokens: int | None,
-    authorization: str | None,
-    flight_key: tuple[str, str],
-    log_ctx: dict,
-    path_label: str,
+async def resolve_extraction_route(
+    account_id: str, entry: dict
+) -> tuple[dict | None, bool, str, str, str | None]:
+    """Destino da inferência de uma extração: (machine, rewrite_model,
+    effective_plan, stack_id, openrouter_slug).
+
+    Com as máquinas ligadas é o resolve_route de sempre (machine preenchida,
+    slug None). Desligadas (system_settings.machines_enabled, 0071), a
+    extração segue a mesma regra do chat: o OCR continua na CPU do gateway e
+    só o chat/completions final vai ao reserva de texto do plano no OpenRouter
+    (0073/0074) — machine None, slug preenchido. Nesta rota o modelo nunca é
+    escolha do cliente (o payload é todo do servidor), então não há "pedido" a
+    honrar: é sempre o reserva do plano.
+
+    Sem máquina E sem reserva (repasse desligado, ou plano sem reserva de
+    texto), 503 com a mesma mensagem do resolve_route — o cliente não tem o
+    que corrigir do lado dele. Esse 503 chegava a cliente real em produção
+    desde o desligamento das máquinas (28/09/2026), antes mesmo do OCR."""
+    if await machines_enabled():
+        machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
+        return machine, rewrite_model, effective_plan, stack_id, None
+    stack, effective_plan = resolve_key_stack(entry)
+    if effective_plan is None:
+        raise HTTPException(status_code=503, detail="conta sem stack configurada")
+    slug = await openrouter_text_target(None, effective_plan)
+    if slug:
+        return None, False, effective_plan, stack["id"], slug
+    raise HTTPException(
+        status_code=503,
+        detail="inferência nas máquinas da Stac temporariamente desligada",
+    )
+
+
+def _reserve_extraction_slot(
+    stack_id: str, machine: dict | None, plan: str
+) -> tuple[str, str] | None:
+    """Reserva a vaga da extração na máquina (in_flight + teto de concorrência)
+    e devolve a flight_key a liberar no finally. None no repasse ao OpenRouter:
+    in_flight existe para a auto-pausa e o check_concurrency da MÁQUINA (os
+    dois contam por machine_id) — sem máquina não há vaga a reservar, e contar
+    numa chave fictícia só confundiria a auto-pausa."""
+    if machine is None:
+        return None
+    flight_key = (stack_id, machine["id"])
+    in_flight[flight_key] += 1
+    check_concurrency(flight_key, machine, plan)
+    return flight_key
+
+
+def _extraction_log_ctx(
+    *, entry: dict, stack_id: str, machine: dict | None, rewrite_model: bool,
+    openrouter_slug: str | None, path: str, request: Request, started: float,
 ) -> dict:
-    """Monta o prompt, chama o pod e valida a saída — a parte IDÊNTICA entre
-    /v1/documents/extract e /v1/images/extract, a partir do momento em que já
-    se tem ([(nome, texto)...], páginas, ocr_used) em mãos. O que muda entre
-    as duas rotas é só COMO chegar até esses três valores (parsing do upload +
-    extração). `documents` tem um item por arquivo enviado — com mais de um,
-    build_messages numera os blocos pra que o modelo saiba de onde veio cada
-    valor."""
-    # `user` COMPÕE com a instrução padrão (ver build_messages): o cliente
-    # acrescenta contexto do documento sem poder remover o "não invente,
-    # use null", que é a garantia contra campo fabricado.
-    messages = document_extract.build_messages(documents, user)
-
-    # `system` segue EXATAMENTE a regra do chat: com conteúdo, substitui o
-    # prompt configurado; ausente ou vazio, vale o da chave (migration 0053)
-    # ou, na falta dele, o da stack. Vazio não substitui nada — mesmo motivo
-    # do chat: um system sem instrução não deve apagar a configuração da conta.
-    #
-    # Sem RAG, ao contrário do chat: aqui o contexto relevante é o
-    # documento que acabou de ser enviado. Trechos da base de conhecimento
-    # competiriam com ele e abririam espaço pro modelo preencher um campo
-    # com dado de OUTRO documento — o oposto do que a extração promete.
-    # Por isso não reaproveita build_stack_system_message, que traz os dois.
-    system_text = (system or "").strip()
-    if not system_text:
-        stack, _ = resolve_key_stack(entry)
-        system_text = resolve_system_prompt(entry, stack) or ""
-    if system_text:
-        messages.insert(0, {"role": "system", "content": system_text})
-
-    payload = {
-        "model": effective_model_name(stack_id, rewrite_model, machine),
-        "messages": messages,
-        # o Form já garante 0 < max_tokens <= CEILING; o clamp real contra a
-        # janela do modelo vem do apply_context_budget abaixo
-        "max_tokens": max_tokens or DOCUMENT_MAX_TOKENS,
-        "stream": False,
-        # temperatura 0: extração é determinística por natureza — o mesmo
-        # documento com o mesmo schema deve dar o mesmo JSON. Sampling
-        # aqui só produziria variação entre chamadas idênticas.
-        "temperature": 0.0,
-        # o que garante JSON aderente ao schema em vez de "JSON provável":
-        # o vLLM converte isto em restrição de gramática. Não exige flag no
-        # template — StructuredOutputsConfig.backend já é "auto" por default
-        # na 0.24 (a tentativa de fixar o backend explicitamente quebrou o
-        # boot dos pods; ver migration 0048).
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "document_extraction", "schema": parsed_schema},
-        },
-        # extração é tarefa fechada: o raciocínio custaria milhares de
-        # tokens e segundos sem melhorar o resultado. E, nos planos com
-        # thinking ligado, o bloco <think> disputaria com a gramática do
-        # guided decoding — desligar remove o problema na origem em vez de
-        # depender do filtro de saída (que ainda existe abaixo, por
-        # segurança).
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-
-    # O conteúdo enviado é a maior fatia do prompt, e um documento/imagem no
-    # teto do plano passa fácil da janela do modelo. Sem isto o vLLM devolveria
-    # 400 e o cliente veria o 502 genérico de "falha no modelo" — culpando
-    # o servidor por um conteúdo grande demais. apply_context_budget clampa
-    # o max_tokens ao que sobra e, se não sobrar espaço viável de resposta,
-    # levanta ContextWindowExceeded (400 com mensagem explicando o
-    # tamanho) — mesmo caminho e mesma mensagem do chat.
-    est_tokens = estimate_prompt_tokens(messages)
-    try:
-        apply_context_budget(payload, machine, "max_tokens", est_tokens)
-    except ContextWindowExceeded:
-        log_gateway_request(**log_ctx, status_code=400, stream=False)
-        # mensagem reescrita: a original é de chat ("comece uma sessão nova
-        # com /clear", "configure CLAUDE_CODE_AUTO_COMPACT_WINDOW") e não
-        # faz sentido nenhum pra quem subiu um documento/imagem — aqui o que
-        # resolve é mandar menos conteúdo. Mesma exceção (mesmo status e
-        # mesmo shape de corpo do exception handler), só o texto muda.
-        # "página(s)" só entra pro caminho de PDF: imagem sempre tem pages=1
-        # fixo, e citar "1 página" nesse caso seria um detalhe sem sentido
-        # pra quem mandou uma imagem solta.
-        if path_label != "documents/extract":
-            content_desc = "o conteúdo enviado ocupa"
-        elif len(documents) > 1:
-            content_desc = f"os {len(documents)} documentos somam {pages} página(s) e ocupam"
-        else:
-            content_desc = f"o documento tem {pages} página(s) e ocupa"
-        raise ContextWindowExceeded(
-            f"{content_desc} ~{est_tokens} tokens, o que não deixa espaço "
-            f"para a resposta na janela de contexto deste plano "
-            f"({machine.get('max_model_len')} tokens). Envie menos conteúdo por "
-            "requisição (ex.: divida o documento) ou use um plano com janela maior."
+    """log_ctx da extração no formato do destino: máquina (machine_id + nome
+    servido pelo vLLM) ou OpenRouter (_openrouter_log_ctx: machine_id NULL,
+    upstream='openrouter', slug na coluna model)."""
+    if openrouter_slug is not None:
+        return _openrouter_log_ctx(
+            entry=entry, stack_id=stack_id, path=path, slug=openrouter_slug,
+            request=request, started=started,
         )
+    return dict(
+        account_id=entry["account_id"], stack_id=stack_id, api_key_id=entry["api_key_id"],
+        machine_id=machine["id"], path=path,
+        model=effective_model_name(stack_id, rewrite_model, machine),
+        user_agent=request.headers.get("user-agent"), started=started,
+    )
 
+
+async def _extraction_call_machine(
+    payload: dict, machine: dict, authorization: str | None, log_ctx: dict,
+    path_label: str, flight_key: tuple[str, str] | None,
+) -> bytes:
+    """chat/completions não-stream no pod vLLM da máquina. Devolve o corpo cru
+    de um 200; qualquer outra coisa vira HTTPException já logada."""
     try:
         upstream = await document_client.post(
             f"{machine['public_url']}/v1/chat/completions",
@@ -5766,13 +5748,259 @@ async def _run_extraction_pipeline(
         raise HTTPException(
             status_code=502, detail="falha ao processar o documento no modelo"
         )
+    return upstream.content
+
+
+# Respostas do OpenRouter que podem significar "este provedor não aceita
+# response_format" (structured outputs): 400 (parâmetro recusado), 404 ("no
+# endpoints found" para os parâmetros pedidos) e 422. Nesses casos a extração
+# repete UMA vez sem o response_format, com a exigência de JSON no prompt.
+_STRUCTURED_OUTPUT_REFUSALS = (400, 404, 422)
+
+
+async def _extraction_call_openrouter(
+    payload: dict, entry: dict, parsed_schema: dict, log_ctx: dict, path_label: str,
+) -> tuple[bytes, float | None]:
+    """chat/completions não-stream no OpenRouter, para a extração. Devolve
+    (corpo cru de um 200, custo em USD); qualquer outra coisa vira
+    HTTPException já logada.
+
+    Mesma infraestrutura do repasse de chat (openrouter_client, chave espelho
+    da chave da Stac, prazo OPENROUTER_NONSTREAM_TIMEOUT_S), mas sem o
+    openrouter_forward: lá a resposta é repassada ao cliente como veio; aqui
+    ela ainda passa pela validação contra o schema, que é a mesma do caminho de
+    máquina (ver _run_extraction_pipeline).
+
+    `response_format` json_schema é aceito pelo OpenRouter (structured
+    outputs), mas nem todo provedor por trás de um slug o suporta. Se o
+    provedor recusar com 4xx, repete uma vez sem ele, com o schema e a
+    exigência de "só JSON" no prompt — e a validação da saída, que já existia
+    como rede de segurança, passa a ser a garantia."""
+    slug = payload["model"]
+    label = f"{path_label}/{slug}"
+    secret = await openrouter_key_for(entry)
+    if not secret and not OPENROUTER_API_KEY:
+        # motivo real no log de openrouter_key_for; o cliente recebe o 503
+        logger.error(
+            "openrouter: chave %s sem espelho e sem OPENROUTER_API_KEY de plano B",
+            log_ctx.get("api_key_id"),
+        )
+        log_gateway_request(**log_ctx, status_code=503, stream=False)
+        raise HTTPException(
+            status_code=503, detail="provedor de inferência temporariamente indisponível"
+        )
+    headers = _openrouter_auth(secret)
+    timeout = httpx.Timeout(OPENROUTER_NONSTREAM_TIMEOUT_S, connect=10.0, write=30.0, pool=10.0)
+
+    try:
+        upstream = await openrouter_client.post(
+            "/chat/completions", json=payload, headers=headers, timeout=timeout
+        )
+        if upstream.status_code in _STRUCTURED_OUTPUT_REFUSALS and "response_format" in payload:
+            logger.warning(
+                "openrouter: %s recusou response_format (%s: %s); repetindo sem ele",
+                label, upstream.status_code, upstream.text[:300],
+            )
+            payload.pop("response_format")
+            document_extract.append_json_only_instruction(payload["messages"], parsed_schema)
+            upstream = await openrouter_client.post(
+                "/chat/completions", json=payload, headers=headers, timeout=timeout
+            )
+    except httpx.HTTPError as e:
+        logger.warning("openrouter: %s indisponível (%s)", label, e)
+        log_gateway_request(**log_ctx, status_code=503, stream=False)
+        raise HTTPException(
+            status_code=503, detail="provedor de inferência indisponível, tente novamente"
+        )
+
+    raw = upstream.content
+    if upstream.status_code >= 400:
+        log_gateway_request(**log_ctx, status_code=upstream.status_code, stream=False)
+        if upstream.status_code == 401 and secret:
+            _forget_openrouter_key(log_ctx.get("api_key_id"))
+        if openrouter.hides_provider_error(upstream.status_code):
+            # chave inválida/crédito esgotado: problema da CONTA da Stac, não
+            # da request — não vaza (mesma regra de _openrouter_error_response)
+            logger.error("openrouter: %s na conta da Stac (%s): %s", upstream.status_code, label, raw[:500])
+            raise HTTPException(
+                status_code=503, detail="provedor de inferência temporariamente indisponível"
+            )
+        logger.warning("openrouter: %s devolveu %s: %s", label, upstream.status_code, raw[:500])
+        if upstream.status_code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail="provedor de inferência no limite no momento, tente novamente",
+                headers={"Retry-After": "2"},
+            )
+        raise HTTPException(
+            status_code=502, detail="falha ao processar o documento no modelo"
+        )
+
+    usage, cost = openrouter.usage_and_cost(raw)
+    try:
+        failure = openrouter.error_of(json.loads(raw))
+    except Exception:
+        failure = None  # corpo não-JSON: o guard de shape adiante trata
+    if failure:
+        # 200 com só `error` no corpo: erro depois de a request ser aceita
+        logger.warning("openrouter: %s respondeu 200 com erro: %s", label, failure)
+        log_gateway_request(**log_ctx, status_code=502, stream=False, usage=usage, cost_usd=cost)
+        raise HTTPException(
+            status_code=502, detail="falha ao processar o documento no modelo"
+        )
+    return raw, cost
+
+
+async def _run_extraction_pipeline(
+    *,
+    documents: list[tuple[str, str]],
+    pages: int,
+    ocr_used: bool,
+    parsed_schema: dict,
+    user: str | None,
+    system: str | None,
+    entry: dict,
+    stack_id: str,
+    machine: dict | None,
+    rewrite_model: bool,
+    max_tokens: int | None,
+    authorization: str | None,
+    flight_key: tuple[str, str] | None,
+    log_ctx: dict,
+    path_label: str,
+    openrouter_slug: str | None = None,
+) -> dict:
+    """Monta o prompt, chama o modelo e valida a saída — a parte IDÊNTICA entre
+    /v1/documents/extract e /v1/images/extract, a partir do momento em que já
+    se tem ([(nome, texto)...], páginas, ocr_used) em mãos. O que muda entre
+    as duas rotas é só COMO chegar até esses três valores (parsing do upload +
+    extração). `documents` tem um item por arquivo enviado — com mais de um,
+    build_messages numera os blocos pra que o modelo saiba de onde veio cada
+    valor.
+
+    O destino vem de resolve_extraction_route: `machine` (pod vLLM) ou
+    `openrouter_slug` (máquinas desligadas). Só a CHAMADA muda entre os dois
+    (_extraction_call_machine / _extraction_call_openrouter); montagem do
+    prompt, orçamento de contexto, filtro de <think>, detecção de truncamento,
+    validação contra o schema e o shape da resposta são um caminho só — o
+    cliente não tem como saber (nem precisa) onde a inferência rodou."""
+    # `user` COMPÕE com a instrução padrão (ver build_messages): o cliente
+    # acrescenta contexto do documento sem poder remover o "não invente,
+    # use null", que é a garantia contra campo fabricado.
+    messages = document_extract.build_messages(documents, user)
+
+    # `system` segue EXATAMENTE a regra do chat: com conteúdo, substitui o
+    # prompt configurado; ausente ou vazio, vale o da chave (migration 0053)
+    # ou, na falta dele, o da stack. Vazio não substitui nada — mesmo motivo
+    # do chat: um system sem instrução não deve apagar a configuração da conta.
+    #
+    # Sem RAG, ao contrário do chat: aqui o contexto relevante é o
+    # documento que acabou de ser enviado. Trechos da base de conhecimento
+    # competiriam com ele e abririam espaço pro modelo preencher um campo
+    # com dado de OUTRO documento — o oposto do que a extração promete.
+    # Por isso não reaproveita build_stack_system_message, que traz os dois.
+    system_text = (system or "").strip()
+    if not system_text:
+        stack, _ = resolve_key_stack(entry)
+        system_text = resolve_system_prompt(entry, stack) or ""
+    if system_text:
+        messages.insert(0, {"role": "system", "content": system_text})
+
+    if openrouter_slug is None:
+        model_name = effective_model_name(stack_id, rewrite_model, machine)
+        # a janela real do pod (machines.max_model_len, migration 0031)
+        window = machine
+    else:
+        model_name = openrouter_slug
+        # o OpenRouter não expõe a janela do provedor na request: vale o teto
+        # configurado (ver OPENROUTER_EXTRACT_CONTEXT_TOKENS)
+        window = {"max_model_len": OPENROUTER_EXTRACT_CONTEXT_TOKENS}
+
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        # o Form já garante 0 < max_tokens <= CEILING; o clamp real contra a
+        # janela do modelo vem do apply_context_budget abaixo
+        "max_tokens": max_tokens or DOCUMENT_MAX_TOKENS,
+        "stream": False,
+        # temperatura 0: extração é determinística por natureza — o mesmo
+        # documento com o mesmo schema deve dar o mesmo JSON. Sampling
+        # aqui só produziria variação entre chamadas idênticas.
+        "temperature": 0.0,
+        # o que garante JSON aderente ao schema em vez de "JSON provável":
+        # o vLLM converte isto em restrição de gramática. Não exige flag no
+        # template — StructuredOutputsConfig.backend já é "auto" por default
+        # na 0.24 (a tentativa de fixar o backend explicitamente quebrou o
+        # boot dos pods; ver migration 0048). No OpenRouter é o structured
+        # outputs; provedor que não o suporte é tratado em
+        # _extraction_call_openrouter.
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "document_extraction", "schema": parsed_schema},
+        },
+        # extração é tarefa fechada: o raciocínio custaria milhares de
+        # tokens e segundos sem melhorar o resultado. E, nos planos com
+        # thinking ligado, o bloco <think> disputaria com a gramática do
+        # guided decoding — desligar remove o problema na origem em vez de
+        # depender do filtro de saída (que ainda existe abaixo, por
+        # segurança).
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    if openrouter_slug is not None:
+        # chat_template_kwargs só o vLLM entende (alguns provedores recusam o
+        # corpo inteiro por causa dele); prepare_openai_body o descarta e
+        # aplica o teto de saída do repasse — o mesmo saneamento do chat.
+        openrouter.prepare_openai_body(payload, openrouter_slug, OPENROUTER_MAX_TOKENS)
+
+    # O conteúdo enviado é a maior fatia do prompt, e um documento/imagem no
+    # teto do plano passa fácil da janela do modelo. Sem isto o vLLM devolveria
+    # 400 e o cliente veria o 502 genérico de "falha no modelo" — culpando
+    # o servidor por um conteúdo grande demais. apply_context_budget clampa
+    # o max_tokens ao que sobra e, se não sobrar espaço viável de resposta,
+    # levanta ContextWindowExceeded (400 com mensagem explicando o
+    # tamanho) — mesmo caminho e mesma mensagem do chat.
+    est_tokens = estimate_prompt_tokens(messages)
+    try:
+        apply_context_budget(payload, window, "max_tokens", est_tokens)
+    except ContextWindowExceeded:
+        log_gateway_request(**log_ctx, status_code=400, stream=False)
+        # mensagem reescrita: a original é de chat ("comece uma sessão nova
+        # com /clear", "configure CLAUDE_CODE_AUTO_COMPACT_WINDOW") e não
+        # faz sentido nenhum pra quem subiu um documento/imagem — aqui o que
+        # resolve é mandar menos conteúdo. Mesma exceção (mesmo status e
+        # mesmo shape de corpo do exception handler), só o texto muda.
+        # "página(s)" só entra pro caminho de PDF: imagem sempre tem pages=1
+        # fixo, e citar "1 página" nesse caso seria um detalhe sem sentido
+        # pra quem mandou uma imagem solta.
+        if path_label != "documents/extract":
+            content_desc = "o conteúdo enviado ocupa"
+        elif len(documents) > 1:
+            content_desc = f"os {len(documents)} documentos somam {pages} página(s) e ocupam"
+        else:
+            content_desc = f"o documento tem {pages} página(s) e ocupa"
+        raise ContextWindowExceeded(
+            f"{content_desc} ~{est_tokens} tokens, o que não deixa espaço "
+            f"para a resposta na janela de contexto deste plano "
+            f"({window.get('max_model_len')} tokens). Envie menos conteúdo por "
+            "requisição (ex.: divida o documento) ou use um plano com janela maior."
+        )
+
+    cost: float | None = None
+    if openrouter_slug is None:
+        raw = await _extraction_call_machine(
+            payload, machine, authorization, log_ctx, path_label, flight_key
+        )
+    else:
+        raw, cost = await _extraction_call_openrouter(
+            payload, entry, parsed_schema, log_ctx, path_label
+        )
 
     # 200 com corpo inesperado (não-JSON, ou sem choices) acontece: um proxy
     # no caminho devolvendo página de erro com status 200, ou o agent
     # respondendo algo fora do shape. Sem este guard viraria
     # ValueError/AttributeError → 500 cru e sem log nenhum.
     try:
-        body = upstream.json()
+        body = json.loads(raw)
         usage = body.get("usage")
         choice = (body.get("choices") or [{}])[0]
         content = choice.get("message", {}).get("content") or ""
@@ -5780,9 +6008,9 @@ async def _run_extraction_pipeline(
     except (ValueError, AttributeError, KeyError, IndexError, TypeError) as e:
         logger.warning(
             "%s: resposta fora do formato esperado (%s): %s",
-            path_label, e, upstream.text[:300],
+            path_label, e, raw[:300],
         )
-        log_gateway_request(**log_ctx, status_code=502, stream=False)
+        log_gateway_request(**log_ctx, status_code=502, stream=False, cost_usd=cost)
         raise HTTPException(
             status_code=502, detail="resposta inesperada do modelo"
         )
@@ -5790,6 +6018,10 @@ async def _run_extraction_pipeline(
     # template ignorar a flag o JSON vem depois de um </think> e o
     # json.loads falharia com um 502 enganoso.
     _, content = split_reasoning(content)
+    # idem para a cerca de código markdown: sem guided decoding (repetição
+    # sem response_format no OpenRouter) o modelo às vezes devolve ```json
+    # ... ``` mesmo instruído a não devolver. Com guided decoding é no-op.
+    content = document_extract.strip_code_fence(content)
 
     # Truncado por teto de tokens: o JSON está pela metade e o validate
     # abaixo falharia com "não devolveu JSON aderente" — culpando o modelo
@@ -5803,7 +6035,7 @@ async def _run_extraction_pipeline(
             "%s: resposta truncada (max_tokens=%s, est_prompt=%s)",
             path_label, payload.get("max_tokens"), est_tokens,
         )
-        log_gateway_request(**log_ctx, status_code=400, stream=False, usage=usage)
+        log_gateway_request(**log_ctx, status_code=400, stream=False, usage=usage, cost_usd=cost)
         raise HTTPException(
             status_code=400,
             detail={
@@ -5834,7 +6066,7 @@ async def _run_extraction_pipeline(
         # interceptada no caminho. Devolver o texto cru é o que torna esse
         # diagnóstico possível do lado do cliente.
         logger.warning("%s: saída não aderente ao schema (%s)", path_label, e)
-        log_gateway_request(**log_ctx, status_code=502, stream=False, usage=usage)
+        log_gateway_request(**log_ctx, status_code=502, stream=False, usage=usage, cost_usd=cost)
         raise HTTPException(
             status_code=502,
             detail={
@@ -5844,7 +6076,7 @@ async def _run_extraction_pipeline(
             },
         )
 
-    log_gateway_request(**log_ctx, status_code=200, stream=False, usage=usage)
+    log_gateway_request(**log_ctx, status_code=200, stream=False, usage=usage, cost_usd=cost)
     return {
         "data": data,
         "pages": pages,
@@ -5854,7 +6086,6 @@ async def _run_extraction_pipeline(
         "ocr_used": ocr_used,
         "usage": usage,
     }
-
 
 async def _collect_uploads(request: Request) -> list[UploadFile]:
     """Todos os arquivos do multipart, na ordem enviada, vindos do campo
@@ -5951,9 +6182,11 @@ async def extract_document(
     com os tetos de bytes e páginas valendo sobre a soma.
 
     É um dos dois endpoints do gateway que fazem trabalho de CPU próprio antes
-    de chamar o pod (extração/OCR, ver document_extract.py e a rota irmã
-    /v1/images/extract) — todo o resto é proxy. As duas consequências que o
-    corpo abaixo respeita:
+    de chamar o modelo (extração/OCR, ver document_extract.py e a rota irmã
+    /v1/images/extract) — todo o resto é proxy. O modelo é o pod vLLM da
+    máquina ou, com as máquinas desligadas, o reserva de texto do plano no
+    OpenRouter (resolve_extraction_route); o OCR é o mesmo nos dois casos. As
+    duas consequências que o corpo abaixo respeita:
 
       * a extração roda em asyncio.to_thread, NUNCA inline: o gateway é um
         processo único e também atende todo o tráfego de chat, então OCR no
@@ -5983,22 +6216,22 @@ async def extract_document(
         raise HTTPException(status_code=413, detail="documento excede o limite do serviço")
 
     # os tetos de quantidade e de bytes são do PLANO, e o plano confiável vem
-    # de resolve_route (key_plan resolvido dentro de
-    # _authenticate_for_extraction é só o da chave, pode não ter stack resolvida)
-    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
-    await maybe_touch(stack_id, machine["id"])
+    # da rota (key_plan resolvido dentro de _authenticate_for_extraction é só
+    # o da chave, pode não ter stack resolvida). `machine` é None quando a
+    # inferência vai ao OpenRouter (máquinas desligadas) — o OCR abaixo é o
+    # mesmo nos dois casos.
+    machine, rewrite_model, effective_plan, stack_id, slug = await resolve_extraction_route(
+        account_id, entry
+    )
+    if machine is not None:
+        await maybe_touch(stack_id, machine["id"])
 
     pdfs = await _read_uploads(uploads, effective_plan, image=False)
 
-    flight_key = (stack_id, machine["id"])
-    in_flight[flight_key] += 1
-    check_concurrency(flight_key, machine, effective_plan)
-
-    log_ctx = dict(
-        account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
-        machine_id=machine["id"], path=DOCUMENT_PATH,
-        model=effective_model_name(stack_id, rewrite_model, machine),
-        user_agent=request.headers.get("user-agent"), started=started,
+    flight_key = _reserve_extraction_slot(stack_id, machine, effective_plan)
+    log_ctx = _extraction_log_ctx(
+        entry=entry, stack_id=stack_id, machine=machine, rewrite_model=rewrite_model,
+        openrouter_slug=slug, path=DOCUMENT_PATH, request=request, started=started,
     )
 
     try:
@@ -6025,11 +6258,13 @@ async def extract_document(
             user=user, system=system, entry=entry, stack_id=stack_id, machine=machine,
             rewrite_model=rewrite_model, max_tokens=max_tokens, authorization=authorization,
             flight_key=flight_key, log_ctx=log_ctx, path_label="documents/extract",
+            openrouter_slug=slug,
         )
     finally:
         # nunca vazar o contador: com in_flight preso em > 0 a auto-pausa da
-        # máquina nunca mais dispararia
-        release_flight(flight_key)
+        # máquina nunca mais dispararia (None = sem máquina, nada a liberar)
+        if flight_key is not None:
+            release_flight(flight_key)
 
 
 @app.post("/v1/images/extract")
@@ -6052,8 +6287,8 @@ async def extract_image(
     Ao contrário de PDF, aqui não existe "texto embutido" a extrair: a imagem
     inteira sempre passa por OCR (pytesseract), por isso `ocr_used` é sempre
     True e `pages` é o número de imagens (1 no caso comum). Não usa modelo vision/multimodal —
-    o OCR roda no gateway (CPU), e o pod só recebe texto, exatamente como no
-    caminho de PDF."""
+    o OCR roda no gateway (CPU), e o modelo (pod ou OpenRouter) só recebe
+    texto, exatamente como no caminho de PDF."""
     started = time.monotonic()
 
     entry, key_hash, account_id, parsed_schema = await _authenticate_for_extraction(
@@ -6066,20 +6301,18 @@ async def extract_image(
     if sum(u.size or 0 for u in uploads) > document_extract.max_limit_image_bytes():
         raise HTTPException(status_code=413, detail="imagem excede o limite do serviço")
 
-    machine, rewrite_model, effective_plan, stack_id = await resolve_route(account_id, entry)
-    await maybe_touch(stack_id, machine["id"])
+    machine, rewrite_model, effective_plan, stack_id, slug = await resolve_extraction_route(
+        account_id, entry
+    )
+    if machine is not None:
+        await maybe_touch(stack_id, machine["id"])
 
     images = await _read_uploads(uploads, effective_plan, image=True)
 
-    flight_key = (stack_id, machine["id"])
-    in_flight[flight_key] += 1
-    check_concurrency(flight_key, machine, effective_plan)
-
-    log_ctx = dict(
-        account_id=account_id, stack_id=stack_id, api_key_id=entry["api_key_id"],
-        machine_id=machine["id"], path=IMAGE_PATH,
-        model=effective_model_name(stack_id, rewrite_model, machine),
-        user_agent=request.headers.get("user-agent"), started=started,
+    flight_key = _reserve_extraction_slot(stack_id, machine, effective_plan)
+    log_ctx = _extraction_log_ctx(
+        entry=entry, stack_id=stack_id, machine=machine, rewrite_model=rewrite_model,
+        openrouter_slug=slug, path=IMAGE_PATH, request=request, started=started,
     )
 
     try:
@@ -6105,10 +6338,11 @@ async def extract_image(
             parsed_schema=parsed_schema, user=user, system=system, entry=entry,
             stack_id=stack_id, machine=machine, rewrite_model=rewrite_model,
             max_tokens=max_tokens, authorization=authorization, flight_key=flight_key,
-            log_ctx=log_ctx, path_label="images/extract",
+            log_ctx=log_ctx, path_label="images/extract", openrouter_slug=slug,
         )
     finally:
-        release_flight(flight_key)
+        if flight_key is not None:
+            release_flight(flight_key)
 
 
 # ---------- Geração de PDF a partir de HTML ----------

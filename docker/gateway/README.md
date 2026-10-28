@@ -127,6 +127,7 @@ advisory lock.
 | `OPENROUTER_MAX_TOKENS`   | não         | Teto de saída por request repassada (`max_tokens`/`max_completion_tokens`/`max_output_tokens`; default 32000, `0` = sem teto) |
 | `OPENROUTER_STREAM_TTFT_TIMEOUT_S` / `OPENROUTER_STREAM_IDLE_TIMEOUT_S` | não | Watchdog do streaming repassado (defaults 180 / 120) |
 | `OPENROUTER_NONSTREAM_TIMEOUT_S` | não  | Read da request repassada sem stream (default 300) |
+| `OPENROUTER_EXTRACT_CONTEXT_TOKENS` | não | Janela de contexto assumida na extração (`documents/extract`, `images/extract`) repassada ao OpenRouter — lá não há `machines.max_model_len` pra o orçamento de contexto consultar (default 131072; reduzir se entrar na allowlist um provedor com janela menor) |
 | `OPENROUTER_IMAGE_TIMEOUT_S` | não      | Read do `POST /images` do OpenRouter (default 240) |
 | `OPENROUTER_MAX_IMAGES`   | não         | Teto de `n` numa geração repassada (default 4) |
 | `OPENROUTER_MANAGEMENT_KEY` | não       | Management API key do OpenRouter (openrouter.ai/settings/management-keys). Com ela, cada chave da Stac ganha uma chave espelho no OpenRouter e o custo aparece por chave na Activity de lá (ver `openrouter_keys.py`). Sem ela, tudo usa `OPENROUTER_API_KEY` (e sem as duas, o repasse fica desligado) |
@@ -229,9 +230,11 @@ alcançar o Supabase e os proxies `*.proxy.runpod.net` dos pods.
 
 - `POST /v1/...` — proxy OpenAI-compatible (Bearer HEX do cliente)
 - `POST /v1/documents/extract` — PDF → JSON via schema (OCR quando escaneado). Vários
-  PDFs na mesma requisição a partir do Pro (campo `files`; tetos somados)
+  PDFs na mesma requisição a partir do Pro (campo `files`; tetos somados). O OCR roda
+  no gateway; a inferência vai ao pod da máquina ou, com as máquinas desligadas, ao
+  reserva de texto do plano no OpenRouter (`resolve_extraction_route`)
 - `POST /v1/images/extract` — imagem solta → JSON via schema (sempre via OCR). Mesma
-  regra de vários arquivos
+  regra de vários arquivos e mesmo destino da inferência
 - `POST /v1/documents/generate` — HTML → PDF (direto ou por instrução ao modelo)
 - `POST /v1/images/generations` — text-to-image (Go/category=image). Corpo JSON,
   resposta `b64_json`. A imagem é gravada no bucket antes da resposta sair

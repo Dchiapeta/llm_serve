@@ -82,7 +82,14 @@ def ctx(monkeypatch):
     async def fake_touch(stack_id, machine_id=None):
         return None
 
+    async def machines_on():
+        # máquinas ligadas: o caminho de pod de sempre. O caminho com elas
+        # desligadas (repasse ao OpenRouter) é assunto de
+        # test_extract_openrouter_routes.py.
+        return True
+
     monkeypatch.setattr(main, "authenticate", fake_authenticate)
+    monkeypatch.setattr(main, "machines_enabled", machines_on)
     monkeypatch.setattr(main, "check_rate_limit", lambda key, plan: None)
     monkeypatch.setattr(main, "check_token_quota", fake_quota)
     monkeypatch.setattr(main, "resolve_key_stack", lambda entry: (None, state["plan"]))
