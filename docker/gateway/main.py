@@ -109,6 +109,7 @@ from recovery import (
 from usage_class import classify_stack
 from usage_norm import SseUsageScanner, normalize_usage, usage_from_event
 import product_analytics
+import observability_export
 from routing import RoutingStore
 from runpod_api import RunPodClient
 from reasoning_filter import (
@@ -663,6 +664,11 @@ openrouter_keys_disabled_reason: str | None = "gateway ainda não terminou de su
 openrouter_key_secrets: dict[str, str] = {}
 # api_key_id -> momento da última falha ao criar (ver OPENROUTER_KEY_RETRY_S)
 openrouter_key_failures: dict[str, float] = {}
+# api_key_id -> motivo da última falha, em texto. É o que
+# /admin/openrouter-keys/provision devolve ao painel: sem isto a falha só
+# existia no log do gateway e ficou dias sem ninguém ver (22/10/2026, chave de
+# gerenciamento revogada no OpenRouter e o processo com a antiga).
+openrouter_key_errors: dict[str, str] = {}
 # uma criação por chave da Stac de cada vez
 openrouter_key_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -935,6 +941,8 @@ async def lifespan(app: FastAPI):
     )
     decisions_task = asyncio.create_task(decisions.decisions_retention_loop(supa))
     analytics_task = asyncio.create_task(product_analytics.export_loop(supa))
+    # integrações de observabilidade das stacks (TryStac, migration 0052)
+    observability_task = asyncio.create_task(observability_export.export_loop(supa))
     yield
     reaper_task.cancel()
     machine_task.cancel()
@@ -945,10 +953,12 @@ async def lifespan(app: FastAPI):
     image_retention_task.cancel()
     decisions_task.cancel()
     analytics_task.cancel()
-    try:
-        await analytics_task
-    except asyncio.CancelledError:
-        pass
+    observability_task.cancel()
+    for task in (analytics_task, observability_task):
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     await proxy_client.aclose()
     await document_client.aclose()
     await openai_client.aclose()
@@ -2384,14 +2394,35 @@ async def openrouter_key_for(entry: dict) -> str | None:
             secret = openrouter_secret_box.decrypt(row["secret_encrypted"])
         except Exception as e:
             openrouter_key_failures[api_key_id] = time.time()
+            reason = _openrouter_key_error_reason(e)
+            openrouter_key_errors[api_key_id] = reason
             logger.warning(
                 "openrouter: sem chave espelho para %s, usando a compartilhada (%s)",
-                api_key_id, e,
+                api_key_id, reason,
             )
             return None
         openrouter_key_secrets[api_key_id] = secret
         openrouter_key_failures.pop(api_key_id, None)
+        openrouter_key_errors.pop(api_key_id, None)
         return secret
+
+
+def _openrouter_key_error_reason(e: Exception) -> str:
+    """Motivo legível de uma falha ao criar a chave espelho. O 401 da API de
+    gerenciamento ganha explicação própria: não é a chave do cliente, é a
+    OPENROUTER_MANAGEMENT_KEY do gateway que o OpenRouter não aceita mais —
+    revogada lá, ou trocada no Railway sem redeploy (o processo só lê a env no
+    boot). Sem isto a mensagem era um "401 Unauthorized" genérico."""
+    if isinstance(e, httpx.HTTPStatusError) and e.request.url.path.endswith("/keys"):
+        status = e.response.status_code
+        if status == 401:
+            return (
+                "OpenRouter recusou a chave de gerenciamento (401): a "
+                "OPENROUTER_MANAGEMENT_KEY do processo do gateway foi revogada ou "
+                "está desatualizada — troque a variável e faça redeploy"
+            )
+        return f"API de gerenciamento do OpenRouter respondeu {status}: {upstream_error_message(e.response.content)[:200]}"
+    return str(e)[:300]
 
 
 async def _create_openrouter_key(entry: dict) -> dict:
@@ -7929,7 +7960,15 @@ async def admin_provision_openrouter_key(
     if identity is None:
         raise HTTPException(status_code=404, detail="chave não encontrada ou inativa")
     secret = await openrouter_key_for(identity)
-    return {"ok": secret is not None}
+    if secret is None:
+        # O motivo volta ao painel, que o registra no log dele: a falha deixa
+        # de existir só aqui dentro.
+        return {
+            "ok": False,
+            "reason": openrouter_key_errors.get(api_key_id)
+            or "falha ao criar a chave espelho (ver log do gateway)",
+        }
+    return {"ok": True}
 
 
 @app.post("/admin/sync-machine-keys")

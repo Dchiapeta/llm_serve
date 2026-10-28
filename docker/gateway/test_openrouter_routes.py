@@ -608,6 +608,50 @@ def test_provision_diz_qual_variavel_falta(rota, monkeypatch):
     assert r.json()["reason"].endswith("OPENROUTER_MANAGEMENT_KEY")
 
 
+def test_provision_devolve_o_motivo_quando_a_criacao_falha(espelho, monkeypatch):
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+    espelho["mgmt"]["falhar"] = True
+    r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
+    body = r.json()
+    assert body["ok"] is False
+    assert "500" in body["reason"] and "boom" in body["reason"]
+    assert "key-1" not in espelho["or_keys"]
+
+
+def test_401_na_chave_de_gerenciamento_explica_a_variavel(espelho, monkeypatch):
+    """22/10/2026: a OPENROUTER_MANAGEMENT_KEY foi revogada no OpenRouter e o
+    processo seguiu com ela por dias. O motivo tem que dizer que é a variável
+    do gateway, não a chave do cliente."""
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+
+    async def recusa(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": {"message": "User not found.", "code": 401}})
+
+    monkeypatch.setattr(main, "openrouter_mgmt_client", httpx.AsyncClient(
+        base_url="https://openrouter.test/api/v1", transport=httpx.MockTransport(recusa),
+    ))
+    r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
+    body = r.json()
+    assert body["ok"] is False
+    assert "OPENROUTER_MANAGEMENT_KEY" in body["reason"] and "401" in body["reason"]
+    # a request do cliente cai no plano B e o motivo fica registrado
+    assert _chat(espelho, model=TEXT_SLUG).status_code == 200
+    assert espelho["sent"][0][0].headers["authorization"] == "Bearer sk-or-da-stac"
+    assert "OPENROUTER_MANAGEMENT_KEY" in main.openrouter_key_errors["key-1"]
+
+
+def test_sucesso_limpa_o_motivo_da_falha_anterior(espelho, monkeypatch):
+    monkeypatch.setattr(main, "require_admin", lambda secret: None)
+    espelho["mgmt"]["falhar"] = True
+    espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
+    assert "key-1" in main.openrouter_key_errors
+    espelho["mgmt"]["falhar"] = False
+    main.openrouter_key_failures.clear()  # fora do cooldown
+    r = espelho["client"].post("/admin/openrouter-keys/provision", json={"api_key_id": "key-1"})
+    assert r.json() == {"ok": True}
+    assert "key-1" not in main.openrouter_key_errors
+
+
 def test_backfill_cria_so_as_que_faltam(espelho, monkeypatch):
     monkeypatch.setattr(main, "require_admin", lambda secret: None)
     espelho["or_keys"]["key-1"] = {

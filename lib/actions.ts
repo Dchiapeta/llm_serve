@@ -2278,6 +2278,14 @@ async function provisionOpenRouterKey(apiKeyId: string) {
     signal: AbortSignal.timeout(20_000),
   })
   if (!res.ok) throw new Error(`gateway respondeu ${res.status}`)
+  // O gateway responde 200 com { ok: false, reason } quando NÃO criou (repasse
+  // desligado, variável ausente, OpenRouter recusou). Só olhar o status HTTP
+  // engolia isso: em 22/10/2026 a chave de gerenciamento foi revogada e as
+  // chaves ficaram dias sem espelho sem uma linha de log no painel.
+  const body = (await res.json().catch(() => null)) as { ok?: boolean; reason?: string } | null
+  if (!body?.ok) {
+    throw new Error(`gateway não criou a chave espelho: ${body?.reason ?? "sem motivo"}`)
+  }
 }
 
 // Pede ao gateway pra reenviar as chaves da máquina ao agent quando o pod

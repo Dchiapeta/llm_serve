@@ -20,3 +20,6 @@ jsonschema>=4.21
 weasyprint>=63
 # cifra dos segredos das chaves espelho do OpenRouter (openrouter_keys.py)
 cryptography>=42
+# integrações de observabilidade: OTLP em protobuf binário para Grafana Cloud,
+# New Relic e coletores OpenTelemetry (observability_formats.py)
+opentelemetry-proto>=1.27
