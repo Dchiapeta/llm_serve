@@ -53,3 +53,35 @@ export function formatPricePerMillion(model: OpenRouterCatalogModel | undefined)
     })
   return `US$ ${fmt(prompt)} / ${fmt(completion)}`
 }
+
+// Saldo da conta da Stac no OpenRouter (GET /api/v1/credits). Precisa da chave
+// de gerenciamento — a mesma que o gateway usa para criar as chaves espelho
+// (docker/gateway/openrouter_keys.py). Sem ela no painel, o Financeiro mostra o
+// gasto (que vem do banco) e só o saldo fica de fora.
+//
+// Revalidate curto: quando o crédito acaba as requisições passam a levar 402,
+// e um saldo de uma hora atrás esconderia exatamente isso.
+export type OpenRouterCredits =
+  | { ok: true; totalCredits: number; totalUsage: number; remaining: number }
+  | { ok: false; reason: "missing_key" | "error"; error?: string }
+
+export async function getOpenRouterCredits(): Promise<OpenRouterCredits> {
+  const key = process.env.OPENROUTER_MANAGEMENT_KEY
+  if (!key) return { ok: false, reason: "missing_key" }
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/credits", {
+      headers: { Authorization: `Bearer ${key}` },
+      next: { revalidate: 60 },
+      signal: AbortSignal.timeout(10_000),
+    })
+    if (!res.ok) return { ok: false, reason: "error", error: `OpenRouter respondeu ${res.status}` }
+    const body = (await res.json()) as {
+      data?: { total_credits?: number; total_usage?: number }
+    }
+    const totalCredits = Number(body.data?.total_credits ?? 0)
+    const totalUsage = Number(body.data?.total_usage ?? 0)
+    return { ok: true, totalCredits, totalUsage, remaining: totalCredits - totalUsage }
+  } catch (e) {
+    return { ok: false, reason: "error", error: e instanceof Error ? e.message : String(e) }
+  }
+}

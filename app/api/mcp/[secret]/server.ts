@@ -13,6 +13,7 @@ import { z } from "zod"
 
 import { summarizeCost } from "@/lib/billing"
 import { applyCrmFilters, summarizeCrm, type CrmRow } from "@/lib/crm"
+import { getOpenRouterCredits } from "@/lib/openrouter"
 import { createSupabaseAdmin } from "@/lib/supabase/server"
 import { TEMPLATE_PLANS, type Machine } from "@/lib/types"
 
@@ -22,7 +23,7 @@ import {
   loadCrmData,
   type CrmPeriod,
 } from "../../../(dashboard)/crm/queries"
-import { loadCostData } from "../../../(dashboard)/financeiro/queries"
+import { loadCostData, loadOpenRouterCost } from "../../../(dashboard)/financeiro/queries"
 
 const PERIODS = ["24h", "7d", "30d", "total"] as const satisfies readonly CrmPeriod[]
 
@@ -237,21 +238,25 @@ export function buildMcpServer(origin: string): McpServer {
     {
       title: "Gasto com máquinas",
       description:
-        "Gasto de GPU no período (USD), quanto custaria 24/7, a economia do liga/desliga automático e o detalhe por máquina. Mesmos números da página Financeiro.",
+        "Gasto no período em USD: RunPod (GPU, com o custo se ficasse 24/7, a economia do liga/desliga e o detalhe por máquina) e OpenRouter (por modelo, por cliente e saldo de créditos). Mesmos números da página Financeiro.",
       inputSchema: { periodo },
       annotations: READ_ONLY,
     },
     async ({ periodo }) => {
-      const { machines, intervals, dataIncomplete, from, to } = await loadCostData(
-        CRM_PERIOD_MS[periodo]
-      )
+      const [{ machines, intervals, dataIncomplete, from, to }, or, credits] =
+        await Promise.all([
+          loadCostData(CRM_PERIOD_MS[periodo]),
+          loadOpenRouterCost(CRM_PERIOD_MS[periodo]),
+          getOpenRouterCredits(),
+        ])
       const s = summarizeCost(intervals, machines, from, to)
       const running = machines.filter((m) => m.status === "running")
       return json({
         periodo: CRM_PERIOD_LABELS[periodo],
         de: new Date(from).toISOString(),
         ate: new Date(to).toISOString(),
-        gasto_usd: usd(s.spent),
+        gasto_total_usd: usd(s.spent + or.totalUsd),
+        gasto_runpod_usd: usd(s.spent),
         custo_se_24_7_usd: usd(s.baseline),
         economia_usd: usd(s.saved),
         economia_pct: Math.round(s.savedPct * 10) / 10,
@@ -270,7 +275,31 @@ export function buildMcpServer(origin: string): McpServer {
           economia_usd: usd(r.saved),
           uptime_pct: Math.round(r.uptimePct * 10) / 10,
         })),
-        avisos: dataIncomplete ? ["Máquinas ou intervalos vieram incompletos."] : [],
+        openrouter: {
+          gasto_usd: usd(or.totalUsd),
+          requisicoes_cobradas: or.requests,
+          // 402 = crédito da conta acabou; o cliente recebeu 503
+          requisicoes_sem_credito: or.outOfCredit,
+          saldo_creditos_usd: credits.ok ? usd(credits.remaining) : null,
+          creditos_comprados_usd: credits.ok ? usd(credits.totalCredits) : null,
+          por_modelo: or.byModel.map((m) => ({
+            modelo: m.model,
+            requisicoes: m.requests,
+            tokens: m.tokens,
+            gasto_usd: usd(m.costUsd),
+          })),
+          por_cliente: or.byAccount.map((a) => ({
+            conta_id: a.accountId,
+            nome: a.name,
+            requisicoes: a.requests,
+            gasto_usd: usd(a.costUsd),
+          })),
+        },
+        avisos: [
+          ...(dataIncomplete ? ["Máquinas ou intervalos vieram incompletos."] : []),
+          ...(or.dataIncomplete ? ["Custo do OpenRouter veio incompleto."] : []),
+          ...(credits.ok ? [] : ["Saldo do OpenRouter indisponível."]),
+        ],
       })
     }
   )

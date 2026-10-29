@@ -10,26 +10,28 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart"
 
-// Duas séries EMPILHADAS na mesma escala (US$): a altura total da barra é o que
-// a máquina custaria ligada 24/7 e a parte sólida é o que de fato foi gasto — a
-// fatia hachurada em cima é a economia. Sem segundo eixo: é a mesma grandeza.
+// Séries EMPILHADAS na mesma escala (US$): GPU gasta, OpenRouter e, por cima, a
+// economia hachurada — o que as máquinas custariam a mais ligadas 24/7. Sem
+// segundo eixo: é a mesma grandeza. O OpenRouter fica fora do 24/7 (é por
+// requisição, não tem "ligado direto"), por isso a hachura sai só da GPU.
 //
 // A economia usa hachura, não uma segunda cor: o design system é monocromático
 // (--chart-1..5 são tons de cinza, idênticos em light e dark), então diferenciar
 // por textura sobrevive aos dois temas e ao daltonismo/impressão.
 const config: ChartConfig = {
-  spent: { label: "Gasto", color: "var(--chart-2)" },
+  spent: { label: "RunPod", color: "var(--chart-2)" },
+  openrouter: { label: "OpenRouter", color: "var(--chart-4)" },
   saved: { label: "Economizado", color: "var(--muted-foreground)" },
 }
 
 export function CostChart({ data }: { data: CostBucket[] }) {
-  const total = data.reduce((s, d) => s + d.baseline, 0)
+  const total = data.reduce((s, d) => s + d.baseline + d.openrouter, 0)
 
   if (total === 0) {
     return (
       <p className="py-10 text-center text-sm text-muted-foreground">
-        Sem histórico de custo ainda — os dados começam a acumular a partir da
-        primeira mudança de estado das máquinas.
+        Sem gasto no período — nem máquina ligada, nem requisição cobrada pelo
+        OpenRouter.
       </p>
     )
   }
@@ -37,6 +39,7 @@ export function CostChart({ data }: { data: CostBucket[] }) {
   const chartData = data.map((d) => ({
     label: d.label,
     spent: d.spent,
+    openrouter: d.openrouter,
     saved: Math.max(0, d.baseline - d.spent),
   }))
 
@@ -48,7 +51,14 @@ export function CostChart({ data }: { data: CostBucket[] }) {
             className="size-2.5 rounded-[2px]"
             style={{ background: "var(--chart-2)" }}
           />
-          Gasto
+          RunPod
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span
+            className="size-2.5 rounded-[2px]"
+            style={{ background: "var(--chart-4)" }}
+          />
+          OpenRouter
         </span>
         <span className="flex items-center gap-1.5">
           <span
@@ -103,15 +113,13 @@ export function CostChart({ data }: { data: CostBucket[] }) {
             content={
               <ChartTooltipContent
                 labelFormatter={(label, payload) => {
-                  const baseline = (payload ?? []).reduce(
-                    (s, item) => s + Number(item.value ?? 0),
-                    0
-                  )
+                  const value = (key: string) =>
+                    Number((payload ?? []).find((item) => item.dataKey === key)?.value ?? 0)
                   return (
                     <span>
-                      {String(label)} ·{" "}
+                      {String(label)} · {formatUsd(value("spent") + value("openrouter"))}{" "}
                       <span className="text-muted-foreground">
-                        24/7 custaria {formatUsd(baseline)}
+                        · GPU 24/7 custaria {formatUsd(value("spent") + value("saved"))}
                       </span>
                     </span>
                   )
@@ -130,6 +138,7 @@ export function CostChart({ data }: { data: CostBucket[] }) {
             }
           />
           <Bar dataKey="spent" stackId="cost" fill="var(--color-spent)" />
+          <Bar dataKey="openrouter" stackId="cost" fill="var(--color-openrouter)" />
           <Bar
             dataKey="saved"
             stackId="cost"

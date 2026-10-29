@@ -191,16 +191,23 @@ export type CostBucket = {
   label: string
   spent: number
   baseline: number
+  /** Gasto repassado ao OpenRouter no bucket (fora do baseline: não há 24/7). */
+  openrouter: number
 }
+
+/** Uma requisição repassada ao OpenRouter, com o custo que ele cobrou. */
+export type OpenRouterCharge = { created_at: string; cost_usd: number }
 
 // Série temporal do gasto: buckets contíguos (incluindo zeros, para barras
 // uniformes) cobrindo [from, to). Cada intervalo é repartido entre os buckets
-// que ele atravessa, proporcional ao tempo em cada um.
+// que ele atravessa, proporcional ao tempo em cada um; o custo do OpenRouter
+// cai inteiro no bucket da requisição.
 export function bucketizeCost(
   intervals: RuntimeInterval[],
   from: number,
   to: number,
-  granularity: Granularity
+  granularity: Granularity,
+  openRouter: OpenRouterCharge[] = []
 ): CostBucket[] {
   const step = granularity === "hour" ? HOUR_MS : DAY_MS
   const origin = floorToBucket(from, step)
@@ -210,7 +217,15 @@ export function bucketizeCost(
     label: labelOf(origin + i * step, granularity),
     spent: 0,
     baseline: 0,
+    openrouter: 0,
   }))
+
+  for (const charge of openRouter) {
+    const t = new Date(charge.created_at).getTime()
+    if (t < from || t >= to) continue
+    const i = Math.floor((t - origin) / step)
+    if (i >= 0 && i < count) buckets[i].openrouter += charge.cost_usd
+  }
 
   for (const iv of intervals) {
     if (!LIVE_STATUSES(iv.status)) continue
