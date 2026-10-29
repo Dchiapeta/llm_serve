@@ -88,8 +88,19 @@ function dataWarnings(data: Awaited<ReturnType<typeof loadCrmData>>): string[] {
   return warnings
 }
 
-export function buildMcpServer(): McpServer {
-  const server = new McpServer({ name: "stac-manager", version: "1.0.0" })
+/** `origin` = origem pública do manager, para as URLs dos ícones (public/brand). */
+export function buildMcpServer(origin: string): McpServer {
+  // `theme` diz o fundo para o qual o ícone foi desenhado: marca escura no
+  // tema claro, marca clara no escuro.
+  const server = new McpServer({
+    name: "stac-manager",
+    title: "Stac Manager",
+    version: "1.0.0",
+    icons: [
+      { src: `${origin}/brand/icon-light.png`, mimeType: "image/png", sizes: ["512x512"], theme: "light" },
+      { src: `${origin}/brand/icon-dark.png`, mimeType: "image/png", sizes: ["512x512"], theme: "dark" },
+    ],
+  })
 
   server.registerTool(
     "resumo_negocio",

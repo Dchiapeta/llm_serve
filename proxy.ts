@@ -99,7 +99,9 @@ export const config = {
     // X-External-Secret no handler — ficar fora daqui não abre nada, e ficar
     // DENTRO as fazia responder 307 /login ao webhook da Chargefy: o cliente
     // pagava e a stack nunca nascia. `api/mcp/[^/]+$` é o conector do Claude,
-    // autenticado pelo segredo no próprio caminho (MCP_SECRET).
-    "/((?!_next/static|_next/image|favicon.ico|api/mcp/[^/]+$|api/agent|api/machines/provision|api/machines/[^/]+/recreate|api/knowledge/ingest|api/stacks$|api/stacks/[^/]+/billing-sync|api/stacks/[^/]+/model-config|api/keys).*)",
+    // autenticado pelo segredo no próprio caminho (MCP_SECRET). `brand/` são
+    // os ícones (public/brand): a tela de login e o conector do Claude os
+    // pedem sem sessão.
+    "/((?!_next/static|_next/image|favicon.ico|brand/|api/mcp/[^/]+$|api/agent|api/machines/provision|api/machines/[^/]+/recreate|api/knowledge/ingest|api/stacks$|api/stacks/[^/]+/billing-sync|api/stacks/[^/]+/model-config|api/keys).*)",
   ],
 }

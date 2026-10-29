@@ -30,6 +30,18 @@ function authorized(secret: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
+/**
+ * Origem que o cliente usou, para as URLs absolutas dos ícones. `req.url` não
+ * serve: o Next o reescreve (em dev vira localhost mesmo pedindo 127.0.0.1) e,
+ * atrás de proxy, pode ser o host interno.
+ */
+function publicOrigin(req: Request): string {
+  const url = new URL(req.url)
+  const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? url.host
+  const proto = req.headers.get("x-forwarded-proto") ?? url.protocol.replace(":", "")
+  return `${proto}://${host}`
+}
+
 async function handle(
   req: Request,
   { params }: { params: Promise<{ secret: string }> }
@@ -40,7 +52,7 @@ async function handle(
   // Stateless: um servidor e um transporte por request. Não há estado de sessão
   // a guardar (as ferramentas só leem), e serverless não garante que a próxima
   // request caia na mesma instância.
-  const server = buildMcpServer()
+  const server = buildMcpServer(publicOrigin(req))
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,

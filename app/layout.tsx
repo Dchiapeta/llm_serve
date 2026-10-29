@@ -18,6 +18,14 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "RunPod LLM Manager",
   description: "Gerenciador de infraestrutura de LLM no RunPod",
+  icons: {
+    // Mesma marca e mesmo esquema do TryStac. O .ico (marca escura) é o
+    // app/favicon.ico, que o Next já declara sozinho — repetir aqui duplicava a
+    // tag. O SVG troca de cor com o tema pela media query interna: o Chrome
+    // ignora `media` no <link rel="icon">, então não dá para trocar por arquivo.
+    icon: [{ url: "/brand/favicon.svg", sizes: "any", type: "image/svg+xml" }],
+    apple: { url: "/brand/apple-touch-icon.png", sizes: "180x180" },
+  },
 };
 
 export default function RootLayout({
