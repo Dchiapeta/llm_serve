@@ -164,7 +164,15 @@ export const getCrmData = cache(async function getCrmData(
 ): Promise<CrmData> {
   // Camada de autorização mais próxima do dado — a que a doc do Next recomenda.
   await requireAdminSession()
+  return loadCrmData(period)
+})
 
+/**
+ * getCrmData sem a checagem de sessão — quem chama responde pelo acesso.
+ * Existe para a rota MCP (app/api/mcp/[secret]), que autentica pelo segredo na
+ * URL e não tem cookie: requireAdminSession redirecionaria para /login.
+ */
+export async function loadCrmData(period: CrmPeriod): Promise<CrmData> {
   const db = createSupabaseAdmin()
   const periodMs = CRM_PERIOD_MS[period]
   const { from: windowFrom, to } = costWindow(periodMs)
@@ -740,7 +748,7 @@ export const getCrmData = cache(async function getCrmData(
     coreIncomplete,
     gpuCostTotalUsd: cost.spent,
   }
-})
+}
 
 /**
  * `stacks.last_activity_at` é `not null default now()`, então uma stack que
